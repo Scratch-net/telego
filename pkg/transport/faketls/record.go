@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 )
@@ -73,20 +74,25 @@ func ReleaseRecord(r *Record) {
 func ReadRecord(r io.Reader) (*Record, error) {
 	rec := AcquireRecord()
 
-	// Read header
+	// Read header (5 bytes: type + version + length)
 	header := make([]byte, RecordHeaderSize)
-	if _, err := io.ReadFull(r, header); err != nil {
+	n, err := io.ReadFull(r, header)
+	if err != nil {
 		ReleaseRecord(rec)
-		return nil, err
+		return nil, fmt.Errorf("read header: %w (read %d bytes)", err, n)
 	}
 
 	rec.Type = header[0]
 	rec.Version = binary.BigEndian.Uint16(header[1:3])
 	length := int(binary.BigEndian.Uint16(header[3:5]))
 
+	// Debug: log what we read
+	fmt.Printf("[DEBUG ReadRecord] header=%02x %02x %02x %02x %02x → type=0x%02x version=0x%04x length=%d\n",
+		header[0], header[1], header[2], header[3], header[4], rec.Type, rec.Version, length)
+
 	if length > MaxRecordPayload {
 		ReleaseRecord(rec)
-		return nil, ErrRecordTooLarge
+		return nil, fmt.Errorf("%w: length=%d", ErrRecordTooLarge, length)
 	}
 
 	// Read payload
@@ -96,9 +102,10 @@ func ReadRecord(r io.Reader) (*Record, error) {
 		rec.Payload = rec.Payload[:length]
 	}
 
-	if _, err := io.ReadFull(r, rec.Payload); err != nil {
+	n, err = io.ReadFull(r, rec.Payload)
+	if err != nil {
 		ReleaseRecord(rec)
-		return nil, err
+		return nil, fmt.Errorf("read payload: %w (expected %d, read %d)", err, length, n)
 	}
 
 	return rec, nil

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -72,7 +73,7 @@ func (c *RewindConn) Read(p []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Read from buffer first
+	// Read from buffer first (only after Rewind has been called)
 	if c.offset < len(c.buf) {
 		n := copy(p, c.buf[c.offset:])
 		c.offset += n
@@ -83,6 +84,7 @@ func (c *RewindConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
 	if n > 0 {
 		c.buf = append(c.buf, p[:n]...)
+		c.offset = len(c.buf) // Mark all buffered data as "delivered"
 	}
 	return n, err
 }
@@ -109,13 +111,18 @@ func (c *RewindConn) StopBuffering() net.Conn {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if len(c.buf) == 0 {
+	// If no buffered data or all buffered data already consumed, return underlying conn
+	if len(c.buf) == 0 || c.offset >= len(c.buf) {
+		log.Printf("[DEBUG StopBuffering] returning underlying conn (buf=%d, offset=%d)", len(c.buf), c.offset)
 		return c.Conn
 	}
 
+	// Return bufferedConn starting from current offset (don't re-read consumed data)
+	log.Printf("[DEBUG StopBuffering] returning bufferedConn (buf=%d, offset=%d, remaining=%d)", len(c.buf), c.offset, len(c.buf)-c.offset)
 	return &bufferedConn{
-		Conn: c.Conn,
-		buf:  c.buf,
+		Conn:   c.Conn,
+		buf:    c.buf,
+		offset: c.offset,
 	}
 }
 

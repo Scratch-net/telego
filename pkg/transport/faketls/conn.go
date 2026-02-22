@@ -2,6 +2,7 @@ package faketls
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -39,6 +40,8 @@ func (c *Conn) Read(p []byte) (int, error) {
 		}
 		defer ReleaseRecord(rec)
 
+		fmt.Printf("[DEBUG FakeTLS.Conn.Read] got record type=0x%02x len=%d\n", rec.Type, len(rec.Payload))
+
 		switch rec.Type {
 		case RecordTypeApplicationData:
 			// Buffer payload and return what fits
@@ -49,8 +52,15 @@ func (c *Conn) Read(p []byte) (int, error) {
 			// Skip change cipher spec records
 			continue
 
+		case RecordTypeHandshake:
+			// After initial handshake, client might send more handshake records
+			// (e.g., for TLS 1.3 key updates). For FakeTLS, we treat these as data.
+			fmt.Printf("[DEBUG FakeTLS.Conn.Read] WARNING: treating handshake record as data\n")
+			c.readBuf.Write(rec.Payload)
+			return c.readBuf.Read(p)
+
 		default:
-			return 0, ErrInvalidRecordType
+			return 0, fmt.Errorf("%w: got 0x%02x", ErrInvalidRecordType, rec.Type)
 		}
 	}
 }

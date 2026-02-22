@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 )
@@ -53,6 +54,10 @@ func ClientHandshake(secret []byte, reader io.Reader) (int, cipher.Stream, ciphe
 		return 0, nil, nil, err
 	}
 
+	// Debug: show raw frame bytes
+	fmt.Printf("[DEBUG obfuscated2] raw frame first 16 bytes: %02x\n", frame[:16])
+	fmt.Printf("[DEBUG obfuscated2] raw frame bytes 56-64: %02x\n", frame[56:64])
+
 	// Derive decryption key using SHA256(secret + frame[8:40])
 	// and decryption IV from frame[40:56]
 	decKey := deriveKey(secret, frame[8:40])
@@ -67,8 +72,12 @@ func ClientHandshake(secret []byte, reader io.Reader) (int, cipher.Stream, ciphe
 	// Decrypt the frame in place
 	decryptor.XORKeyStream(frame[:], frame[:])
 
+	// Debug: show decrypted frame
+	fmt.Printf("[DEBUG obfuscated2] decrypted frame bytes 56-64: %02x\n", frame[56:64])
+
 	// Validate connection type
 	connType := binary.LittleEndian.Uint32(frame[56:60])
+	fmt.Printf("[DEBUG obfuscated2] connType=0x%08x (want 0x%08x)\n", connType, ConnectionTypeFakeTLS)
 	if connType != ConnectionTypeFakeTLS {
 		return 0, nil, nil, ErrUnsupportedConnection
 	}

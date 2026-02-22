@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -267,6 +268,13 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext, conn *tlsfront.RewindConn
 	// Parse and validate ClientHello
 	hello, err := faketls.ParseClientHello(p.config.Secret, rec.Payload)
 	if err != nil {
+		// Debug: show first 20 bytes of payload
+		hexDump := ""
+		for i := 0; i < 20 && i < len(rec.Payload); i++ {
+			hexDump += fmt.Sprintf("%02x ", rec.Payload[i])
+		}
+		p.logger.Debug("ParseClientHello error: %v (payload len=%d, secret len=%d, first bytes: %s)",
+			err, len(rec.Payload), len(p.config.Secret), hexDump)
 		return nil, nil, err
 	}
 
