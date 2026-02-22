@@ -86,11 +86,16 @@ func ClientHandshake(secret []byte, reader io.Reader) (int, cipher.Stream, ciphe
 	dcID := int(int16(binary.LittleEndian.Uint16(frame[60:62])))
 
 	// Derive encryption key for responses
-	// Reverse key and IV for the other direction
-	encKey := reverseBytes(decKey)
-	encIV := reverseBytes(decIV)
+	// Per mtg: reverse the entire key+IV block (48 bytes), then extract key and IV
+	// This is NOT the same as reversing key and IV separately!
+	invertedKeyIV := reverseBytes(frame[8:56]) // Reverse the 48-byte key+IV block
+	encKeyData := invertedKeyIV[:32]
+	encIVData := invertedKeyIV[32:48]
 
-	encryptor, err := NewAESCTR(encKey, encIV)
+	// Derive encryptor key: SHA256(inverted_key || secret)
+	encKey := deriveKey(secret, encKeyData)
+
+	encryptor, err := NewAESCTR(encKey, encIVData)
 	if err != nil {
 		return 0, nil, nil, err
 	}

@@ -38,10 +38,11 @@ var (
 
 // ClientHello represents a parsed TLS ClientHello.
 type ClientHello struct {
-	Time      time.Time
-	Random    [32]byte
-	SessionID []byte
-	Host      string
+	Time        time.Time
+	Random      [32]byte
+	SessionID   []byte
+	Host        string
+	CipherSuite uint16
 }
 
 // ParseClientHello parses and validates a FakeTLS ClientHello.
@@ -111,10 +112,24 @@ func ParseClientHello(secret []byte, payload []byte) (*ClientHello, error) {
 	hello.SessionID = make([]byte, sessionIDLen)
 	copy(hello.SessionID, payload[clientHelloSessionIDOffset+1:])
 
+	// Extract cipher suite (first one from the list)
+	hello.CipherSuite = extractCipherSuite(payload, sessionIDLen)
+
 	// Extract SNI hostname from extensions
 	hello.Host = extractSNI(payload)
 
 	return hello, nil
+}
+
+// extractCipherSuite extracts the first cipher suite from ClientHello.
+func extractCipherSuite(payload []byte, sessionIDLen int) uint16 {
+	// Cipher suites start after: handshake_header(4) + version(2) + random(32) + session_id_len(1) + session_id
+	offset := 4 + 2 + 32 + 1 + sessionIDLen
+	if offset+4 > len(payload) {
+		return 0
+	}
+	// Skip cipher suites length (2 bytes), read first cipher suite
+	return binary.BigEndian.Uint16(payload[offset+2 : offset+4])
 }
 
 // Valid checks if the ClientHello is valid for the given host and time tolerance.
@@ -201,62 +216,55 @@ func extractSNI(payload []byte) string {
 	return ""
 }
 
+// WelcomePacketRandomOffset is the offset of server random in the welcome packet.
+// This is: record_header(5) + handshake_type(1) + handshake_length(3) + version(2) = 11
+const WelcomePacketRandomOffset = 11
+
 // BuildServerHello creates a ServerHello response for FakeTLS.
+// Based on mtg v2 welcome.go implementation.
 func BuildServerHello(secret []byte, clientHello *ClientHello) ([]byte, error) {
 	buf := &bytes.Buffer{}
 
-	// Generate random padding (1024 + 0-3072 random bytes)
-	paddingLen := 1024 + (time.Now().UnixNano() % 3072)
+	// Build ServerHello handshake message (with zeroed random initially)
+	serverHello := buildServerHelloMessage(clientHello)
+
+	// Write ServerHello as TLS record (TLS 1.2 version per mtg)
+	writeRecordTLS12(buf, RecordTypeHandshake, serverHello)
+
+	// Write ChangeCipherSpec (TLS 1.2 version per mtg)
+	writeRecordTLS12(buf, RecordTypeChangeCipherSpec, []byte{0x01})
+
+	// Write ApplicationData with random padding (1024 + random 0-3091 bytes, per mtg)
+	paddingLen := 1024 + int(time.Now().UnixNano()%3092)
 	randomData := make([]byte, paddingLen)
 	rand.Read(randomData)
+	writeRecordTLS12(buf, RecordTypeApplicationData, randomData)
 
-	// Build ServerHello handshake message
-	serverHello := buildServerHelloMessage()
+	// Get the complete packet
+	packet := buf.Bytes()
 
-	// Build the TLS record that will be sent (with zeroed random for MAC)
-	serverHelloCopy := make([]byte, len(serverHello))
-	copy(serverHelloCopy, serverHello)
-	copy(serverHelloCopy[6:6+randomLen], emptyRandom)
-
-	// Build full TLS record for MAC computation (matching ClientHello pattern)
-	record := make([]byte, 5+len(serverHelloCopy))
-	record[0] = RecordTypeHandshake // 0x16
-	record[1] = 0x03                // TLS 1.0 major (match ClientHello)
-	record[2] = 0x01                // TLS 1.0 minor
-	binary.BigEndian.PutUint16(record[3:5], uint16(len(serverHelloCopy)))
-	copy(record[5:], serverHelloCopy)
-
-	// Compute MAC for response
-	// server_random = HMAC-SHA256(secret, client_random || serverHello_record_with_zeroed_random)
+	// Compute MAC over: client_random || entire_packet (with zeroed server_random)
+	// Per mtg: mac.Write(clientHello.Random[:]); mac.Write(packet)
 	mac := hmac.New(sha256.New, secret)
 	mac.Write(clientHello.Random[:])
-	mac.Write(record)
+	mac.Write(packet)
 	serverRandom := mac.Sum(nil)
 
-	fmt.Printf("[DEBUG BuildServerHello] clientRandom=%02x..., serverRandom=%02x...\n",
-		clientHello.Random[:8], serverRandom[:8])
+	// Place computed random into the packet at offset 11
+	copy(packet[WelcomePacketRandomOffset:], serverRandom)
 
-	// Place computed random into ServerHello
-	copy(serverHello[6:6+randomLen], serverRandom)
+	fmt.Printf("[DEBUG BuildServerHello] clientRandom=%02x..., serverRandom=%02x..., packetLen=%d\n",
+		clientHello.Random[:8], serverRandom[:8], len(packet))
 
-	// Write ServerHello as TLS handshake record (use TLS 1.0 version for record header)
-	writeRecordWithVersion(buf, RecordTypeHandshake, VersionTLS10, serverHello)
-
-	// Write ChangeCipherSpec
-	writeRecordWithVersion(buf, RecordTypeChangeCipherSpec, VersionTLS10, []byte{0x01})
-
-	// Write encrypted application data (random padding)
-	writeRecordWithVersion(buf, RecordTypeApplicationData, VersionTLS12, randomData)
-
-	return buf.Bytes(), nil
+	return packet, nil
 }
 
-// writeRecordWithVersion writes a TLS record with the specified version.
-func writeRecordWithVersion(w *bytes.Buffer, recordType byte, version uint16, payload []byte) {
+// writeRecordTLS12 writes a TLS record with TLS 1.2 version (0x0303).
+func writeRecordTLS12(w *bytes.Buffer, recordType byte, payload []byte) {
 	header := [RecordHeaderSize]byte{
 		recordType,
-		byte(version >> 8),
-		byte(version),
+		0x03, // TLS 1.2 major
+		0x03, // TLS 1.2 minor
 		byte(len(payload) >> 8),
 		byte(len(payload)),
 	}
@@ -264,65 +272,60 @@ func writeRecordWithVersion(w *bytes.Buffer, recordType byte, version uint16, pa
 	w.Write(payload)
 }
 
+// serverHelloSuffix contains compression method + extensions header.
+// Per mtg: compression(1) + extensions_length(2) + supported_versions(6) + key_share_header(8)
+var serverHelloSuffix = []byte{
+	0x00,       // no compression
+	0x00, 0x2e, // 46 bytes of extensions
+	0x00, 0x2b, // Extension: Supported Versions
+	0x00, 0x02, // 2 bytes
+	0x03, 0x04, // TLS 1.3
+	0x00, 0x33, // Extension: Key Share
+	0x00, 0x24, // 36 bytes
+	0x00, 0x1d, // x25519 curve
+	0x00, 0x20, // 32 bytes of key
+}
+
 // buildServerHelloMessage creates the ServerHello handshake message.
-func buildServerHelloMessage() []byte {
-	// ServerHello structure:
-	// [0]     Handshake type (0x02 = ServerHello)
-	// [1:4]   Length (3 bytes, big-endian)
-	// [4:6]   Version (TLS 1.2 = 0x0303)
-	// [6:38]  Server random (32 bytes)
-	// [38]    Session ID length (0)
-	// [39:41] Cipher suite (TLS_AES_128_GCM_SHA256 = 0x1301)
-	// [41]    Compression method (null = 0x00)
-	// [42:44] Extensions length
-	// [44+]   Extensions
+// Per mtg welcome.go generateServerHello function.
+func buildServerHelloMessage(clientHello *ClientHello) []byte {
+	buf := &bytes.Buffer{}
 
-	// TLS 1.3 extensions for ServerHello
-	extensions := []byte{
-		0x00, 0x2b, // Extension: Supported Versions
-		0x00, 0x02, // Length: 2 bytes
-		0x03, 0x04, // TLS 1.3
+	// Version (TLS 1.2)
+	buf.WriteByte(0x03)
+	buf.WriteByte(0x03)
 
-		0x00, 0x33, // Extension: Key Share
-		0x00, 0x24, // Length: 36 bytes
-		0x00, 0x1d, // x25519 curve
-		0x00, 0x20, // 32 bytes of key share
+	// Random (32 bytes of zeros - will be filled in later by MAC)
+	buf.Write(emptyRandom)
+
+	// Session ID (copy from client)
+	buf.WriteByte(byte(len(clientHello.SessionID)))
+	buf.Write(clientHello.SessionID)
+
+	// Cipher suite (copy from client, or use default)
+	cipherSuite := clientHello.CipherSuite
+	if cipherSuite == 0 {
+		cipherSuite = 0x1301 // TLS_AES_128_GCM_SHA256
 	}
-	// Add 32 random bytes for key share
+	buf.WriteByte(byte(cipherSuite >> 8))
+	buf.WriteByte(byte(cipherSuite))
+
+	// Suffix (compression + extensions header)
+	buf.Write(serverHelloSuffix)
+
+	// Generate x25519 key share (32 bytes)
 	keyShare := make([]byte, 32)
 	rand.Read(keyShare)
-	extensions = append(extensions, keyShare...)
+	buf.Write(keyShare)
 
-	// Total message length
-	msgLen := 2 + 32 + 1 + 2 + 1 + 2 + len(extensions) // version + random + session_id_len + cipher + compression + ext_len + extensions
-
-	msg := make([]byte, 4+msgLen)
-	msg[0] = 0x02 // ServerHello
-	msg[1] = byte(msgLen >> 16)
-	msg[2] = byte(msgLen >> 8)
-	msg[3] = byte(msgLen)
-
-	// Version (TLS 1.2 in ServerHello, real version in extension)
-	msg[4] = 0x03
-	msg[5] = 0x03
-
-	// Random will be filled later (32 bytes at offset 6)
-
-	// Session ID length = 0
-	msg[38] = 0x00
-
-	// Cipher suite
-	msg[39] = 0x13
-	msg[40] = 0x01
-
-	// Compression method
-	msg[41] = 0x00
-
-	// Extensions length
-	binary.BigEndian.PutUint16(msg[42:44], uint16(len(extensions)))
-
-	// Extensions
-	copy(msg[44:], extensions)
+	// Build final message with handshake header
+	body := buf.Bytes()
+	msg := make([]byte, 4+len(body))
+	msg[0] = 0x02 // ServerHello handshake type
+	msg[1] = byte(len(body) >> 16)
+	msg[2] = byte(len(body) >> 8)
+	msg[3] = byte(len(body))
+	copy(msg[4:], body)
 
 	return msg
 }
