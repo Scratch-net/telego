@@ -194,6 +194,8 @@ func (p *Proxy) handleConn(conn net.Conn) {
 	ctx := p.newStreamContext(conn)
 	defer ctx.cancel()
 
+	p.logger.Debug("New connection from %s", conn.RemoteAddr())
+
 	// Set initial deadline
 	conn.SetDeadline(time.Now().Add(30 * time.Second))
 
@@ -203,10 +205,14 @@ func (p *Proxy) handleConn(conn net.Conn) {
 	// Step 1: FakeTLS handshake
 	ftlsConn, clientHello, err := p.doFakeTLSHandshake(ctx, rewindConn)
 	if err != nil {
+		p.logger.Debug("FakeTLS handshake failed: %v", err)
 		// Invalid ClientHello - splice to mask host
 		if p.splicer != nil && p.config.SpliceUnrecognized {
+			p.logger.Debug("Splicing to mask host")
 			rewindConn.Rewind()
 			p.splicer.Splice(ctx.ctx, rewindConn.StopBuffering(), nil)
+		} else {
+			p.logger.Debug("No splice configured, closing connection")
 		}
 		return
 	}

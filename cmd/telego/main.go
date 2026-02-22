@@ -26,7 +26,7 @@ var CLI struct {
 type RunCmd struct {
 	Config string `short:"c" help:"Path to config file" type:"existingfile"`
 	Secret string `short:"s" help:"Proxy secret (overrides config)"`
-	Bind   string `short:"b" default:"0.0.0.0:443" help:"Address to bind to"`
+	Bind   string `short:"b" help:"Address to bind to (default: 0.0.0.0:443)"`
 }
 
 func (c *RunCmd) Run() error {
@@ -57,6 +57,11 @@ func (c *RunCmd) Run() error {
 	}
 	if c.Bind != "" {
 		cfg.BindAddr = c.Bind
+	}
+
+	// Default bind address
+	if cfg.BindAddr == "" {
+		cfg.BindAddr = "0.0.0.0:443"
 	}
 
 	// Validate
@@ -150,7 +155,7 @@ func main() {
 type consoleLogger struct{}
 
 func (l *consoleLogger) Debug(format string, args ...any) {
-	// Debug disabled by default
+	fmt.Printf("[DEBUG] "+format+"\n", args...)
 }
 
 func (l *consoleLogger) Info(format string, args ...any) {
