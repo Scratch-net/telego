@@ -1,0 +1,56 @@
+# telego configuration example
+
+# Proxy secret (ee-prefixed FakeTLS secret)
+# Generate with: telego generate www.google.com
+secret = "ee..."
+
+# Address to bind to
+bind-to = "0.0.0.0:443"
+
+[middle-end]
+# Enable Middle-End support for better performance
+enabled = true
+
+# Connection pool size (concurrent ME connections)
+pool-size = 16
+
+# Pre-warmed connections for low latency
+warm-standby = 8
+
+# Keepalive interval
+keepalive-interval = "30s"
+
+# Fallback to direct DC if ME unavailable
+fallback-to-direct = true
+
+# Custom ME servers (optional, uses defaults if empty)
+# servers = ["149.154.175.50:8888", "149.154.167.50:8888"]
+
+[tls-fronting]
+# Hostname to impersonate (must match secret)
+mask-host = "www.google.com"
+mask-port = 443
+
+# Fetch real certificate from mask-host
+# Makes proxy indistinguishable from real server
+fetch-real-cert = true
+
+# Forward unrecognized TLS clients to mask-host
+# DPI sees legitimate HTTPS traffic
+splice-unrecognized = true
+
+# Certificate refresh interval (hours)
+cert-refresh-hours = 5
+
+[performance]
+# TCP buffer size in KB (256KB recommended)
+tcp-buffer-kb = 256
+
+# Maximum concurrent connections
+concurrency = 8192
+
+# IP preference: prefer-ipv4, prefer-ipv6, only-ipv4, only-ipv6
+prefer-ip = "prefer-ipv4"
+
+# Idle connection timeout
+idle-timeout = "5m"
