@@ -248,8 +248,7 @@ Tested on Intel i9-12900K, Linux 6.6:
 PRs are welcome! Please ensure:
 
 1. Tests pass: `go test -race ./...`
-2. No lint errors: `golangci-lint run`
-3. Benchmarks don't regress: `go test -bench=. ./...`
+2. Benchmarks don't regress: `go test -bench=. ./...`
 
 **Note:** Middle-End (ME) protocol and ad-tags will not be supported.
 
