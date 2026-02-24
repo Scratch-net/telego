@@ -1,0 +1,18 @@
+# Multi-stage build for local Docker builds
+# Usage: docker build -f Dockerfile.build -t telego .
+
+FROM golang:1.26-alpine AS builder
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 go build -tags="poll_opt,gc_opt" -ldflags="-s -w" -o telego ./cmd/telego
+
+FROM scratch
+
+COPY --from=builder /src/telego /telego
+
+ENTRYPOINT ["/telego"]
+CMD ["run", "-c", "/config.toml"]

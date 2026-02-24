@@ -1,0 +1,6 @@
+telego
+telego-linux-*
+*.pb.gz
+*.log
+.git
+.gitignore

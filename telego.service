@@ -1,0 +1,18 @@
+[Unit]
+Description=Telego MTProxy
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/telego run -c CONFIG_PATH
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+
+# Security hardening (ProtectHome disabled to allow config in /root)
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

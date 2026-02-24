@@ -1,0 +1,29 @@
+# TeleGO Configuration Example
+# Copy this file to config.toml and customize
+
+# Network binding address
+bind-to = "0.0.0.0:443"
+
+# Log level: debug, info, warn, error
+log-level = "info"
+
+# Named secrets (32 hex characters = 16 bytes)
+# Generate with: telego generate <hostname>
+[secrets]
+user1 = "0123456789abcdef0123456789abcdef"
+# user2 = "fedcba9876543210fedcba9876543210"
+
+# TLS fronting - host to mimic (must match your secret's hostname)
+[tls-fronting]
+mask-host = "www.google.com"
+
+# Performance tuning (all optional)
+[performance]
+# IP preference: prefer-ipv4, prefer-ipv6, only-ipv4, only-ipv6
+prefer-ip = "prefer-ipv4"
+
+# Connection idle timeout
+idle-timeout = "5m"
+
+# Number of event loops (0 = auto, uses all CPU cores)
+num-event-loops = 0
