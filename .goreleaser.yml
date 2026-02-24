@@ -1,0 +1,83 @@
+version: 2
+
+project_name: telego
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: telego
+    main: ./cmd/telego
+    binary: telego
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    tags:
+      - poll_opt
+      - gc_opt
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.ShortCommit}}
+      - -X main.date={{.Date}}
+
+archives:
+  - id: default
+    formats:
+      - tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - LICENSE
+      - README.md
+      - config.example.toml
+
+checksum:
+  name_template: 'checksums.txt'
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^ci:'
+      - Merge pull request
+      - Merge branch
+
+dockers:
+  - image_templates:
+      - "scratchnet/telego:{{ .Tag }}"
+      - "scratchnet/telego:v{{ .Major }}"
+      - "scratchnet/telego:v{{ .Major }}.{{ .Minor }}"
+      - "scratchnet/telego:latest"
+    dockerfile: Dockerfile
+    build_flag_templates:
+      - "--pull"
+      - "--label=org.opencontainers.image.created={{.Date}}"
+      - "--label=org.opencontainers.image.title={{.ProjectName}}"
+      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+      - "--label=org.opencontainers.image.version={{.Version}}"
+      - "--platform=linux/amd64"
+
+release:
+  github:
+    owner: Scratch-net
+    name: telego
+  draft: false
+  prerelease: auto
+  mode: replace
+  header: |
+    ## TeleGO {{ .Tag }}
+
+    High-performance Telegram MTProxy with TLS fronting.
+  footer: |
+    **Full Changelog**: https://github.com/Scratch-net/telego/compare/{{ .PreviousTag }}...{{ .Tag }}

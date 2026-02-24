@@ -1,0 +1,52 @@
+# Binaries for programs and plugins
+/telego
+telego-*
+getProxySecret
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Profiling
+*.pb.gz
+pprof.*
+
+# Logs
+*.log
+logs.txt
+
+# Zone identifiers (Windows)
+*:Zone.Identifier
+
+# Test binary, built with `go test -c`
+*.test
+
+# Code coverage profiles and other test artifacts
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+
+# Dependency directories
+# vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# env file
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config with secrets
+config.toml
