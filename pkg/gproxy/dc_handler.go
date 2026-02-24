@@ -83,22 +83,24 @@ func (h *ProxyHandler) dialDC(clientConn gnet.Conn, ctx *ConnContext) {
 
 // dialDirectDC connects directly to Telegram DC with obfuscated2 handshake.
 func (h *ProxyHandler) dialDirectDC(dcID int) (net.Conn, error) {
-	// Negative DC IDs are for media/CDN - use absolute value for address lookup
-	// but preserve the sign for the obfuscated2 handshake
-	addrDC := dcID
-	if addrDC < 0 {
-		addrDC = -addrDC
+	// Get DC addresses (sorted by RTT if probing was done)
+	addrs, known := dc.GetProbedAddresses(dcID)
+
+	// Filter by IP preference
+	if h.config.IPPreference == dc.OnlyIPv4 || h.config.IPPreference == dc.OnlyIPv6 {
+		filtered := make([]dc.Addr, 0, len(addrs))
+		for _, a := range addrs {
+			if h.config.IPPreference == dc.OnlyIPv4 && !a.IsIPv6() {
+				filtered = append(filtered, a)
+			} else if h.config.IPPreference == dc.OnlyIPv6 && a.IsIPv6() {
+				filtered = append(filtered, a)
+			}
+		}
+		addrs = filtered
 	}
 
-	// Get DC addresses based on IP preference
-	var addrs []dc.Addr
-	switch h.config.IPPreference {
-	case dc.OnlyIPv4:
-		addrs = dc.DCAddressesIPv4(addrDC)
-	case dc.OnlyIPv6:
-		addrs = dc.DCAddressesIPv6(addrDC)
-	default:
-		addrs = dc.DCAddresses(addrDC)
+	if !known {
+		h.logger.Warn("unknown DC %d requested, falling back to DC %d", dcID, dc.DefaultDC)
 	}
 
 	if len(addrs) == 0 {

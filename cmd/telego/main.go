@@ -77,7 +77,7 @@ func (c *RunCmd) Run() error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	shutdown, errCh := gproxy.RunWithShutdown(&cfg, &zerologAdapter{})
+	shutdown, errCh := gproxy.Run(&cfg, &zerologAdapter{})
 
 	select {
 	case sig := <-sigCh:

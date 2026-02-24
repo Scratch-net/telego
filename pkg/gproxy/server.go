@@ -61,56 +61,18 @@ func DefaultConfig() Config {
 	}
 }
 
-// Run starts the gnet-based proxy server.
-func Run(cfg *Config, logger Logger) error {
+// Run starts the proxy with graceful shutdown support.
+// Returns a shutdown function that can be called to stop the server.
+func Run(cfg *Config, logger Logger) (shutdown func(), errCh <-chan error) {
+	ch := make(chan error, 1)
+
 	if logger == nil {
 		logger = defaultLogger{}
 	}
 
-	handler := NewProxyHandler(cfg, logger)
-
-	// Initialize TLS fronting if configured
-	if cfg.MaskHost != "" && cfg.FetchRealCert {
-		handler.certFetcher = tlsfront.NewCertFetcher(cfg.CertRefreshHours)
-
-		// Fetch certificate synchronously at startup
-		logger.Info("Fetching TLS certificate from %s:%d...", cfg.MaskHost, cfg.MaskPort)
-		cert, err := handler.certFetcher.FetchCert(cfg.MaskHost, cfg.MaskPort)
-		if err != nil {
-			logger.Warn("Failed to fetch certificate: %v (will retry in background)", err)
-		} else {
-			logger.Info("Certificate fetched: %d certs in chain", len(cert.Chain))
-		}
-
-		// Start background refresh
-		handler.certFetcher.StartBackgroundRefresh(cfg.MaskHost, cfg.MaskPort)
-	}
-
-	// Build gnet options
-	opts := []gnet.Option{
-		gnet.WithMulticore(cfg.Multicore),
-		gnet.WithReusePort(cfg.ReusePort),
-		gnet.WithLockOSThread(cfg.LockOSThread),
-	}
-
-	if cfg.NumEventLoop > 0 {
-		opts = append(opts, gnet.WithNumEventLoop(cfg.NumEventLoop))
-	}
-
-	// Format address for gnet
-	addr := "tcp://" + cfg.BindAddr
-
-	logger.Info("Starting gnet proxy on %s (multicore=%v, reuseport=%v)",
-		cfg.BindAddr, cfg.Multicore, cfg.ReusePort)
-
-	// Run the gnet server (blocks until shutdown)
-	return gnet.Run(handler, addr, opts...)
-}
-
-// RunWithShutdown starts the proxy with graceful shutdown support.
-// Returns a shutdown function that can be called to stop the server.
-func RunWithShutdown(cfg *Config, logger Logger) (shutdown func(), errCh <-chan error) {
-	ch := make(chan error, 1)
+	// Probe DC addresses at startup and sort by RTT
+	dc.SetProbeLogger(logger.Info)
+	dc.Init()
 
 	// Use atomic pointer to store engine reference
 	var engPtr atomic.Pointer[gnet.Engine]
@@ -123,6 +85,17 @@ func RunWithShutdown(cfg *Config, logger Logger) (shutdown func(), errCh <-chan 
 		// Initialize TLS fronting if configured
 		if cfg.MaskHost != "" && cfg.FetchRealCert {
 			handler.certFetcher = tlsfront.NewCertFetcher(cfg.CertRefreshHours)
+
+			// Fetch certificate synchronously at startup
+			logger.Info("Fetching TLS certificate from %s:%d...", cfg.MaskHost, cfg.MaskPort)
+			cert, err := handler.certFetcher.FetchCert(cfg.MaskHost, cfg.MaskPort)
+			if err != nil {
+				logger.Warn("Failed to fetch certificate: %v (will retry in background)", err)
+			} else {
+				logger.Info("Certificate fetched: %d certs in chain", len(cert.Chain))
+			}
+
+			// Start background refresh
 			handler.certFetcher.StartBackgroundRefresh(cfg.MaskHost, cfg.MaskPort)
 		}
 
@@ -139,7 +112,14 @@ func RunWithShutdown(cfg *Config, logger Logger) (shutdown func(), errCh <-chan 
 			gnet.WithLockOSThread(cfg.LockOSThread),
 		}
 
+		if cfg.NumEventLoop > 0 {
+			opts = append(opts, gnet.WithNumEventLoop(cfg.NumEventLoop))
+		}
+
 		addr := "tcp://" + cfg.BindAddr
+
+		logger.Info("Starting gnet proxy on %s (multicore=%v, reuseport=%v)",
+			cfg.BindAddr, cfg.Multicore, cfg.ReusePort)
 
 		ch <- gnet.Run(wrapper, addr, opts...)
 	}()
