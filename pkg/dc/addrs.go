@@ -4,15 +4,15 @@ package dc
 import "net"
 
 // Default Telegram DC addresses.
-// These are the official Telegram datacenter endpoints.
+// Source: https://github.com/telegramdesktop/tdesktop/blob/master/Telegram/SourceFiles/mtproto/mtproto_dc_options.cpp
 var DefaultDCs = map[int][]Addr{
 	1: {
 		{Network: "tcp4", Address: "149.154.175.50:443"},
 		{Network: "tcp6", Address: "[2001:b28:f23d:f001::a]:443"},
 	},
 	2: {
-		{Network: "tcp4", Address: "149.154.167.50:443"},
 		{Network: "tcp4", Address: "149.154.167.51:443"},
+		{Network: "tcp4", Address: "95.161.76.100:443"},
 		{Network: "tcp6", Address: "[2001:67c:4e8:f002::a]:443"},
 	},
 	3: {
@@ -24,8 +24,15 @@ var DefaultDCs = map[int][]Addr{
 		{Network: "tcp6", Address: "[2001:67c:4e8:f004::a]:443"},
 	},
 	5: {
-		{Network: "tcp4", Address: "91.108.56.100:443"},
+		{Network: "tcp4", Address: "149.154.171.5:443"},
 		{Network: "tcp6", Address: "[2001:b28:f23f:f005::a]:443"},
+	},
+}
+
+// CDN/regional DC overrides for special DCs (200+).
+var CDNDCs = map[int][]Addr{
+	203: {
+		{Network: "tcp4", Address: "91.105.192.100:443"},
 	},
 }
 
@@ -60,8 +67,18 @@ func (a Addr) IsIPv6() bool {
 }
 
 // DCAddresses returns addresses for a given DC.
+// Negative DC IDs are media-only variants; we use the absolute value for lookup.
 func DCAddresses(dc int) []Addr {
-	if addrs, ok := DefaultDCs[dc]; ok {
+	// Check CDN/special DCs first
+	if addrs, ok := CDNDCs[dc]; ok {
+		return addrs
+	}
+	// Negative DC = media-only, use absolute value
+	absDC := dc
+	if absDC < 0 {
+		absDC = -absDC
+	}
+	if addrs, ok := DefaultDCs[absDC]; ok {
 		return addrs
 	}
 	// Fallback to DC 2 for unknown DCs
