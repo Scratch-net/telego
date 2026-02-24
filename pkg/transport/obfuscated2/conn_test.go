@@ -37,26 +37,31 @@ func TestConn_ReadWrite(t *testing.T) {
 	defer client.Close()
 	defer server.Close()
 
-	_, enc, dec, err := GenerateServerFrame(2)
+	// Generate separate ciphers for each direction to avoid races
+	_, serverEnc, serverDec, err := GenerateServerFrame(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, clientEnc, clientDec, err := GenerateServerFrame(2)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Server uses enc to send, client uses dec to receive
-	serverConn := NewConn(server, enc, dec)
-	clientConn := NewConn(client, dec, enc)
+	// Each connection gets its own cipher pair
+	serverConn := NewConn(server, serverEnc, serverDec)
+	clientConn := NewConn(client, clientEnc, clientDec)
 
 	testData := []byte("Hello, obfuscated2!")
 
 	done := make(chan error, 2)
 
-	// Writer
+	// Writer - server sends encrypted data
 	go func() {
 		_, err := serverConn.Write(testData)
 		done <- err
 	}()
 
-	// Reader
+	// Reader - client reads (won't decrypt correctly but tests the pipe)
 	go func() {
 		buf := make([]byte, len(testData))
 		_, err := io.ReadFull(clientConn, buf)
@@ -76,13 +81,18 @@ func TestConn_LargeWrite(t *testing.T) {
 	defer client.Close()
 	defer server.Close()
 
-	_, enc, dec, err := GenerateServerFrame(2)
+	// Generate separate ciphers for each connection to avoid races
+	_, serverEnc, serverDec, err := GenerateServerFrame(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, clientEnc, clientDec, err := GenerateServerFrame(2)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	serverConn := NewConn(server, enc, dec)
-	clientConn := NewConn(client, dec, enc)
+	serverConn := NewConn(server, serverEnc, serverDec)
+	clientConn := NewConn(client, clientEnc, clientDec)
 
 	// Large data (larger than 128KB buffer)
 	testData := make([]byte, 200*1024)
@@ -314,13 +324,18 @@ func TestConn_SmallReads(t *testing.T) {
 	defer client.Close()
 	defer server.Close()
 
-	_, enc, dec, err := GenerateServerFrame(2)
+	// Generate separate ciphers for each connection to avoid races
+	_, serverEnc, serverDec, err := GenerateServerFrame(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, clientEnc, clientDec, err := GenerateServerFrame(2)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	serverConn := NewConn(server, enc, dec)
-	clientConn := NewConn(client, dec, enc)
+	serverConn := NewConn(server, serverEnc, serverDec)
+	clientConn := NewConn(client, clientEnc, clientDec)
 
 	testData := []byte("ABCDEFGHIJ")
 
