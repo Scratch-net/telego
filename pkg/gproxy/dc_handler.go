@@ -17,10 +17,10 @@ import (
 
 // Buffer pools for read operations
 var (
-	// 128KB buffer pool for DC->client relay
+	// 256KB buffer pool for DC->client relay - larger reads reduce syscalls
 	dcReadBufPool = sync.Pool{
 		New: func() any {
-			buf := make([]byte, 128*1024)
+			buf := make([]byte, 256*1024)
 			return &buf
 		},
 	}
@@ -331,24 +331,34 @@ func (h *ProxyHandler) relaySpliceToClientLoop(spliceConn net.Conn, clientConn g
 	defer spliceConn.Close()
 	defer clientConn.Close()
 
-	// Get buffer from pool (no crypto needed for splice)
-	bufPtr := spliceReadBufPool.Get().(*[]byte)
-	buf := *bufPtr
-	defer spliceReadBufPool.Put(bufPtr)
-
 	for {
 		if h.config.IdleTimeout > 0 {
 			spliceConn.SetReadDeadline(time.Now().Add(h.config.IdleTimeout))
 		}
 
+		// Get a fresh buffer each iteration - returned via AsyncWrite callback
+		// This prevents buffer reuse race with gnet's async write queue
+		bufPtr := spliceReadBufPool.Get().(*[]byte)
+		buf := *bufPtr
+
 		n, err := spliceConn.Read(buf)
 		if err != nil {
+			spliceReadBufPool.Put(bufPtr)
 			return
 		}
 
 		if n > 0 {
-			clientConn.AsyncWrite(buf[:n], nil)
+			// Buffer ownership transfers to gnet until callback fires
+			err = clientConn.AsyncWrite(buf[:n], func(c gnet.Conn, err error) error {
+				spliceReadBufPool.Put(bufPtr)
+				return nil
+			})
+			if err != nil {
+				spliceReadBufPool.Put(bufPtr)
+				return
+			}
+		} else {
+			spliceReadBufPool.Put(bufPtr)
 		}
 	}
 }
-

@@ -106,7 +106,7 @@ func TestReplayCache_Expiry(t *testing.T) {
 
 // TestReplayCache_MaxSize tests cleanup when size is exceeded.
 func TestReplayCache_MaxSize(t *testing.T) {
-	maxSize := 10
+	maxSize := 100
 	cache := NewReplayCache(maxSize, time.Minute)
 
 	// Add more than maxSize entries
@@ -117,13 +117,16 @@ func TestReplayCache_MaxSize(t *testing.T) {
 	}
 
 	// The cache should handle this without panicking
-	// Actual size reduction happens during cleanup, which runs on timer
-	cache.mu.RLock()
-	size := len(cache.seen)
-	cache.mu.RUnlock()
+	// Count total entries across all shards
+	totalSize := 0
+	for i := range cache.shards {
+		cache.shards[i].mu.RLock()
+		totalSize += len(cache.shards[i].seen)
+		cache.shards[i].mu.RUnlock()
+	}
 
 	// Size might exceed maxSize before cleanup runs
-	t.Logf("Cache size after %d inserts: %d (max: %d)", maxSize*2, size, maxSize)
+	t.Logf("Cache size after %d inserts: %d across %d shards (max: %d)", maxSize*2, totalSize, numShards, maxSize)
 }
 
 // TestReplayCache_Concurrent tests thread-safety under parallel access.
@@ -226,12 +229,19 @@ func TestNewReplayCache(t *testing.T) {
 		t.Errorf("maxSize: got %d, want 100", cache.maxSize)
 	}
 
+	if cache.maxPerShard != 100/numShards {
+		t.Errorf("maxPerShard: got %d, want %d", cache.maxPerShard, 100/numShards)
+	}
+
 	if cache.ttl != time.Minute {
 		t.Errorf("ttl: got %v, want 1m", cache.ttl)
 	}
 
-	if cache.seen == nil {
-		t.Error("seen map is nil")
+	// Verify all shards are initialized
+	for i := range cache.shards {
+		if cache.shards[i].seen == nil {
+			t.Errorf("shard %d map is nil", i)
+		}
 	}
 }
 
@@ -249,4 +259,50 @@ func TestReplayCache_SameContent(t *testing.T) {
 	if !cache.Seen(id2) {
 		t.Error("same content should be detected as replay")
 	}
+}
+
+// BenchmarkReplayCache_New benchmarks checking new session IDs.
+func BenchmarkReplayCache_New(b *testing.B) {
+	cache := NewReplayCache(100000, time.Minute)
+
+	// Pre-generate session IDs
+	ids := make([][]byte, b.N)
+	for i := range ids {
+		ids[i] = make([]byte, 32)
+		rand.Read(ids[i])
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cache.Seen(ids[i])
+	}
+}
+
+// BenchmarkReplayCache_Replay benchmarks detecting replay attacks.
+func BenchmarkReplayCache_Replay(b *testing.B) {
+	cache := NewReplayCache(100000, time.Minute)
+
+	// Pre-add session ID
+	sessionID := make([]byte, 32)
+	rand.Read(sessionID)
+	cache.Seen(sessionID)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cache.Seen(sessionID)
+	}
+}
+
+// BenchmarkReplayCache_Parallel benchmarks concurrent access.
+func BenchmarkReplayCache_Parallel(b *testing.B) {
+	cache := NewReplayCache(100000, time.Minute)
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			sessionID := make([]byte, 32)
+			rand.Read(sessionID)
+			cache.Seen(sessionID)
+			cache.Seen(sessionID) // Check for replay
+		}
+	})
 }

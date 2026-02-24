@@ -117,20 +117,42 @@ func ReadRecord(r io.Reader) (*Record, error) {
 	return rec, nil
 }
 
+// writeRecordPool provides buffers for WriteRecord to avoid allocations
+var writeRecordPool = sync.Pool{
+	New: func() any {
+		// Most handshake records are small, but ServerHello can be ~2KB with certs
+		buf := make([]byte, 4*1024)
+		return &buf
+	},
+}
+
 // WriteRecord writes a TLS record to the writer.
 func WriteRecord(w io.Writer, recordType byte, payload []byte) error {
-	// Use stack-allocated header
-	var header [RecordHeaderSize]byte
-	header[0] = recordType
-	binary.BigEndian.PutUint16(header[1:3], VersionTLS12)
-	binary.BigEndian.PutUint16(header[3:5], uint16(len(payload)))
+	totalLen := RecordHeaderSize + len(payload)
 
-	// Write header and payload together to minimize syscalls
-	buf := make([]byte, RecordHeaderSize+len(payload))
-	copy(buf, header[:])
+	// Get buffer from pool or allocate if payload is large
+	var buf []byte
+	var bufPtr *[]byte
+	if totalLen <= 4*1024 {
+		bufPtr = writeRecordPool.Get().(*[]byte)
+		buf = (*bufPtr)[:totalLen]
+	} else {
+		buf = make([]byte, totalLen)
+	}
+
+	// Write header
+	buf[0] = recordType
+	binary.BigEndian.PutUint16(buf[1:3], VersionTLS12)
+	binary.BigEndian.PutUint16(buf[3:5], uint16(len(payload)))
+
+	// Copy payload
 	copy(buf[RecordHeaderSize:], payload)
 
+	// Write and return buffer to pool
 	_, err := w.Write(buf)
+	if bufPtr != nil {
+		writeRecordPool.Put(bufPtr)
+	}
 	return err
 }
 
@@ -209,14 +231,9 @@ func WrapApplicationDataChunked(payload []byte) []byte {
 	numRecords := (len(payload) + MaxRecordPayload - 1) / MaxRecordPayload
 	totalSize := len(payload) + numRecords*RecordHeaderSize
 
-	buf := make([]byte, 0, totalSize)
-	for len(payload) > 0 {
-		chunk := min(MaxRecordPayload, len(payload))
-		record := WrapApplicationData(payload[:chunk])
-		buf = append(buf, record...)
-		payload = payload[chunk:]
-	}
-
+	// Allocate once and write directly - avoids intermediate allocations
+	buf := make([]byte, totalSize)
+	WrapApplicationDataTo(buf, payload)
 	return buf
 }
 
