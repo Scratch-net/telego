@@ -500,3 +500,224 @@ func TestDefaultTimeSkewTolerance(t *testing.T) {
 		t.Errorf("DefaultTimeSkewTolerance: got %v, want 3s", DefaultTimeSkewTolerance)
 	}
 }
+
+// TestGenerateX25519Key tests that X25519 key generation produces valid 32-byte keys.
+func TestGenerateX25519Key(t *testing.T) {
+	key1 := generateX25519Key()
+	key2 := generateX25519Key()
+
+	if len(key1) != 32 {
+		t.Errorf("key1 length: got %d, want 32", len(key1))
+	}
+	if len(key2) != 32 {
+		t.Errorf("key2 length: got %d, want 32", len(key2))
+	}
+
+	// Keys should be different (random)
+	if bytes.Equal(key1, key2) {
+		t.Error("generated keys should be different")
+	}
+
+	// Keys should not be all zeros
+	allZero := true
+	for _, b := range key1 {
+		if b != 0 {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		t.Error("key should not be all zeros")
+	}
+}
+
+// TestExtractALPN tests ALPN protocol extraction from ClientHello.
+func TestExtractALPN(t *testing.T) {
+	// Build a ClientHello with ALPN extension
+	secret := make([]byte, 16)
+	rand.Read(secret)
+
+	sessionID := make([]byte, 32)
+	rand.Read(sessionID)
+
+	// Build ClientHello with ALPN
+	payload := buildClientHelloWithALPN(secret, "www.example.com", sessionID, []string{"h2", "http/1.1"})
+
+	hello, err := ParseClientHello(secret, payload)
+	if err != nil {
+		t.Fatalf("ParseClientHello failed: %v", err)
+	}
+
+	if len(hello.ALPN) != 2 {
+		t.Fatalf("ALPN count: got %d, want 2", len(hello.ALPN))
+	}
+
+	if hello.ALPN[0] != "h2" {
+		t.Errorf("ALPN[0]: got %q, want %q", hello.ALPN[0], "h2")
+	}
+	if hello.ALPN[1] != "http/1.1" {
+		t.Errorf("ALPN[1]: got %q, want %q", hello.ALPN[1], "http/1.1")
+	}
+}
+
+// TestExtractALPN_None tests that missing ALPN returns nil.
+func TestExtractALPN_None(t *testing.T) {
+	secret := make([]byte, 16)
+	rand.Read(secret)
+
+	sessionID := make([]byte, 32)
+	rand.Read(sessionID)
+
+	// Build ClientHello without ALPN
+	payload := buildValidClientHello(secret, "www.example.com", sessionID)
+
+	hello, err := ParseClientHello(secret, payload)
+	if err != nil {
+		t.Fatalf("ParseClientHello failed: %v", err)
+	}
+
+	if hello.ALPN != nil {
+		t.Errorf("expected nil ALPN, got %v", hello.ALPN)
+	}
+}
+
+// TestBuildServerHello_WithALPN tests that ALPN is echoed in ServerHello.
+func TestBuildServerHello_WithALPN(t *testing.T) {
+	secret := make([]byte, 16)
+	rand.Read(secret)
+
+	clientHello := &ClientHello{
+		SessionID:   make([]byte, 32),
+		CipherSuite: 0x1301,
+		ALPN:        []string{"h2", "http/1.1"},
+	}
+	rand.Read(clientHello.SessionID)
+	rand.Read(clientHello.Random[:])
+
+	response, err := BuildServerHello(secret, clientHello)
+	if err != nil {
+		t.Fatalf("BuildServerHello failed: %v", err)
+	}
+
+	// Response should contain ALPN extension (0x00 0x10)
+	// Find it in the ServerHello portion
+	found := false
+	for i := 0; i < len(response)-1; i++ {
+		if response[i] == 0x00 && response[i+1] == 0x10 {
+			// Check if "h2" follows (the selected protocol)
+			for j := i + 2; j < len(response)-2 && j < i+20; j++ {
+				if response[j] == 'h' && response[j+1] == '2' {
+					found = true
+					break
+				}
+			}
+			break
+		}
+	}
+
+	if !found {
+		t.Error("ALPN extension with 'h2' not found in ServerHello")
+	}
+}
+
+// buildClientHelloWithALPN builds a ClientHello with SNI and ALPN extensions.
+func buildClientHelloWithALPN(secret []byte, host string, sessionID []byte, alpn []string) []byte {
+	buf := &bytes.Buffer{}
+
+	// Handshake type
+	buf.WriteByte(0x01)
+
+	// Placeholder for handshake length
+	lengthPos := buf.Len()
+	buf.Write([]byte{0, 0, 0})
+
+	// Version (TLS 1.2)
+	buf.Write([]byte{0x03, 0x03})
+
+	// Random (32 bytes)
+	randomPos := buf.Len()
+	buf.Write(make([]byte, 32))
+
+	// Session ID
+	buf.WriteByte(byte(len(sessionID)))
+	buf.Write(sessionID)
+
+	// Cipher suites
+	buf.Write([]byte{0x00, 0x04, 0x13, 0x01, 0x13, 0x02})
+
+	// Compression methods
+	buf.Write([]byte{0x01, 0x00})
+
+	// Extensions
+	extBuf := &bytes.Buffer{}
+
+	// SNI extension
+	sniExt := buildSNIExtension(host)
+	extBuf.Write(sniExt)
+
+	// ALPN extension
+	alpnExt := buildALPNExtension(alpn)
+	extBuf.Write(alpnExt)
+
+	// Write extensions
+	extensions := extBuf.Bytes()
+	binary.Write(buf, binary.BigEndian, uint16(len(extensions)))
+	buf.Write(extensions)
+
+	payload := buf.Bytes()
+
+	// Fill in handshake length
+	handshakeLen := len(payload) - 4
+	payload[lengthPos] = byte(handshakeLen >> 16)
+	payload[lengthPos+1] = byte(handshakeLen >> 8)
+	payload[lengthPos+2] = byte(handshakeLen)
+
+	// Compute HMAC
+	payloadCopy := make([]byte, len(payload))
+	copy(payloadCopy, payload)
+
+	record := make([]byte, 5+len(payloadCopy))
+	record[0] = RecordTypeHandshake
+	record[1] = 0x03
+	record[2] = 0x01
+	binary.BigEndian.PutUint16(record[3:5], uint16(len(payloadCopy)))
+	copy(record[5:], payloadCopy)
+
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(record)
+	computedRandom := mac.Sum(nil)
+
+	timestamp := uint32(time.Now().Unix())
+	computedRandom[28] ^= byte(timestamp)
+	computedRandom[29] ^= byte(timestamp >> 8)
+	computedRandom[30] ^= byte(timestamp >> 16)
+	computedRandom[31] ^= byte(timestamp >> 24)
+
+	copy(payload[randomPos:randomPos+32], computedRandom)
+
+	return payload
+}
+
+// buildALPNExtension builds an ALPN extension with the given protocols.
+func buildALPNExtension(protocols []string) []byte {
+	buf := &bytes.Buffer{}
+
+	// Extension type (0x0010 = ALPN)
+	buf.Write([]byte{0x00, 0x10})
+
+	// Build protocol list
+	listBuf := &bytes.Buffer{}
+	for _, proto := range protocols {
+		listBuf.WriteByte(byte(len(proto)))
+		listBuf.WriteString(proto)
+	}
+	listData := listBuf.Bytes()
+
+	// Extension data: list_len(2) + list
+	extDataLen := 2 + len(listData)
+	binary.Write(buf, binary.BigEndian, uint16(extDataLen))
+	binary.Write(buf, binary.BigEndian, uint16(len(listData)))
+	buf.Write(listData)
+
+	return buf.Bytes()
+}

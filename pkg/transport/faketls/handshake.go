@@ -2,6 +2,7 @@ package faketls
 
 import (
 	"bytes"
+	"crypto/ecdh"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -43,6 +44,7 @@ type ClientHello struct {
 	SessionID   []byte
 	Host        string
 	CipherSuite uint16
+	ALPN        []string // ALPN protocols offered by client
 }
 
 // ParseClientHello parses and validates a FakeTLS ClientHello.
@@ -117,6 +119,9 @@ func ParseClientHello(secret []byte, payload []byte) (*ClientHello, error) {
 
 	// Extract SNI hostname from extensions
 	hello.Host = extractSNI(payload)
+
+	// Extract ALPN protocols from extensions
+	hello.ALPN = extractALPN(payload)
 
 	return hello, nil
 }
@@ -214,6 +219,73 @@ func extractSNI(payload []byte) string {
 	}
 
 	return ""
+}
+
+// extractALPN extracts ALPN protocols from ClientHello extensions.
+func extractALPN(payload []byte) []string {
+	// Skip to extensions (same as extractSNI)
+	offset := clientHelloSessionIDOffset
+	if offset >= len(payload) {
+		return nil
+	}
+
+	sessionIDLen := int(payload[offset])
+	offset += 1 + sessionIDLen
+	if offset+2 > len(payload) {
+		return nil
+	}
+
+	cipherSuitesLen := int(binary.BigEndian.Uint16(payload[offset:]))
+	offset += 2 + cipherSuitesLen
+	if offset+1 > len(payload) {
+		return nil
+	}
+
+	compressionLen := int(payload[offset])
+	offset += 1 + compressionLen
+	if offset+2 > len(payload) {
+		return nil
+	}
+
+	extensionsLen := int(binary.BigEndian.Uint16(payload[offset:]))
+	offset += 2
+	extensionsEnd := offset + extensionsLen
+
+	// Parse extensions looking for ALPN (type 0x0010)
+	for offset+4 <= extensionsEnd && offset+4 <= len(payload) {
+		extType := binary.BigEndian.Uint16(payload[offset:])
+		extLen := int(binary.BigEndian.Uint16(payload[offset+2:]))
+		offset += 4
+
+		if extType == 0x0010 && extLen >= 2 { // ALPN extension
+			// ALPN format: [list_length(2)][proto_len(1)][proto]...
+			if offset+2 > len(payload) {
+				return nil
+			}
+			listLen := int(binary.BigEndian.Uint16(payload[offset:]))
+			pos := offset + 2
+			listEnd := pos + listLen
+			if listEnd > len(payload) || listEnd > offset+extLen {
+				return nil
+			}
+
+			var protocols []string
+			for pos < listEnd {
+				protoLen := int(payload[pos])
+				pos++
+				if pos+protoLen > listEnd {
+					break
+				}
+				protocols = append(protocols, string(payload[pos:pos+protoLen]))
+				pos += protoLen
+			}
+			return protocols
+		}
+
+		offset += extLen
+	}
+
+	return nil
 }
 
 // WelcomePacketRandomOffset is the offset of server random in the welcome packet.
@@ -339,12 +411,25 @@ func buildEncryptedHandshakeWithCert(certChain [][]byte) []byte {
 }
 
 // writeApplicationDataChunked writes data as ApplicationData records,
-// splitting into chunks if needed (max ~16KB per TLS record).
+// splitting into chunks with jittered sizes to evade DPI fingerprinting.
+// Uses ±3% variance on chunk sizes (similar to telemt).
 func writeApplicationDataChunked(buf *bytes.Buffer, data []byte) {
-	const maxChunk = 16000 // Leave room for headers
+	const baseChunk = 16000 // Base chunk size
+	const jitterPercent = 3 // ±3% variance
 
 	for len(data) > 0 {
-		chunkLen := min(len(data), maxChunk)
+		// Apply jitter: baseChunk ± 3%
+		jitterRange := baseChunk * jitterPercent / 100 // ~480 bytes
+		var jitterBytes [2]byte
+		rand.Read(jitterBytes[:])
+		jitter := int(jitterBytes[0])%(2*jitterRange+1) - jitterRange // -480 to +480
+
+		targetChunk := baseChunk + jitter
+		if targetChunk < 1000 {
+			targetChunk = 1000 // Minimum reasonable size
+		}
+
+		chunkLen := min(len(data), targetChunk)
 		writeRecordTLS12(buf, RecordTypeApplicationData, data[:chunkLen])
 		data = data[chunkLen:]
 	}
@@ -363,26 +448,26 @@ func writeRecordTLS12(w *bytes.Buffer, recordType byte, payload []byte) {
 	w.Write(payload)
 }
 
-// serverHelloSuffix contains compression method + extensions header.
-// Per mtg: compression(1) + extensions_length(2) + supported_versions(6) + key_share_header(8)
-var serverHelloSuffix = []byte{
-	0x00,       // no compression
-	0x00, 0x2e, // 46 bytes of extensions
-	0x00, 0x2b, // Extension: Supported Versions
-	0x00, 0x02, // 2 bytes
-	0x03, 0x04, // TLS 1.3
-	0x00, 0x33, // Extension: Key Share
-	0x00, 0x24, // 36 bytes
-	0x00, 0x1d, // x25519 curve
-	0x00, 0x20, // 32 bytes of key
+// generateX25519Key generates a valid X25519 public key.
+// Uses crypto/ecdh to ensure the key is a valid curve point (quadratic residue),
+// which is harder for DPI to detect as fake.
+func generateX25519Key() []byte {
+	key, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		// Fallback to random bytes if key generation fails (shouldn't happen)
+		fallback := make([]byte, 32)
+		rand.Read(fallback)
+		return fallback
+	}
+	return key.PublicKey().Bytes()
 }
 
 // buildServerHelloMessage creates the ServerHello handshake message.
-// Per mtg welcome.go generateServerHello function.
+// Generates proper X25519 keys and optionally includes ALPN.
 func buildServerHelloMessage(clientHello *ClientHello) []byte {
 	buf := &bytes.Buffer{}
 
-	// Version (TLS 1.2)
+	// Version (TLS 1.2 in header, TLS 1.3 in extension)
 	buf.WriteByte(0x03)
 	buf.WriteByte(0x03)
 
@@ -401,13 +486,49 @@ func buildServerHelloMessage(clientHello *ClientHello) []byte {
 	buf.WriteByte(byte(cipherSuite >> 8))
 	buf.WriteByte(byte(cipherSuite))
 
-	// Suffix (compression + extensions header)
-	buf.Write(serverHelloSuffix)
+	// Compression method
+	buf.WriteByte(0x00)
 
-	// Generate x25519 key share (32 bytes)
-	keyShare := make([]byte, 32)
-	rand.Read(keyShare)
-	buf.Write(keyShare)
+	// Build extensions
+	extBuf := &bytes.Buffer{}
+
+	// Extension: Supported Versions (TLS 1.3)
+	extBuf.Write([]byte{0x00, 0x2b}) // type
+	extBuf.Write([]byte{0x00, 0x02}) // length
+	extBuf.Write([]byte{0x03, 0x04}) // TLS 1.3
+
+	// Extension: Key Share (X25519)
+	x25519Key := generateX25519Key()
+	extBuf.Write([]byte{0x00, 0x33}) // type
+	extBuf.Write([]byte{0x00, 0x24}) // length: 36 bytes
+	extBuf.Write([]byte{0x00, 0x1d}) // curve: x25519
+	extBuf.Write([]byte{0x00, 0x20}) // key length: 32
+	extBuf.Write(x25519Key)
+
+	// Extension: ALPN (if client offered any)
+	if len(clientHello.ALPN) > 0 {
+		// Select first protocol (typically "h2" or "http/1.1")
+		selectedProto := clientHello.ALPN[0]
+		protoBytes := []byte(selectedProto)
+
+		// ALPN extension format:
+		// type(2) + ext_len(2) + list_len(2) + proto_len(1) + proto
+		extBuf.Write([]byte{0x00, 0x10}) // type: ALPN
+		listLen := 1 + len(protoBytes)
+		extLen := 2 + listLen
+		extBuf.WriteByte(byte(extLen >> 8))
+		extBuf.WriteByte(byte(extLen))
+		extBuf.WriteByte(byte(listLen >> 8))
+		extBuf.WriteByte(byte(listLen))
+		extBuf.WriteByte(byte(len(protoBytes)))
+		extBuf.Write(protoBytes)
+	}
+
+	// Write extensions length + data
+	extensions := extBuf.Bytes()
+	buf.WriteByte(byte(len(extensions) >> 8))
+	buf.WriteByte(byte(len(extensions)))
+	buf.Write(extensions)
 
 	// Build final message with handshake header
 	body := buf.Bytes()
