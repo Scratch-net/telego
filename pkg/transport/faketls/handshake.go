@@ -349,10 +349,6 @@ func BuildServerHelloWithOptions(secret []byte, clientHello *ClientHello, opts *
 	// Write ApplicationData records (split into max 16KB chunks per TLS spec)
 	writeApplicationDataChunked(buf, encryptedData)
 
-	// Write fake NewSessionTicket records (TLS 1.3 style)
-	// These appear as encrypted ApplicationData and make the handshake look more realistic
-	writeFakeSessionTickets(buf, 1+int(time.Now().UnixNano()%2)) // 1-2 tickets
-
 	// Get the complete packet
 	packet := buf.Bytes()
 
@@ -442,10 +438,7 @@ func writeApplicationDataChunked(buf *bytes.Buffer, data []byte) {
 		rand.Read(jitterBytes[:])
 		jitter := int(jitterBytes[0])%(2*jitterRange+1) - jitterRange // -480 to +480
 
-		targetChunk := baseChunk + jitter
-		if targetChunk < 1000 {
-			targetChunk = 1000 // Minimum reasonable size
-		}
+		targetChunk := max(baseChunk+jitter, 1000) // Minimum reasonable size
 
 		chunkLen := min(len(data), targetChunk)
 		writeRecordTLS12(buf, RecordTypeApplicationData, data[:chunkLen])
@@ -464,24 +457,6 @@ func writeRecordTLS12(w *bytes.Buffer, recordType byte, payload []byte) {
 	}
 	w.Write(header[:])
 	w.Write(payload)
-}
-
-// writeFakeSessionTickets writes fake TLS 1.3 NewSessionTicket records.
-// In TLS 1.3, these appear as ApplicationData (encrypted).
-// Adding 1-2 tickets makes the handshake look more realistic to DPI.
-func writeFakeSessionTickets(buf *bytes.Buffer, count int) {
-	for i := 0; i < count; i++ {
-		// Real NewSessionTicket is typically 48-200 bytes
-		// Generate random size in that range
-		var sizeByte [1]byte
-		rand.Read(sizeByte[:])
-		ticketLen := 48 + int(sizeByte[0])%48 // 48-95 bytes
-
-		ticket := make([]byte, ticketLen)
-		rand.Read(ticket)
-
-		writeRecordTLS12(buf, RecordTypeApplicationData, ticket)
-	}
 }
 
 // generateX25519Key generates a valid X25519 public key.
@@ -542,6 +517,7 @@ func buildServerHelloMessage(clientHello *ClientHello) []byte {
 	extBuf.Write(x25519Key)
 
 	// Extension: ALPN (if client offered any)
+	// Safe to include - client only validates record headers, not ServerHello content
 	if len(clientHello.ALPN) > 0 {
 		// Select first protocol (typically "h2" or "http/1.1")
 		selectedProto := clientHello.ALPN[0]
