@@ -698,6 +698,36 @@ func buildClientHelloWithALPN(secret []byte, host string, sessionID []byte, alpn
 	return payload
 }
 
+// TestClientHello_Valid_BootTime tests that boot time timestamps are accepted.
+func TestClientHello_Valid_BootTime(t *testing.T) {
+	// Simulate a device that's been running for 2 hours
+	// Timestamp = 7200 seconds (uptime, not Unix time)
+	hello := &ClientHello{
+		Host: "www.example.com",
+		Time: time.Unix(7200, 0), // 2 hours uptime
+	}
+
+	err := hello.Valid("www.example.com", DefaultTimeSkewTolerance)
+	if err != nil {
+		t.Errorf("boot time should be accepted, got %v", err)
+	}
+
+	// Test edge case: 1 day uptime (should still be accepted)
+	hello.Time = time.Unix(86400, 0)
+	err = hello.Valid("www.example.com", DefaultTimeSkewTolerance)
+	if err != nil {
+		t.Errorf("1 day uptime should be accepted, got %v", err)
+	}
+
+	// Test: timestamp just above threshold should use normal validation
+	// (and fail if it's way off from current time)
+	hello.Time = time.Unix(bootTimeThreshold+1, 0)
+	err = hello.Valid("www.example.com", DefaultTimeSkewTolerance)
+	if err != ErrBadTimestamp {
+		t.Errorf("timestamp above boot threshold should fail normal validation, got %v", err)
+	}
+}
+
 // buildALPNExtension builds an ALPN extension with the given protocols.
 func buildALPNExtension(protocols []string) []byte {
 	buf := &bytes.Buffer{}

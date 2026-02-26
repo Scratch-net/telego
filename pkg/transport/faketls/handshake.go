@@ -137,6 +137,11 @@ func extractCipherSuite(payload []byte, sessionIDLen int) uint16 {
 	return binary.BigEndian.Uint16(payload[offset+2 : offset+4])
 }
 
+// bootTimeThreshold is the maximum timestamp considered as "boot time" (uptime).
+// Some embedded clients send uptime instead of Unix timestamp.
+// ~2.7 years in seconds - timestamps below this are likely uptime, not Unix time.
+const bootTimeThreshold = 60 * 60 * 24 * 1000
+
 // Valid checks if the ClientHello is valid for the given host and time tolerance.
 func (h *ClientHello) Valid(expectedHost string, tolerance time.Duration) error {
 	// Check SNI (allow empty - some clients don't send it)
@@ -145,6 +150,15 @@ func (h *ClientHello) Valid(expectedHost string, tolerance time.Duration) error 
 	}
 
 	// Check timestamp
+	timestamp := h.Time.Unix()
+
+	// Boot time quirk: some clients send uptime instead of Unix time
+	// Accept small timestamps (< ~2.7 years) as valid boot time
+	if timestamp > 0 && timestamp < bootTimeThreshold {
+		return nil
+	}
+
+	// Normal Unix timestamp validation
 	now := time.Now()
 	diff := now.Sub(h.Time)
 	if diff < 0 {
@@ -335,6 +349,10 @@ func BuildServerHelloWithOptions(secret []byte, clientHello *ClientHello, opts *
 	// Write ApplicationData records (split into max 16KB chunks per TLS spec)
 	writeApplicationDataChunked(buf, encryptedData)
 
+	// Write fake NewSessionTicket records (TLS 1.3 style)
+	// These appear as encrypted ApplicationData and make the handshake look more realistic
+	writeFakeSessionTickets(buf, 1+int(time.Now().UnixNano()%2)) // 1-2 tickets
+
 	// Get the complete packet
 	packet := buf.Bytes()
 
@@ -446,6 +464,24 @@ func writeRecordTLS12(w *bytes.Buffer, recordType byte, payload []byte) {
 	}
 	w.Write(header[:])
 	w.Write(payload)
+}
+
+// writeFakeSessionTickets writes fake TLS 1.3 NewSessionTicket records.
+// In TLS 1.3, these appear as ApplicationData (encrypted).
+// Adding 1-2 tickets makes the handshake look more realistic to DPI.
+func writeFakeSessionTickets(buf *bytes.Buffer, count int) {
+	for i := 0; i < count; i++ {
+		// Real NewSessionTicket is typically 48-200 bytes
+		// Generate random size in that range
+		var sizeByte [1]byte
+		rand.Read(sizeByte[:])
+		ticketLen := 48 + int(sizeByte[0])%48 // 48-95 bytes
+
+		ticket := make([]byte, ticketLen)
+		rand.Read(ticket)
+
+		writeRecordTLS12(buf, RecordTypeApplicationData, ticket)
+	}
 }
 
 // generateX25519Key generates a valid X25519 public key.
