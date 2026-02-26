@@ -289,9 +289,9 @@ func (h *ProxyHandler) relayDCToClientLoop(dcConn net.Conn, clientConn gnet.Conn
 	}
 }
 
-// dialSplice establishes a connection to the splice target (mask host).
+// dialSplice establishes a connection to the splice target.
 func (h *ProxyHandler) dialSplice(clientConn gnet.Conn, ctx *ConnContext) {
-	addr := fmt.Sprintf("%s:%d", h.config.MaskHost, h.config.MaskPort)
+	addr := fmt.Sprintf("%s:%d", h.config.SpliceHost, h.config.SplicePort)
 
 	dialer := netx.NewDialer()
 	conn, err := dialer.Dial("tcp", addr)
@@ -302,6 +302,23 @@ func (h *ProxyHandler) dialSplice(clientConn gnet.Conn, ctx *ConnContext) {
 	}
 
 	h.logger.Debug("splice target connected: %s", addr)
+
+	// Send PROXY protocol header if configured
+	if h.config.SpliceProxyProtocol > 0 {
+		header := buildProxyProtocolHeader(
+			h.config.SpliceProxyProtocol,
+			clientConn.RemoteAddr(),
+			clientConn.LocalAddr(),
+		)
+		if header != nil {
+			if _, err := conn.Write(header); err != nil {
+				h.logger.Debug("failed to send PROXY protocol header: %v", err)
+				conn.Close()
+				clientConn.Close()
+				return
+			}
+		}
+	}
 
 	// Get buffered data from client BEFORE storing connection
 	data, _ := clientConn.Peek(-1)
@@ -361,4 +378,74 @@ func (h *ProxyHandler) relaySpliceToClientLoop(spliceConn net.Conn, clientConn g
 			spliceReadBufPool.Put(bufPtr)
 		}
 	}
+}
+
+// buildProxyProtocolHeader builds a PROXY protocol header.
+// version: 1 = v1 (text), 2 = v2 (binary)
+func buildProxyProtocolHeader(version int, src, dst net.Addr) []byte {
+	srcTCP, srcOK := src.(*net.TCPAddr)
+	dstTCP, dstOK := dst.(*net.TCPAddr)
+	if !srcOK || !dstOK {
+		return nil
+	}
+
+	if version == 1 {
+		return buildProxyProtocolV1(srcTCP, dstTCP)
+	}
+	return buildProxyProtocolV2(srcTCP, dstTCP)
+}
+
+// buildProxyProtocolV1 builds a PROXY protocol v1 (text) header.
+// Format: "PROXY TCP4 <src_ip> <dst_ip> <src_port> <dst_port>\r\n"
+func buildProxyProtocolV1(src, dst *net.TCPAddr) []byte {
+	proto := "TCP4"
+	if src.IP.To4() == nil {
+		proto = "TCP6"
+	}
+	return []byte(fmt.Sprintf("PROXY %s %s %s %d %d\r\n",
+		proto, src.IP.String(), dst.IP.String(), src.Port, dst.Port))
+}
+
+// proxyProtocolV2Sig is the 12-byte signature for PROXY protocol v2.
+var proxyProtocolV2Sig = []byte{0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A}
+
+// buildProxyProtocolV2 builds a PROXY protocol v2 (binary) header.
+func buildProxyProtocolV2(src, dst *net.TCPAddr) []byte {
+	var (
+		family byte
+		addrs  []byte
+	)
+
+	if src4, dst4 := src.IP.To4(), dst.IP.To4(); src4 != nil && dst4 != nil {
+		// IPv4
+		family = 0x11 // AF_INET << 4 | STREAM
+		addrs = make([]byte, 12)
+		copy(addrs[0:4], src4)
+		copy(addrs[4:8], dst4)
+		addrs[8] = byte(src.Port >> 8)
+		addrs[9] = byte(src.Port)
+		addrs[10] = byte(dst.Port >> 8)
+		addrs[11] = byte(dst.Port)
+	} else {
+		// IPv6
+		family = 0x21 // AF_INET6 << 4 | STREAM
+		addrs = make([]byte, 36)
+		copy(addrs[0:16], src.IP.To16())
+		copy(addrs[16:32], dst.IP.To16())
+		addrs[32] = byte(src.Port >> 8)
+		addrs[33] = byte(src.Port)
+		addrs[34] = byte(dst.Port >> 8)
+		addrs[35] = byte(dst.Port)
+	}
+
+	// Build header: signature(12) + ver_cmd(1) + family(1) + len(2) + addrs
+	header := make([]byte, 16+len(addrs))
+	copy(header[0:12], proxyProtocolV2Sig)
+	header[12] = 0x21 // version 2, PROXY command
+	header[13] = family
+	header[14] = byte(len(addrs) >> 8)
+	header[15] = byte(len(addrs))
+	copy(header[16:], addrs)
+
+	return header
 }

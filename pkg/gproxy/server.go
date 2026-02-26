@@ -29,11 +29,17 @@ type Config struct {
 	BindAddr string
 
 	// TLS Fronting
-	MaskHost           string
-	MaskPort           int
+	MaskHost           string // Domain to mimic (for cert fetching)
+	MaskPort           int    // Port to fetch cert from
 	FetchRealCert      bool
 	SpliceUnrecognized bool
 	CertRefreshHours   int
+
+	// Splice target (where to forward unrecognized clients)
+	// Defaults to MaskHost:MaskPort if not set
+	SpliceHost          string
+	SplicePort          int
+	SpliceProxyProtocol int // 0 = off, 1 = v1 (text), 2 = v2 (binary)
 
 	// Performance
 	IPPreference      dc.IPPreference

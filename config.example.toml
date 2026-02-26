@@ -13,9 +13,25 @@ log-level = "info"
 user1 = "0123456789abcdef0123456789abcdef"
 # user2 = "fedcba9876543210fedcba9876543210"
 
-# TLS fronting - host to mimic (must match your secret's hostname)
+# TLS fronting configuration
 [tls-fronting]
+# Host to mimic - used for certificate fetching and SNI validation
+# Must match the hostname in your secret
 mask-host = "www.google.com"
+
+# Port to fetch certificate from (optional, default: 443)
+# mask-port = 443
+
+# Where to forward unrecognized/invalid clients (optional)
+# Useful for forwarding probes to a local decoy server
+# Defaults to mask-host:mask-port if not set
+# splice-host = "127.0.0.1"
+# splice-port = 8080
+
+# Send PROXY protocol header to splice target (optional)
+# Allows backend (nginx/haproxy) to see real client IP
+# 0 = off (default), 1 = v1 (text), 2 = v2 (binary)
+# splice-proxy-protocol = 1
 
 # Performance tuning (all optional)
 [performance]

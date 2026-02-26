@@ -28,7 +28,14 @@ type Config struct {
 
 // TLSFrontingConfig configures TLS fronting.
 type TLSFrontingConfig struct {
-	MaskHost string `toml:"mask-host"`
+	MaskHost string `toml:"mask-host"` // Domain to mimic (for cert fetching)
+	MaskPort int    `toml:"mask-port"` // Port to fetch cert from (default: 443)
+
+	// Splice target - where to forward unrecognized clients
+	// Defaults to mask-host:mask-port if not set
+	SpliceHost          string `toml:"splice-host"`
+	SplicePort          int    `toml:"splice-port"`
+	SpliceProxyProtocol int    `toml:"splice-proxy-protocol"` // 0=off, 1=v1, 2=v2
 }
 
 // PerformanceConfig configures performance settings.
@@ -100,15 +107,29 @@ func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
 	}
 	cfg.Host = host
 
-	// TLS Fronting (hardcoded: port 443, always fetch cert, always splice, 1h refresh)
+	// TLS Fronting
 	cfg.MaskHost = c.TLSFronting.MaskHost
 	if cfg.MaskHost == "" {
 		cfg.MaskHost = "www.google.com"
 	}
-	cfg.MaskPort = 443
+	cfg.MaskPort = c.TLSFronting.MaskPort
+	if cfg.MaskPort == 0 {
+		cfg.MaskPort = 443
+	}
 	cfg.FetchRealCert = true
 	cfg.SpliceUnrecognized = true
 	cfg.CertRefreshHours = 1
+
+	// Splice target (defaults to mask-host:mask-port if not set)
+	cfg.SpliceHost = c.TLSFronting.SpliceHost
+	if cfg.SpliceHost == "" {
+		cfg.SpliceHost = cfg.MaskHost
+	}
+	cfg.SplicePort = c.TLSFronting.SplicePort
+	if cfg.SplicePort == 0 {
+		cfg.SplicePort = cfg.MaskPort
+	}
+	cfg.SpliceProxyProtocol = c.TLSFronting.SpliceProxyProtocol
 
 	// Performance
 	cfg.IdleTimeout = c.Performance.IdleTimeout.Duration()

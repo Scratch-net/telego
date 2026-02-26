@@ -260,14 +260,14 @@ func (h *ProxyHandler) handleO2Frame(c gnet.Conn, ctx *ConnContext) gnet.Action 
 
 // startSplice transitions to splice mode for unrecognized clients.
 func (h *ProxyHandler) startSplice(c gnet.Conn, ctx *ConnContext) gnet.Action {
-	if h.config.MaskHost == "" {
-		h.logger.Debug("no mask host configured, closing")
+	if h.config.SpliceHost == "" {
+		h.logger.Debug("no splice host configured, closing")
 		return gnet.Close
 	}
 
 	ctx.SetState(StateSplicing)
 
-	h.logger.Debug("splicing to mask host %s:%d", h.config.MaskHost, h.config.MaskPort)
+	h.logger.Debug("splicing to %s:%d", h.config.SpliceHost, h.config.SplicePort)
 
 	// Dial mask host asynchronously
 	go h.dialSplice(c, ctx)
