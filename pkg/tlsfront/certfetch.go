@@ -37,11 +37,13 @@ type CertFetcher struct {
 	mu       sync.RWMutex
 	dialer   *net.Dialer
 	timeout  time.Duration
-	refreshH int // refresh interval in hours (with jitter)
+	refreshH int    // refresh interval in hours (with jitter)
+	sni      string // SNI to send (may differ from connection host)
 }
 
 // NewCertFetcher creates a new certificate fetcher.
-func NewCertFetcher(refreshHours int) *CertFetcher {
+// sni is the ServerName to send in TLS handshake (the domain to mimic).
+func NewCertFetcher(refreshHours int, sni string) *CertFetcher {
 	if refreshHours <= 0 {
 		refreshHours = 5 // Default: refresh every 5 hours
 	}
@@ -50,6 +52,7 @@ func NewCertFetcher(refreshHours int) *CertFetcher {
 		dialer:   &net.Dialer{Timeout: 10 * time.Second},
 		timeout:  10 * time.Second,
 		refreshH: refreshHours,
+		sni:      sni,
 	}
 }
 
@@ -86,12 +89,19 @@ func (f *CertFetcher) FetchCert(host string, port int) (*CachedCert, error) {
 }
 
 // fetchFromHost connects to the host and extracts its certificate.
+// Uses the fetcher's SNI field for ServerName (allows connecting to different host than SNI).
 func (f *CertFetcher) fetchFromHost(host string, port int) (*CachedCert, error) {
 	addr := fmt.Sprintf("%s:%d", host, port)
 
+	// Use configured SNI, or fall back to host
+	sni := f.sni
+	if sni == "" {
+		sni = host
+	}
+
 	// Connect with TLS
 	conn, err := tls.DialWithDialer(f.dialer, "tcp", addr, &tls.Config{
-		ServerName:         host,
+		ServerName:         sni,
 		InsecureSkipVerify: true, // We just want to get the cert
 	})
 	if err != nil {

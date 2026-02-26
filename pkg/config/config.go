@@ -28,8 +28,14 @@ type Config struct {
 
 // TLSFrontingConfig configures TLS fronting.
 type TLSFrontingConfig struct {
-	MaskHost string `toml:"mask-host"` // Domain to mimic (for cert fetching)
-	MaskPort int    `toml:"mask-port"` // Port to fetch cert from (default: 443)
+	MaskHost string `toml:"mask-host"` // Domain to mimic (SNI validation, proxy links)
+	MaskPort int    `toml:"mask-port"` // Default port (default: 443)
+
+	// Certificate fetching - where to connect to get real TLS cert
+	// Defaults to mask-host:mask-port if not set
+	// Useful when cert must be fetched from local nginx bypassing front proxy
+	CertHost string `toml:"cert-host"`
+	CertPort int    `toml:"cert-port"`
 
 	// Splice target - where to forward unrecognized clients
 	// Defaults to mask-host:mask-port if not set
@@ -119,6 +125,16 @@ func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
 	cfg.FetchRealCert = true
 	cfg.SpliceUnrecognized = true
 	cfg.CertRefreshHours = 1
+
+	// Certificate fetching (defaults to mask-host:mask-port if not set)
+	cfg.CertHost = c.TLSFronting.CertHost
+	if cfg.CertHost == "" {
+		cfg.CertHost = cfg.MaskHost
+	}
+	cfg.CertPort = c.TLSFronting.CertPort
+	if cfg.CertPort == 0 {
+		cfg.CertPort = cfg.MaskPort
+	}
 
 	// Splice target (defaults to mask-host:mask-port if not set)
 	cfg.SpliceHost = c.TLSFronting.SpliceHost

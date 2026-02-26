@@ -123,8 +123,10 @@ user2 = "fedcba9876543210fedcba9876543210"
 
 # TLS fronting configuration
 [tls-fronting]
-mask-host = "www.google.com"  # Host to mimic (cert fetching, SNI validation)
-# mask-port = 443             # Port to fetch cert from (default: 443)
+mask-host = "www.google.com"  # Host to mimic (SNI validation, proxy links)
+# mask-port = 443             # Port for mask-host (default: 443)
+# cert-host = "127.0.0.1"     # Where to fetch TLS cert (default: mask-host)
+# cert-port = 8443            # Cert fetch port (default: mask-port)
 # splice-host = "127.0.0.1"   # Forward unrecognized clients here (default: mask-host)
 # splice-port = 8080          # Splice port (default: mask-port)
 # splice-proxy-protocol = 1   # PROXY protocol: 0=off, 1=v1(text), 2=v2(binary)

@@ -29,11 +29,16 @@ type Config struct {
 	BindAddr string
 
 	// TLS Fronting
-	MaskHost           string // Domain to mimic (for cert fetching)
-	MaskPort           int    // Port to fetch cert from
+	MaskHost           string // Domain to mimic (SNI validation, proxy links)
+	MaskPort           int    // Default port
 	FetchRealCert      bool
 	SpliceUnrecognized bool
 	CertRefreshHours   int
+
+	// Certificate fetching (where to connect to get real cert)
+	// Defaults to MaskHost:MaskPort if not set
+	CertHost string
+	CertPort int
 
 	// Splice target (where to forward unrecognized clients)
 	// Defaults to MaskHost:MaskPort if not set
@@ -90,11 +95,11 @@ func Run(cfg *Config, logger Logger) (shutdown func(), errCh <-chan error) {
 
 		// Initialize TLS fronting if configured
 		if cfg.MaskHost != "" && cfg.FetchRealCert {
-			handler.certFetcher = tlsfront.NewCertFetcher(cfg.CertRefreshHours)
+			handler.certFetcher = tlsfront.NewCertFetcher(cfg.CertRefreshHours, cfg.MaskHost)
 
 			// Fetch certificate synchronously at startup
-			logger.Info("Fetching TLS certificate from %s:%d...", cfg.MaskHost, cfg.MaskPort)
-			cert, err := handler.certFetcher.FetchCert(cfg.MaskHost, cfg.MaskPort)
+			logger.Info("Fetching TLS certificate from %s:%d (SNI: %s)...", cfg.CertHost, cfg.CertPort, cfg.MaskHost)
+			cert, err := handler.certFetcher.FetchCert(cfg.CertHost, cfg.CertPort)
 			if err != nil {
 				logger.Warn("Failed to fetch certificate: %v (will retry in background)", err)
 			} else {
@@ -102,7 +107,7 @@ func Run(cfg *Config, logger Logger) (shutdown func(), errCh <-chan error) {
 			}
 
 			// Start background refresh
-			handler.certFetcher.StartBackgroundRefresh(cfg.MaskHost, cfg.MaskPort)
+			handler.certFetcher.StartBackgroundRefresh(cfg.CertHost, cfg.CertPort)
 		}
 
 		// Custom handler to capture engine

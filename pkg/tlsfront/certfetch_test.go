@@ -92,7 +92,7 @@ func TestCachedCert_GetRawCertChain_Nil(t *testing.T) {
 
 // TestNewCertFetcher_DefaultRefresh tests that 0 hours defaults to 5.
 func TestNewCertFetcher_DefaultRefresh(t *testing.T) {
-	fetcher := NewCertFetcher(0)
+	fetcher := NewCertFetcher(0, "")
 
 	if fetcher.refreshH != 5 {
 		t.Errorf("refreshH: got %d, want 5 (default)", fetcher.refreshH)
@@ -101,7 +101,7 @@ func TestNewCertFetcher_DefaultRefresh(t *testing.T) {
 
 // TestNewCertFetcher_NegativeRefresh tests that negative hours defaults to 5.
 func TestNewCertFetcher_NegativeRefresh(t *testing.T) {
-	fetcher := NewCertFetcher(-1)
+	fetcher := NewCertFetcher(-1, "")
 
 	if fetcher.refreshH != 5 {
 		t.Errorf("refreshH: got %d, want 5 (default)", fetcher.refreshH)
@@ -110,7 +110,7 @@ func TestNewCertFetcher_NegativeRefresh(t *testing.T) {
 
 // TestNewCertFetcher_CustomRefresh tests custom refresh hours.
 func TestNewCertFetcher_CustomRefresh(t *testing.T) {
-	fetcher := NewCertFetcher(10)
+	fetcher := NewCertFetcher(10, "")
 
 	if fetcher.refreshH != 10 {
 		t.Errorf("refreshH: got %d, want 10", fetcher.refreshH)
@@ -119,7 +119,7 @@ func TestNewCertFetcher_CustomRefresh(t *testing.T) {
 
 // TestNewCertFetcher_Initialization tests fetcher initialization.
 func TestNewCertFetcher(t *testing.T) {
-	fetcher := NewCertFetcher(5)
+	fetcher := NewCertFetcher(5, "")
 
 	if fetcher == nil {
 		t.Fatal("NewCertFetcher returned nil")
@@ -164,7 +164,7 @@ func TestCachedCert_Fields(t *testing.T) {
 
 // TestFetchCert_CacheHit tests that cached cert is returned without fetch.
 func TestFetchCert_CacheHit(t *testing.T) {
-	fetcher := NewCertFetcher(5)
+	fetcher := NewCertFetcher(5, "")
 
 	// Pre-populate cache
 	host := "cached.example.com"
@@ -195,7 +195,7 @@ func TestFetchCert_CacheHit(t *testing.T) {
 
 // TestFetchCert_CacheExpired tests that expired cache triggers fetch attempt.
 func TestFetchCert_CacheExpired(t *testing.T) {
-	fetcher := NewCertFetcher(5)
+	fetcher := NewCertFetcher(5, "")
 
 	// Pre-populate cache with expired entry
 	host := "expired.example.com"
@@ -232,7 +232,7 @@ func TestFetchCert_CacheExpired(t *testing.T) {
 
 // TestFetchCert_CacheMiss tests that cache miss triggers fetch.
 func TestFetchCert_CacheMiss(t *testing.T) {
-	fetcher := NewCertFetcher(5)
+	fetcher := NewCertFetcher(5, "")
 
 	// This will try to connect to a non-existent server
 	// and should return an error
@@ -246,7 +246,7 @@ func TestFetchCert_CacheMiss(t *testing.T) {
 
 // TestFetchCert_StaleFallback tests that stale cert is returned on fetch error.
 func TestFetchCert_StaleFallback(t *testing.T) {
-	fetcher := NewCertFetcher(5)
+	fetcher := NewCertFetcher(5, "")
 
 	host := "stale.example.com"
 	port := 443
@@ -282,7 +282,7 @@ func TestFetchCert_StaleFallback(t *testing.T) {
 
 // TestCertFetcher_CacheKey tests cache key format.
 func TestCertFetcher_CacheKey(t *testing.T) {
-	fetcher := NewCertFetcher(5)
+	fetcher := NewCertFetcher(5, "")
 
 	// Add entries with different hosts/ports
 	cert1 := &CachedCert{ExpiresAt: time.Now().Add(time.Hour)}

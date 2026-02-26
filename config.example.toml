@@ -19,8 +19,15 @@ user1 = "0123456789abcdef0123456789abcdef"
 # Must match the hostname in your secret
 mask-host = "www.google.com"
 
-# Port to fetch certificate from (optional, default: 443)
+# Port for mask-host (optional, default: 443)
 # mask-port = 443
+
+# Where to fetch TLS certificate from (optional)
+# Defaults to mask-host:mask-port if not set
+# Useful when running behind a front proxy (e.g., Xray) and you need
+# to fetch certs from a local nginx instance directly
+# cert-host = "127.0.0.1"
+# cert-port = 8443
 
 # Where to forward unrecognized/invalid clients (optional)
 # Useful for forwarding probes to a local decoy server
