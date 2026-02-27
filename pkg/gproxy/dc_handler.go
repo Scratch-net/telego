@@ -11,27 +11,16 @@ import (
 
 	"github.com/scratch-net/telego/pkg/dc"
 	"github.com/scratch-net/telego/pkg/netx"
-	"github.com/scratch-net/telego/pkg/transport/faketls"
 	"github.com/scratch-net/telego/pkg/transport/obfuscated2"
 )
 
-// Buffer pools for read operations
-var (
-	// 256KB buffer pool for DC->client relay - larger reads reduce syscalls
-	dcReadBufPool = sync.Pool{
-		New: func() any {
-			buf := make([]byte, 256*1024)
-			return &buf
-		},
-	}
-	// 64KB buffer pool for splice relay
-	spliceReadBufPool = sync.Pool{
-		New: func() any {
-			buf := make([]byte, 64*1024)
-			return &buf
-		},
-	}
-)
+// Buffer pool for splice relay (still uses goroutine)
+var spliceReadBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 64*1024)
+		return &buf
+	},
+}
 
 // dialDC establishes a direct connection to the Telegram DC.
 func (h *ProxyHandler) dialDC(clientConn gnet.Conn, ctx *ConnContext) {
@@ -41,48 +30,63 @@ func (h *ProxyHandler) dialDC(clientConn gnet.Conn, ctx *ConnContext) {
 	if ctx.secret != nil {
 		userName = ctx.secret.Name
 	}
+	clientEncryptor := ctx.encryptor
+	clientDecryptor := ctx.decryptor
+	pendingData := ctx.pendingData
+	ctx.pendingData = nil
 	ctx.mu.Unlock()
 
 	// Direct DC connection (simple, reliable)
-	dcConn, err := h.dialDirectDC(dcID)
+	ddc, err := h.dialDirectDC(dcID)
 	if err != nil {
 		h.logger.Debug("[%s] failed to dial DC %d: %v", userName, dcID, err)
 		clientConn.Close()
 		return
 	}
-	h.logger.Info("[%s] DC %d connected", userName, dcID)
 
-	// Build relay context with DC connection info
-	ctx.mu.Lock()
+	// Enroll the DC connection into gnet client event loop
+	dcGnetConn, err := h.dcClient.Enroll(ddc.Conn)
+	if err != nil {
+		h.logger.Debug("[%s] failed to enroll DC connection: %v", userName, err)
+		ddc.Conn.Close()
+		clientConn.Close()
+		return
+	}
+
+	h.logger.Info("[%s] DC %d connected (event-driven)", userName, dcID)
+
+	// Set up DC connection context (for dcEventHandler.OnTraffic)
+	dcCtx := &DCConnContext{
+		ClientConn:    clientConn,
+		ClientCtx:     ctx,
+		DCEncrypt:     ddc.encryptor,
+		DCDecrypt:     ddc.decryptor,
+		ClientEncrypt: clientEncryptor,
+	}
+	dcGnetConn.SetContext(dcCtx)
+
+	// Build relay context for client -> DC direction
 	relay := &RelayContext{
-		Encryptor: ctx.encryptor,
-		Decryptor: ctx.decryptor,
+		Encryptor: clientEncryptor,
+		Decryptor: clientDecryptor,
+		DCConn:    dcGnetConn,
+		DCEncrypt: ddc.encryptor,
+		DCDecrypt: ddc.decryptor,
 	}
-	if ddc, ok := dcConn.(*directDCConn); ok {
-		relay.DCConn = ddc.Conn
-		relay.DCEncrypt = ddc.encryptor
-		relay.DCDecrypt = ddc.decryptor
-	} else {
-		relay.DCConn = dcConn
-	}
-	pendingData := ctx.pendingData
-	ctx.pendingData = nil
-	ctx.mu.Unlock()
 
 	// Atomically set relay context and state
 	ctx.SetRelay(relay)
 
 	// Process any pending data
 	if len(pendingData) > 0 {
-		h.sendPendingData(dcConn, ctx, pendingData)
+		h.sendPendingDataGnet(dcGnetConn, relay, pendingData)
 	}
 
-	// Start relay goroutine for DC -> client traffic
-	go h.relayDCToClientLoop(dcConn, clientConn, ctx)
+	// No goroutine needed - DC traffic handled by dcEventHandler.OnTraffic
 }
 
 // dialDirectDC connects directly to Telegram DC with obfuscated2 handshake.
-func (h *ProxyHandler) dialDirectDC(dcID int) (net.Conn, error) {
+func (h *ProxyHandler) dialDirectDC(dcID int) (*directDCConn, error) {
 	// Get DC addresses (sorted by RTT if probing was done)
 	addrs, known := dc.GetProbedAddresses(dcID)
 
@@ -154,20 +158,14 @@ type directDCConn struct {
 	encryptor, decryptor cipher.Stream
 }
 
-// sendPendingData sends buffered client data to DC.
-func (h *ProxyHandler) sendPendingData(dcConn net.Conn, ctx *ConnContext, pendingData []byte) {
-	// Lock-free read of relay context
-	relay := ctx.Relay()
-	if relay == nil {
-		return
-	}
+// sendPendingDataGnet sends buffered client data to DC via gnet.Conn.
+func (h *ProxyHandler) sendPendingDataGnet(dcConn gnet.Conn, relay *RelayContext, pendingData []byte) {
 	clientDecryptor := relay.Decryptor
 	dcEncrypt := relay.DCEncrypt
 
 	// Get buffer from pool for crypto operations
 	bufPtr := relayBufPool.Get().(*[]byte)
 	buf := *bufPtr
-	defer relayBufPool.Put(bufPtr)
 
 	// Handle data larger than pool buffer (rare)
 	var decrypted []byte
@@ -175,6 +173,8 @@ func (h *ProxyHandler) sendPendingData(dcConn net.Conn, ctx *ConnContext, pendin
 		decrypted = buf[:len(pendingData)]
 		copy(decrypted, pendingData)
 	} else {
+		relayBufPool.Put(bufPtr)
+		bufPtr = nil
 		decrypted = make([]byte, len(pendingData))
 		copy(decrypted, pendingData)
 	}
@@ -187,105 +187,18 @@ func (h *ProxyHandler) sendPendingData(dcConn net.Conn, ctx *ConnContext, pendin
 		dcEncrypt.XORKeyStream(decrypted, decrypted)
 	}
 
-	if _, err := dcConn.Write(decrypted); err != nil {
+	// Async write to DC - buffer returned to pool after write completes
+	err := dcConn.AsyncWrite(decrypted, func(c gnet.Conn, err error) error {
+		if bufPtr != nil {
+			relayBufPool.Put(bufPtr)
+		}
+		return nil
+	})
+	if err != nil {
+		if bufPtr != nil {
+			relayBufPool.Put(bufPtr)
+		}
 		h.logger.Debug("failed to send pending data to DC: %v", err)
-	}
-}
-
-// relayDCToClientLoop reads from DC and writes to client.
-func (h *ProxyHandler) relayDCToClientLoop(dcConn net.Conn, clientConn gnet.Conn, ctx *ConnContext) {
-	defer dcConn.Close()
-	defer clientConn.Close()
-
-	// Cache relay context once - it's immutable after handshake
-	relay := ctx.Relay()
-	if relay == nil {
-		return
-	}
-	dcDecrypt := relay.DCDecrypt
-	encryptor := relay.Encryptor
-
-	// Get read buffer from pool
-	readBufPtr := dcReadBufPool.Get().(*[]byte)
-	readBuf := *readBufPtr
-	defer dcReadBufPool.Put(readBufPtr)
-
-	for {
-		// Set read deadline
-		if h.config.IdleTimeout > 0 {
-			dcConn.SetReadDeadline(time.Now().Add(h.config.IdleTimeout))
-		}
-
-		n, err := dcConn.Read(readBuf)
-		if err != nil {
-			return
-		}
-
-		if n == 0 {
-			continue
-		}
-
-		// Check state (lock-free)
-		if ctx.State() != StateRelaying {
-			return
-		}
-
-		// Calculate TLS output size
-		numRecords := (n + faketls.MaxRecordPayload - 1) / faketls.MaxRecordPayload
-		tlsSize := n + numRecords*faketls.RecordHeaderSize
-
-		// Get buffer from pool - returned via AsyncWrite callback
-		var tlsBuf []byte
-		var tlsBufPtr *[]byte
-		tlsBufPtr = dcBufPool.Get().(*[]byte)
-		if tlsSize <= len(*tlsBufPtr) {
-			tlsBuf = (*tlsBufPtr)[:tlsSize]
-		} else {
-			// Large data - allocate (rare for 512KB+ pool)
-			dcBufPool.Put(tlsBufPtr)
-			tlsBufPtr = nil
-			tlsBuf = make([]byte, tlsSize)
-		}
-
-		// Decrypt from DC, encrypt for client, wrap in TLS - all in one pass
-		// Process in 16KB chunks to build TLS records
-		srcOffset := 0
-		dstOffset := 0
-		for srcOffset < n {
-			chunk := min(faketls.MaxRecordPayload, n-srcOffset)
-
-			// Write TLS header
-			tlsBuf[dstOffset] = faketls.RecordTypeApplicationData
-			tlsBuf[dstOffset+1] = 0x03
-			tlsBuf[dstOffset+2] = 0x03
-			tlsBuf[dstOffset+3] = byte(chunk >> 8)
-			tlsBuf[dstOffset+4] = byte(chunk)
-			dstOffset += faketls.RecordHeaderSize
-
-			// Decrypt from DC directly into TLS payload area
-			dcDecrypt.XORKeyStream(tlsBuf[dstOffset:dstOffset+chunk], readBuf[srcOffset:srcOffset+chunk])
-
-			// Encrypt for client (in-place)
-			encryptor.XORKeyStream(tlsBuf[dstOffset:dstOffset+chunk], tlsBuf[dstOffset:dstOffset+chunk])
-
-			dstOffset += chunk
-			srcOffset += chunk
-		}
-
-		// Send to client - buffer returned to pool after write completes
-		err = clientConn.AsyncWrite(tlsBuf, func(c gnet.Conn, err error) error {
-			if tlsBufPtr != nil {
-				dcBufPool.Put(tlsBufPtr)
-			}
-			return nil
-		})
-		if err != nil {
-			// Write failed, return buffer now
-			if tlsBufPtr != nil {
-				dcBufPool.Put(tlsBufPtr)
-			}
-			return
-		}
 	}
 }
 
@@ -323,10 +236,8 @@ func (h *ProxyHandler) dialSplice(clientConn gnet.Conn, ctx *ConnContext) {
 	// Get buffered data from client BEFORE storing connection
 	data, _ := clientConn.Peek(-1)
 
-	// Store splice connection in context for handleSplice
-	ctx.mu.Lock()
-	ctx.spliceNetConn = conn
-	ctx.mu.Unlock()
+	// Store splice connection atomically for handleSplice
+	ctx.SetSpliceConn(conn)
 	// State already set to StateSplicing by startSplice
 
 	// Send buffered data to splice target
@@ -348,9 +259,21 @@ func (h *ProxyHandler) relaySpliceToClientLoop(spliceConn net.Conn, clientConn g
 	defer spliceConn.Close()
 	defer clientConn.Close()
 
+	// Cache timeout config and set initial deadline
+	// Only update deadline when half the timeout has elapsed to reduce syscalls
+	idleTimeout := h.config.IdleTimeout
+	var lastDeadlineSet time.Time
+	deadlineRefreshThreshold := idleTimeout / 2
+	if idleTimeout > 0 {
+		lastDeadlineSet = time.Now()
+		spliceConn.SetReadDeadline(lastDeadlineSet.Add(idleTimeout))
+	}
+
 	for {
-		if h.config.IdleTimeout > 0 {
-			spliceConn.SetReadDeadline(time.Now().Add(h.config.IdleTimeout))
+		// Refresh deadline only if threshold elapsed (reduces syscalls)
+		if idleTimeout > 0 && time.Since(lastDeadlineSet) >= deadlineRefreshThreshold {
+			lastDeadlineSet = time.Now()
+			spliceConn.SetReadDeadline(lastDeadlineSet.Add(idleTimeout))
 		}
 
 		// Get a fresh buffer each iteration - returned via AsyncWrite callback

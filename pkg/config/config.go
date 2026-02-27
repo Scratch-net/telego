@@ -50,6 +50,7 @@ type PerformanceConfig struct {
 	NumEventLoops int      `toml:"num-event-loops"` // gnet event loops (0 = auto, uses all cores)
 	PreferIP      string   `toml:"prefer-ip"`
 	IdleTimeout   Duration `toml:"idle-timeout"`
+	PprofAddr     string   `toml:"pprof-addr"` // pprof HTTP server address (e.g., "localhost:6060")
 }
 
 // Duration is a TOML-parseable duration.
@@ -153,6 +154,8 @@ func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
 		cfg.IdleTimeout = 5 * time.Minute
 	}
 	cfg.NumEventLoop = c.Performance.NumEventLoops
+
+	cfg.PprofAddr = c.Performance.PprofAddr
 
 	switch strings.ToLower(c.Performance.PreferIP) {
 	case "prefer-ipv4", "ipv4":

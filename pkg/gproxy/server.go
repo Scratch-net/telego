@@ -2,6 +2,9 @@ package gproxy
 
 import (
 	"context"
+	"fmt"
+	"net/http"
+	_ "net/http/pprof"
 	"sync/atomic"
 	"time"
 
@@ -56,6 +59,9 @@ type Config struct {
 	ReusePort    bool // Enable SO_REUSEPORT
 	LockOSThread bool // Lock goroutines to OS threads
 	NumEventLoop int  // Number of event loops (0 = auto)
+
+	// Debug
+	PprofAddr string // Address for pprof HTTP server (e.g., "localhost:6060")
 }
 
 // DefaultConfig returns sensible defaults.
@@ -85,6 +91,16 @@ func Run(cfg *Config, logger Logger) (shutdown func(), errCh <-chan error) {
 	dc.SetProbeLogger(logger.Info)
 	dc.Init()
 
+	// Start pprof server if configured
+	if cfg.PprofAddr != "" {
+		go func() {
+			logger.Info("pprof server listening on %s", cfg.PprofAddr)
+			if err := http.ListenAndServe(cfg.PprofAddr, nil); err != nil {
+				logger.Error("pprof server failed: %v", err)
+			}
+		}()
+	}
+
 	// Use atomic pointer to store engine reference
 	var engPtr atomic.Pointer[gnet.Engine]
 	// Signal that engine is ready
@@ -92,6 +108,26 @@ func Run(cfg *Config, logger Logger) (shutdown func(), errCh <-chan error) {
 
 	go func() {
 		handler := NewProxyHandler(cfg, logger)
+
+		// Initialize DC client for outgoing connections
+		dcHandler := &dcEventHandler{proxy: handler}
+		dcClient, err := gnet.NewClient(
+			dcHandler,
+			gnet.WithMulticore(cfg.Multicore),
+			gnet.WithLockOSThread(cfg.LockOSThread),
+			gnet.WithReadBufferCap(256*1024),  // 256KB read buffer
+			gnet.WithWriteBufferCap(768*1024), // 768KB write buffer
+		)
+		if err != nil {
+			ch <- fmt.Errorf("failed to create DC client: %w", err)
+			return
+		}
+		if err := dcClient.Start(); err != nil {
+			ch <- fmt.Errorf("failed to start DC client: %w", err)
+			return
+		}
+		handler.dcClient = dcClient
+		logger.Info("DC client started with %d event loops", cfg.NumEventLoop)
 
 		// Initialize TLS fronting if configured
 		if cfg.MaskHost != "" && cfg.FetchRealCert {

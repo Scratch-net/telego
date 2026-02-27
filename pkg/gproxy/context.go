@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/panjf2000/gnet/v2"
+
 	"github.com/scratch-net/telego/pkg/transport/faketls"
 )
 
@@ -54,7 +56,7 @@ type RelayContext struct {
 	Decryptor cipher.Stream // decrypt data FROM client
 
 	// DC connection and ciphers (proxy <-> DC)
-	DCConn    net.Conn      // TCP connection to Telegram DC
+	DCConn    gnet.Conn     // gnet connection to Telegram DC (enrolled in dcClient)
 	DCEncrypt cipher.Stream // encrypt data TO DC
 	DCDecrypt cipher.Stream // decrypt data FROM DC
 }
@@ -87,8 +89,9 @@ type ConnContext struct {
 	// Buffered data from handshake (protected by mu)
 	pendingData []byte
 
-	// Splice connection (protected by mu)
-	spliceNetConn net.Conn
+	// Splice connection - set once atomically when entering splice state
+	// After set, read without locking
+	spliceConn atomic.Pointer[net.Conn]
 
 	// Timing
 	connTime time.Time
@@ -124,3 +127,15 @@ func (c *ConnContext) SetRelay(r *RelayContext) {
 	c.state.Store(int32(StateRelaying))
 }
 
+// SpliceConn returns the splice connection (lock-free, may be nil).
+func (c *ConnContext) SpliceConn() net.Conn {
+	if ptr := c.spliceConn.Load(); ptr != nil {
+		return *ptr
+	}
+	return nil
+}
+
+// SetSpliceConn sets the splice connection.
+func (c *ConnContext) SetSpliceConn(conn net.Conn) {
+	c.spliceConn.Store(&conn)
+}

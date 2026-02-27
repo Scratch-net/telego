@@ -42,7 +42,7 @@ func (h *ProxyHandler) handleRelay(c gnet.Conn, ctx *ConnContext) gnet.Action {
 		return gnet.None
 	}
 
-	dcNetConn := relay.DCConn
+	dcConn := relay.DCConn
 	decryptor := relay.Decryptor
 	dcEncrypt := relay.DCEncrypt
 
@@ -52,10 +52,8 @@ func (h *ProxyHandler) handleRelay(c gnet.Conn, ctx *ConnContext) gnet.Action {
 	}
 
 	// Get pooled buffer for batching writes to DC
-	// dcNetConn.Write is blocking, so we can safely reuse after it returns
 	batchBufPtr := dcBufPool.Get().(*[]byte)
 	batchBuf := *batchBufPtr
-	defer dcBufPool.Put(batchBufPtr)
 
 	batchOffset := 0
 
@@ -79,9 +77,13 @@ func (h *ProxyHandler) handleRelay(c gnet.Conn, ctx *ConnContext) gnet.Action {
 
 			// Check if batch buffer has space
 			if batchOffset+len(payload) > len(batchBuf) {
-				// Flush current batch
+				// Flush current batch via async write
 				if batchOffset > 0 {
-					if _, err := dcNetConn.Write(batchBuf[:batchOffset]); err != nil {
+					// Need a separate buffer for async write
+					flushBuf := make([]byte, batchOffset)
+					copy(flushBuf, batchBuf[:batchOffset])
+					if err := dcConn.AsyncWrite(flushBuf, nil); err != nil {
+						dcBufPool.Put(batchBufPtr)
 						return gnet.Close
 					}
 					batchOffset = 0
@@ -100,9 +102,19 @@ func (h *ProxyHandler) handleRelay(c gnet.Conn, ctx *ConnContext) gnet.Action {
 
 	// Flush remaining batch
 	if batchOffset > 0 {
-		if _, err := dcNetConn.Write(batchBuf[:batchOffset]); err != nil {
+		// For final batch, we can reuse the pool buffer with callback
+		finalBuf := batchBuf[:batchOffset]
+		err := dcConn.AsyncWrite(finalBuf, func(c gnet.Conn, err error) error {
+			dcBufPool.Put(batchBufPtr)
+			return nil
+		})
+		if err != nil {
+			dcBufPool.Put(batchBufPtr)
 			return gnet.Close
 		}
+	} else {
+		// No data written, return buffer immediately
+		dcBufPool.Put(batchBufPtr)
 	}
 
 	if consumed > 0 {

@@ -87,12 +87,9 @@ func (h *ProxyHandler) OnClose(c gnet.Conn, err error) gnet.Action {
 	}
 
 	// Close splice connection if active
-	ctx.mu.Lock()
-	if ctx.spliceNetConn != nil {
-		ctx.spliceNetConn.Close()
-		ctx.spliceNetConn = nil
+	if spliceConn := ctx.SpliceConn(); spliceConn != nil {
+		spliceConn.Close()
 	}
-	ctx.mu.Unlock()
 
 	if err != nil {
 		ctx.mu.Lock()

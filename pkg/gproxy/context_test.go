@@ -2,10 +2,11 @@ package gproxy
 
 import (
 	"crypto/cipher"
-	"net"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/panjf2000/gnet/v2"
 )
 
 // TestConnContext_StateTransitions tests atomic state changes.
@@ -194,7 +195,7 @@ func TestConnContext_ConcurrentRelay(t *testing.T) {
 func TestRelayContext_Fields(t *testing.T) {
 	// Create mock cipher streams (nil is fine for field testing)
 	var encryptor, decryptor cipher.Stream
-	var dcConn net.Conn
+	var dcConn gnet.Conn // nil gnet.Conn for testing
 
 	relay := &RelayContext{
 		Encryptor: encryptor,

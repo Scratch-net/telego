@@ -29,6 +29,7 @@ type RunCmd struct {
 	Config string `short:"c" help:"Path to config file" type:"existingfile" required:""`
 	Bind   string `short:"b" help:"Address to bind to (overrides config)"`
 	Link   bool   `short:"l" help:"Print Telegram proxy links on startup (detects public IP via STUN)"`
+	Pprof  string `short:"p" help:"Enable pprof on address (e.g., localhost:6060)"`
 }
 
 func (c *RunCmd) Run() error {
@@ -53,6 +54,9 @@ func (c *RunCmd) Run() error {
 	// CLI overrides
 	if c.Bind != "" {
 		cfg.BindAddr = c.Bind
+	}
+	if c.Pprof != "" {
+		cfg.PprofAddr = c.Pprof
 	}
 
 	// Default bind address

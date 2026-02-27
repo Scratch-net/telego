@@ -277,10 +277,8 @@ func (h *ProxyHandler) startSplice(c gnet.Conn, ctx *ConnContext) gnet.Action {
 
 // handleSplice forwards data to the splice target.
 func (h *ProxyHandler) handleSplice(c gnet.Conn, ctx *ConnContext) gnet.Action {
-	ctx.mu.Lock()
-	spliceConn := ctx.spliceNetConn
-	ctx.mu.Unlock()
-
+	// Lock-free read of splice connection
+	spliceConn := ctx.SpliceConn()
 	if spliceConn == nil {
 		// Still waiting for splice connection
 		return gnet.None
