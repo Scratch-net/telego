@@ -45,12 +45,9 @@ func (h *dcEventHandler) OnClose(c gnet.Conn, err error) gnet.Action {
 	if !ok || ctx == nil {
 		return gnet.None
 	}
-
-	// Close the associated client connection
 	if ctx.ClientConn != nil {
 		ctx.ClientConn.Close()
 	}
-
 	return gnet.None
 }
 

@@ -3,8 +3,6 @@ package gproxy
 import (
 	"context"
 	"fmt"
-	"net/http"
-	_ "net/http/pprof"
 	"sync/atomic"
 	"time"
 
@@ -59,9 +57,6 @@ type Config struct {
 	ReusePort    bool // Enable SO_REUSEPORT
 	LockOSThread bool // Lock goroutines to OS threads
 	NumEventLoop int  // Number of event loops (0 = auto)
-
-	// Debug
-	PprofAddr string // Address for pprof HTTP server (e.g., "localhost:6060")
 }
 
 // DefaultConfig returns sensible defaults.
@@ -78,7 +73,7 @@ func DefaultConfig() Config {
 	}
 }
 
-// Run starts the proxy with graceful shutdown support.
+// Run starts the proxy with graceful shutdown support using gnet.
 // Returns a shutdown function that can be called to stop the server.
 func Run(cfg *Config, logger Logger) (shutdown func(), errCh <-chan error) {
 	ch := make(chan error, 1)
@@ -90,16 +85,6 @@ func Run(cfg *Config, logger Logger) (shutdown func(), errCh <-chan error) {
 	// Probe DC addresses at startup and sort by RTT
 	dc.SetProbeLogger(logger.Info)
 	dc.Init()
-
-	// Start pprof server if configured
-	if cfg.PprofAddr != "" {
-		go func() {
-			logger.Info("pprof server listening on %s", cfg.PprofAddr)
-			if err := http.ListenAndServe(cfg.PprofAddr, nil); err != nil {
-				logger.Error("pprof server failed: %v", err)
-			}
-		}()
-	}
 
 	// Use atomic pointer to store engine reference
 	var engPtr atomic.Pointer[gnet.Engine]
