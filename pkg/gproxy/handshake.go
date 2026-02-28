@@ -110,7 +110,7 @@ func (h *ProxyHandler) handleTLSPayload(c gnet.Conn, ctx *ConnContext) gnet.Acti
 	// Build ServerHello response
 	var response []byte
 	if h.certFetcher != nil {
-		cachedCert, err := h.certFetcher.FetchCert(h.config.MaskHost, h.config.MaskPort)
+		cachedCert, err := h.certFetcher.FetchCert(h.config.CertHost, h.config.CertPort)
 		if err == nil && cachedCert != nil && len(cachedCert.RawChain) > 0 {
 			opts := &faketls.ServerHelloOptions{
 				CertChain: cachedCert.GetRawCertChain(),
