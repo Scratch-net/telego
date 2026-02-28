@@ -28,9 +28,14 @@ const (
 // Record size limits
 const (
 	RecordHeaderSize = 5
-	MaxRecordPayload = 16384 // TLS max record size
 
-	// OptimalChunkSize for writes - use max TLS record size for fewer syscalls
+	// MaxRecordPayload is the maximum TLS record payload we accept.
+	// RFC 8446 §5.2 allows up to 16384 + 256 bytes for TLS 1.3 ciphertext.
+	// iOS Telegram clients may send records up to this size for media uploads.
+	// Using strict 16384 limit breaks iOS uploads (media/file sending fails).
+	MaxRecordPayload = 16384 + 256 // 16640 bytes
+
+	// OptimalChunkSize for writes - use standard TLS fragment size
 	OptimalChunkSize = 16384
 )
 

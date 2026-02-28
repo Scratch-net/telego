@@ -410,8 +410,8 @@ func TestConstants(t *testing.T) {
 		t.Errorf("RecordHeaderSize: got %d, want 5", RecordHeaderSize)
 	}
 
-	if MaxRecordPayload != 16384 {
-		t.Errorf("MaxRecordPayload: got %d, want 16384", MaxRecordPayload)
+	if MaxRecordPayload != 16640 {
+		t.Errorf("MaxRecordPayload: got %d, want 16640", MaxRecordPayload)
 	}
 
 	if OptimalChunkSize != 16384 {
