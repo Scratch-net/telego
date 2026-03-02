@@ -52,6 +52,9 @@ type Config struct {
 	IdleTimeout       time.Duration
 	TimeSkewTolerance time.Duration
 
+	// Upstream (DC connection)
+	Socks5Addr string // SOCKS5 proxy for DC connections (e.g., "127.0.0.1:1080")
+
 	// gnet-specific
 	Multicore    bool // Use multiple event loops
 	ReusePort    bool // Enable SO_REUSEPORT
@@ -84,6 +87,13 @@ func Run(cfg *Config, logger Logger) (shutdown func(), errCh <-chan error) {
 
 	// Probe DC addresses at startup and sort by RTT
 	dc.SetProbeLogger(logger.Info)
+	if cfg.Socks5Addr != "" {
+		if err := dc.SetProbeSocks5(cfg.Socks5Addr); err != nil {
+			logger.Warn("Failed to set SOCKS5 for DC probing: %v", err)
+		} else {
+			logger.Info("DC probing via SOCKS5: %s", cfg.Socks5Addr)
+		}
+	}
 	dc.Init()
 
 	// Use atomic pointer to store engine reference
@@ -112,7 +122,11 @@ func Run(cfg *Config, logger Logger) (shutdown func(), errCh <-chan error) {
 			return
 		}
 		handler.dcClient = dcClient
-		logger.Info("DC client started with %d event loops", cfg.NumEventLoop)
+		if cfg.Socks5Addr != "" {
+			logger.Info("DC client started with SOCKS5 proxy: %s", cfg.Socks5Addr)
+		} else {
+			logger.Info("DC client started with %d event loops", cfg.NumEventLoop)
+		}
 
 		// Initialize TLS fronting if configured
 		if cfg.MaskHost != "" && cfg.FetchRealCert {

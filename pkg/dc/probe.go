@@ -1,11 +1,14 @@
 package dc
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"sort"
 	"sync"
 	"time"
+
+	"golang.org/x/net/proxy"
 )
 
 // ProbeResult holds the result of probing a single address.
@@ -31,11 +34,29 @@ var (
 	probedMu    sync.RWMutex
 	probeOnce   sync.Once
 	probeLogger func(format string, args ...any)
+	probeSocks5 string // SOCKS5 proxy address for probing
+	probeDialer proxy.Dialer
 )
 
 // SetProbeLogger sets the logger for probe output.
 func SetProbeLogger(logger func(format string, args ...any)) {
 	probeLogger = logger
+}
+
+// SetProbeSocks5 sets the SOCKS5 proxy for DC probing.
+func SetProbeSocks5(addr string) error {
+	if addr == "" {
+		probeSocks5 = ""
+		probeDialer = nil
+		return nil
+	}
+	dialer, err := proxy.SOCKS5("tcp", addr, nil, proxy.Direct)
+	if err != nil {
+		return err
+	}
+	probeSocks5 = addr
+	probeDialer = dialer
+	return nil
 }
 
 func logProbe(format string, args ...any) {
@@ -130,7 +151,25 @@ func probeDC(dcID int, addrs []Addr) DCProbeResult {
 func probeAddr(addr Addr) ProbeResult {
 	start := time.Now()
 
-	conn, err := net.DialTimeout(addr.Network, addr.Address, ProbeTimeout)
+	var conn net.Conn
+	var err error
+
+	if probeDialer != nil {
+		// Use SOCKS5 proxy for probing with timeout
+		ctx, cancel := context.WithTimeout(context.Background(), ProbeTimeout)
+		defer cancel()
+
+		if ctxDialer, ok := probeDialer.(proxy.ContextDialer); ok {
+			conn, err = ctxDialer.DialContext(ctx, addr.Network, addr.Address)
+		} else {
+			// Fallback without context (rare)
+			conn, err = probeDialer.Dial(addr.Network, addr.Address)
+		}
+	} else {
+		// Direct connection
+		conn, err = net.DialTimeout(addr.Network, addr.Address, ProbeTimeout)
+	}
+
 	if err != nil {
 		return ProbeResult{
 			Addr:    addr,
@@ -149,7 +188,11 @@ func probeAddr(addr Addr) ProbeResult {
 
 // printProbeResults prints probe results in telemt style.
 func printProbeResults(results []DCProbeResult) {
-	logProbe("================== Telegram DC Connectivity ==================")
+	if probeSocks5 != "" {
+		logProbe("============== Telegram DC Connectivity (via SOCKS5) ============")
+	} else {
+		logProbe("================== Telegram DC Connectivity ==================")
+	}
 
 	// Count successes
 	var totalV4, totalV6, successV4, successV6 int

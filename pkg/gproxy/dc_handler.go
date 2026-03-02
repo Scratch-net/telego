@@ -111,12 +111,23 @@ func (h *ProxyHandler) dialDirectDC(dcID int) (*directDCConn, error) {
 		return nil, fmt.Errorf("no addresses for DC %d", dcID)
 	}
 
-	dialer := netx.NewDialer()
+	// Create dialer - use SOCKS5 if configured
+	var dialFunc func(network, address string) (netx.Conn, error)
+	if h.config.Socks5Addr != "" {
+		socks5Dialer, err := netx.NewSocks5Dialer(h.config.Socks5Addr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create SOCKS5 dialer: %w", err)
+		}
+		dialFunc = socks5Dialer.Dial
+	} else {
+		dialer := netx.NewDialer()
+		dialFunc = dialer.Dial
+	}
 
 	var conn netx.Conn
 	var err error
 	for _, addr := range addrs {
-		conn, err = dialer.Dial(addr.Network, addr.Address)
+		conn, err = dialFunc(addr.Network, addr.Address)
 		if err == nil {
 			break
 		}

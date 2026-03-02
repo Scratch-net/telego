@@ -24,6 +24,7 @@ type Config struct {
 
 	TLSFronting TLSFrontingConfig `toml:"tls-fronting"`
 	Performance PerformanceConfig `toml:"performance"`
+	Upstream    UpstreamConfig    `toml:"upstream"`
 }
 
 // TLSFrontingConfig configures TLS fronting.
@@ -50,6 +51,11 @@ type PerformanceConfig struct {
 	NumEventLoops int      `toml:"num-event-loops"` // gnet event loops (0 = auto, uses all cores)
 	PreferIP      string   `toml:"prefer-ip"`
 	IdleTimeout   Duration `toml:"idle-timeout"`
+}
+
+// UpstreamConfig configures upstream (DC) connection settings.
+type UpstreamConfig struct {
+	Socks5 string `toml:"socks5"` // SOCKS5 proxy address (e.g., "127.0.0.1:1080")
 }
 
 // Duration is a TOML-parseable duration.
@@ -166,6 +172,9 @@ func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
 	default:
 		cfg.IPPreference = dc.PreferIPv4
 	}
+
+	// Upstream settings
+	cfg.Socks5Addr = c.Upstream.Socks5
 
 	return cfg, nil
 }
