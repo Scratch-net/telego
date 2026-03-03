@@ -107,6 +107,8 @@ func IsUnixSocket(addr string) bool {
 // Run starts the proxy with graceful shutdown support using gnet.
 // Returns a shutdown function that can be called to stop the server.
 func Run(cfg *Config, logger Logger) (shutdown func(), errCh <-chan error) {
+	var cancelFunc context.CancelFunc
+
 	ch := make(chan error, 1)
 
 	if logger == nil {
@@ -203,10 +205,17 @@ func Run(cfg *Config, logger Logger) (shutdown func(), errCh <-chan error) {
 		logger.Info("Starting gnet proxy on %s (multicore=%v, reuseport=%v)",
 			cfg.BindAddr, cfg.Multicore, cfg.ReusePort)
 
+		if isUnix {
+			cancelFunc = runSetModeUnixSocket(logger, addr, os.FileMode(0666))
+			defer cancelFunc()
+		}
 		ch <- gnet.Run(wrapper, addr, opts...)
 	}()
 
 	shutdownFn := func() {
+		if cancelFunc != nil {
+			cancelFunc()
+		}
 		// Wait for engine to be ready with a timeout
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -214,7 +223,7 @@ func Run(cfg *Config, logger Logger) (shutdown func(), errCh <-chan error) {
 		select {
 		case <-ready:
 			if eng := engPtr.Load(); eng != nil {
-				eng.Stop(ctx)
+				_ = eng.Stop(ctx)
 			}
 		case <-ctx.Done():
 			// Timeout waiting for engine, nothing to stop
@@ -222,6 +231,70 @@ func Run(cfg *Config, logger Logger) (shutdown func(), errCh <-chan error) {
 	}
 
 	return shutdownFn, ch
+}
+
+// In the gnet library, there are no options for configuring Unix socket.
+// And I cannot create a Unix socket file in advance with the needed permissions,
+// because it is deleted in the gnet library before creating a Unix socket (this is correct behavior).
+// This function starts, checks for a Unix Socket file, and changes access rights.
+// The function returns the tool to abort the works of the function.
+func runSetModeUnixSocket(logger Logger, addr string, mode os.FileMode) (cancelFunc context.CancelFunc) {
+	const (
+		errUnixSocket   = "unix socket file is not specified"
+		errChmod        = "set chmod for file %q, was interrupted by an error: %s"
+		unixSocketProto = "unix://"
+		ticTimeout      = time.Second * 3
+	)
+	var (
+		err  error
+		ctx  context.Context
+		usf  string
+		done chan struct{}
+	)
+
+	ctx, cancelFunc = context.WithCancel(context.Background())
+	if usf = strings.TrimPrefix(addr, unixSocketProto); usf == "" {
+		logger.Error(errUnixSocket)
+		return
+	}
+	done = make(chan struct{})
+	go func(onDone chan<- struct{}) {
+		var (
+			tic *time.Ticker
+			end bool
+			inf os.FileInfo
+		)
+
+		tic = time.NewTicker(ticTimeout)
+		defer tic.Stop()
+		onDone <- struct{}{}
+		for !end {
+			select {
+			case <-ctx.Done():
+				end = true
+				continue
+			case <-tic.C:
+				inf, err = os.Stat(usf)
+				if err != nil {
+					continue
+				}
+				if inf.IsDir() {
+					end = true
+					continue
+				}
+				if inf.Mode() == mode {
+					continue
+				}
+			}
+			if err = os.Chmod(usf, mode); err != nil {
+				logger.Warn(errChmod, usf, err)
+			}
+		}
+	}(done)
+	<-done
+	close(done)
+
+	return
 }
 
 // engineCaptureHandler wraps ProxyHandler to capture the engine on boot.
