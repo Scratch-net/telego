@@ -39,7 +39,7 @@ func (h *ProxyHandler) dialDC(clientConn gnet.Conn, ctx *ConnContext) {
 	// Direct DC connection (simple, reliable)
 	ddc, err := h.dialDirectDC(dcID)
 	if err != nil {
-		h.logger.Debug("[%s] failed to dial DC %d: %v", userName, dcID, err)
+		h.logger.Debug("[#%d:%s] failed to dial DC %d: %v", ctx.id, userName, dcID, err)
 		clientConn.Close()
 		return
 	}
@@ -47,13 +47,15 @@ func (h *ProxyHandler) dialDC(clientConn gnet.Conn, ctx *ConnContext) {
 	// Enroll the DC connection into gnet client event loop
 	dcGnetConn, err := h.dcClient.Enroll(ddc.Conn)
 	if err != nil {
-		h.logger.Debug("[%s] failed to enroll DC connection: %v", userName, err)
+		h.logger.Debug("[#%d:%s] failed to enroll DC connection: %v", ctx.id, userName, err)
 		ddc.Conn.Close()
 		clientConn.Close()
 		return
 	}
 
-	h.logger.Info("[%s] DC %d connected (event-driven)", userName, dcID)
+	// Log with client IP (use real IP from PROXY protocol if available)
+	clientAddr := ctx.RealClientAddr(clientConn.RemoteAddr())
+	h.logger.Info("[#%d:%s] %s -> DC %d", ctx.id, userName, clientAddr, dcID)
 
 	// Set up DC connection context (for dcEventHandler.OnTraffic)
 	dcCtx := &DCConnContext{

@@ -21,14 +21,14 @@ func (h *ProxyHandler) handleTLSHeader(c gnet.Conn, ctx *ConnContext) gnet.Actio
 
 	// Check if this is a TLS handshake record
 	if data[0] != faketls.RecordTypeHandshake {
-		h.logger.Debug("not a TLS handshake record: 0x%02x", data[0])
+		h.logger.Debug("[#%d] not a TLS handshake record: 0x%02x", ctx.id, data[0])
 		return h.startSplice(c, ctx)
 	}
 
 	// Validate TLS version (should be TLS 1.0 for ClientHello record header)
 	version := binary.BigEndian.Uint16(data[1:3])
 	if version != faketls.VersionTLS10 && version != faketls.VersionTLS11 && version != faketls.VersionTLS12 {
-		h.logger.Debug("invalid TLS version: 0x%04x", version)
+		h.logger.Debug("[#%d] invalid TLS version: 0x%04x", ctx.id, version)
 		return h.startSplice(c, ctx)
 	}
 
@@ -87,13 +87,13 @@ func (h *ProxyHandler) handleTLSPayload(c gnet.Conn, ctx *ConnContext) gnet.Acti
 	}
 
 	if hello == nil {
-		h.logger.Debug("no matching secret found")
+		h.logger.Debug("[#%d] no matching secret found", ctx.id)
 		return h.startSplice(c, ctx)
 	}
 
 	// Check replay
 	if h.replayCache.Seen(hello.SessionID) {
-		h.logger.Debug("replay attack detected")
+		h.logger.Debug("[#%d] replay attack detected", ctx.id)
 		return h.startSplice(c, ctx)
 	}
 
@@ -119,7 +119,7 @@ func (h *ProxyHandler) handleTLSPayload(c gnet.Conn, ctx *ConnContext) gnet.Acti
 		if clientIP != nil {
 			key, ok := h.connLimiter.TryAcquire(clientIP, matchedSecret.Key)
 			if !ok {
-				h.logger.Debug("[%s] connection limit exceeded for %s", matchedSecret.Name, clientIP)
+				h.logger.Debug("[#%d:%s] connection limit exceeded for %s", ctx.id, matchedSecret.Name, clientIP)
 				return gnet.Close
 			}
 			// Store tracking info for cleanup in OnClose
@@ -130,7 +130,7 @@ func (h *ProxyHandler) handleTLSPayload(c gnet.Conn, ctx *ConnContext) gnet.Acti
 		}
 	}
 
-	h.logger.Debug("client matched secret %q", matchedSecret.Name)
+	h.logger.Debug("[#%d] matched secret %q", ctx.id, matchedSecret.Name)
 
 	// Build ServerHello response
 	var response []byte
@@ -257,7 +257,7 @@ func (h *ProxyHandler) handleO2Frame(c gnet.Conn, ctx *ConnContext) gnet.Action 
 			ctx.mu.Unlock()
 			ctx.SetState(StateDialingDC)
 
-			h.logger.Info("[%s] connecting to DC %d", secret.Name, dcID)
+			h.logger.Debug("[#%d:%s] dialing DC %d", ctx.id, secret.Name, dcID)
 
 			// Clear handshake deadline, set idle timeout
 			c.SetReadDeadline(time.Time{})
@@ -286,13 +286,13 @@ func (h *ProxyHandler) handleO2Frame(c gnet.Conn, ctx *ConnContext) gnet.Action 
 // startSplice transitions to splice mode for unrecognized clients.
 func (h *ProxyHandler) startSplice(c gnet.Conn, ctx *ConnContext) gnet.Action {
 	if h.config.SpliceHost == "" {
-		h.logger.Debug("no splice host configured, closing")
+		h.logger.Debug("[#%d] no splice host configured, closing", ctx.id)
 		return gnet.Close
 	}
 
 	ctx.SetState(StateSplicing)
 
-	h.logger.Debug("splicing to %s:%d", h.config.SpliceHost, h.config.SplicePort)
+	h.logger.Debug("[#%d] splicing to %s:%d", ctx.id, h.config.SpliceHost, h.config.SplicePort)
 
 	// Dial mask host asynchronously
 	go h.dialSplice(c, ctx)

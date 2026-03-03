@@ -151,9 +151,9 @@ func Run(cfg *Config, logger Logger) (shutdown func(), errCh <-chan error) {
 		}
 		handler.dcClient = dcClient
 		if cfg.Socks5Addr != "" {
-			logger.Info("DC client started with SOCKS5 proxy: %s", cfg.Socks5Addr)
+			logger.Debug("DC client started with SOCKS5 proxy: %s", cfg.Socks5Addr)
 		} else {
-			logger.Info("DC client started with %d event loops", cfg.NumEventLoop)
+			logger.Debug("DC client started with %d event loops", cfg.NumEventLoop)
 		}
 
 		// Initialize TLS fronting if configured
@@ -161,12 +161,12 @@ func Run(cfg *Config, logger Logger) (shutdown func(), errCh <-chan error) {
 			handler.certFetcher = tlsfront.NewCertFetcher(cfg.CertRefreshHours, cfg.MaskHost)
 
 			// Fetch certificate synchronously at startup
-			logger.Info("Fetching TLS certificate from %s:%d (SNI: %s)...", cfg.CertHost, cfg.CertPort, cfg.MaskHost)
+			logger.Debug("Fetching TLS certificate from %s:%d (SNI: %s)...", cfg.CertHost, cfg.CertPort, cfg.MaskHost)
 			cert, err := handler.certFetcher.FetchCert(cfg.CertHost, cfg.CertPort)
 			if err != nil {
 				logger.Warn("Failed to fetch certificate: %v (will retry in background)", err)
 			} else {
-				logger.Info("Certificate fetched: %d certs in chain", len(cert.Chain))
+				logger.Debug("Certificate fetched: %d certs in chain", len(cert.Chain))
 			}
 
 			// Start background refresh

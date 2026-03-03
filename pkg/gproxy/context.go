@@ -3,6 +3,7 @@ package gproxy
 
 import (
 	"crypto/cipher"
+	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -64,8 +65,14 @@ type RelayContext struct {
 	DCDecrypt cipher.Stream // decrypt data FROM DC
 }
 
+// Global connection ID counter
+var connIDCounter atomic.Uint64
+
 // ConnContext holds per-connection state for the gnet event handler.
 type ConnContext struct {
+	// Connection ID for logging (immutable after creation)
+	id uint64
+
 	// Atomic state - no lock needed for reads
 	state atomic.Int32
 
@@ -111,10 +118,31 @@ type ConnContext struct {
 // NewConnContext creates a new connection context.
 func NewConnContext() *ConnContext {
 	ctx := &ConnContext{
+		id:       connIDCounter.Add(1),
 		connTime: time.Now(),
 	}
 	ctx.state.Store(int32(StateReadTLSHeader))
 	return ctx
+}
+
+// ID returns the connection ID.
+func (c *ConnContext) ID() uint64 {
+	return c.id
+}
+
+// LogPrefix returns a log prefix like "#123" or "#123:user1".
+func (c *ConnContext) LogPrefix() string {
+	c.mu.Lock()
+	name := ""
+	if c.secret != nil {
+		name = c.secret.Name
+	}
+	c.mu.Unlock()
+
+	if name != "" {
+		return fmt.Sprintf("#%d:%s", c.id, name)
+	}
+	return fmt.Sprintf("#%d", c.id)
 }
 
 // State returns the current connection state (lock-free).

@@ -1,6 +1,8 @@
 package gproxy
 
 import (
+	"errors"
+	"io"
 	"time"
 
 	"github.com/panjf2000/gnet/v2"
@@ -83,7 +85,7 @@ func (h *ProxyHandler) OnOpen(c gnet.Conn) ([]byte, gnet.Action) {
 
 	c.SetContext(ctx)
 
-	h.logger.Debug("new connection from %s", c.RemoteAddr())
+	h.logger.Debug("[#%d] new connection from %s", ctx.id, c.RemoteAddr())
 
 	// Set read deadline for handshake
 	c.SetReadDeadline(time.Now().Add(30 * time.Second))
@@ -108,24 +110,30 @@ func (h *ProxyHandler) OnClose(c gnet.Conn, err error) gnet.Action {
 		spliceConn.Close()
 	}
 
-	// Release connection limit slot
+	// Release connection limit slot and check if authenticated
 	ctx.mu.Lock()
-	userName := ""
-	if ctx.secret != nil {
-		userName = ctx.secret.Name
-	}
+	authenticated := ctx.secret != nil
 	if ctx.limitTracked && h.connLimiter != nil {
 		h.connLimiter.Release(ctx.limitKey)
 		ctx.limitTracked = false
 	}
 	ctx.mu.Unlock()
 
-	if err != nil {
-		if userName != "" {
-			h.logger.Debug("[%s] closed: %v", userName, err)
+	// Log closure
+	duration := time.Since(ctx.connTime)
+	prefix := ctx.LogPrefix()
+
+	// Determine if this is a real error (not just EOF/normal close)
+	isRealError := err != nil && !errors.Is(err, io.EOF)
+
+	if authenticated {
+		if isRealError {
+			h.logger.Warn("[%s] closed (%v): %v", prefix, duration.Round(time.Millisecond), err)
 		} else {
-			h.logger.Debug("connection closed: %v", err)
+			h.logger.Info("[%s] closed (%v)", prefix, duration.Round(time.Millisecond))
 		}
+	} else if isRealError {
+		h.logger.Debug("[%s] closed (%v): %v", prefix, duration.Round(time.Millisecond), err)
 	}
 
 	return gnet.None
@@ -171,7 +179,7 @@ func (h *ProxyHandler) handleProxyProto(c gnet.Conn, ctx *ConnContext) gnet.Acti
 
 	result, err := ParseProxyProtocol(data)
 	if err != nil {
-		h.logger.Debug("PROXY protocol error: %v", err)
+		h.logger.Debug("[#%d] PROXY protocol error: %v", ctx.id, err)
 		return gnet.Close
 	}
 
@@ -187,7 +195,7 @@ func (h *ProxyHandler) handleProxyProto(c gnet.Conn, ctx *ConnContext) gnet.Acti
 	// Store real client address if provided
 	if result.SrcAddr != nil {
 		ctx.SetRealClientAddr(result.SrcAddr)
-		h.logger.Debug("PROXY protocol: real client %s", result.SrcAddr)
+		h.logger.Debug("[#%d] PROXY protocol: real client %s", ctx.id, result.SrcAddr)
 	}
 
 	// Proceed to TLS handshake
