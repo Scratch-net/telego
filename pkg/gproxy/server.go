@@ -198,6 +198,7 @@ func Run(cfg *Config, logger Logger) (shutdown func(), errCh <-chan error) {
 			if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
 				logger.Warn("Failed to remove existing socket file %s: %v", socketPath, err)
 			}
+			wrapper.socketPath = socketPath
 		}
 
 		logger.Info("Starting gnet proxy on %s (multicore=%v, reuseport=%v)",
@@ -227,12 +228,21 @@ func Run(cfg *Config, logger Logger) (shutdown func(), errCh <-chan error) {
 // engineCaptureHandler wraps ProxyHandler to capture the engine on boot.
 type engineCaptureHandler struct {
 	*ProxyHandler
-	engPtr *atomic.Pointer[gnet.Engine]
-	ready  chan struct{}
+	engPtr     *atomic.Pointer[gnet.Engine]
+	ready      chan struct{}
+	socketPath string // Unix socket path for chmod (empty if TCP)
 }
 
 func (h *engineCaptureHandler) OnBoot(eng gnet.Engine) gnet.Action {
 	h.engPtr.Store(&eng)
 	close(h.ready)
+
+	// Set Unix socket permissions so nginx/haproxy can connect
+	if h.socketPath != "" {
+		if err := os.Chmod(h.socketPath, 0666); err != nil {
+			h.logger.Warn("Failed to chmod socket %s: %v", h.socketPath, err)
+		}
+	}
+
 	return h.ProxyHandler.OnBoot(eng)
 }
