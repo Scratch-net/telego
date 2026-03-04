@@ -174,10 +174,9 @@ func (c *GenerateCmd) Run() error {
 	fullSecret := config.BuildFullSecret(key, c.Host)
 
 	log.Info().
-		Str("key", keyHex).
-		Str("full_secret", fullSecret).
+		Str("secret", keyHex).
 		Str("link", "tg://proxy?server=YOUR_IP&port=443&secret="+fullSecret).
-		Msg("generated new key")
+		Msg("generated secret")
 
 	return nil
 }
