@@ -1,6 +1,7 @@
 FROM scratch
 
-COPY telego /telego
+ARG TARGETPLATFORM
+COPY ${TARGETPLATFORM}/telego /telego
 
 ENTRYPOINT ["/telego"]
 CMD ["run", "-c", "/config.toml"]

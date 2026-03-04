@@ -9,6 +9,7 @@ require (
 	github.com/pelletier/go-toml/v2 v2.2.4
 	github.com/pion/stun/v3 v3.1.1
 	github.com/rs/zerolog v1.34.0
+	github.com/zeebo/blake3 v0.2.4
 	golang.org/x/net v0.51.0
 	golang.org/x/sys v0.41.0
 )
@@ -40,7 +41,6 @@ require (
 	github.com/shopspring/decimal v1.4.0 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
-	github.com/zeebo/blake3 v0.2.4 // indirect
 	go.opentelemetry.io/otel v1.40.0 // indirect
 	go.opentelemetry.io/otel/metric v1.40.0 // indirect
 	go.opentelemetry.io/otel/trace v1.40.0 // indirect

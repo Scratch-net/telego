@@ -10,7 +10,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 go build -tags="${BUILD_TAGS}" -ldflags="-s -w" -o telego ./cmd/telego
+RUN CGO_ENABLED=0 go build -trimpath -tags="${BUILD_TAGS}" -ldflags="-s -w" -o telego ./cmd/telego
 
 FROM scratch
 

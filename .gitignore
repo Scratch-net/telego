@@ -52,3 +52,4 @@ Thumbs.db
 
 # Config with secrets
 config.toml
+.build/
