@@ -85,9 +85,8 @@ go install github.com/scratch-net/telego/cmd/telego@latest
 
 ```bash
 telego generate www.google.com
-# Output: ee0123456789abcdef0123456789abcdef7777772e676f6f676c652e636f6d
-#            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-#            This 32-char part is the key for config
+# secret=0123456789abcdef0123456789abcdef  <- put this in config
+# link=tg://proxy?server=YOUR_IP&port=443&secret=ee...  <- share with clients
 ```
 
 **2. Create `config.toml`:**
@@ -97,16 +96,11 @@ telego generate www.google.com
 bind-to = "0.0.0.0:443"
 
 [secrets]
-# Use only the 32 hex-char key (after 'ee', before the hostname bytes)
 alice = "0123456789abcdef0123456789abcdef"
 
 [tls-fronting]
-# This MUST match the hostname used in 'telego generate'
 mask-host = "www.google.com"
 ```
-
-The full generated secret (`ee...`) is what you share with Telegram clients.
-The 32-char key in `[secrets]` is extracted from it (bytes 2-33).
 
 **3. Run:**
 
