@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo.jpg" alt="TeleGO Logo" width="200">
+  <img src="docs/logo.jpg" alt="TeleGO Logo" width="200">
 </p>
 
 <h1 align="center">TeleGO</h1>
@@ -207,7 +207,7 @@ services:
 ### Build Locally
 
 ```bash
-docker build -f Dockerfile.build -t telego .
+docker build -f dist/Dockerfile.build -t telego .
 docker run -d -p 443:443 -v ./config.toml:/config.toml telego
 ```
 

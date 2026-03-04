@@ -31,7 +31,7 @@ install: build
 	install -d $(BINDIR)
 	install -m 755 $(BINARY) $(BINDIR)/$(BINARY)
 	@echo "Installing systemd service..."
-	sed 's|CONFIG_PATH|$(CONFIG)|g' $(MAKEFILE_DIR)telego.service > /etc/systemd/system/telego.service
+	sed 's|CONFIG_PATH|$(CONFIG)|g' $(MAKEFILE_DIR)dist/telego.service > /etc/systemd/system/telego.service
 	systemctl daemon-reload
 	@echo "Creating config directory..."
 	install -d $(SYSCONFDIR)

@@ -59,7 +59,7 @@ dockers:
       - "scratchnet/telego:v{{ .Major }}"
       - "scratchnet/telego:v{{ .Major }}.{{ .Minor }}"
       - "scratchnet/telego:latest"
-    dockerfile: Dockerfile
+    dockerfile: dist/Dockerfile
     build_flag_templates:
       - "--pull"
       - "--label=org.opencontainers.image.created={{.Date}}"
