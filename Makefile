@@ -23,7 +23,7 @@ CONFIG := $(SYSCONFDIR)/config.toml
 
 # Default target: build with all optimizations
 build:
-	CGO_ENABLED=0 go build -tags="$(TAGS)" -ldflags="$(LDFLAGS)" -o $(BINARY) ./cmd/telego
+	CGO_ENABLED=0 go build -trimpath -tags="$(TAGS)" -ldflags="$(LDFLAGS)" -o $(BINARY) ./cmd/telego
 
 # Install as systemd service
 install: build
@@ -75,10 +75,10 @@ build-debug:
 
 # Build for multiple platforms
 build-linux:
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags="$(TAGS)" -ldflags="$(LDFLAGS)" -o $(BINARY)-linux-amd64 ./cmd/telego
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -tags="$(TAGS)" -ldflags="$(LDFLAGS)" -o $(BINARY)-linux-amd64 ./cmd/telego
 
 build-linux-arm64:
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -tags="$(TAGS)" -ldflags="$(LDFLAGS)" -o $(BINARY)-linux-arm64 ./cmd/telego
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -tags="$(TAGS)" -ldflags="$(LDFLAGS)" -o $(BINARY)-linux-arm64 ./cmd/telego
 
 # Clean build artifacts
 clean:

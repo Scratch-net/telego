@@ -21,6 +21,8 @@ builds:
     tags:
       - poll_opt
       - gc_opt
+    flags:
+      - -trimpath
     ldflags:
       - -s -w
       - -X main.version={{.Version}}
