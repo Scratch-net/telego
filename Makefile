@@ -21,6 +21,11 @@ BINDIR := $(PREFIX)/bin
 SYSCONFDIR := /etc/telego
 CONFIG := $(SYSCONFDIR)/config.toml
 
+# Creating an RPM distribution
+ifneq ("$(wildcard $(MAKEFILE_DIR)/dist/rpmbuild.mk)","")
+include $(MAKEFILE_DIR)/dist/rpmbuild.mk
+endif
+
 # Default target: build with all optimizations
 build:
 	CGO_ENABLED=0 go build -trimpath -tags="$(TAGS)" -ldflags="$(LDFLAGS)" -o $(BINARY) ./cmd/telego
