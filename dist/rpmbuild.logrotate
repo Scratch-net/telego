@@ -1,0 +1,13 @@
+/var/log/telego/*.log {
+  compress
+  dateext
+  maxage 365
+  rotate 14
+  size=+4096k
+  missingok
+  notifempty
+  create 644 telego telego
+  postrotate
+    systemctl restart telego.service
+  endscript
+}

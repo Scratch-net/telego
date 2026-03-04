@@ -1,0 +1,33 @@
+[Unit]
+Description=Telego telegram MTPRoto service
+DefaultDependencies=no
+After=nss-lookup.target network.target time-sync.target
+
+[Service]
+Type=simple
+WorkingDirectory=/usr/share/telego
+EnvironmentFile=/etc/sysconfig/telego
+ExecStart=/usr/sbin/telego run -c "${TELEGO_CONFIG_PATH}"
+PIDFile=/run/telego/telego.pid
+Restart=always
+RestartSec=5
+TimeoutStartSec=40
+TimeoutStopSec=200
+LimitNOFILE=infinity
+LimitNPROC=infinity
+LimitCORE=infinity
+KillMode=process
+User=telego
+Group=telego
+NonBlocking=true
+NoNewPrivileges=true
+InaccessibleDirectories=/sys
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=full
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

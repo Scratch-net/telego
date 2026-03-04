@@ -1,0 +1,3 @@
+d /run/telego                    0777  telego    telego
+d /var/log/telego                0750  telego    telego
+d /usr/share/telego              0755  telego    telego
