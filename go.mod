@@ -8,7 +8,7 @@ require (
 	github.com/gotd/td v0.142.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/panjf2000/gnet/v2 v2.9.7
-	github.com/pelletier/go-toml/v2 v2.2.4
+	github.com/pelletier/go-toml/v2 v2.3.0
 	github.com/pion/stun/v3 v3.1.1
 	github.com/rs/zerolog v1.34.0
 	github.com/zeebo/blake3 v0.2.4
