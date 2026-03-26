@@ -34,11 +34,12 @@ type Config struct {
 
 // GeneralConfig contains general server settings.
 type GeneralConfig struct {
-	BindTo         string   `toml:"bind-to"`
-	LogLevel       string   `toml:"log-level"`        // trace, debug, info, warn, error
-	ProxyProtocol  bool     `toml:"proxy-protocol"`   // Accept incoming PROXY protocol
-	MaxIPsPerUser  int      `toml:"max-ips-per-user"` // Max unique IPs per user, 0 = unlimited
-	IPBlockTimeout Duration `toml:"ip-block-timeout"` // How long blocked IPs stay blocked
+	BindTo              string   `toml:"bind-to"`
+	LogLevel            string   `toml:"log-level"`              // trace, debug, info, warn, error
+	ProxyProtocol       bool     `toml:"proxy-protocol"`         // Accept incoming PROXY protocol
+	MaxConnectionsPerIP int      `toml:"max-connections-per-ip"` // Max connections per IP+secret, 0 = unlimited
+	MaxIPsPerUser       int      `toml:"max-ips-per-user"`       // Max unique IPs per user, 0 = unlimited
+	IPBlockTimeout      Duration `toml:"ip-block-timeout"`       // How long blocked IPs stay blocked
 }
 
 // TLSFrontingConfig configures TLS fronting.
@@ -204,6 +205,7 @@ func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
 
 	// General settings
 	cfg.ProxyProtocol = c.General.ProxyProtocol || c.ProxyProtocol
+	cfg.MaxConnectionsPerIP = c.General.MaxConnectionsPerIP
 	cfg.MaxIPsPerUser = c.General.MaxIPsPerUser
 	cfg.IPBlockTimeout = c.General.IPBlockTimeout.Duration()
 	if cfg.IPBlockTimeout == 0 {

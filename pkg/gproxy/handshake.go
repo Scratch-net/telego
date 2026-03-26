@@ -112,32 +112,53 @@ func (h *ProxyHandler) handleTLSPayload(c gnet.Conn, ctx *ConnContext) gnet.Acti
 	ctx.secret = matchedSecret
 	ctx.mu.Unlock()
 
-	// Check user IP limit (if enabled)
-	if h.userLimiter != nil {
-		clientAddr := ctx.RealClientAddr(c.RemoteAddr())
-		var clientIP net.IP
-		if tcpAddr, ok := clientAddr.(*net.TCPAddr); ok {
-			clientIP = tcpAddr.IP
-		} else if host, _, err := net.SplitHostPort(clientAddr.String()); err == nil {
-			clientIP = net.ParseIP(host)
-		}
+	// Get client IP for limiter checks
+	clientAddr := ctx.RealClientAddr(c.RemoteAddr())
+	var clientIP net.IP
+	if tcpAddr, ok := clientAddr.(*net.TCPAddr); ok {
+		clientIP = tcpAddr.IP
+	} else if host, _, err := net.SplitHostPort(clientAddr.String()); err == nil {
+		clientIP = net.ParseIP(host)
+	}
 
-		if clientIP != nil {
-			key, ok := h.userLimiter.TryAcquire(clientIP, matchedSecret.Key, matchedSecret.Name)
-			if !ok {
-				h.logger.Debug("[#%d:%s] IP blocked for user (too many unique IPs): %s", ctx.id, matchedSecret.Name, clientIP)
-				return gnet.Close
+	// Check connection limit per IP (if enabled)
+	if h.connLimiter != nil && clientIP != nil {
+		key, ok := h.connLimiter.TryAcquire(clientIP, matchedSecret.Key)
+		if !ok {
+			h.logger.Info("[#%d:%s] connection limit exceeded for IP: %s", ctx.id, matchedSecret.Name, clientIP)
+			return gnet.Close
+		}
+		ctx.mu.Lock()
+		ctx.connLimitTracked = true
+		ctx.connLimitKey = key
+		ctx.mu.Unlock()
+	}
+
+	// Check user IP limit and track stats
+	if h.userLimiter != nil && clientIP != nil {
+		key, ok := h.userLimiter.TryAcquire(clientIP, matchedSecret.Key, matchedSecret.Name)
+		if !ok {
+			// Release conn limiter slot if acquired
+			if h.connLimiter != nil {
+				ctx.mu.Lock()
+				if ctx.connLimitTracked {
+					h.connLimiter.Release(ctx.connLimitKey)
+					ctx.connLimitTracked = false
+				}
+				ctx.mu.Unlock()
 			}
-			// Store tracking info for cleanup in OnClose
-			ctx.mu.Lock()
-			ctx.limitTracked = true
-			ctx.limitKey = key
-			ctx.mu.Unlock()
-
-			// Store traffic counter pointers for hot-path counting
-			bytesIn, bytesOut := h.userLimiter.TrafficCounters(matchedSecret.Key)
-			ctx.SetTrafficCounters(bytesIn, bytesOut)
+			h.logger.Info("[#%d:%s] IP blocked for user (too many unique IPs): %s", ctx.id, matchedSecret.Name, clientIP)
+			return gnet.Close
 		}
+		// Store tracking info for cleanup in OnClose
+		ctx.mu.Lock()
+		ctx.limitTracked = true
+		ctx.limitKey = key
+		ctx.mu.Unlock()
+
+		// Store traffic counter pointers for hot-path counting
+		bytesIn, bytesOut := h.userLimiter.TrafficCounters(matchedSecret.Key)
+		ctx.SetTrafficCounters(bytesIn, bytesOut)
 	}
 
 	h.logger.Debug("[#%d] matched secret %q", ctx.id, matchedSecret.Name)

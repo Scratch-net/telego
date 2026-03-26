@@ -58,9 +58,10 @@ type Config struct {
 	Socks5Addr string // SOCKS5 proxy for DC connections (e.g., "127.0.0.1:1080")
 
 	// Incoming connection handling
-	ProxyProtocol  bool          // Accept incoming PROXY protocol headers
-	MaxIPsPerUser  int           // Max unique IPs per user, 0 = unlimited
-	IPBlockTimeout time.Duration // How long blocked IPs stay blocked (default 5m)
+	ProxyProtocol       bool          // Accept incoming PROXY protocol headers
+	MaxConnectionsPerIP int           // Max concurrent connections per IP+secret, 0 = unlimited
+	MaxIPsPerUser       int           // Max unique IPs per user, 0 = unlimited
+	IPBlockTimeout      time.Duration // How long blocked IPs stay blocked (default 5m)
 
 	// Backpressure
 	MaxWriteBuffer int // Max pending bytes per connection before closing (0 = 4MB default)

@@ -47,7 +47,7 @@
 ### Operations
 - **Multi-user Support** — Named secrets with per-user tracking and logging
 - **Connection Tracking** — Unique connection IDs for easy log correlation
-- **IP Limits per User** — Limits unique IPs per user with LRU eviction and timed blocking
+- **Connection Limits** — Per-IP connection limits and per-user IP limits with timed blocking
 - **Prometheus Metrics** — Per-user connection counts, traffic, and blocked IP statistics
 - **DC Probing** — Automatic RTT-based DC address sorting at startup
 - **Config Hot-Reload** — SIGHUP and file watching for runtime config changes
@@ -132,10 +132,15 @@ log-level = "info"
 # Accept incoming PROXY protocol headers (from HAProxy/nginx)
 # proxy-protocol = false
 
+# Maximum connections per IP+user (0 = unlimited)
+# Protects against abuse when many users share one IP (NAT, VPN)
+# max-connections-per-ip = 100
+
 # Maximum unique IPs per user (0 = unlimited)
+# Prevents secret sharing - limits how many devices/locations can use one secret
 # max-ips-per-user = 3
 
-# How long blocked IPs stay blocked
+# How long blocked IPs stay blocked (for max-ips-per-user)
 # ip-block-timeout = "5m"
 
 # Named secrets (hex format, 32 chars = 16 bytes)
@@ -234,7 +239,8 @@ TeleGO can run behind HAProxy or nginx using Unix sockets and PROXY protocol:
 [general]
 bind-to = "/run/telego/telego.sock"
 proxy-protocol = true
-max-ips-per-user = 3
+max-connections-per-ip = 100  # DoS protection
+max-ips-per-user = 3          # Sharing protection
 
 [secrets]
 user1 = "..."
@@ -295,7 +301,7 @@ kill -HUP $(pidof telego)
 - `idle-timeout` — Applies to new connections
 
 **Require restart:**
-- `bind-to`, `secrets`, `tls-fronting.*`, `proxy-protocol`, `max-ips-per-user`
+- `bind-to`, `secrets`, `tls-fronting.*`, `proxy-protocol`, `max-connections-per-ip`, `max-ips-per-user`
 
 ---
 
@@ -331,11 +337,12 @@ Connections are tracked with unique IDs for easy correlation:
 
 ```
 INF gnet proxy started on 0.0.0.0:443
+INF Connection limiter enabled: max 100 connections per IP
 INF User IP limiter enabled: max 3 IPs per user, block timeout 5m0s
 INF [#1:alice] 203.0.113.5:54321 -> DC 2
 INF [#2:bob] 198.51.100.10:12345 -> DC 4
-INF [#1:alice] closed (45.2s)
-WRN [#2:bob] closed (30s): i/o timeout
+INF [#1:alice] DC 2 closed (45.2s) (active: 1)
+WRN [#2:bob] DC 4 closed (30s): i/o timeout (active: 0)
 ```
 
 - `#N` — Connection ID (incremental, unique per session)

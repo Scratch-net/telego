@@ -34,7 +34,10 @@ type ProxyHandler struct {
 	// Replay cache for anti-replay protection
 	replayCache *ReplayCache
 
-	// User IP limiter (nil if disabled)
+	// Connection limiter (per IP+secret)
+	connLimiter *ConnLimiter
+
+	// User IP limiter/stats tracker
 	userLimiter *UserIPLimiter
 
 	// TLS fronting
@@ -77,6 +80,12 @@ func NewProxyHandler(cfg *Config, logger Logger) *ProxyHandler {
 		dcBufPool:      NewBufferPool(64*1024 + 256), // 64KB + TLS header overhead
 		relayBufPool:   NewBufferPool(16 * 1024),     // 16KB TLS record
 		desyncDetector: NewDesyncDetector(),
+	}
+
+	// Initialize connection limiter if configured
+	if cfg.MaxConnectionsPerIP > 0 {
+		h.connLimiter = NewConnLimiter(cfg.MaxConnectionsPerIP)
+		logger.Info("Connection limiter enabled: max %d connections per IP", cfg.MaxConnectionsPerIP)
 	}
 
 	// Initialize user IP limiter/stats tracker (always created for metrics)
@@ -168,9 +177,13 @@ func (h *ProxyHandler) OnClose(c gnet.Conn, err error) gnet.Action {
 		spliceConn.Close()
 	}
 
-	// Release connection limit slot and check if authenticated
+	// Release connection limit slots and check if authenticated
 	ctx.mu.Lock()
 	authenticated := ctx.secret != nil
+	if ctx.connLimitTracked && h.connLimiter != nil {
+		h.connLimiter.Release(ctx.connLimitKey)
+		ctx.connLimitTracked = false
+	}
 	if ctx.limitTracked && h.userLimiter != nil {
 		h.userLimiter.Release(ctx.limitKey)
 		ctx.limitTracked = false

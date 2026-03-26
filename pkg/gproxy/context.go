@@ -108,8 +108,10 @@ type ConnContext struct {
 	realClientAddr net.Addr
 
 	// Connection limit tracking (protected by mu)
-	limitTracked bool   // Whether this connection is tracked in limiter
-	limitKey     string // Cached key for limiter release
+	connLimitTracked bool   // Whether this connection is tracked in conn limiter
+	connLimitKey     string // Cached key for conn limiter release
+	limitTracked     bool   // Whether this connection is tracked in user IP limiter
+	limitKey         string // Cached key for user IP limiter release
 
 	// Traffic counters (pointers to user's atomic counters)
 	trafficIn  *atomic.Int64

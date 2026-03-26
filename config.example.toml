@@ -15,11 +15,16 @@ log-level = "info"
 # When enabled, parses PROXY protocol v1/v2 to get real client IP
 # proxy-protocol = false
 
+# Maximum connections per IP+user (0 = unlimited)
+# Limits how many connections one IP can have for each user.
+# Useful when many users share one IP (NAT, corporate VPN).
+# max-connections-per-ip = 100
+
 # Maximum unique IP addresses per user/secret (0 = unlimited)
-# When exceeded, oldest IP is blocked. Protects against leaked account abuse.
+# When exceeded, oldest IP is evicted and blocked. Protects against secret sharing.
 # max-ips-per-user = 3
 
-# How long blocked IPs stay blocked (with refresh on attempts)
+# How long evicted IPs stay blocked (refreshes on connection attempts)
 # ip-block-timeout = "5m"
 
 # Named secrets (32 hex characters = 16 bytes)
