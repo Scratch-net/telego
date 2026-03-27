@@ -353,12 +353,12 @@ func (h *ProxyHandler) dialSplice(clientConn gnet.Conn, ctx *ConnContext) {
 }
 
 // relaySpliceToClientLoop reads from splice target and writes to client.
-// Implements flow control by pausing reads when client is slow.
+// Implements flow control by waiting for buffer space instead of busy-polling.
 func (h *ProxyHandler) relaySpliceToClientLoop(spliceConn net.Conn, clientConn gnet.Conn, ctx *ConnContext) {
 	defer spliceConn.Close()
 	defer clientConn.Close()
 
-	// Cache timeout config and set initial deadline
+	// Cache config and set initial deadline
 	// Only update deadline when half the timeout has elapsed to reduce syscalls
 	idleTimeout := h.IdleTimeout()
 	var lastDeadlineSet time.Time
@@ -367,6 +367,9 @@ func (h *ProxyHandler) relaySpliceToClientLoop(spliceConn net.Conn, clientConn g
 		lastDeadlineSet = time.Now()
 		spliceConn.SetReadDeadline(lastDeadlineSet.Add(idleTimeout))
 	}
+
+	// Cache resume channel - used for flow control signaling
+	resumeCh := ctx.spliceResume
 
 	for {
 		// Check if client connection was closed
@@ -383,10 +386,14 @@ func (h *ProxyHandler) relaySpliceToClientLoop(spliceConn net.Conn, clientConn g
 			return
 		}
 
-		// Throttle when buffer is getting full (half of hard limit)
-		// This provides backpressure to splice target via TCP
-		if buffered > h.maxWriteBuffer/2 {
-			time.Sleep(10 * time.Millisecond)
+		// Throttle when buffer is getting full - wait for signal instead of sleeping
+		if buffered > h.bpSoftLimit {
+			select {
+			case <-resumeCh:
+				// Buffer drained, continue
+			case <-time.After(50 * time.Millisecond):
+				// Fallback timeout prevents deadlock if signal is missed
+			}
 			continue
 		}
 
@@ -408,9 +415,22 @@ func (h *ProxyHandler) relaySpliceToClientLoop(spliceConn net.Conn, clientConn g
 		}
 
 		if n > 0 {
+			// Capture variables for callback closure
+			poolBuf := bufPtr
+			resume := resumeCh
+			softLimit := h.bpSoftLimit
+
 			// Buffer ownership transfers to gnet until callback fires
-			err = clientConn.AsyncWrite(buf[:n], func(c gnet.Conn, err error) error {
-				spliceReadBufPool.Put(bufPtr)
+			err = clientConn.AsyncWrite(buf[:n], func(c gnet.Conn, _ error) error {
+				spliceReadBufPool.Put(poolBuf)
+				// Signal resume if buffer dropped below soft limit
+				if c.OutboundBuffered() < softLimit {
+					select {
+					case resume <- struct{}{}:
+					default:
+						// Channel full, already signaled
+					}
+				}
 				return nil
 			})
 			if err != nil {

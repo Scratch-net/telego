@@ -103,6 +103,10 @@ type ConnContext struct {
 	// After set, read without locking
 	spliceConn atomic.Pointer[net.Conn]
 
+	// Splice flow control: signaled when client buffer has space
+	// Used to avoid busy-wait sleep in relaySpliceToClientLoop
+	spliceResume chan struct{}
+
 	// Real client address from PROXY protocol (if parsed)
 	// Protected by mu during handshake, immutable after
 	realClientAddr net.Addr
@@ -116,6 +120,10 @@ type ConnContext struct {
 	// Traffic counters (pointers to user's atomic counters)
 	trafficIn  *atomic.Int64
 	trafficOut *atomic.Int64
+
+	// Backpressure state for hysteresis (avoids oscillation at threshold boundaries)
+	// Once throttled, stays throttled until buffer drops below resumeAt
+	throttledToDC atomic.Bool // Client->DC direction is throttled
 
 	// Timing
 	connTime time.Time
@@ -180,8 +188,10 @@ func (c *ConnContext) SpliceConn() net.Conn {
 	return nil
 }
 
-// SetSpliceConn sets the splice connection.
+// SetSpliceConn sets the splice connection and initializes flow control.
 func (c *ConnContext) SetSpliceConn(conn net.Conn) {
+	// Initialize flow control channel (buffered to allow non-blocking signal)
+	c.spliceResume = make(chan struct{}, 1)
 	c.spliceConn.Store(&conn)
 }
 

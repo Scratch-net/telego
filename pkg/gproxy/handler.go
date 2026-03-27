@@ -56,6 +56,10 @@ type ProxyHandler struct {
 	// Hard limit for OOM protection (bytes per connection)
 	maxWriteBuffer int
 
+	// Cached backpressure thresholds (computed from maxWriteBuffer)
+	bpSoftLimit int // Start throttling above this (maxWriteBuffer / 2)
+	bpResumeAt  int // Resume full speed below this (maxWriteBuffer / 4)
+
 	// Buffer pools with stats
 	dcBufPool    *BufferPool // 64KB+ for batching writes
 	relayBufPool *BufferPool // 16KB for TLS record processing
@@ -84,6 +88,8 @@ func NewProxyHandler(cfg *Config, logger Logger) *ProxyHandler {
 		replayCache:    NewReplayCache(1000000, 10*time.Minute),
 		logger:         logger,
 		maxWriteBuffer: maxWriteBuf,
+		bpSoftLimit:    maxWriteBuf / 2,
+		bpResumeAt:     maxWriteBuf / 4,
 		dcBufPool:      NewBufferPool(64*1024 + 256), // 64KB + TLS header overhead
 		relayBufPool:   NewBufferPool(16 * 1024),     // 16KB TLS record
 		desyncDetector: NewDesyncDetector(),
@@ -316,6 +322,9 @@ type Logger interface {
 	Info(format string, args ...any)
 	Warn(format string, args ...any)
 	Error(format string, args ...any)
+	// DebugEnabled returns true if debug logging is enabled.
+	// Use to guard expensive debug log argument evaluation.
+	DebugEnabled() bool
 }
 
 type defaultLogger struct{}
@@ -324,3 +333,4 @@ func (defaultLogger) Debug(format string, args ...any) {}
 func (defaultLogger) Info(format string, args ...any)  {}
 func (defaultLogger) Warn(format string, args ...any)  {}
 func (defaultLogger) Error(format string, args ...any) {}
+func (defaultLogger) DebugEnabled() bool               { return false }

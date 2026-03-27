@@ -4,6 +4,7 @@ import (
 	"crypto/cipher"
 	"errors"
 	"io"
+	"sync/atomic"
 	"time"
 
 	"github.com/panjf2000/gnet/v2"
@@ -47,6 +48,10 @@ type DCConnContext struct {
 
 	// Flow control: DC connection reference for wake mechanism
 	DCConn gnet.Conn
+
+	// Backpressure state for hysteresis (avoids oscillation at threshold boundaries)
+	// Once throttled, stays throttled until buffer drops below resumeAt
+	throttledToClient atomic.Bool // DC->Client direction is throttled
 }
 
 // OnTraffic handles data arriving from DC.
@@ -110,27 +115,35 @@ func (h *ProxyHandler) handleDCTraffic(dcConn gnet.Conn, dcCtx *DCConnContext) g
 		return gnet.None
 	}
 
-	// Flow control parameters
-	softLimit := h.maxWriteBuffer / 2 // 2MB for 4MB hard limit
-	resumeAt := softLimit / 2         // 1MB - resume when below this
-
-	// Rate limiting: process less when buffer is filling up
-	// No hard disconnects - let TCP flow control + idle timeout handle stuck clients
+	// Rate limiting with hysteresis: once throttled, stay throttled until buffer
+	// drops below resumeAt to prevent oscillation at threshold boundaries.
+	// No hard disconnects - let TCP flow control + idle timeout handle stuck clients.
+	wasThrottled := dcCtx.throttledToClient.Load()
 	maxProcess := len(data) // Default: full speed
+
 	if clientBuffered > h.maxWriteBuffer {
 		// Above hard limit: trickle mode - keep alive but minimal throughput
 		// TCP backpressure will naturally slow DC, idle timeout catches truly stuck clients
 		maxProcess = min(16*1024, len(data))
-		h.logger.Debug("[%s] backpressure: client buffer %dMB > hard limit, trickle mode",
-			clientCtx.LogPrefix(), clientBuffered/1024/1024)
-	} else if clientBuffered > softLimit {
+		dcCtx.throttledToClient.Store(true)
+		if h.logger.DebugEnabled() {
+			h.logger.Debug("[%s] backpressure: client buffer %dMB > hard limit, trickle mode",
+				clientCtx.LogPrefix(), clientBuffered/1024/1024)
+		}
+	} else if clientBuffered > h.bpSoftLimit {
 		// Above soft limit: small chunks only
 		maxProcess = min(64*1024, len(data))
-		h.logger.Debug("[%s] backpressure: client buffer %dKB > soft limit, throttling",
-			clientCtx.LogPrefix(), clientBuffered/1024)
-	} else if clientBuffered > resumeAt {
-		// Between resume and soft: medium chunks
+		dcCtx.throttledToClient.Store(true)
+		if h.logger.DebugEnabled() {
+			h.logger.Debug("[%s] backpressure: client buffer %dKB > soft limit, throttling",
+				clientCtx.LogPrefix(), clientBuffered/1024)
+		}
+	} else if wasThrottled && clientBuffered > h.bpResumeAt {
+		// Hysteresis: stay throttled until below resumeAt
 		maxProcess = min(256*1024, len(data))
+	} else if wasThrottled {
+		// Exiting throttle mode
+		dcCtx.throttledToClient.Store(false)
 	}
 	// else: full speed - process all available data
 

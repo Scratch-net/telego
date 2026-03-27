@@ -29,29 +29,37 @@ func (h *ProxyHandler) handleRelay(c gnet.Conn, ctx *ConnContext) gnet.Action {
 		return gnet.None
 	}
 
-	// Flow control parameters
-	softLimit := h.maxWriteBuffer / 2 // 2MB for 4MB hard limit
-	resumeAt := softLimit / 2         // 1MB - resume when below this
-
-	// Rate limiting: process less when buffer is filling up
-	// No hard disconnects - let TCP flow control + idle timeout handle stuck DCs
+	// Rate limiting with hysteresis: once throttled, stay throttled until buffer
+	// drops below resumeAt to prevent oscillation at threshold boundaries.
+	// No hard disconnects - let TCP flow control + idle timeout handle stuck DCs.
+	wasThrottled := ctx.throttledToDC.Load()
 	var maxProcess int
+
 	if dcBuffered > h.maxWriteBuffer {
 		// Above hard limit: trickle mode
 		maxProcess = 16 * 1024
-		h.logger.Debug("[%s] backpressure: DC buffer %dMB > hard limit, trickle mode",
-			ctx.LogPrefix(), dcBuffered/1024/1024)
-	} else if dcBuffered > softLimit {
+		ctx.throttledToDC.Store(true)
+		if h.logger.DebugEnabled() {
+			h.logger.Debug("[%s] backpressure: DC buffer %dMB > hard limit, trickle mode",
+				ctx.LogPrefix(), dcBuffered/1024/1024)
+		}
+	} else if dcBuffered > h.bpSoftLimit {
 		// Above soft limit: small chunks only
 		maxProcess = 64 * 1024
-		h.logger.Debug("[%s] backpressure: DC buffer %dKB > soft limit, throttling",
-			ctx.LogPrefix(), dcBuffered/1024)
-	} else if dcBuffered > resumeAt {
-		// Between resume and soft: medium chunks
+		ctx.throttledToDC.Store(true)
+		if h.logger.DebugEnabled() {
+			h.logger.Debug("[%s] backpressure: DC buffer %dKB > soft limit, throttling",
+				ctx.LogPrefix(), dcBuffered/1024)
+		}
+	} else if wasThrottled && dcBuffered > h.bpResumeAt {
+		// Hysteresis: stay throttled until below resumeAt
 		maxProcess = 256 * 1024
 	} else {
 		// Full speed - process everything
 		maxProcess = len(data)
+		if wasThrottled {
+			ctx.throttledToDC.Store(false)
+		}
 	}
 
 	// Get pooled buffer for batching writes to DC
@@ -118,15 +126,15 @@ func (h *ProxyHandler) handleRelay(c gnet.Conn, ctx *ConnContext) gnet.Action {
 			dcEncrypt.XORKeyStream(batchBuf[batchOffset:batchOffset+len(payload)], batchBuf[batchOffset:batchOffset+len(payload)])
 			batchOffset += len(payload)
 			processed += len(payload)
-
-			// Count traffic (client -> DC = upload/in)
-			if counter := ctx.TrafficIn(); counter != nil {
-				counter.Add(int64(len(payload)))
-			}
 		}
 
 		consumed += recordLen
 		data = data[recordLen:]
+	}
+
+	// Count traffic once after processing all records (client -> DC = upload/in)
+	if counter := ctx.TrafficIn(); counter != nil && processed > 0 {
+		counter.Add(int64(processed))
 	}
 
 	// Flush remaining batch via AsyncWrite (cross-event-loop safe)
@@ -144,11 +152,10 @@ func (h *ProxyHandler) handleRelay(c gnet.Conn, ctx *ConnContext) gnet.Action {
 		h.dcBufPool.Put(batchBufPtr)
 	}
 
-	// Only wake if we rate-limited and there's more data to process
-	// Don't wake for incomplete records - gnet will call OnTraffic when more data arrives
-	if rateLimited {
-		c.Wake(nil)
-	}
+	// Don't wake on rate-limit - let TCP backpressure naturally slow the client.
+	// gnet will call OnTraffic when more data arrives or DC buffer drains.
+	// This eliminates the spin loop that occurred with immediate Wake.
+	_ = rateLimited // Silence unused variable warning
 
 	if consumed > 0 {
 		c.Discard(consumed)

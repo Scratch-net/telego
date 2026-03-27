@@ -285,3 +285,7 @@ func (l *zerologAdapter) Warn(format string, args ...any) {
 func (l *zerologAdapter) Error(format string, args ...any) {
 	log.Error().Msgf(format, args...)
 }
+
+func (l *zerologAdapter) DebugEnabled() bool {
+	return log.Debug().Enabled()
+}
