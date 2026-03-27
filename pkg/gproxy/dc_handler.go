@@ -84,9 +84,17 @@ func (h *ProxyHandler) dialDC(clientConn gnet.Conn, ctx *ConnContext) {
 	}
 
 	// Pre-create DC context before Enroll.
-	// To eliminate the race between Enroll() and SetContext(), we store the
-	// context in a map keyed by fd BEFORE calling Enroll. DC event handlers
-	// check this map if c.Context() returns nil.
+	//
+	// RACE WINDOW MITIGATION: gnet's SetContext() is not concurrency-safe,
+	// but we must set context after Enroll returns. Between Enroll return and
+	// SetContext, DC event handlers might run with c.Context() == nil.
+	//
+	// Solution: Store context in pendingDCContexts map BEFORE Enroll.
+	// DC event handlers (getDCContext) check both c.Context() and this map.
+	// This eliminates the race: either c.Context() works or the map works.
+	//
+	// The map entry is deleted after SetContext. The sync.Map delete provides
+	// a memory barrier ensuring the SetContext write is visible.
 	dcCtx := &DCConnContext{
 		ClientConn:    clientConn,
 		ClientCtx:     ctx,
@@ -377,6 +385,9 @@ func (h *ProxyHandler) relaySpliceToClientLoop(spliceConn net.Conn, clientConn g
 			return
 		}
 
+		// NOTE: OutboundBuffered is not concurrency-safe per gnet docs.
+		// We call it from goroutine (clientConn belongs to server event loop).
+		// This is acceptable for approximate flow control decisions.
 		buffered := clientConn.OutboundBuffered()
 
 		// HARD LIMIT: Close if client buffer exceeds max

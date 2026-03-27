@@ -108,6 +108,11 @@ func (h *ProxyHandler) handleDCTraffic(dcConn gnet.Conn, dcCtx *DCConnContext) g
 		return gnet.Close
 	}
 
+	// NOTE: OutboundBuffered is not concurrency-safe per gnet docs.
+	// We call it cross-event-loop (clientConn belongs to server event loop).
+	// This is acceptable: we only use the value for approximate flow control
+	// decisions (is buffer above threshold?). A stale read just means we
+	// throttle slightly early or late, which doesn't affect correctness.
 	clientBuffered := clientConn.OutboundBuffered()
 
 	data, _ := dcConn.Peek(-1)

@@ -22,6 +22,11 @@ func (h *ProxyHandler) handleRelay(c gnet.Conn, ctx *ConnContext) gnet.Action {
 	decryptor := relay.Decryptor
 	dcEncrypt := relay.DCEncrypt
 
+	// NOTE: OutboundBuffered is not concurrency-safe per gnet docs.
+	// We call it cross-event-loop (dcConn belongs to dcClient event loop).
+	// This is acceptable: we only use the value for approximate flow control
+	// decisions (is buffer above threshold?). A stale read just means we
+	// throttle slightly early or late, which doesn't affect correctness.
 	dcBuffered := dcConn.OutboundBuffered()
 
 	data, _ := c.Peek(-1)
