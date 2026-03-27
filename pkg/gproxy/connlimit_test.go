@@ -112,7 +112,7 @@ func TestConnLimiter_Disabled(t *testing.T) {
 	secret := []byte("testsecret123456")
 
 	// Should always succeed when disabled
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		_, ok := l.TryAcquire(ip, secret)
 		if !ok {
 			t.Fatal("should always succeed when limit is 0")
@@ -147,7 +147,7 @@ func TestConnLimiter_ActiveConnections(t *testing.T) {
 	}
 
 	keys := make([]string, 5)
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		key, ok := l.TryAcquire(ip, secret)
 		if !ok {
 			t.Fatal("should succeed")
@@ -178,15 +178,13 @@ func TestConnLimiter_Concurrent(t *testing.T) {
 	successCount := make(chan int, 200)
 
 	// Try 200 concurrent acquisitions with limit of 100
-	for i := 0; i < 200; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 200 {
+		wg.Go(func() {
 			_, ok := l.TryAcquire(ip, secret)
 			if ok {
 				successCount <- 1
 			}
-		}()
+		})
 	}
 
 	wg.Wait()
@@ -234,7 +232,7 @@ func BenchmarkConnLimiter_TryAcquire(b *testing.B) {
 	secret := []byte("testsecret123456")
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		l.TryAcquire(ip, secret)
 	}
 }
@@ -245,7 +243,7 @@ func BenchmarkConnLimiter_TryAcquireRelease(b *testing.B) {
 	secret := []byte("testsecret123456")
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		key, _ := l.TryAcquire(ip, secret)
 		l.Release(key)
 	}

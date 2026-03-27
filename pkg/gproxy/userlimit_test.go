@@ -17,7 +17,7 @@ func TestUserIPLimiter_UnlimitedConnectionsPerIP(t *testing.T) {
 
 	// Same IP should allow unlimited connections
 	var keys []string
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		key, ok := l.TryAcquire(ip, secret, "test")
 		if !ok {
 			t.Fatalf("TryAcquire failed at iteration %d", i)
@@ -91,7 +91,7 @@ func TestUserIPLimiter_BlockedIPRejected(t *testing.T) {
 	l.TryAcquire(ip3, secret, "test")
 
 	// Multiple attempts from blocked IP1 should fail
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		_, ok := l.TryAcquire(ip1, secret, "test")
 		if ok {
 			t.Fatalf("Blocked IP should be rejected (attempt %d)", i)
@@ -227,7 +227,7 @@ func TestUserIPLimiter_BlockTimeoutRefresh(t *testing.T) {
 	l.TryAcquire(ip3, secret, "test")
 
 	// Keep refreshing block by attempting connection
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		time.Sleep(60 * time.Millisecond)
 		_, ok := l.TryAcquire(ip1, secret, "test")
 		if ok {
@@ -246,18 +246,17 @@ func TestUserIPLimiter_ConcurrentAccess(t *testing.T) {
 	secret := []byte("0123456789abcdef")
 
 	var wg sync.WaitGroup
-	for i := 0; i < 100; i++ {
-		wg.Add(1)
-		go func(n int) {
-			defer wg.Done()
+	for i := range 100 {
+		n := i
+		wg.Go(func() {
 			ip := net.ParseIP(fmt.Sprintf("192.168.1.%d", n%10))
-			for j := 0; j < 100; j++ {
+			for range 100 {
 				key, ok := l.TryAcquire(ip, secret, "test")
 				if ok {
 					l.Release(key)
 				}
 			}
-		}(i)
+		})
 	}
 	wg.Wait()
 }
@@ -379,7 +378,7 @@ func BenchmarkUserIPLimiter_TryAcquire(b *testing.B) {
 	ip := net.ParseIP("192.168.1.1")
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		l.TryAcquire(ip, secret, "test")
 	}
 }
@@ -392,7 +391,7 @@ func BenchmarkUserIPLimiter_TryAcquireRelease(b *testing.B) {
 	ip := net.ParseIP("192.168.1.1")
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		key, _ := l.TryAcquire(ip, secret, "test")
 		l.Release(key)
 	}
@@ -427,11 +426,13 @@ func BenchmarkUserIPLimiter_MultipleIPs(b *testing.B) {
 	}
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	i := 0
+	for b.Loop() {
 		ip := ips[i%len(ips)]
 		key, ok := l.TryAcquire(ip, secret, "test")
 		if ok {
 			l.Release(key)
 		}
+		i++
 	}
 }

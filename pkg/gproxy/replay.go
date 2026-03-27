@@ -31,10 +31,7 @@ type ReplayCache struct {
 // maxSize is the total capacity across all shards.
 // ttl is how long entries are kept before automatic expiration.
 func NewReplayCache(maxSize int, ttl time.Duration) *ReplayCache {
-	maxPerShard := maxSize / numShards
-	if maxPerShard < 1 {
-		maxPerShard = 1
-	}
+	maxPerShard := max(maxSize/numShards, 1)
 
 	c := &ReplayCache{
 		maxPerShard: maxPerShard,
@@ -53,7 +50,7 @@ func NewReplayCache(maxSize int, ttl time.Duration) *ReplayCache {
 func (c *ReplayCache) getShardIdx(key string) int {
 	// FNV-1a hash - fast and good distribution
 	h := uint32(2166136261)
-	for i := 0; i < len(key); i++ {
+	for i := range len(key) {
 		h ^= uint32(key[i])
 		h *= 16777619
 	}

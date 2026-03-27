@@ -3,52 +3,65 @@ package log
 
 import (
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
 )
 
-// Logger is the global logger instance.
-var Logger zerolog.Logger
+// logger holds a pointer to the global logger for thread-safe access.
+// We use atomic.Pointer instead of atomic.Value for type safety and to avoid
+// the pointer-method-on-value issue with zerolog.Logger.
+var logger atomic.Pointer[zerolog.Logger]
 
 func init() {
 	// Default to info level with console output
-	Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339}).
+	l := zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339}).
 		With().Timestamp().Logger().
 		Level(zerolog.InfoLevel)
+	logger.Store(&l)
+}
+
+// getLogger returns the current logger instance.
+func getLogger() *zerolog.Logger {
+	return logger.Load()
 }
 
 // SetLevel sets the global log level.
 func SetLevel(level string) {
+	l := *getLogger()
 	switch level {
 	case "trace":
-		Logger = Logger.Level(zerolog.TraceLevel)
+		l = l.Level(zerolog.TraceLevel)
 	case "debug":
-		Logger = Logger.Level(zerolog.DebugLevel)
+		l = l.Level(zerolog.DebugLevel)
 	case "info":
-		Logger = Logger.Level(zerolog.InfoLevel)
+		l = l.Level(zerolog.InfoLevel)
 	case "warn", "warning":
-		Logger = Logger.Level(zerolog.WarnLevel)
+		l = l.Level(zerolog.WarnLevel)
 	case "error":
-		Logger = Logger.Level(zerolog.ErrorLevel)
+		l = l.Level(zerolog.ErrorLevel)
 	case "fatal":
-		Logger = Logger.Level(zerolog.FatalLevel)
+		l = l.Level(zerolog.FatalLevel)
 	case "disabled", "none":
-		Logger = Logger.Level(zerolog.Disabled)
+		l = l.Level(zerolog.Disabled)
 	default:
-		Logger = Logger.Level(zerolog.InfoLevel)
+		l = l.Level(zerolog.InfoLevel)
 	}
+	logger.Store(&l)
 }
 
 // SetJSON switches to JSON output format.
 func SetJSON() {
-	Logger = zerolog.New(os.Stderr).With().Timestamp().Logger().Level(Logger.GetLevel())
+	l := getLogger()
+	newL := zerolog.New(os.Stderr).With().Timestamp().Logger().Level(l.GetLevel())
+	logger.Store(&newL)
 }
 
 // Convenience functions
-func Trace() *zerolog.Event { return Logger.Trace() }
-func Debug() *zerolog.Event { return Logger.Debug() }
-func Info() *zerolog.Event  { return Logger.Info() }
-func Warn() *zerolog.Event  { return Logger.Warn() }
-func Error() *zerolog.Event { return Logger.Error() }
-func Fatal() *zerolog.Event { return Logger.Fatal() }
+func Trace() *zerolog.Event { return getLogger().Trace() }
+func Debug() *zerolog.Event { return getLogger().Debug() }
+func Info() *zerolog.Event  { return getLogger().Info() }
+func Warn() *zerolog.Event  { return getLogger().Warn() }
+func Error() *zerolog.Event { return getLogger().Error() }
+func Fatal() *zerolog.Event { return getLogger().Fatal() }

@@ -3,6 +3,7 @@ package gproxy
 import (
 	"errors"
 	"io"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -24,6 +25,9 @@ type ProxyHandler struct {
 
 	// Configuration
 	config *Config
+
+	// Hot-reloadable config: IdleTimeout stored as nanoseconds for atomic access
+	idleTimeoutNs atomic.Int64
 
 	// DC client for outgoing connections
 	dcClient *gnet.Client
@@ -58,6 +62,9 @@ type ProxyHandler struct {
 
 	// Desync detector
 	desyncDetector *DesyncDetector
+
+	// Pending DC contexts: keyed by fd, used to eliminate race between Enroll and SetContext
+	pendingDCContexts sync.Map // int (fd) -> *DCConnContext
 }
 
 // NewProxyHandler creates a new gnet proxy handler.
@@ -81,6 +88,9 @@ func NewProxyHandler(cfg *Config, logger Logger) *ProxyHandler {
 		relayBufPool:   NewBufferPool(16 * 1024),     // 16KB TLS record
 		desyncDetector: NewDesyncDetector(),
 	}
+
+	// Initialize hot-reloadable config atomically
+	h.idleTimeoutNs.Store(int64(cfg.IdleTimeout))
 
 	// Initialize connection limiter if configured
 	if cfg.MaxConnectionsPerIP > 0 {
@@ -109,10 +119,13 @@ func NewProxyHandler(cfg *Config, logger Logger) *ProxyHandler {
 // Non-hot fields (require restart):
 //   - BindAddr, Secrets, MaskHost/Port, ProxyProtocol, MaxIPsPerUser
 func (h *ProxyHandler) ApplyHotConfig(cfg *Config) {
-	// Update idle timeout - new connections will use this value
-	// Note: This is not atomic but safe since we're just updating duration value
-	// and readers don't need strict consistency (they get old or new value)
-	h.config.IdleTimeout = cfg.IdleTimeout
+	// Update idle timeout atomically - thread-safe for concurrent readers
+	h.idleTimeoutNs.Store(int64(cfg.IdleTimeout))
+}
+
+// IdleTimeout returns the current idle timeout value (thread-safe).
+func (h *ProxyHandler) IdleTimeout() time.Duration {
+	return time.Duration(h.idleTimeoutNs.Load())
 }
 
 // UserLimiter returns the user IP limiter for metrics access.

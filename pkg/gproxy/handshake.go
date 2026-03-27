@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/panjf2000/gnet/v2"
@@ -89,11 +90,11 @@ func (h *ProxyHandler) handleTLSPayload(c gnet.Conn, ctx *ConnContext) gnet.Acti
 
 	if hello == nil {
 		// Log diagnostic info to help troubleshoot
-		hexDump := ""
+		var hexDump strings.Builder
 		for i := 0; i < 20 && i < len(payload); i++ {
-			hexDump += fmt.Sprintf("%02x ", payload[i])
+			hexDump.WriteString(fmt.Sprintf("%02x ", payload[i]))
 		}
-		h.logger.Debug("[#%d] no matching secret found (payload len=%d, first bytes: %s)", ctx.id, len(payload), hexDump)
+		h.logger.Debug("[#%d] no matching secret found (payload len=%d, first bytes: %s)", ctx.id, len(payload), hexDump.String())
 		return h.startSplice(c, ctx)
 	}
 
@@ -292,8 +293,8 @@ func (h *ProxyHandler) handleO2Frame(c gnet.Conn, ctx *ConnContext) gnet.Action 
 
 			// Clear handshake deadline, set idle timeout
 			c.SetReadDeadline(time.Time{})
-			if h.config.IdleTimeout > 0 {
-				c.SetReadDeadline(time.Now().Add(h.config.IdleTimeout))
+			if idleTimeout := h.IdleTimeout(); idleTimeout > 0 {
+				c.SetReadDeadline(time.Now().Add(idleTimeout))
 			}
 
 			// Dial DC asynchronously
@@ -340,14 +341,19 @@ func (h *ProxyHandler) handleSplice(c gnet.Conn, ctx *ConnContext) gnet.Action {
 		return gnet.None
 	}
 
-	// Read all available data
-	data, _ := c.Next(-1)
+	// Peek data first - don't consume until write succeeds
+	data, _ := c.Peek(-1)
 	if len(data) == 0 {
 		return gnet.None
 	}
 
 	// Forward to splice target
-	if _, err := spliceConn.Write(data); err != nil {
+	n, err := spliceConn.Write(data)
+	if n > 0 {
+		// Discard only what was successfully written
+		c.Discard(n)
+	}
+	if err != nil {
 		return gnet.Close
 	}
 

@@ -51,12 +51,10 @@ func NewHotReloader(cfg HotReloadConfig) *HotReloader {
 // Returns immediately; watching runs in background goroutines.
 func (r *HotReloader) Start() {
 	// SIGHUP handler
-	r.wg.Add(1)
-	go r.watchSignal()
+	r.wg.Go(r.watchSignal)
 
 	// File watcher (best-effort, may fail on some systems)
-	r.wg.Add(1)
-	go r.watchFile()
+	r.wg.Go(r.watchFile)
 }
 
 // Stop stops the hot reloader.
@@ -67,8 +65,6 @@ func (r *HotReloader) Stop() {
 
 // watchSignal handles SIGHUP for manual reload trigger.
 func (r *HotReloader) watchSignal() {
-	defer r.wg.Done()
-
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGHUP)
 	defer signal.Stop(sigCh)
@@ -86,8 +82,6 @@ func (r *HotReloader) watchSignal() {
 
 // watchFile uses fsnotify to watch for file changes.
 func (r *HotReloader) watchFile() {
-	defer r.wg.Done()
-
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		r.logger.Warn("file watcher unavailable: %v", err)

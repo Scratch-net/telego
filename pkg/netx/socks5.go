@@ -2,10 +2,13 @@ package netx
 
 import (
 	"context"
+	"errors"
 	"net"
 
 	"golang.org/x/net/proxy"
 )
+
+var errNoHalfClose = errors.New("connection does not support half-close")
 
 // Socks5Dialer wraps a SOCKS5 proxy dialer with socket tuning.
 type Socks5Dialer struct {
@@ -43,7 +46,14 @@ func (d *Socks5Dialer) Dial(network, address string) (Conn, error) {
 		return tcpConn, nil
 	}
 
-	return conn.(Conn), nil
+	// Check if connection implements Conn interface (half-close support)
+	if c, ok := conn.(Conn); ok {
+		return c, nil
+	}
+
+	// Connection doesn't support half-close - close and return error
+	conn.Close()
+	return nil, errNoHalfClose
 }
 
 // DialContext connects to the address via SOCKS5 proxy with context support.
@@ -62,7 +72,15 @@ func (d *Socks5Dialer) DialContext(ctx context.Context, network, address string)
 			}
 			return tcpConn, nil
 		}
-		return conn.(Conn), nil
+
+		// Check if connection implements Conn interface (half-close support)
+		if c, ok := conn.(Conn); ok {
+			return c, nil
+		}
+
+		// Connection doesn't support half-close - close and return error
+		conn.Close()
+		return nil, errNoHalfClose
 	}
 
 	// Fallback to non-context dial

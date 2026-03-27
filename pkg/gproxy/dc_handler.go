@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/panjf2000/gnet/v2"
@@ -20,6 +21,27 @@ var spliceReadBufPool = sync.Pool{
 		buf := make([]byte, 64*1024)
 		return &buf
 	},
+}
+
+// getFd extracts the file descriptor from a net.Conn.
+// Returns -1 if the fd cannot be obtained.
+func getFd(conn net.Conn) int {
+	type syscallConn interface {
+		SyscallConn() (syscall.RawConn, error)
+	}
+	sc, ok := conn.(syscallConn)
+	if !ok {
+		return -1
+	}
+	rawConn, err := sc.SyscallConn()
+	if err != nil {
+		return -1
+	}
+	var fd int = -1
+	rawConn.Control(func(f uintptr) {
+		fd = int(f)
+	})
+	return fd
 }
 
 // dialDC establishes a direct connection to the Telegram DC.
@@ -61,26 +83,45 @@ func (h *ProxyHandler) dialDC(clientConn gnet.Conn, ctx *ConnContext) {
 		return
 	}
 
-	// Enroll the DC connection into gnet client event loop
-	dcGnetConn, err := h.dcClient.Enroll(ddc.Conn)
-	if err != nil {
-		h.logger.Debug("[#%d:%s] failed to enroll DC connection: %v", ctx.id, userName, err)
-		ddc.Conn.Close()
-		clientConn.Close()
-		return
-	}
-
-	// Set up DC connection context IMMEDIATELY after Enroll to minimize race window.
-	// OnTraffic can fire as soon as Enroll completes if DC sends data quickly.
+	// Pre-create DC context before Enroll.
+	// To eliminate the race between Enroll() and SetContext(), we store the
+	// context in a map keyed by fd BEFORE calling Enroll. DC event handlers
+	// check this map if c.Context() returns nil.
 	dcCtx := &DCConnContext{
 		ClientConn:    clientConn,
 		ClientCtx:     ctx,
 		DCEncrypt:     ddc.encryptor,
 		DCDecrypt:     ddc.decryptor,
 		ClientEncrypt: clientEncryptor,
-		DCConn:        dcGnetConn, // Self-reference for flow control wake
+		// DCConn set below after Enroll
 	}
+
+	// Get fd and store context in map BEFORE Enroll - eliminates race completely
+	fd := getFd(ddc.Conn)
+	if fd >= 0 {
+		h.pendingDCContexts.Store(fd, dcCtx)
+	}
+
+	// Enroll the DC connection into gnet client event loop
+	dcGnetConn, err := h.dcClient.Enroll(ddc.Conn)
+	if err != nil {
+		if fd >= 0 {
+			h.pendingDCContexts.Delete(fd)
+		}
+		h.logger.Debug("[#%d:%s] failed to enroll DC connection: %v", ctx.id, userName, err)
+		ddc.Conn.Close()
+		clientConn.Close()
+		return
+	}
+
+	// Set context on the gnet connection
+	dcCtx.DCConn = dcGnetConn
 	dcGnetConn.SetContext(dcCtx)
+
+	// Remove from pending map - context is now accessible via c.Context()
+	if fd >= 0 {
+		h.pendingDCContexts.Delete(fd)
+	}
 
 	// Log with client IP (use real IP from PROXY protocol if available)
 	clientAddr := ctx.RealClientAddr(clientConn.RemoteAddr())
@@ -313,13 +354,13 @@ func (h *ProxyHandler) dialSplice(clientConn gnet.Conn, ctx *ConnContext) {
 
 // relaySpliceToClientLoop reads from splice target and writes to client.
 // Implements flow control by pausing reads when client is slow.
-func (h *ProxyHandler) relaySpliceToClientLoop(spliceConn net.Conn, clientConn gnet.Conn, _ *ConnContext) {
+func (h *ProxyHandler) relaySpliceToClientLoop(spliceConn net.Conn, clientConn gnet.Conn, ctx *ConnContext) {
 	defer spliceConn.Close()
 	defer clientConn.Close()
 
 	// Cache timeout config and set initial deadline
 	// Only update deadline when half the timeout has elapsed to reduce syscalls
-	idleTimeout := h.config.IdleTimeout
+	idleTimeout := h.IdleTimeout()
 	var lastDeadlineSet time.Time
 	deadlineRefreshThreshold := idleTimeout / 2
 	if idleTimeout > 0 {
@@ -328,6 +369,11 @@ func (h *ProxyHandler) relaySpliceToClientLoop(spliceConn net.Conn, clientConn g
 	}
 
 	for {
+		// Check if client connection was closed
+		if ctx.State() == StateClosed {
+			return
+		}
+
 		buffered := clientConn.OutboundBuffered()
 
 		// HARD LIMIT: Close if client buffer exceeds max

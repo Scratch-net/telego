@@ -110,7 +110,7 @@ func TestReplayCache_MaxSize(t *testing.T) {
 	cache := NewReplayCache(maxSize, time.Minute)
 
 	// Add more than maxSize entries
-	for i := 0; i < maxSize*2; i++ {
+	for range maxSize * 2 {
 		id := make([]byte, 32)
 		rand.Read(id)
 		cache.Seen(id)
@@ -135,12 +135,10 @@ func TestReplayCache_Concurrent(t *testing.T) {
 	const opsPerGoroutine = 100
 
 	var wg sync.WaitGroup
-	wg.Add(numGoroutines)
 
 	for i := range numGoroutines {
-		go func(id int) {
-			defer wg.Done()
-
+		id := i
+		wg.Go(func() {
 			for j := range opsPerGoroutine {
 				sessionID := make([]byte, 32)
 				rand.Read(sessionID)
@@ -153,7 +151,7 @@ func TestReplayCache_Concurrent(t *testing.T) {
 					t.Errorf("replay not detected for session %d-%d", id, j)
 				}
 			}
-		}(i)
+		})
 	}
 
 	wg.Wait()
@@ -282,7 +280,7 @@ func BenchmarkReplayCache_Replay(b *testing.B) {
 	cache.Seen(sessionID)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		cache.Seen(sessionID)
 	}
 }

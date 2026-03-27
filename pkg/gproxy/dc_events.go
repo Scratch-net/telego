@@ -17,6 +17,19 @@ type dcEventHandler struct {
 	proxy *ProxyHandler
 }
 
+// getDCContext retrieves the DCConnContext for a connection.
+// Falls back to the pending map if c.Context() returns nil (race window during setup).
+func (h *dcEventHandler) getDCContext(c gnet.Conn) *DCConnContext {
+	if ctx, ok := c.Context().(*DCConnContext); ok && ctx != nil {
+		return ctx
+	}
+	// Fallback: check pending map during Enroll/SetContext race window
+	if val, ok := h.proxy.pendingDCContexts.Load(c.Fd()); ok {
+		return val.(*DCConnContext)
+	}
+	return nil
+}
+
 // DCConnContext holds per-DC-connection state.
 type DCConnContext struct {
 	// Link back to client connection
@@ -38,8 +51,9 @@ type DCConnContext struct {
 
 // OnTraffic handles data arriving from DC.
 func (h *dcEventHandler) OnTraffic(c gnet.Conn) gnet.Action {
-	ctx, ok := c.Context().(*DCConnContext)
-	if !ok || ctx == nil {
+	ctx := h.getDCContext(c)
+	if ctx == nil {
+		// Should never happen with pending map fallback
 		return gnet.Close
 	}
 	return h.proxy.handleDCTraffic(c, ctx)
@@ -47,8 +61,8 @@ func (h *dcEventHandler) OnTraffic(c gnet.Conn) gnet.Action {
 
 // OnClose handles DC connection close.
 func (h *dcEventHandler) OnClose(c gnet.Conn, err error) gnet.Action {
-	ctx, ok := c.Context().(*DCConnContext)
-	if !ok || ctx == nil {
+	ctx := h.getDCContext(c)
+	if ctx == nil {
 		return gnet.None
 	}
 
@@ -106,26 +120,17 @@ func (h *ProxyHandler) handleDCTraffic(dcConn gnet.Conn, dcCtx *DCConnContext) g
 	if clientBuffered > h.maxWriteBuffer {
 		// Above hard limit: trickle mode - keep alive but minimal throughput
 		// TCP backpressure will naturally slow DC, idle timeout catches truly stuck clients
-		maxProcess = 16 * 1024
-		if maxProcess > len(data) {
-			maxProcess = len(data)
-		}
+		maxProcess = min(16*1024, len(data))
 		h.logger.Debug("[%s] backpressure: client buffer %dMB > hard limit, trickle mode",
 			clientCtx.LogPrefix(), clientBuffered/1024/1024)
 	} else if clientBuffered > softLimit {
 		// Above soft limit: small chunks only
-		maxProcess = 64 * 1024
-		if maxProcess > len(data) {
-			maxProcess = len(data)
-		}
+		maxProcess = min(64*1024, len(data))
 		h.logger.Debug("[%s] backpressure: client buffer %dKB > soft limit, throttling",
 			clientCtx.LogPrefix(), clientBuffered/1024)
 	} else if clientBuffered > resumeAt {
 		// Between resume and soft: medium chunks
-		maxProcess = 256 * 1024
-		if maxProcess > len(data) {
-			maxProcess = len(data)
-		}
+		maxProcess = min(256*1024, len(data))
 	}
 	// else: full speed - process all available data
 
