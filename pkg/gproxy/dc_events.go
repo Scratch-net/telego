@@ -220,7 +220,10 @@ func (h *ProxyHandler) handleDCTraffic(dcConn gnet.Conn, dcCtx *DCConnContext) g
 		return gnet.Close
 	}
 
-	// If there's more data, wake self to continue
+	// Wake to continue processing if there's more data in DC buffer.
+	// This is NOT a spin loop because each wake processes real data (crypto,
+	// TLS framing, syscalls). Rate limiting caps throughput when client buffer
+	// is congested, but we still make forward progress each iteration.
 	if dcConn.InboundBuffered() > 0 {
 		dcConn.Wake(nil)
 	}

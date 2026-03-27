@@ -68,7 +68,7 @@ func (h *ProxyHandler) handleRelay(c gnet.Conn, ctx *ConnContext) gnet.Action {
 
 	batchOffset := 0
 	processed := 0
-	rateLimited := false // Track if we stopped due to rate limiting vs incomplete record
+	hasMoreData := false // Track if we stopped with unprocessed data remaining
 
 	// Process complete TLS records
 	consumed := 0
@@ -96,7 +96,7 @@ func (h *ProxyHandler) handleRelay(c gnet.Conn, ctx *ConnContext) gnet.Action {
 
 			// Check if we'd exceed maxProcess (but always process at least one record)
 			if processed > 0 && processed+len(payload) > maxProcess {
-				rateLimited = true
+				hasMoreData = true
 				break
 			}
 
@@ -152,13 +152,16 @@ func (h *ProxyHandler) handleRelay(c gnet.Conn, ctx *ConnContext) gnet.Action {
 		h.dcBufPool.Put(batchBufPtr)
 	}
 
-	// Don't wake on rate-limit - let TCP backpressure naturally slow the client.
-	// gnet will call OnTraffic when more data arrives or DC buffer drains.
-	// This eliminates the spin loop that occurred with immediate Wake.
-	_ = rateLimited // Silence unused variable warning
-
 	if consumed > 0 {
 		c.Discard(consumed)
+	}
+
+	// Wake to continue processing if there's more data in buffer.
+	// This is NOT a spin loop because each wake processes at least one TLS record
+	// (real work: crypto, syscalls). Rate limiting caps throughput when DC buffer
+	// is congested, but we still make forward progress each iteration.
+	if hasMoreData {
+		c.Wake(nil)
 	}
 
 	return gnet.None
