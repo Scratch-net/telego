@@ -121,9 +121,11 @@ func (l *UserIPLimiter) getOrCreateUserState(shard *userLimiterShard, secretKey 
 
 	if l.limitingEnabled {
 		// Limiting mode: use configured max with eviction callback
-		activeIPs, _ := lru.NewWithEvict[string, *int64](l.maxIPsPerUser, func(ip string, _ *int64) {
-			// Move evicted IP to blocked list
-			if state.blockedIPs != nil {
+		activeIPs, _ := lru.NewWithEvict[string, *int64](l.maxIPsPerUser, func(ip string, countPtr *int64) {
+			// Only block IPs that still have active connections when evicted.
+			// IPs that had legitimately disconnected (count=0) should not be blocked -
+			// they're just being removed to make room for new IPs.
+			if state.blockedIPs != nil && atomic.LoadInt64(countPtr) > 0 {
 				state.blockedIPs.Add(ip, struct{}{})
 				state.blockedTotal.Add(1)
 			}
@@ -212,7 +214,9 @@ func (l *UserIPLimiter) Release(key string) {
 		return
 	}
 
-	countPtr, exists := state.activeIPs.Get(ipStr)
+	// Use Peek instead of Get to avoid moving the IP to front of LRU.
+	// Releasing a connection shouldn't affect eviction order.
+	countPtr, exists := state.activeIPs.Peek(ipStr)
 	if !exists {
 		return
 	}

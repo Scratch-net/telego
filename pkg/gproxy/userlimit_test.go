@@ -337,6 +337,92 @@ func TestUserIPLimiter_Stats(t *testing.T) {
 	l.Release(key3)
 }
 
+func TestUserIPLimiter_DisconnectedIPNotBlocked(t *testing.T) {
+	// IPs that have closed all connections (count=0) should NOT be blocked when evicted
+	l := NewUserIPLimiter(3, 5*time.Minute)
+	defer l.Close()
+
+	secret := []byte("0123456789abcdef")
+	ip1 := net.ParseIP("192.168.1.1")
+	ip2 := net.ParseIP("192.168.1.2")
+	ip3 := net.ParseIP("192.168.1.3")
+	ip4 := net.ParseIP("192.168.1.4")
+
+	// Connect IP1, IP2, IP3
+	key1, _ := l.TryAcquire(ip1, secret, "test")
+	key2, _ := l.TryAcquire(ip2, secret, "test")
+	key3, _ := l.TryAcquire(ip3, secret, "test")
+
+	// Disconnect IP1 (release all connections)
+	l.Release(key1)
+
+	// Connect IP4 - this evicts IP1 (oldest in LRU)
+	key4, ok := l.TryAcquire(ip4, secret, "test")
+	if !ok {
+		t.Fatal("IP4 should succeed")
+	}
+
+	// IP1 should NOT be blocked because it had 0 connections when evicted
+	// Use a fresh limiter check without reconnecting (to avoid cascading evictions)
+	stats := l.Stats()
+	if len(stats) != 1 {
+		t.Fatalf("Expected 1 user stat, got %d", len(stats))
+	}
+	if stats[0].BlockedIPs != 0 {
+		t.Errorf("BlockedIPs = %d, want 0 (disconnected IPs shouldn't be blocked)", stats[0].BlockedIPs)
+	}
+
+	// Now verify IP1 can reconnect (will evict IP2)
+	_, ok = l.TryAcquire(ip1, secret, "test")
+	if !ok {
+		t.Fatal("IP1 should NOT be blocked - it had disconnected before eviction")
+	}
+
+	l.Release(key2)
+	l.Release(key3)
+	l.Release(key4)
+}
+
+func TestUserIPLimiter_ActiveIPBlocked(t *testing.T) {
+	// IPs that still have active connections SHOULD be blocked when evicted
+	l := NewUserIPLimiter(2, 5*time.Minute)
+	defer l.Close()
+
+	secret := []byte("0123456789abcdef")
+	ip1 := net.ParseIP("192.168.1.1")
+	ip2 := net.ParseIP("192.168.1.2")
+	ip3 := net.ParseIP("192.168.1.3")
+
+	// Connect IP1 and IP2 (keep connections active)
+	key1, _ := l.TryAcquire(ip1, secret, "test")
+	key2, _ := l.TryAcquire(ip2, secret, "test")
+
+	// Connect IP3 - this evicts IP1 which still has an active connection
+	key3, ok := l.TryAcquire(ip3, secret, "test")
+	if !ok {
+		t.Fatal("IP3 should succeed")
+	}
+
+	// IP1 SHOULD be blocked because it had active connections when evicted
+	_, ok = l.TryAcquire(ip1, secret, "test")
+	if ok {
+		t.Fatal("IP1 should be blocked - it had active connections when evicted")
+	}
+
+	// Verify IP1 is in blocked list
+	stats := l.Stats()
+	if len(stats) != 1 {
+		t.Fatalf("Expected 1 user stat, got %d", len(stats))
+	}
+	if stats[0].BlockedIPs != 1 {
+		t.Errorf("BlockedIPs = %d, want 1", stats[0].BlockedIPs)
+	}
+
+	l.Release(key1)
+	l.Release(key2)
+	l.Release(key3)
+}
+
 func TestUserIPLimiter_StatsWithBlockedIPs(t *testing.T) {
 	l := NewUserIPLimiter(2, 5*time.Minute)
 	defer l.Close()
