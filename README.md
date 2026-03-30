@@ -26,6 +26,29 @@
   <a href="#performance">Performance</a>
 </p>
 
+<p align="center">
+  <b>English</b> | <a href="README.ru.md">Русский</a>
+</p>
+
+---
+
+> **Telegram blocked in your country?** TeleGO's TLS fronting makes your proxy indistinguishable from regular HTTPS traffic to censors. [Get started in 2 minutes](#quick-start)
+
+---
+
+## Why TeleGO?
+
+| Feature | TeleGO | mtg | Official MTProxy |
+|---------|:------:|:---:|:----------------:|
+| TLS Fronting | Yes | Yes | No |
+| Probe Resistance | Yes | Yes | No |
+| Per-user traffic metrics | Yes | No | No |
+| Per-user IP limits | Yes | No | No |
+| Smart IP blocking | Yes | No | No |
+| Backpressure (OOM protection) | Yes | No | No |
+| Hot config reload | Yes | Yes | No |
+| Actively maintained (2026) | Yes | Limited | No |
+
 ---
 
 ## Features
@@ -47,7 +70,7 @@
 ### Operations
 - **Multi-user Support** — Named secrets with per-user tracking and logging
 - **Connection Tracking** — Unique connection IDs for easy log correlation
-- **Connection Limits** — Per-IP connection limits and per-user IP limits with timed blocking
+- **Connection Limits** — Per-IP connection limits and per-user IP limits with smart blocking (only blocks IPs with active connections when evicted, allowing legitimate reconnections)
 - **Prometheus Metrics** — Per-user connection counts, traffic, and blocked IP statistics
 - **DC Probing** — Automatic RTT-based DC address sorting at startup
 - **Config Hot-Reload** — SIGHUP and file watching for runtime config changes
@@ -327,7 +350,7 @@ Tested on Intel i9-12900K, Linux 6.6:
 - **Zero-copy crypto** — XORKeyStream directly into output buffers
 - **Batched writes** — Multiple TLS records coalesced into single syscall
 - **Lock-free state** — Atomic state machine for connection handling
-- **Backpressure** — Flow control with soft/hard limits prevents OOM on slow clients
+- **Backpressure** — Flow control with hysteresis (soft/hard limits) prevents OOM on slow clients without oscillation
 
 ---
 
