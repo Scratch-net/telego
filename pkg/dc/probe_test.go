@@ -282,6 +282,174 @@ func TestGetProbedAddresses_AfterStore(t *testing.T) {
 	}
 }
 
+func TestPrintProbeResults_IPv4Only(t *testing.T) {
+	// Capture logs
+	var logs []string
+	SetProbeLogger(func(format string, args ...any) {
+		logs = append(logs, format)
+	})
+	defer SetProbeLogger(nil)
+
+	results := []DCProbeResult{
+		{
+			DCID: 1,
+			Results: []ProbeResult{
+				{Addr: Addr{Network: "tcp4", Address: "1.1.1.1:443"}, RTT: 50 * time.Millisecond, Success: true},
+				{Addr: Addr{Network: "tcp4", Address: "1.1.1.2:443"}, RTT: 0, Success: false, Error: "timeout"},
+			},
+		},
+	}
+
+	printProbeResults(results)
+
+	if len(logs) < 3 {
+		t.Errorf("expected at least 3 log lines, got %d", len(logs))
+	}
+}
+
+func TestPrintProbeResults_IPv6Only(t *testing.T) {
+	var logs []string
+	SetProbeLogger(func(format string, args ...any) {
+		logs = append(logs, format)
+	})
+	defer SetProbeLogger(nil)
+
+	results := []DCProbeResult{
+		{
+			DCID: 2,
+			Results: []ProbeResult{
+				{Addr: Addr{Network: "tcp6", Address: "[2001:db8::1]:443"}, RTT: 30 * time.Millisecond, Success: true},
+			},
+		},
+	}
+
+	printProbeResults(results)
+
+	if len(logs) < 3 {
+		t.Errorf("expected at least 3 log lines, got %d", len(logs))
+	}
+}
+
+func TestPrintProbeResults_BothIPv4AndIPv6(t *testing.T) {
+	var logs []string
+	SetProbeLogger(func(format string, args ...any) {
+		logs = append(logs, format)
+	})
+	defer SetProbeLogger(nil)
+
+	results := []DCProbeResult{
+		{
+			DCID: 3,
+			Results: []ProbeResult{
+				{Addr: Addr{Network: "tcp4", Address: "3.3.3.3:443"}, RTT: 40 * time.Millisecond, Success: true},
+				{Addr: Addr{Network: "tcp6", Address: "[2001:db8::3]:443"}, RTT: 35 * time.Millisecond, Success: true},
+			},
+		},
+	}
+
+	printProbeResults(results)
+
+	if len(logs) < 4 {
+		t.Errorf("expected at least 4 log lines, got %d", len(logs))
+	}
+}
+
+func TestPrintProbeResults_NoConnectivity(t *testing.T) {
+	var logs []string
+	SetProbeLogger(func(format string, args ...any) {
+		logs = append(logs, format)
+	})
+	defer SetProbeLogger(nil)
+
+	results := []DCProbeResult{
+		{
+			DCID: 4,
+			Results: []ProbeResult{
+				{Addr: Addr{Network: "tcp4", Address: "4.4.4.4:443"}, Success: false, Error: "timeout"},
+				{Addr: Addr{Network: "tcp6", Address: "[2001:db8::4]:443"}, Success: false, Error: "timeout"},
+			},
+		},
+	}
+
+	printProbeResults(results)
+
+	// Should log "No DC connectivity!"
+	found := false
+	for _, log := range logs {
+		if log == "  No DC connectivity!" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected 'No DC connectivity!' message")
+	}
+}
+
+func TestPrintProbeResults_ViaSocks5(t *testing.T) {
+	// Set SOCKS5 to change the header
+	probeSocks5 = "127.0.0.1:1080"
+	defer func() { probeSocks5 = "" }()
+
+	var logs []string
+	SetProbeLogger(func(format string, args ...any) {
+		logs = append(logs, format)
+	})
+	defer SetProbeLogger(nil)
+
+	results := []DCProbeResult{
+		{
+			DCID: 5,
+			Results: []ProbeResult{
+				{Addr: Addr{Network: "tcp4", Address: "5.5.5.5:443"}, RTT: 100 * time.Millisecond, Success: true},
+			},
+		},
+	}
+
+	printProbeResults(results)
+
+	// First log should mention SOCKS5
+	if len(logs) == 0 {
+		t.Fatal("expected logs")
+	}
+	found := false
+	for _, log := range logs {
+		if log == "============== Telegram DC Connectivity (via SOCKS5) ============" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected SOCKS5 header in output")
+	}
+}
+
+func TestPrintProbeResults_FailedAddresses(t *testing.T) {
+	var logs []string
+	SetProbeLogger(func(format string, args ...any) {
+		logs = append(logs, format)
+	})
+	defer SetProbeLogger(nil)
+
+	results := []DCProbeResult{
+		{
+			DCID: 6,
+			Results: []ProbeResult{
+				{Addr: Addr{Network: "tcp4", Address: "6.6.6.6:443"}, RTT: 50 * time.Millisecond, Success: true},
+				{Addr: Addr{Network: "tcp4", Address: "6.6.6.7:443"}, Success: false, Error: "connection refused"},
+				{Addr: Addr{Network: "tcp6", Address: "[2001:db8::6]:443"}, RTT: 45 * time.Millisecond, Success: true},
+				{Addr: Addr{Network: "tcp6", Address: "[2001:db8::7]:443"}, Success: false, Error: "timeout"},
+			},
+		},
+	}
+
+	printProbeResults(results)
+
+	if len(logs) < 6 {
+		t.Errorf("expected at least 6 log lines for mixed results, got %d", len(logs))
+	}
+}
+
 // BenchmarkProbeAddr benchmarks address probing
 func BenchmarkProbeAddr(b *testing.B) {
 	// Start a fast mock server
