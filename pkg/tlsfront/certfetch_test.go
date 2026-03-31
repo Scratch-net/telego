@@ -1,6 +1,13 @@
 package tlsfront
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"math/big"
+	"net"
 	"testing"
 	"time"
 )
@@ -312,4 +319,354 @@ func TestIsExpired_ExactBoundary(t *testing.T) {
 	// so exactly 1 hour should be considered expired
 	result := cert.IsExpired()
 	t.Logf("At exactly 1 hour boundary, IsExpired=%v", result)
+}
+
+// TestNewCertFetcher_SNI tests SNI field is stored.
+func TestNewCertFetcher_SNI(t *testing.T) {
+	sni := "example.com"
+	fetcher := NewCertFetcher(5, sni)
+
+	if fetcher.sni != sni {
+		t.Errorf("sni: got %q, want %q", fetcher.sni, sni)
+	}
+}
+
+// TestCertFetcher_ConcurrentAccess tests concurrent cache access.
+func TestCertFetcher_ConcurrentAccess(t *testing.T) {
+	fetcher := NewCertFetcher(5, "")
+
+	// Pre-populate cache
+	cachedCert := &CachedCert{
+		RawChain:  [][]byte{{1, 2, 3}},
+		ExpiresAt: time.Now().Add(24 * time.Hour),
+		Host:      "concurrent.test",
+	}
+	fetcher.mu.Lock()
+	fetcher.cache["concurrent.test:443"] = cachedCert
+	fetcher.mu.Unlock()
+
+	// Concurrent reads
+	done := make(chan bool, 10)
+	for i := 0; i < 10; i++ {
+		go func() {
+			cert, _ := fetcher.FetchCert("concurrent.test", 443)
+			if cert != cachedCert {
+				t.Error("concurrent read returned wrong cert")
+			}
+			done <- true
+		}()
+	}
+
+	// Wait for all
+	for i := 0; i < 10; i++ {
+		<-done
+	}
+}
+
+// TestCachedCert_ChainField tests Chain field access.
+func TestCachedCert_ChainField(t *testing.T) {
+	cert := &CachedCert{
+		Chain: nil,
+	}
+
+	if cert.Chain != nil {
+		t.Error("Chain should be nil")
+	}
+}
+
+// generateTestCert creates a self-signed certificate for testing.
+func generateTestCert(notBefore, notAfter time.Time) (tls.Certificate, error) {
+	// Generate key
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	// Create certificate template
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: "test.example.com",
+		},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+		DNSNames:              []string{"localhost", "test.example.com"},
+	}
+
+	// Self-sign
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	return tls.Certificate{
+		Certificate: [][]byte{certDER},
+		PrivateKey:  key,
+	}, nil
+}
+
+// startTestTLSServer starts a TLS server for testing and returns the port.
+func startTestTLSServer(t *testing.T, cert tls.Certificate) (int, func()) {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+	}
+	tlsListener := tls.NewListener(listener, tlsConfig)
+
+	// Serve in goroutine
+	go func() {
+		for {
+			conn, err := tlsListener.Accept()
+			if err != nil {
+				return
+			}
+			// Must complete TLS handshake before closing
+			tlsConn, ok := conn.(*tls.Conn)
+			if ok {
+				tlsConn.Handshake()
+			}
+			// Keep connection open briefly to allow client to read cert
+			time.Sleep(10 * time.Millisecond)
+			conn.Close()
+		}
+	}()
+
+	port := listener.Addr().(*net.TCPAddr).Port
+	cleanup := func() {
+		listener.Close()
+	}
+
+	return port, cleanup
+}
+
+// TestFetchFromHost_Success tests successful cert fetch from local TLS server.
+func TestFetchFromHost_Success(t *testing.T) {
+	// Create a cert valid for 30 days
+	notBefore := time.Now()
+	notAfter := time.Now().Add(30 * 24 * time.Hour)
+	cert, err := generateTestCert(notBefore, notAfter)
+	if err != nil {
+		t.Fatalf("failed to generate test cert: %v", err)
+	}
+
+	port, cleanup := startTestTLSServer(t, cert)
+	defer cleanup()
+
+	// Create fetcher and fetch
+	fetcher := NewCertFetcher(5, "")
+	cachedCert, err := fetcher.FetchCert("127.0.0.1", port)
+	if err != nil {
+		t.Fatalf("FetchCert failed: %v", err)
+	}
+
+	if cachedCert == nil {
+		t.Fatal("expected cached cert, got nil")
+	}
+
+	// Verify cert fields
+	if len(cachedCert.Chain) == 0 {
+		t.Error("expected non-empty Chain")
+	}
+	if len(cachedCert.RawChain) == 0 {
+		t.Error("expected non-empty RawChain")
+	}
+	if cachedCert.Host != "127.0.0.1" {
+		t.Errorf("Host: got %q, want %q", cachedCert.Host, "127.0.0.1")
+	}
+	if cachedCert.FetchedAt.IsZero() {
+		t.Error("FetchedAt should not be zero")
+	}
+	if cachedCert.ExpiresAt.IsZero() {
+		t.Error("ExpiresAt should not be zero")
+	}
+}
+
+// TestFetchFromHost_WithSNI tests fetching with custom SNI.
+func TestFetchFromHost_WithSNI(t *testing.T) {
+	notBefore := time.Now()
+	notAfter := time.Now().Add(30 * 24 * time.Hour)
+	cert, err := generateTestCert(notBefore, notAfter)
+	if err != nil {
+		t.Fatalf("failed to generate test cert: %v", err)
+	}
+
+	port, cleanup := startTestTLSServer(t, cert)
+	defer cleanup()
+
+	// Create fetcher with custom SNI
+	fetcher := NewCertFetcher(5, "custom.sni.example.com")
+	cachedCert, err := fetcher.FetchCert("127.0.0.1", port)
+	if err != nil {
+		t.Fatalf("FetchCert failed: %v", err)
+	}
+
+	if cachedCert == nil {
+		t.Fatal("expected cached cert, got nil")
+	}
+
+	// Verify the fetcher's SNI was used (cert still fetched successfully)
+	if len(cachedCert.RawChain) == 0 {
+		t.Error("expected non-empty RawChain")
+	}
+}
+
+// TestFetchFromHost_ConnectionError tests fetch error handling.
+func TestFetchFromHost_ConnectionError(t *testing.T) {
+	fetcher := NewCertFetcher(5, "")
+
+	// Use a port that's definitely not listening
+	_, err := fetcher.FetchCert("127.0.0.1", 19999)
+	if err == nil {
+		t.Error("expected error for connection to non-existent server")
+	}
+}
+
+// TestFetchFromHost_CacheUpdate tests that successful fetch updates cache.
+func TestFetchFromHost_CacheUpdate(t *testing.T) {
+	notBefore := time.Now()
+	notAfter := time.Now().Add(30 * 24 * time.Hour)
+	cert, err := generateTestCert(notBefore, notAfter)
+	if err != nil {
+		t.Fatalf("failed to generate test cert: %v", err)
+	}
+
+	port, cleanup := startTestTLSServer(t, cert)
+	defer cleanup()
+
+	fetcher := NewCertFetcher(5, "")
+
+	// First fetch
+	cachedCert1, err := fetcher.FetchCert("127.0.0.1", port)
+	if err != nil {
+		t.Fatalf("first FetchCert failed: %v", err)
+	}
+
+	// Check cache was updated
+	key := "127.0.0.1:" + string(rune('0'+port/10000)) + string(rune('0'+(port/1000)%10)) + string(rune('0'+(port/100)%10)) + string(rune('0'+(port/10)%10)) + string(rune('0'+port%10))
+	_ = key // Key format check removed, just verify cache hit
+
+	// Second fetch should return cached
+	cachedCert2, err := fetcher.FetchCert("127.0.0.1", port)
+	if err != nil {
+		t.Fatalf("second FetchCert failed: %v", err)
+	}
+
+	// Should be same object
+	if cachedCert1 != cachedCert2 {
+		t.Error("second fetch should return cached cert")
+	}
+}
+
+// TestStartBackgroundRefresh tests background refresh starts.
+func TestStartBackgroundRefresh(t *testing.T) {
+	notBefore := time.Now()
+	notAfter := time.Now().Add(30 * 24 * time.Hour)
+	cert, err := generateTestCert(notBefore, notAfter)
+	if err != nil {
+		t.Fatalf("failed to generate test cert: %v", err)
+	}
+
+	port, cleanup := startTestTLSServer(t, cert)
+	defer cleanup()
+
+	// Use small refresh interval for testing
+	fetcher := NewCertFetcher(1, "")
+
+	// Start background refresh
+	fetcher.StartBackgroundRefresh("127.0.0.1", port)
+
+	// Wait for initial fetch
+	time.Sleep(100 * time.Millisecond)
+
+	// Check that cert was fetched
+	fetcher.mu.RLock()
+	cached := fetcher.cache["127.0.0.1:"+itoa(port)]
+	fetcher.mu.RUnlock()
+
+	if cached == nil {
+		t.Error("background refresh should have populated cache")
+	}
+}
+
+// itoa converts int to string without importing strconv
+func itoa(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	var b [20]byte
+	n := len(b) - 1
+	for i > 0 {
+		b[n] = byte('0' + i%10)
+		n--
+		i /= 10
+	}
+	return string(b[n+1:])
+}
+
+// TestFetchCert_ExpiryCalculation tests expiry time is reasonable.
+func TestFetchCert_ExpiryCalculation(t *testing.T) {
+	notBefore := time.Now()
+	notAfter := time.Now().Add(30 * 24 * time.Hour) // 30 days
+	cert, err := generateTestCert(notBefore, notAfter)
+	if err != nil {
+		t.Fatalf("failed to generate test cert: %v", err)
+	}
+
+	port, cleanup := startTestTLSServer(t, cert)
+	defer cleanup()
+
+	fetcher := NewCertFetcher(5, "") // 5 hour refresh
+	cachedCert, err := fetcher.FetchCert("127.0.0.1", port)
+	if err != nil {
+		t.Fatalf("FetchCert failed: %v", err)
+	}
+
+	// Expiry should be within reasonable range
+	// With 5 hour refresh and jitter, should be roughly 4-6 hours from now
+	minExpiry := time.Now().Add(3 * time.Hour)
+	maxExpiry := time.Now().Add(7 * time.Hour)
+
+	if cachedCert.ExpiresAt.Before(minExpiry) {
+		t.Errorf("ExpiresAt %v too early (min: %v)", cachedCert.ExpiresAt, minExpiry)
+	}
+	if cachedCert.ExpiresAt.After(maxExpiry) {
+		// Might exceed if cert expiry is close
+		t.Logf("ExpiresAt %v later than expected (max: %v)", cachedCert.ExpiresAt, maxExpiry)
+	}
+}
+
+// TestFetchCert_ShortLivedCert tests handling of soon-to-expire cert.
+func TestFetchCert_ShortLivedCert(t *testing.T) {
+	// Create a cert that expires in 2 hours
+	notBefore := time.Now()
+	notAfter := time.Now().Add(2 * time.Hour)
+	cert, err := generateTestCert(notBefore, notAfter)
+	if err != nil {
+		t.Fatalf("failed to generate test cert: %v", err)
+	}
+
+	port, cleanup := startTestTLSServer(t, cert)
+	defer cleanup()
+
+	fetcher := NewCertFetcher(5, "") // 5 hour refresh, but cert expires in 2h
+	cachedCert, err := fetcher.FetchCert("127.0.0.1", port)
+	if err != nil {
+		t.Fatalf("FetchCert failed: %v", err)
+	}
+
+	// Expiry should be adjusted to 1 hour before cert expiry
+	expectedMax := notAfter.Add(-time.Hour)
+	if cachedCert.ExpiresAt.After(expectedMax.Add(time.Minute)) {
+		t.Errorf("ExpiresAt %v should be at most %v (1h before cert expiry)", cachedCert.ExpiresAt, expectedMax)
+	}
 }

@@ -2,12 +2,25 @@ package gproxy
 
 import (
 	"crypto/cipher"
+	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/panjf2000/gnet/v2"
+
+	"github.com/scratch-net/telego/pkg/transport/faketls"
 )
+
+// mockCipherStream implements cipher.Stream for testing
+type mockCipherStream struct{}
+
+func (m *mockCipherStream) XORKeyStream(dst, src []byte) {
+	copy(dst, src)
+}
+
+var _ cipher.Stream = (*mockCipherStream)(nil)
 
 // TestConnContext_StateTransitions tests atomic state changes.
 func TestConnContext_StateTransitions(t *testing.T) {
@@ -277,5 +290,135 @@ func TestConnState_Values(t *testing.T) {
 	}
 	if StateClosed != 7 {
 		t.Errorf("StateClosed should be 7, got %d", StateClosed)
+	}
+}
+
+// TestConnContext_RealClientAddr tests real client address handling.
+func TestConnContext_RealClientAddr(t *testing.T) {
+	ctx := NewConnContext()
+	fallback := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8888}
+
+	// Initially returns fallback
+	addr := ctx.RealClientAddr(fallback)
+	if addr != fallback {
+		t.Error("RealClientAddr should return fallback when not set")
+	}
+
+	// Set real address
+	realAddr := &net.TCPAddr{IP: net.ParseIP("192.168.1.100"), Port: 12345}
+	ctx.SetRealClientAddr(realAddr)
+
+	// Should now return real address
+	addr = ctx.RealClientAddr(fallback)
+	if addr != realAddr {
+		t.Error("RealClientAddr should return set address")
+	}
+
+	// Verify IP
+	tcpAddr, ok := addr.(*net.TCPAddr)
+	if !ok {
+		t.Fatal("expected *net.TCPAddr")
+	}
+	if !tcpAddr.IP.Equal(net.ParseIP("192.168.1.100")) {
+		t.Errorf("IP mismatch: got %s", tcpAddr.IP)
+	}
+	if tcpAddr.Port != 12345 {
+		t.Errorf("Port mismatch: got %d", tcpAddr.Port)
+	}
+}
+
+// TestConnContext_TrafficCounters tests traffic counter handling.
+func TestConnContext_TrafficCounters(t *testing.T) {
+	ctx := NewConnContext()
+
+	// Initially nil
+	if ctx.TrafficIn() != nil {
+		t.Error("TrafficIn should be nil initially")
+	}
+	if ctx.TrafficOut() != nil {
+		t.Error("TrafficOut should be nil initially")
+	}
+
+	// Set counters
+	var bytesIn, bytesOut atomic.Int64
+	ctx.SetTrafficCounters(&bytesIn, &bytesOut)
+
+	// Verify they are set
+	if ctx.TrafficIn() != &bytesIn {
+		t.Error("TrafficIn not set correctly")
+	}
+	if ctx.TrafficOut() != &bytesOut {
+		t.Error("TrafficOut not set correctly")
+	}
+
+	// Verify we can use them
+	ctx.TrafficIn().Add(100)
+	ctx.TrafficOut().Add(200)
+
+	if bytesIn.Load() != 100 {
+		t.Errorf("bytesIn: got %d, want 100", bytesIn.Load())
+	}
+	if bytesOut.Load() != 200 {
+		t.Errorf("bytesOut: got %d, want 200", bytesOut.Load())
+	}
+}
+
+// TestConnContext_DCID tests DC ID getter.
+func TestConnContext_DCID(t *testing.T) {
+	ctx := NewConnContext()
+
+	// Initially 0
+	if ctx.DCID() != 0 {
+		t.Errorf("DCID should be 0 initially, got %d", ctx.DCID())
+	}
+
+	// Set via mutex
+	ctx.mu.Lock()
+	ctx.dcID = 2
+	ctx.mu.Unlock()
+
+	// Verify getter
+	if ctx.DCID() != 2 {
+		t.Errorf("DCID: got %d, want 2", ctx.DCID())
+	}
+}
+
+// TestConnContext_CleanupWithData tests cleanup zeroes sensitive data.
+func TestConnContext_CleanupWithData(t *testing.T) {
+	ctx := NewConnContext()
+
+	// Set up sensitive data
+	ctx.mu.Lock()
+	ctx.clientHello = &faketls.ClientHello{
+		SessionID: []byte{1, 2, 3, 4, 5, 6, 7, 8},
+		Random:    [32]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
+	}
+	ctx.pendingData = []byte{1, 2, 3, 4, 5}
+	ctx.encryptor = &mockCipherStream{}
+	ctx.decryptor = &mockCipherStream{}
+	ctx.secret = &Secret{Name: "test"}
+	ctx.mu.Unlock()
+
+	// Cleanup
+	ctx.Cleanup()
+
+	// Verify everything is cleared
+	ctx.mu.Lock()
+	defer ctx.mu.Unlock()
+
+	if ctx.clientHello != nil {
+		t.Error("clientHello should be nil after cleanup")
+	}
+	if ctx.pendingData != nil {
+		t.Error("pendingData should be nil after cleanup")
+	}
+	if ctx.encryptor != nil {
+		t.Error("encryptor should be nil after cleanup")
+	}
+	if ctx.decryptor != nil {
+		t.Error("decryptor should be nil after cleanup")
+	}
+	if ctx.secret != nil {
+		t.Error("secret should be nil after cleanup")
 	}
 }
