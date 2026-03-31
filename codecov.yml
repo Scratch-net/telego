@@ -1,0 +1,14 @@
+coverage:
+  status:
+    project:
+      default:
+        target: 70%
+        threshold: 2%
+    patch:
+      default:
+        target: 70%
+
+ignore:
+  - "cmd/**"
+  - "tools/**"
+  - "benchmark/**"
