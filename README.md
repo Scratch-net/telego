@@ -36,21 +36,6 @@
 
 ---
 
-## Why TeleGO?
-
-| Feature | TeleGO | mtg | Official MTProxy |
-|---------|:------:|:---:|:----------------:|
-| TLS Fronting | Yes | Yes | No |
-| Probe Resistance | Yes | Yes | No |
-| Per-user traffic metrics | Yes | No | No |
-| Per-user IP limits | Yes | No | No |
-| Smart IP blocking | Yes | No | No |
-| Backpressure (OOM protection) | Yes | No | No |
-| Hot config reload | Yes | Yes | No |
-| Actively maintained (2026) | Yes | Limited | No |
-
----
-
 ## Features
 
 ### Networking
