@@ -1,0 +1,45 @@
+version: "2"
+
+run:
+  modules-download-mode: readonly
+
+linters:
+  enable:
+    - gocritic
+    - misspell
+    - nolintlint
+    - unconvert
+  disable:
+    - errcheck
+  settings:
+    gocritic:
+      disabled-checks:
+        - ifElseChain
+        - switchTrue
+        - singleCaseSwitch
+        - appendAssign
+        - exitAfterDefer
+    govet:
+      disable:
+        - fieldalignment
+    misspell:
+      locale: US
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - gocritic
+          - unused
+        path: _test\.go
+      - linters:
+          - gocritic
+        path: tools/
+
+issues:
+  max-issues-per-linter: 50
+  max-same-issues: 10

@@ -32,9 +32,6 @@ type ProxyHandler struct {
 	// DC client for outgoing connections
 	dcClient *gnet.Client
 
-	// Our public IP (detected via STUN, used for logging)
-	publicIP string
-
 	// Replay cache for anti-replay protection
 	replayCache *ReplayCache
 

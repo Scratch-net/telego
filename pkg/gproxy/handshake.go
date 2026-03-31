@@ -92,7 +92,7 @@ func (h *ProxyHandler) handleTLSPayload(c gnet.Conn, ctx *ConnContext) gnet.Acti
 		// Log diagnostic info to help troubleshoot
 		var hexDump strings.Builder
 		for i := 0; i < 20 && i < len(payload); i++ {
-			hexDump.WriteString(fmt.Sprintf("%02x ", payload[i]))
+			fmt.Fprintf(&hexDump, "%02x ", payload[i])
 		}
 		h.logger.Debug("[#%d] no matching secret found (payload len=%d, first bytes: %s)", ctx.id, len(payload), hexDump.String())
 		return h.startSplice(c, ctx)

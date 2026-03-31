@@ -221,12 +221,10 @@ func (l *UserIPLimiter) Release(key string) {
 		return
 	}
 
-	// Decrement connection count
-	newCount := atomic.AddInt64(countPtr, -1)
-	if newCount <= 0 {
-		// Keep IP in LRU even at 0 connections - preserves LRU ordering
-		// Will be evicted naturally when other IPs need the slot
-	}
+	// Decrement connection count.
+	// Keep IP in LRU even at 0 connections - preserves LRU ordering.
+	// Will be evicted naturally when other IPs need the slot.
+	atomic.AddInt64(countPtr, -1)
 }
 
 // TrafficCounters returns pointers to traffic counters for a user.

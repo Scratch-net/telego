@@ -108,13 +108,13 @@ func TestSocks5Dialer_DialContext(t *testing.T) {
 		t.Fatalf("NewSocks5Dialer failed: %v", err)
 	}
 
-	// Test with cancelled context
+	// Test with canceled context
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
 	_, err = dialer.DialContext(ctx, "tcp", "127.0.0.1:80")
 	if err == nil {
-		t.Error("expected error with cancelled context")
+		t.Error("expected error with canceled context")
 	}
 }
 
@@ -421,8 +421,8 @@ func TestSocks5Dialer_DialContextWithMock(t *testing.T) {
 	}
 }
 
-// TestSocks5Dialer_DialContextCancelled tests cancelled context.
-func TestSocks5Dialer_DialContextCancelled(t *testing.T) {
+// TestSocks5Dialer_DialContextCanceled tests canceled context.
+func TestSocks5Dialer_DialContextCanceled(t *testing.T) {
 	proxyAddr, _, cleanup := startMockSocks5Server(t)
 	defer cleanup()
 
@@ -437,7 +437,7 @@ func TestSocks5Dialer_DialContextCancelled(t *testing.T) {
 
 	_, err = dialer.DialContext(ctx, "tcp", "127.0.0.1:12345")
 	if err == nil {
-		t.Error("expected error with cancelled context")
+		t.Error("expected error with canceled context")
 	}
 }
 

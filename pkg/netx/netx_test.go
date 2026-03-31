@@ -81,17 +81,17 @@ func TestDialer_DialContext_Timeout(t *testing.T) {
 	t.Logf("Dial error (expected): %v", err)
 }
 
-// TestDialer_DialContext_Cancelled tests immediate cancellation.
-func TestDialer_DialContext_Cancelled(t *testing.T) {
+// TestDialer_DialContext_Canceled tests immediate cancellation.
+func TestDialer_DialContext_Canceled(t *testing.T) {
 	dialer := NewDialer()
 
-	// Pre-cancelled context
+	// Pre-canceled context
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
 	_, err := dialer.DialContext(ctx, "tcp", "127.0.0.1:1234")
 	if err == nil {
-		t.Error("expected error for cancelled context")
+		t.Error("expected error for canceled context")
 	}
 }
 

@@ -37,7 +37,7 @@ func getFd(conn net.Conn) int {
 	if err != nil {
 		return -1
 	}
-	var fd int = -1
+	fd := -1
 	rawConn.Control(func(f uintptr) {
 		fd = int(f)
 	})
@@ -79,7 +79,7 @@ func (h *ProxyHandler) dialDC(clientConn gnet.Conn, ctx *ConnContext) {
 	// Optimization: skip setup if client closed during slow dial.
 	// Not required for correctness - handleDCTraffic would detect StateClosed anyway.
 	if ctx.State() == StateClosed {
-		ddc.Conn.Close()
+		ddc.Close()
 		return
 	}
 
@@ -117,7 +117,7 @@ func (h *ProxyHandler) dialDC(clientConn gnet.Conn, ctx *ConnContext) {
 			h.pendingDCContexts.Delete(fd)
 		}
 		h.logger.Debug("[#%d:%s] failed to enroll DC connection: %v", ctx.id, userName, err)
-		ddc.Conn.Close()
+		ddc.Close()
 		clientConn.Close()
 		return
 	}
