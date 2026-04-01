@@ -42,7 +42,8 @@ type ProxyHandler struct {
 	userLimiter *UserIPLimiter
 
 	// TLS fronting
-	certFetcher *tlsfront.CertFetcher
+	certFetcher        *tlsfront.CertFetcher
+	serverHelloFetcher *tlsfront.ServerHelloFetcher // Hybrid mode: fetches real ServerHello
 
 	// Logger
 	logger Logger

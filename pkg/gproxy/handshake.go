@@ -166,27 +166,42 @@ func (h *ProxyHandler) handleTLSPayload(c gnet.Conn, ctx *ConnContext) gnet.Acti
 
 	// Build ServerHello response
 	var response []byte
-	if h.certFetcher != nil {
-		cachedCert, err := h.certFetcher.FetchCert(h.config.CertHost, h.config.CertPort)
-		if err == nil && cachedCert != nil && len(cachedCert.RawChain) > 0 {
+	var err error
+
+	// HYBRID MODE: Use real ServerHello from mask host (best DPI evasion)
+	if h.serverHelloFetcher != nil {
+		realHello, randomOffset, fetchErr := h.serverHelloFetcher.GetServerHelloTemplate()
+		if fetchErr == nil && len(realHello) > 0 {
 			opts := &faketls.ServerHelloOptions{
-				CertChain: cachedCert.GetRawCertChain(),
+				RealServerHello:             realHello,
+				RealServerHelloRandomOffset: randomOffset,
 			}
 			response, err = faketls.BuildServerHelloWithOptions(matchedSecret.Key, hello, opts)
 			if err != nil {
-				h.logger.Debug("BuildServerHelloWithOptions failed: %v", err)
+				h.logger.Debug("BuildServerHelloWithOptions (hybrid) failed: %v", err)
 				return gnet.Close
+			}
+			h.logger.Debug("[#%d] using hybrid ServerHello (real TLS fingerprint)", ctx.id)
+		} else {
+			h.logger.Debug("[#%d] hybrid ServerHello fetch failed: %v, falling back", ctx.id, fetchErr)
+		}
+	}
+
+	// LEGACY MODE: Synthetic ServerHello with optional real cert embedding
+	if response == nil {
+		if h.certFetcher != nil {
+			cachedCert, certErr := h.certFetcher.FetchCert(h.config.CertHost, h.config.CertPort)
+			if certErr == nil && cachedCert != nil && len(cachedCert.RawChain) > 0 {
+				opts := &faketls.ServerHelloOptions{
+					CertChain: cachedCert.GetRawCertChain(),
+				}
+				response, err = faketls.BuildServerHelloWithOptions(matchedSecret.Key, hello, opts)
+			} else {
+				response, err = faketls.BuildServerHello(matchedSecret.Key, hello)
 			}
 		} else {
 			response, err = faketls.BuildServerHello(matchedSecret.Key, hello)
-			if err != nil {
-				h.logger.Debug("BuildServerHello failed: %v", err)
-				return gnet.Close
-			}
 		}
-	} else {
-		var err error
-		response, err = faketls.BuildServerHello(matchedSecret.Key, hello)
 		if err != nil {
 			h.logger.Debug("BuildServerHello failed: %v", err)
 			return gnet.Close

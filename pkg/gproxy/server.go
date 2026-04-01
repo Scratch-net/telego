@@ -185,6 +185,17 @@ func RunWithHandler(cfg *Config, logger Logger) (shutdown func(), handler *Proxy
 
 			// Start background refresh
 			h.certFetcher.StartBackgroundRefresh(cfg.CertHost, cfg.CertPort)
+
+			// Initialize ServerHello fetcher for hybrid mode (real TLS fingerprint)
+			h.serverHelloFetcher = tlsfront.NewServerHelloFetcher(cfg.CertHost, cfg.CertPort)
+			logger.Debug("Fetching real ServerHello from %s:%d for hybrid TLS mode...", cfg.CertHost, cfg.CertPort)
+			_, _, err = h.serverHelloFetcher.GetServerHelloTemplate()
+			if err != nil {
+				logger.Warn("Failed to fetch ServerHello template: %v (will retry)", err)
+			} else {
+				logger.Info("Hybrid TLS mode enabled: using real ServerHello from %s", cfg.CertHost)
+			}
+			h.serverHelloFetcher.StartBackgroundRefresh()
 		}
 
 		// Custom handler to capture engine

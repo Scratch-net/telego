@@ -312,6 +312,16 @@ type ServerHelloOptions struct {
 	// If non-nil, it will be included in the encrypted portion to make
 	// DPI see real certificate bytes.
 	CertChain [][]byte
+
+	// RealServerHello is a captured ServerHello response from a real TLS server.
+	// If non-nil, this will be used as the base response instead of generating
+	// a synthetic one. The random field will be patched with the computed HMAC.
+	// This provides authentic TLS fingerprints to defeat DPI.
+	RealServerHello []byte
+
+	// RealServerHelloRandomOffset is the offset within RealServerHello where
+	// the 32-byte random field starts. Required when RealServerHello is set.
+	RealServerHelloRandomOffset int
 }
 
 // BuildServerHello creates a ServerHello response for FakeTLS.
@@ -322,6 +332,48 @@ func BuildServerHello(secret []byte, clientHello *ClientHello) ([]byte, error) {
 
 // BuildServerHelloWithOptions creates a ServerHello response with configurable options.
 func BuildServerHelloWithOptions(secret []byte, clientHello *ClientHello, opts *ServerHelloOptions) ([]byte, error) {
+	// HYBRID MODE: Use real ServerHello from mask host if provided
+	if opts != nil && len(opts.RealServerHello) > 0 {
+		return buildHybridServerHello(secret, clientHello, opts)
+	}
+
+	// LEGACY MODE: Generate synthetic ServerHello
+	return buildSyntheticServerHello(secret, clientHello, opts)
+}
+
+// buildHybridServerHello uses a real ServerHello template from a mask host,
+// patching only the random field with our HMAC. This provides authentic TLS
+// fingerprints while maintaining client authentication.
+func buildHybridServerHello(secret []byte, clientHello *ClientHello, opts *ServerHelloOptions) ([]byte, error) {
+	if opts.RealServerHelloRandomOffset < 11 || opts.RealServerHelloRandomOffset+32 > len(opts.RealServerHello) {
+		return nil, fmt.Errorf("invalid RealServerHelloRandomOffset: %d (response len: %d)",
+			opts.RealServerHelloRandomOffset, len(opts.RealServerHello))
+	}
+
+	// Make a copy of the real ServerHello response
+	packet := make([]byte, len(opts.RealServerHello))
+	copy(packet, opts.RealServerHello)
+
+	// Zero out the random field for HMAC computation
+	randomOffset := opts.RealServerHelloRandomOffset
+	for i := range 32 {
+		packet[randomOffset+i] = 0
+	}
+
+	// Compute HMAC: SHA256(secret, client_random || packet_with_zeroed_random)
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(clientHello.Random[:])
+	mac.Write(packet)
+	serverRandom := mac.Sum(nil)
+
+	// Patch the random field with our HMAC
+	copy(packet[randomOffset:], serverRandom)
+
+	return packet, nil
+}
+
+// buildSyntheticServerHello generates a ServerHello from scratch (legacy mode).
+func buildSyntheticServerHello(secret []byte, clientHello *ClientHello, opts *ServerHelloOptions) ([]byte, error) {
 	buf := &bytes.Buffer{}
 
 	// Build ServerHello handshake message (with zeroed random initially)
@@ -353,7 +405,6 @@ func BuildServerHelloWithOptions(secret []byte, clientHello *ClientHello, opts *
 	packet := buf.Bytes()
 
 	// Compute MAC over: client_random || entire_packet (with zeroed server_random)
-	// Per mtg: mac.Write(clientHello.Random[:]); mac.Write(packet)
 	mac := hmac.New(sha256.New, secret)
 	mac.Write(clientHello.Random[:])
 	mac.Write(packet)
