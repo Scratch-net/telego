@@ -1,16 +1,22 @@
 # Multi-stage build for local Docker builds
 # Usage: docker build -f Dockerfile.build -t telego .
+# With version: docker build -f Dockerfile.build --build-arg VERSION=v1.0.0 -t telego .
 
 FROM golang:1.26-alpine AS builder
 
 ARG BUILD_TAGS="poll_opt,gc_opt"
+ARG VERSION="dev"
+ARG COMMIT="unknown"
+ARG DATE="unknown"
 
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -tags="${BUILD_TAGS}" -ldflags="-s -w" -o telego ./cmd/telego
+RUN CGO_ENABLED=0 go build -trimpath -tags="${BUILD_TAGS}" \
+    -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${DATE}" \
+    -o telego ./cmd/telego
 
 FROM scratch
 
