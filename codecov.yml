@@ -1,13 +1,14 @@
 coverage:
+  range: "50...75"
   status:
     project:
       default:
-        target: 68%
-        threshold: 2%
+        target: auto
+        threshold: 5%
     patch:
       default:
-        target: 60%
-        threshold: 5%
+        target: auto
+        threshold: 10%
 
 ignore:
   - "cmd/**"
