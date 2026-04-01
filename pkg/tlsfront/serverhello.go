@@ -17,9 +17,8 @@ type ServerHelloFetcher struct {
 	port    int
 	timeout time.Duration
 
-	mu            sync.RWMutex
-	cachedHello   []byte // Raw ServerHello record (just the ServerHello, not subsequent records)
-	cachedFull    []byte // Full response (ServerHello + ChangeCipherSpec + ApplicationData)
+	mu         sync.RWMutex
+	cachedFull []byte // Full response (ServerHello + ChangeCipherSpec + ApplicationData)
 	randomOffset  int    // Offset of random field within cachedFull
 	lastFetch     time.Time
 	refreshPeriod time.Duration
