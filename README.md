@@ -375,7 +375,8 @@ bind-to = "127.0.0.1:9090"
 | Metric | Type | Description |
 |--------|------|-------------|
 | `telego_connections_active` | Gauge | Active connections per user |
-| `telego_ips_active` | Gauge | Unique active IPs per user |
+| `telego_ips_active` | Gauge | IPs with active connections per user |
+| `telego_ips_tracked` | Gauge | Unique IPs in LRU cache per user |
 | `telego_ips_blocked` | Gauge | Currently blocked IPs per user |
 | `telego_blocked_total` | Counter | Total IP block events per user |
 | `telego_traffic_in_bytes_total` | Counter | Bytes received from clients |

@@ -62,9 +62,10 @@ type userIPState struct {
 // UserIPStats contains statistics for a single user.
 type UserIPStats struct {
 	SecretName    string
-	ActiveIPs     int
+	TrackedIPs    int      // Unique IPs in LRU cache (may include disconnected)
+	ActiveIPs     int      // IPs with active connections right now
 	BlockedIPs    int
-	ActiveIPList  []string // List of active IP addresses
+	TrackedIPList []string // List of tracked IP addresses
 	BlockedIPList []string // List of currently blocked IP addresses
 	Connections   int64
 	BytesIn       int64
@@ -265,10 +266,15 @@ func (l *UserIPLimiter) Stats() []UserIPStats {
 
 		for _, state := range shard.users {
 			var totalConns int64
-			activeKeys := state.activeIPs.Keys()
-			for _, ip := range activeKeys {
+			var activeIPs int
+			trackedKeys := state.activeIPs.Keys()
+			for _, ip := range trackedKeys {
 				if countPtr, ok := state.activeIPs.Peek(ip); ok {
-					totalConns += atomic.LoadInt64(countPtr)
+					count := atomic.LoadInt64(countPtr)
+					totalConns += count
+					if count > 0 {
+						activeIPs++
+					}
 				}
 			}
 
@@ -279,9 +285,10 @@ func (l *UserIPLimiter) Stats() []UserIPStats {
 
 			stats = append(stats, UserIPStats{
 				SecretName:    state.secretName,
-				ActiveIPs:     state.activeIPs.Len(),
+				TrackedIPs:    state.activeIPs.Len(),
+				ActiveIPs:     activeIPs,
 				BlockedIPs:    len(blockedKeys),
-				ActiveIPList:  activeKeys,
+				TrackedIPList: trackedKeys,
 				BlockedIPList: blockedKeys,
 				Connections:   totalConns,
 				BytesIn:       state.bytesIn.Load(),

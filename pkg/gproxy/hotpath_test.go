@@ -7,8 +7,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	
 )
 
 // Hot path and multithreading tests to catch gnet-related race conditions.
@@ -185,7 +183,7 @@ func TestConnContext_ConcurrentCleanup(t *testing.T) {
 		// Reader goroutine
 		go func() {
 			defer wg.Done()
-			for i := 0; i < 100; i++ {
+			for range 100 {
 				_ = ctx.State()
 				_ = ctx.Relay()
 				_ = ctx.TrafficIn()
@@ -196,7 +194,7 @@ func TestConnContext_ConcurrentCleanup(t *testing.T) {
 		// Writer goroutine
 		go func() {
 			defer wg.Done()
-			for i := 0; i < 100; i++ {
+			for i := range 100 {
 				ctx.SetState(ConnState(i % 7))
 			}
 		}()

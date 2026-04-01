@@ -44,9 +44,9 @@ func TestMetricsIntegration(t *testing.T) {
 	provider := &countingStatsProvider{
 		callCount: &callCount,
 		stats: []gproxy.UserIPStats{
-			{SecretName: "user1", Connections: 5, ActiveIPs: 2, BlockedIPs: 0, BlockedTotal: 0, BytesIn: 500, BytesOut: 1000},
-			{SecretName: "user2", Connections: 15, ActiveIPs: 8, BlockedIPs: 2, BlockedTotal: 10, BytesIn: 5000, BytesOut: 10000},
-			{SecretName: "", Connections: 3, ActiveIPs: 1, BlockedIPs: 0, BlockedTotal: 0, BytesIn: 100, BytesOut: 200}, // Empty name should become "unknown"
+			{SecretName: "user1", Connections: 5, TrackedIPs: 3, ActiveIPs: 2, BlockedIPs: 0, BlockedTotal: 0, BytesIn: 500, BytesOut: 1000},
+			{SecretName: "user2", Connections: 15, TrackedIPs: 10, ActiveIPs: 8, BlockedIPs: 2, BlockedTotal: 10, BytesIn: 5000, BytesOut: 10000},
+			{SecretName: "", Connections: 3, TrackedIPs: 2, ActiveIPs: 1, BlockedIPs: 0, BlockedTotal: 0, BytesIn: 100, BytesOut: 200}, // Empty name should become "unknown"
 		},
 	}
 
@@ -80,7 +80,7 @@ func TestMetricsIntegration(t *testing.T) {
 
 	// Give server time to start and retry if needed
 	var resp *http.Response
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		time.Sleep(100 * time.Millisecond)
 		resp, err = http.Get("http://127.0.0.1:19280/metrics")
 		if err == nil {
@@ -99,15 +99,16 @@ func TestMetricsIntegration(t *testing.T) {
 		t.Fatalf("expected status 200, got %d: %s", resp.StatusCode, content)
 	}
 
-	// Should have called Stats() at least 6 times (once per metric type)
-	if callCount < 6 {
-		t.Errorf("expected at least 6 Stats() calls from callbacks, got %d", callCount)
+	// Should have called Stats() at least 7 times (once per metric type)
+	if callCount < 7 {
+		t.Errorf("expected at least 7 Stats() calls from callbacks, got %d", callCount)
 	}
 
 	// Verify all expected metrics are present
 	expectedMetrics := []string{
 		"telego_connections_active",
 		"telego_ips_active",
+		"telego_ips_tracked",
 		"telego_ips_blocked",
 		"telego_blocked_total",
 		"telego_traffic_in_bytes_total",

@@ -11,7 +11,7 @@ require (
 	github.com/pelletier/go-toml/v2 v2.3.0
 	github.com/pion/stun/v3 v3.1.1
 	github.com/prometheus/client_golang v1.23.2
-	github.com/rs/zerolog v1.34.0
+	github.com/rs/zerolog v1.35.0
 	github.com/zeebo/blake3 v0.2.4
 	go.opentelemetry.io/otel v1.42.0
 	go.opentelemetry.io/otel/exporters/prometheus v0.64.0
@@ -43,7 +43,7 @@ require (
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
-	github.com/ogen-go/ogen v1.20.1 // indirect
+	github.com/ogen-go/ogen v1.20.2 // indirect
 	github.com/panjf2000/ants/v2 v2.12.0 // indirect
 	github.com/pion/dtls/v3 v3.1.2 // indirect
 	github.com/pion/logging v0.2.4 // indirect

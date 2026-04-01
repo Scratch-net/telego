@@ -180,7 +180,8 @@ go install github.com/scratch-net/telego/cmd/telego@latest
 | Метрика | Тип | Описание |
 |---------|-----|----------|
 | `telego_connections_active` | Gauge | Активные подключения |
-| `telego_ips_active` | Gauge | Уникальные IP |
+| `telego_ips_active` | Gauge | IP с активными подключениями |
+| `telego_ips_tracked` | Gauge | Уникальные IP в LRU кэше |
 | `telego_ips_blocked` | Gauge | Заблокированные IP |
 | `telego_blocked_total` | Counter | Всего блокировок |
 | `telego_traffic_in_bytes_total` | Counter | Входящий трафик |

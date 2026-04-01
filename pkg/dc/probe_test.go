@@ -2,6 +2,7 @@ package dc
 
 import (
 	"net"
+	"slices"
 	"testing"
 	"time"
 )
@@ -374,13 +375,7 @@ func TestPrintProbeResults_NoConnectivity(t *testing.T) {
 	printProbeResults(results)
 
 	// Should log "No DC connectivity!"
-	found := false
-	for _, log := range logs {
-		if log == "  No DC connectivity!" {
-			found = true
-			break
-		}
-	}
+	found := slices.Contains(logs, "  No DC connectivity!")
 	if !found {
 		t.Error("expected 'No DC connectivity!' message")
 	}
@@ -412,13 +407,7 @@ func TestPrintProbeResults_ViaSocks5(t *testing.T) {
 	if len(logs) == 0 {
 		t.Fatal("expected logs")
 	}
-	found := false
-	for _, log := range logs {
-		if log == "============== Telegram DC Connectivity (via SOCKS5) ============" {
-			found = true
-			break
-		}
-	}
+	found := slices.Contains(logs, "============== Telegram DC Connectivity (via SOCKS5) ============")
 	if !found {
 		t.Error("expected SOCKS5 header in output")
 	}

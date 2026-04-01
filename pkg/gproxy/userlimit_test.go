@@ -325,8 +325,8 @@ func TestUserIPLimiter_Stats(t *testing.T) {
 	}
 
 	// Verify IP lists are populated
-	if len(s.ActiveIPList) != 2 {
-		t.Errorf("ActiveIPList len = %d, want 2", len(s.ActiveIPList))
+	if len(s.TrackedIPList) != 2 {
+		t.Errorf("ActiveIPList len = %d, want 2", len(s.TrackedIPList))
 	}
 	if len(s.BlockedIPList) != 0 {
 		t.Errorf("BlockedIPList len = %d, want 0", len(s.BlockedIPList))
@@ -443,14 +443,63 @@ func TestUserIPLimiter_StatsWithBlockedIPs(t *testing.T) {
 	}
 
 	s := stats[0]
-	if len(s.ActiveIPList) != 2 {
-		t.Errorf("ActiveIPList len = %d, want 2", len(s.ActiveIPList))
+	if len(s.TrackedIPList) != 2 {
+		t.Errorf("ActiveIPList len = %d, want 2", len(s.TrackedIPList))
 	}
 	if len(s.BlockedIPList) != 1 {
 		t.Errorf("BlockedIPList len = %d, want 1", len(s.BlockedIPList))
 	}
 	if s.BlockedIPList[0] != "192.168.1.1" {
 		t.Errorf("BlockedIPList[0] = %q, want 192.168.1.1", s.BlockedIPList[0])
+	}
+}
+
+func TestUserIPLimiter_TrackedVsActiveIPs(t *testing.T) {
+	l := NewUserIPLimiter(10, 5*time.Minute)
+	defer l.Close()
+
+	secret := []byte("0123456789abcdef")
+	ip1 := net.ParseIP("192.168.1.1")
+	ip2 := net.ParseIP("192.168.1.2")
+
+	// Connect both IPs
+	key1, _ := l.TryAcquire(ip1, secret, "testuser")
+	key2, _ := l.TryAcquire(ip2, secret, "testuser")
+
+	// Both should be tracked and active
+	stats := l.Stats()
+	s := stats[0]
+	if s.TrackedIPs != 2 {
+		t.Errorf("TrackedIPs = %d, want 2", s.TrackedIPs)
+	}
+	if s.ActiveIPs != 2 {
+		t.Errorf("ActiveIPs = %d, want 2", s.ActiveIPs)
+	}
+
+	// Release one IP
+	l.Release(key1)
+
+	// Should still be tracked (in LRU cache) but not active
+	stats = l.Stats()
+	s = stats[0]
+	if s.TrackedIPs != 2 {
+		t.Errorf("TrackedIPs after release = %d, want 2 (still in cache)", s.TrackedIPs)
+	}
+	if s.ActiveIPs != 1 {
+		t.Errorf("ActiveIPs after release = %d, want 1", s.ActiveIPs)
+	}
+
+	// Release the other IP
+	l.Release(key2)
+
+	// Both should still be tracked, but neither active
+	stats = l.Stats()
+	s = stats[0]
+	if s.TrackedIPs != 2 {
+		t.Errorf("TrackedIPs after all release = %d, want 2 (still in cache)", s.TrackedIPs)
+	}
+	if s.ActiveIPs != 0 {
+		t.Errorf("ActiveIPs after all release = %d, want 0", s.ActiveIPs)
 	}
 }
 

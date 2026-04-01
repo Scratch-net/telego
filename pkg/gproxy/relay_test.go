@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"testing"
 
-	
 	"github.com/scratch-net/telego/pkg/transport/faketls"
 )
 
@@ -140,7 +139,7 @@ func TestHandleRelay_MultipleRecords(t *testing.T) {
 
 	// Create multiple ApplicationData records
 	var data []byte
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		payload := make([]byte, 100)
 		rand.Read(payload)
 		data = append(data, buildTLSApplicationData(payload)...)
@@ -182,7 +181,7 @@ func TestHandleRelay_IncompleteRecord(t *testing.T) {
 	// Header says 100 bytes but only 50 provided
 	record := []byte{
 		0x17, 0x03, 0x03, // ApplicationData, TLS 1.2
-		0x00, 0x64,       // Length: 100
+		0x00, 0x64, // Length: 100
 	}
 	record = append(record, make([]byte, 50)...) // Only 50 bytes
 	mockConn.SetReadData(record)
@@ -216,7 +215,7 @@ func TestHandleRelay_NonApplicationData(t *testing.T) {
 	// Create a Handshake record (should be skipped)
 	record := []byte{
 		0x16, 0x03, 0x03, // Handshake, TLS 1.2
-		0x00, 0x05,       // Length: 5
+		0x00, 0x05, // Length: 5
 		0x01, 0x02, 0x03, 0x04, 0x05, // Payload
 	}
 	mockConn.SetReadData(record)
@@ -251,7 +250,7 @@ func TestHandleRelay_DesyncDetection(t *testing.T) {
 	// DesyncFrameSizeThreshold is 1MB
 	record := []byte{
 		0x17, 0x03, 0x03, // ApplicationData, TLS 1.2
-		0x10, 0x00,       // Length: 4096 (0x1000) - normal size
+		0x10, 0x00, // Length: 4096 (0x1000) - normal size
 	}
 	record = append(record, make([]byte, 4096)...)
 	mockConn.SetReadData(record)
@@ -289,7 +288,7 @@ func TestHandleRelay_BackpressureThrottling(t *testing.T) {
 
 	// Create a large amount of data
 	var data []byte
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		payload := make([]byte, 1000)
 		data = append(data, buildTLSApplicationData(payload)...)
 	}

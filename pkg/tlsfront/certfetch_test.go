@@ -347,7 +347,7 @@ func TestCertFetcher_ConcurrentAccess(t *testing.T) {
 
 	// Concurrent reads
 	done := make(chan bool, 10)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		go func() {
 			cert, _ := fetcher.FetchCert("concurrent.test", 443)
 			if cert != cachedCert {
@@ -358,7 +358,7 @@ func TestCertFetcher_ConcurrentAccess(t *testing.T) {
 	}
 
 	// Wait for all
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		<-done
 	}
 }

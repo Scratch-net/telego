@@ -87,9 +87,9 @@ func registerMetrics(meter metric.Meter, limiter StatsProvider) {
 		}),
 	)
 
-	// Active IPs gauge
+	// Active IPs gauge (IPs with at least one connection right now)
 	meter.Int64ObservableGauge("telego_ips_active",
-		metric.WithDescription("Active unique IPs per user"),
+		metric.WithDescription("IPs with active connections per user"),
 		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
 			for _, s := range limiter.Stats() {
 				name := s.SecretName
@@ -97,6 +97,21 @@ func registerMetrics(meter metric.Meter, limiter StatsProvider) {
 					name = "unknown"
 				}
 				o.Observe(int64(s.ActiveIPs), metric.WithAttributes(attribute.String("user", name)))
+			}
+			return nil
+		}),
+	)
+
+	// Tracked IPs gauge (unique IPs in LRU cache, may include disconnected)
+	meter.Int64ObservableGauge("telego_ips_tracked",
+		metric.WithDescription("Unique IPs tracked in LRU cache per user"),
+		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
+			for _, s := range limiter.Stats() {
+				name := s.SecretName
+				if name == "" {
+					name = "unknown"
+				}
+				o.Observe(int64(s.TrackedIPs), metric.WithAttributes(attribute.String("user", name)))
 			}
 			return nil
 		}),
