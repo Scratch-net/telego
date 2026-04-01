@@ -19,6 +19,13 @@ import (
 	"github.com/scratch-net/telego/pkg/metrics"
 )
 
+// Build-time variables injected via ldflags.
+var (
+	version = "dev"
+	commit  = "unknown"
+	date    = "unknown"
+)
+
 // CLI defines the command-line interface.
 var CLI struct {
 	Run      RunCmd      `cmd:"" help:"Run the proxy server"`
@@ -244,7 +251,9 @@ type VersionCmd struct{}
 
 func (c *VersionCmd) Run() error {
 	log.Info().
-		Str("version", "v0.1.0").
+		Str("version", version).
+		Str("commit", commit).
+		Str("date", date).
 		Str("description", "Production-grade Telegram MTProxy in Go").
 		Strs("features", []string{
 			"Event-driven gnet architecture",
