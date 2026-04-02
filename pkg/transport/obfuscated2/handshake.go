@@ -13,8 +13,11 @@ const (
 	// FrameSize is the size of the obfuscated2 handshake frame.
 	FrameSize = 64
 
-	// Connection type for FakeTLS (0xdddddddd)
+	// Connection type for FakeTLS/Secure mode (0xdddddddd) - with random padding
 	ConnectionTypeFakeTLS = 0xdddddddd
+
+	// Connection type for Intermediate mode (0xeeeeeeee) - without random padding
+	ConnectionTypeIntermediate = 0xeeeeeeee
 )
 
 var (
@@ -136,9 +139,9 @@ func ParseClientFrame(secret, frame []byte) (int, cipher.Stream, cipher.Stream, 
 	// NOW decrypt the frame in place
 	decryptor.XORKeyStream(frameCopy[:], frameCopy[:])
 
-	// Validate connection type
+	// Validate connection type - accept both Secure (padded) and Intermediate (unpadded)
 	connType := binary.LittleEndian.Uint32(frameCopy[56:60])
-	if connType != ConnectionTypeFakeTLS {
+	if connType != ConnectionTypeFakeTLS && connType != ConnectionTypeIntermediate {
 		return 0, nil, nil, ErrUnsupportedConnection
 	}
 
