@@ -13,6 +13,40 @@ import (
 	"github.com/scratch-net/telego/pkg/transport/obfuscated2"
 )
 
+// handleDetectProtocol detects whether the client is using ee (TLS) or dd (raw) mode.
+// TLS traffic starts with 0x16 (handshake record type).
+func (h *ProxyHandler) handleDetectProtocol(c gnet.Conn, ctx *ConnContext) gnet.Action {
+	data, _ := c.Peek(5)
+	if len(data) < 5 {
+		// Need at least 5 bytes to detect protocol
+		return gnet.None
+	}
+
+	// Check for TLS handshake record: type=0x16, version=0x0301/0x0302/0x0303
+	if data[0] == faketls.RecordTypeHandshake {
+		version := binary.BigEndian.Uint16(data[1:3])
+		if version == faketls.VersionTLS10 || version == faketls.VersionTLS11 || version == faketls.VersionTLS12 {
+			// TLS traffic -> ee mode
+			ctx.SetProtocolMode(ModeEE)
+			ctx.SetState(StateReadTLSHeader)
+			h.logger.Debug("[#%d] detected ee mode (TLS)", ctx.id)
+			return h.handleTLSHeader(c, ctx)
+		}
+	}
+
+	// Non-TLS traffic -> dd mode (raw obfuscated2)
+	ctx.SetProtocolMode(ModeDD)
+	ctx.SetState(StateReadDDFrame)
+	h.logger.Debug("[#%d] detected dd mode (raw)", ctx.id)
+	return h.handleDDFrame(c, ctx)
+}
+
+// handleDDFrame parses the raw obfuscated2 handshake frame (DD mode).
+func (h *ProxyHandler) handleDDFrame(c gnet.Conn, ctx *ConnContext) gnet.Action {
+	// TODO: implement in next task
+	return gnet.Close
+}
+
 // handleTLSHeader reads and validates the TLS record header (5 bytes).
 func (h *ProxyHandler) handleTLSHeader(c gnet.Conn, ctx *ConnContext) gnet.Action {
 	data, _ := c.Peek(-1)
