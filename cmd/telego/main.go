@@ -236,12 +236,14 @@ func (c *GenerateCmd) Run() error {
 	}
 
 	key, _ := config.ParseKey(keyHex)
-	fullSecret := config.BuildFullSecret(key, c.Host)
+	eeSecret := config.BuildFullSecret(key, c.Host)
+	ddSecret := config.BuildDDSecret(key)
 
 	log.Info().
 		Str("secret", keyHex).
-		Str("link", "tg://proxy?server=YOUR_IP&port=443&secret="+fullSecret).
-		Msg("generated secret")
+		Str("ee_link", "tg://proxy?server=YOUR_IP&port=443&secret="+eeSecret).
+		Str("dd_link", "tg://proxy?server=YOUR_IP&port=443&secret="+ddSecret).
+		Msg("generated secret (use ee for FakeTLS, dd for raw)")
 
 	return nil
 }
