@@ -1,6 +1,7 @@
 package gproxy
 
 import (
+	"crypto/cipher"
 	"encoding/binary"
 	"fmt"
 	"net"
@@ -42,9 +43,118 @@ func (h *ProxyHandler) handleDetectProtocol(c gnet.Conn, ctx *ConnContext) gnet.
 }
 
 // handleDDFrame parses the raw obfuscated2 handshake frame (DD mode).
+// In DD mode, the 64-byte O2 frame comes directly without TLS wrapping.
 func (h *ProxyHandler) handleDDFrame(c gnet.Conn, ctx *ConnContext) gnet.Action {
-	// TODO: implement in next task
-	return gnet.Close
+	data, _ := c.Peek(-1)
+	if len(data) < obfuscated2.FrameSize {
+		// Need more data
+		return gnet.None
+	}
+
+	// Try each secret until one matches
+	var dcID int
+	var encryptor, decryptor cipher.Stream
+	var matchedSecret *Secret
+	var err error
+
+	for i := range h.config.Secrets {
+		s := &h.config.Secrets[i]
+		dcID, encryptor, decryptor, err = obfuscated2.ParseClientFrame(s.Key, data[:obfuscated2.FrameSize])
+		if err == nil {
+			matchedSecret = s
+			break
+		}
+	}
+
+	if matchedSecret == nil {
+		h.logger.Debug("[#%d] dd mode: no matching secret found", ctx.id)
+		return h.startSplice(c, ctx)
+	}
+
+	// Check replay using first 32 bytes of frame as session ID
+	sessionID := data[:32]
+	if h.replayCache.Seen(sessionID) {
+		h.logger.Debug("[#%d] dd mode: replay attack detected", ctx.id)
+		return h.startSplice(c, ctx)
+	}
+
+	// Discard the frame from buffer
+	c.Discard(obfuscated2.FrameSize)
+
+	// Store matched secret
+	ctx.mu.Lock()
+	ctx.secret = matchedSecret
+	ctx.mu.Unlock()
+
+	// Get client IP for limiter checks
+	clientAddr := ctx.RealClientAddr(c.RemoteAddr())
+	var clientIP net.IP
+	if tcpAddr, ok := clientAddr.(*net.TCPAddr); ok {
+		clientIP = tcpAddr.IP
+	} else if host, _, err := net.SplitHostPort(clientAddr.String()); err == nil {
+		clientIP = net.ParseIP(host)
+	}
+
+	// Check connection limit per IP (if enabled)
+	if h.connLimiter != nil && clientIP != nil {
+		key, ok := h.connLimiter.TryAcquire(clientIP, matchedSecret.Key)
+		if !ok {
+			h.logger.Info("[#%d:%s] connection limit exceeded for IP: %s", ctx.id, matchedSecret.Name, clientIP)
+			return gnet.Close
+		}
+		ctx.mu.Lock()
+		ctx.connLimitTracked = true
+		ctx.connLimitKey = key
+		ctx.mu.Unlock()
+	}
+
+	// Check user IP limit and track stats
+	if h.userLimiter != nil && clientIP != nil {
+		key, ok := h.userLimiter.TryAcquire(clientIP, matchedSecret.Key, matchedSecret.Name)
+		if !ok {
+			// Release conn limiter slot if acquired
+			if h.connLimiter != nil {
+				ctx.mu.Lock()
+				if ctx.connLimitTracked {
+					h.connLimiter.Release(ctx.connLimitKey)
+					ctx.connLimitTracked = false
+				}
+				ctx.mu.Unlock()
+			}
+			h.logger.Info("[#%d:%s] IP blocked for user (too many unique IPs): %s", ctx.id, matchedSecret.Name, clientIP)
+			return gnet.Close
+		}
+		// Store tracking info for cleanup in OnClose
+		ctx.mu.Lock()
+		ctx.limitTracked = true
+		ctx.limitKey = key
+		ctx.mu.Unlock()
+
+		// Store traffic counter pointers for hot-path counting
+		bytesIn, bytesOut := h.userLimiter.TrafficCounters(matchedSecret.Key)
+		ctx.SetTrafficCounters(bytesIn, bytesOut)
+	}
+
+	h.logger.Debug("[#%d] dd mode: matched secret %q, DC %d", ctx.id, matchedSecret.Name, dcID)
+
+	// Store ciphers and DC ID
+	ctx.mu.Lock()
+	ctx.dcID = dcID
+	ctx.encryptor = encryptor
+	ctx.decryptor = decryptor
+	ctx.mu.Unlock()
+	ctx.SetState(StateDialingDC)
+
+	// Clear handshake deadline, set idle timeout
+	c.SetReadDeadline(time.Time{})
+	if idleTimeout := h.IdleTimeout(); idleTimeout > 0 {
+		c.SetReadDeadline(time.Now().Add(idleTimeout))
+	}
+
+	// Dial DC asynchronously
+	go h.dialDC(c, ctx)
+
+	return gnet.None
 }
 
 // handleTLSHeader reads and validates the TLS record header (5 bytes).
