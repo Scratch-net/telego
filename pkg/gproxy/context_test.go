@@ -27,8 +27,8 @@ func TestConnContext_StateTransitions(t *testing.T) {
 	ctx := NewConnContext()
 
 	// Initial state
-	if ctx.State() != StateReadTLSHeader {
-		t.Errorf("initial state: got %v, want StateReadTLSHeader", ctx.State())
+	if ctx.State() != StateDetectProtocol {
+		t.Errorf("initial state: got %v, want StateDetectProtocol", ctx.State())
 	}
 
 	// Transition through states
@@ -90,8 +90,8 @@ func TestNewConnContext(t *testing.T) {
 	}
 
 	// Check initial state
-	if ctx.State() != StateReadTLSHeader {
-		t.Errorf("initial state: got %v, want StateReadTLSHeader", ctx.State())
+	if ctx.State() != StateDetectProtocol {
+		t.Errorf("initial state: got %v, want StateDetectProtocol", ctx.State())
 	}
 
 	// Check time is recent
@@ -111,9 +111,12 @@ func TestConnState_String(t *testing.T) {
 		state    ConnState
 		expected string
 	}{
+		{StateDetectProtocol, "DetectProtocol"},
+		{StateReadProxyProto, "ReadProxyProto"},
 		{StateReadTLSHeader, "ReadTLSHeader"},
 		{StateReadTLSPayload, "ReadTLSPayload"},
 		{StateReadO2Frame, "ReadO2Frame"},
+		{StateReadDDFrame, "ReadDDFrame"},
 		{StateDialingDC, "DialingDC"},
 		{StateRelaying, "Relaying"},
 		{StateSplicing, "Splicing"},
@@ -267,29 +270,35 @@ func TestConnContext_PendingData(t *testing.T) {
 // TestConnState_Values tests state constant values.
 func TestConnState_Values(t *testing.T) {
 	// States should be sequential from 0
-	if StateReadProxyProto != 0 {
-		t.Errorf("StateReadProxyProto should be 0, got %d", StateReadProxyProto)
+	if StateDetectProtocol != 0 {
+		t.Errorf("StateDetectProtocol should be 0, got %d", StateDetectProtocol)
 	}
-	if StateReadTLSHeader != 1 {
-		t.Errorf("StateReadTLSHeader should be 1, got %d", StateReadTLSHeader)
+	if StateReadProxyProto != 1 {
+		t.Errorf("StateReadProxyProto should be 1, got %d", StateReadProxyProto)
 	}
-	if StateReadTLSPayload != 2 {
-		t.Errorf("StateReadTLSPayload should be 2, got %d", StateReadTLSPayload)
+	if StateReadTLSHeader != 2 {
+		t.Errorf("StateReadTLSHeader should be 2, got %d", StateReadTLSHeader)
 	}
-	if StateReadO2Frame != 3 {
-		t.Errorf("StateReadO2Frame should be 3, got %d", StateReadO2Frame)
+	if StateReadTLSPayload != 3 {
+		t.Errorf("StateReadTLSPayload should be 3, got %d", StateReadTLSPayload)
 	}
-	if StateDialingDC != 4 {
-		t.Errorf("StateDialingDC should be 4, got %d", StateDialingDC)
+	if StateReadO2Frame != 4 {
+		t.Errorf("StateReadO2Frame should be 4, got %d", StateReadO2Frame)
 	}
-	if StateRelaying != 5 {
-		t.Errorf("StateRelaying should be 5, got %d", StateRelaying)
+	if StateReadDDFrame != 5 {
+		t.Errorf("StateReadDDFrame should be 5, got %d", StateReadDDFrame)
 	}
-	if StateSplicing != 6 {
-		t.Errorf("StateSplicing should be 6, got %d", StateSplicing)
+	if StateDialingDC != 6 {
+		t.Errorf("StateDialingDC should be 6, got %d", StateDialingDC)
 	}
-	if StateClosed != 7 {
-		t.Errorf("StateClosed should be 7, got %d", StateClosed)
+	if StateRelaying != 7 {
+		t.Errorf("StateRelaying should be 7, got %d", StateRelaying)
+	}
+	if StateSplicing != 8 {
+		t.Errorf("StateSplicing should be 8, got %d", StateSplicing)
+	}
+	if StateClosed != 9 {
+		t.Errorf("StateClosed should be 9, got %d", StateClosed)
 	}
 }
 

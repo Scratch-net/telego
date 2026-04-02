@@ -108,6 +108,11 @@ func (h *ProxyHandler) handleDCTraffic(dcConn gnet.Conn, dcCtx *DCConnContext) g
 		return gnet.Close
 	}
 
+	// DD mode uses raw stream without TLS wrapping
+	if clientCtx.ProtocolMode() == ModeDD {
+		return h.handleDCTrafficDD(dcConn, dcCtx)
+	}
+
 	// NOTE: OutboundBuffered is not concurrency-safe per gnet docs.
 	// We call it cross-event-loop (clientConn belongs to server event loop).
 	// This is acceptable: we only use the value for approximate flow control
@@ -229,6 +234,91 @@ func (h *ProxyHandler) handleDCTraffic(dcConn gnet.Conn, dcCtx *DCConnContext) g
 	// This is NOT a spin loop because each wake processes real data (crypto,
 	// TLS framing, syscalls). Rate limiting caps throughput when client buffer
 	// is congested, but we still make forward progress each iteration.
+	if dcConn.InboundBuffered() > 0 {
+		dcConn.Wake(nil)
+	}
+
+	return gnet.None
+}
+
+// handleDCTrafficDD processes data from DC and forwards to client in DD mode.
+// DD mode sends raw obfuscated2 stream without TLS wrapping.
+func (h *ProxyHandler) handleDCTrafficDD(dcConn gnet.Conn, dcCtx *DCConnContext) gnet.Action {
+	clientConn := dcCtx.ClientConn
+	clientCtx := dcCtx.ClientCtx
+
+	clientBuffered := clientConn.OutboundBuffered()
+
+	data, _ := dcConn.Peek(-1)
+	if len(data) == 0 {
+		return gnet.None
+	}
+
+	// Rate limiting with hysteresis (same as TLS mode)
+	wasThrottled := dcCtx.throttledToClient.Load()
+	maxProcess := len(data)
+
+	if clientBuffered > h.maxWriteBuffer {
+		maxProcess = min(16*1024, len(data))
+		dcCtx.throttledToClient.Store(true)
+		if h.logger.DebugEnabled() {
+			h.logger.Debug("[%s] backpressure: client buffer %dMB > hard limit, trickle mode",
+				clientCtx.LogPrefix(), clientBuffered/1024/1024)
+		}
+	} else if clientBuffered > h.bpSoftLimit {
+		maxProcess = min(64*1024, len(data))
+		dcCtx.throttledToClient.Store(true)
+		if h.logger.DebugEnabled() {
+			h.logger.Debug("[%s] backpressure: client buffer %dKB > soft limit, throttling",
+				clientCtx.LogPrefix(), clientBuffered/1024)
+		}
+	} else if wasThrottled && clientBuffered > h.bpResumeAt {
+		maxProcess = min(256*1024, len(data))
+	} else if wasThrottled {
+		dcCtx.throttledToClient.Store(false)
+	}
+
+	processData := data[:maxProcess]
+
+	// Count traffic (DC -> client = download/out)
+	if counter := clientCtx.TrafficOut(); counter != nil {
+		counter.Add(int64(len(processData)))
+	}
+
+	// Get buffer from pool
+	bufPtr := h.dcBufPool.Get()
+	buf := *bufPtr
+
+	// Ensure buffer is large enough
+	if len(processData) > len(buf) {
+		h.dcBufPool.Put(bufPtr)
+		bufPtr = nil
+		buf = make([]byte, len(processData))
+	}
+
+	// Decrypt from DC, encrypt for client (no TLS wrapping in DD mode)
+	dcCtx.DCDecrypt.XORKeyStream(buf[:len(processData)], processData)
+	dcCtx.ClientEncrypt.XORKeyStream(buf[:len(processData)], buf[:len(processData)])
+
+	dcConn.Discard(len(processData))
+
+	var err error
+	if bufPtr != nil {
+		poolRef := bufPtr
+		err = clientConn.AsyncWrite(buf[:len(processData)], func(_ gnet.Conn, _ error) error {
+			h.dcBufPool.Put(poolRef)
+			return nil
+		})
+		if err != nil {
+			h.dcBufPool.Put(poolRef)
+		}
+	} else {
+		err = clientConn.AsyncWrite(buf[:len(processData)], nil)
+	}
+	if err != nil {
+		return gnet.Close
+	}
+
 	if dcConn.InboundBuffered() > 0 {
 		dcConn.Wake(nil)
 	}

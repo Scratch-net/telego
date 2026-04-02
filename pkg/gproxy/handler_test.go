@@ -269,9 +269,9 @@ func TestProxyHandler_OnOpen_Context(t *testing.T) {
 		t.Fatal("context is not *ConnContext")
 	}
 
-	// Initial state should be StateReadTLSHeader (not proxy protocol mode)
-	if connCtx.State() != StateReadTLSHeader {
-		t.Errorf("initial state: got %v, want StateReadTLSHeader", connCtx.State())
+	// Initial state should be StateDetectProtocol (not proxy protocol mode)
+	if connCtx.State() != StateDetectProtocol {
+		t.Errorf("initial state: got %v, want StateDetectProtocol", connCtx.State())
 	}
 }
 
@@ -447,9 +447,9 @@ func TestHandleProxyProto_V1(t *testing.T) {
 
 	action := handler.handleProxyProto(mockConn, ctx)
 
-	// Should transition to TLS header state
-	if ctx.State() != StateReadTLSHeader {
-		t.Errorf("expected StateReadTLSHeader, got %v", ctx.State())
+	// Should transition to protocol detection state
+	if ctx.State() != StateDetectProtocol {
+		t.Errorf("expected StateDetectProtocol, got %v", ctx.State())
 	}
 
 	// Real client address should be set
@@ -503,9 +503,9 @@ func TestHandleProxyProto_V2(t *testing.T) {
 
 	action := handler.handleProxyProto(mockConn, ctx)
 
-	// Should transition to TLS header state
-	if ctx.State() != StateReadTLSHeader {
-		t.Errorf("expected StateReadTLSHeader, got %v", ctx.State())
+	// Should transition to protocol detection state
+	if ctx.State() != StateDetectProtocol {
+		t.Errorf("expected StateDetectProtocol, got %v", ctx.State())
 	}
 	_ = action
 }
@@ -529,11 +529,11 @@ func TestHandleProxyProto_NotProxy(t *testing.T) {
 
 	action := handler.handleProxyProto(mockConn, ctx)
 
-	// handleProxyProto transitions to StateReadTLSHeader, then calls handleTLSHeader
-	// which may further transition to StateReadTLSPayload if header is complete
+	// handleProxyProto transitions to StateDetectProtocol, then calls handleDetectProtocol
+	// which detects TLS and may transition through TLS states
 	state := ctx.State()
-	if state != StateReadTLSHeader && state != StateReadTLSPayload {
-		t.Errorf("expected TLS state, got %v", state)
+	if state != StateDetectProtocol && state != StateReadTLSHeader && state != StateReadTLSPayload {
+		t.Errorf("expected protocol detect or TLS state, got %v", state)
 	}
 	_ = action
 }
@@ -657,9 +657,10 @@ func TestOnTraffic_ProxyProtocolState(t *testing.T) {
 
 	action := handler.OnTraffic(mockConn)
 
-	// Should transition to TLS handling
-	if ctx.State() != StateReadTLSHeader && ctx.State() != StateReadTLSPayload {
-		t.Errorf("expected TLS state, got %v", ctx.State())
+	// Should transition through protocol detection to TLS handling
+	state := ctx.State()
+	if state != StateDetectProtocol && state != StateReadTLSHeader && state != StateReadTLSPayload {
+		t.Errorf("expected protocol detect or TLS state, got %v", state)
 	}
 	_ = action
 }

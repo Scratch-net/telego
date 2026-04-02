@@ -175,11 +175,18 @@ func printTelegramLinks(secrets []gproxy.Secret, bindAddr string) error {
 	}
 
 	for _, s := range secrets {
-		link := fmt.Sprintf("tg://proxy?server=%s&port=%s&secret=%s", publicIP, port, s.RawHex)
+		// ee link (FakeTLS) - uses full secret with hostname
+		eeLink := fmt.Sprintf("tg://proxy?server=%s&port=%s&secret=%s", publicIP, port, s.RawHex)
+
+		// dd link (raw) - uses dd prefix + key only (no hostname)
+		ddSecret := config.BuildDDSecret(s.Key)
+		ddLink := fmt.Sprintf("tg://proxy?server=%s&port=%s&secret=%s", publicIP, port, ddSecret)
+
 		log.Info().
 			Str("name", s.Name).
-			Str("link", link).
-			Msg("Telegram proxy link")
+			Str("ee_link", eeLink).
+			Str("dd_link", ddLink).
+			Msg("Telegram proxy links")
 	}
 
 	return nil
@@ -261,7 +268,7 @@ func (c *VersionCmd) Run() error {
 			"Event-driven gnet architecture",
 			"TLS fronting with real cert fetching",
 			"Splice mode for probe resistance",
-			"FakeTLS (0xee prefix) support",
+			"FakeTLS (ee) and raw (dd) protocol support",
 			"Multiple secrets per user",
 		}).
 		Msg("telego")

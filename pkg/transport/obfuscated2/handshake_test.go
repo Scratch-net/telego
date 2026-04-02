@@ -345,3 +345,22 @@ func TestConnectionTypeFakeTLS(t *testing.T) {
 		t.Errorf("ConnectionTypeFakeTLS should be 0xdddddddd, got 0x%x", ConnectionTypeFakeTLS)
 	}
 }
+
+// TestConnectionTypeIntermediate tests the intermediate connection type constant.
+func TestConnectionTypeIntermediate(t *testing.T) {
+	if ConnectionTypeIntermediate != 0xeeeeeeee {
+		t.Errorf("ConnectionTypeIntermediate should be 0xeeeeeeee, got 0x%x", ConnectionTypeIntermediate)
+	}
+}
+
+// TestConnectionTypeConstants verifies both connection type constants have correct values.
+func TestConnectionTypeConstants(t *testing.T) {
+	// Verify the connection type constants have correct values
+	if ConnectionTypeFakeTLS != 0xdddddddd {
+		t.Errorf("ConnectionTypeFakeTLS = 0x%08x, want 0xdddddddd", ConnectionTypeFakeTLS)
+	}
+
+	if ConnectionTypeIntermediate != 0xeeeeeeee {
+		t.Errorf("ConnectionTypeIntermediate = 0x%08x, want 0xeeeeeeee", ConnectionTypeIntermediate)
+	}
+}

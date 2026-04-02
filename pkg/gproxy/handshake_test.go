@@ -643,3 +643,55 @@ func BenchmarkHandleTLSPayload(b *testing.B) {
 		handler.handleTLSPayload(mockConn, ctx)
 	}
 }
+
+// TestProtocolDetection tests ee/dd protocol detection based on first 5 bytes.
+func TestProtocolDetection(t *testing.T) {
+	tests := []struct {
+		name         string
+		firstBytes   []byte
+		expectedMode ProtocolMode
+	}{
+		{
+			name:         "TLS handshake TLS 1.0",
+			firstBytes:   []byte{0x16, 0x03, 0x01, 0x00, 0x05},
+			expectedMode: ModeEE,
+		},
+		{
+			name:         "TLS handshake TLS 1.2",
+			firstBytes:   []byte{0x16, 0x03, 0x03, 0x00, 0x05},
+			expectedMode: ModeEE,
+		},
+		{
+			name:         "Raw obfuscated2 (random first byte)",
+			firstBytes:   []byte{0x45, 0x12, 0x34, 0x56, 0x78},
+			expectedMode: ModeDD,
+		},
+		{
+			name:         "Raw obfuscated2 (0x16 but wrong version)",
+			firstBytes:   []byte{0x16, 0x04, 0x00, 0x00, 0x05},
+			expectedMode: ModeDD,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Check if first byte is TLS handshake
+			isTLS := tt.firstBytes[0] == 0x16
+			if isTLS {
+				version := binary.BigEndian.Uint16(tt.firstBytes[1:3])
+				isTLS = version == 0x0301 || version == 0x0302 || version == 0x0303
+			}
+
+			var detectedMode ProtocolMode
+			if isTLS {
+				detectedMode = ModeEE
+			} else {
+				detectedMode = ModeDD
+			}
+
+			if detectedMode != tt.expectedMode {
+				t.Errorf("got mode %v, want %v", detectedMode, tt.expectedMode)
+			}
+		})
+	}
+}

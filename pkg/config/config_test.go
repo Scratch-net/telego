@@ -654,3 +654,36 @@ mask-host = "www.google.com"
 		t.Errorf("IPBlockTimeout = %v, want 5m", proxyCfg.IPBlockTimeout)
 	}
 }
+
+func TestBuildDDSecret(t *testing.T) {
+	key, _ := hex.DecodeString("0123456789abcdef0123456789abcdef")
+
+	result := BuildDDSecret(key)
+
+	// Expected: dd + key = "dd" + "0123456789abcdef0123456789abcdef"
+	expected := "dd0123456789abcdef0123456789abcdef"
+
+	if result != expected {
+		t.Errorf("BuildDDSecret() = %q, want %q", result, expected)
+	}
+
+	// Verify length: 1 byte prefix + 16 bytes key = 17 bytes = 34 hex chars
+	if len(result) != 34 {
+		t.Errorf("BuildDDSecret() length = %d, want 34", len(result))
+	}
+}
+
+func TestBuildFullSecret_EE(t *testing.T) {
+	key, _ := hex.DecodeString("0123456789abcdef0123456789abcdef")
+	host := "www.google.com"
+
+	result := BuildFullSecret(key, host)
+
+	// Expected: ee + key + host_hex
+	hostHex := hex.EncodeToString([]byte(host))
+	expected := "ee0123456789abcdef0123456789abcdef" + hostHex
+
+	if result != expected {
+		t.Errorf("BuildFullSecret() = %q, want %q", result, expected)
+	}
+}

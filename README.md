@@ -51,7 +51,7 @@
 - **Replay Protection** — 64-shard LRU cache with TTL expiration ([hashicorp/golang-lru](https://github.com/hashicorp/golang-lru))
 - **Key Zeroization** — Sensitive data (session IDs, random bytes) zeroed on connection close
 - **Desync Detection** — Detects crypto state divergence via abnormal frame sizes
-- **Obfuscated2 + FakeTLS** — Full protocol support with streaming encryption
+- **Dual Protocol Support** — FakeTLS (ee) and raw Obfuscated2 (dd) with auto-detection on single port
 
 ### Operations
 - **Multi-user Support** — Named secrets with per-user tracking and logging
@@ -99,7 +99,8 @@ go install github.com/scratch-net/telego/cmd/telego@latest
 ```bash
 telego generate www.google.com
 # secret=0123456789abcdef0123456789abcdef  <- put this in config
-# link=tg://proxy?server=YOUR_IP&port=443&secret=ee...  <- share with clients
+# ee_link=tg://proxy?server=YOUR_IP&port=443&secret=ee...  <- FakeTLS (recommended)
+# dd_link=tg://proxy?server=YOUR_IP&port=443&secret=dd...  <- raw Obfuscated2
 ```
 
 **2. Create `config.toml`:**
@@ -122,6 +123,23 @@ telego run -c config.toml -l
 ```
 
 The `-l` flag prints Telegram proxy links with auto-detected public IP.
+
+---
+
+## Protocol Modes
+
+TeleGO supports two MTProxy protocol variants on a single port with auto-detection:
+
+| Mode | Secret Prefix | Description | Best For |
+|------|---------------|-------------|----------|
+| **FakeTLS (ee)** | `ee...` | TLS-wrapped Obfuscated2 | Maximum stealth, censorship bypass |
+| **Raw (dd)** | `dd...` | Plain Obfuscated2 | Compatibility, lower overhead |
+
+**FakeTLS (ee)** wraps traffic in TLS 1.3 records, making it indistinguishable from HTTPS. The secret includes the mask hostname for SNI validation. Unrecognized connections are forwarded to the mask host for probe resistance.
+
+**Raw (dd)** sends Obfuscated2 directly without TLS wrapping. Lower overhead but easier to fingerprint. Useful for compatibility with older clients or when TLS fronting isn't needed.
+
+Both modes use the same 16-byte secret key. The `ee` or `dd` prefix in the client link determines which mode the client uses. TeleGO auto-detects the protocol from the first bytes of each connection.
 
 ---
 
@@ -192,9 +210,10 @@ num-event-loops = 0          # 0 = auto (all CPU cores)
 telego run       Start the proxy server
   -c, --config   Path to config file (required)
   -b, --bind     Override bind address
-  -l, --link     Print Telegram proxy links on startup
+  -l, --link     Print Telegram proxy links on startup (both ee and dd)
 
-telego generate <hostname>   Generate a new FakeTLS secret for hostname
+telego generate <hostname>   Generate a new secret for hostname
+                             Outputs both ee (FakeTLS) and dd (raw) links
 
 telego version   Show version information
 ```
@@ -391,10 +410,13 @@ All metrics include a `user` label for per-user breakdown.
 ```
 ┌─────────────┐     ┌──────────────────────────────────────┐     ┌──────────┐
 │   Client    │────▶│              TeleGO                  │────▶│ Telegram │
-│ (Telegram)  │◀────│  FakeTLS ─▶ Obfuscated2 ─▶ Relay    │◀────│    DC    │
-└─────────────┘     └──────────────────────────────────────┘     └──────────┘
+│ (Telegram)  │◀────│      Auto-detect ee/dd protocol      │◀────│    DC    │
+└─────────────┘     │                                      │     └──────────┘
+                    │  ee: FakeTLS ─▶ Obfuscated2 ─▶ Relay │
+                    │  dd: Obfuscated2 ─▶ Relay            │
+                    └──────────────────────────────────────┘
                                      │
-                                     ▼ (unrecognized)
+                                     ▼ (unrecognized ee)
                                ┌──────────┐
                                │   Mask   │
                                │   Host   │

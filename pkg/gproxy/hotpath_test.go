@@ -60,7 +60,7 @@ func TestConnContext_ConcurrentStateTransitions(t *testing.T) {
 			for range iterations {
 				state := ctx.State()
 				// Verify state is valid
-				if state < StateReadProxyProto || state > StateClosed {
+				if state < StateDetectProtocol || state > StateClosed {
 					t.Errorf("invalid state value: %d", state)
 				}
 				_ = state.String()
@@ -448,11 +448,11 @@ func TestConnContext_StateTransitionRace(t *testing.T) {
 		// Simulate handshake completing
 		go func() {
 			defer wg.Done()
+			if ctx.State() == StateDetectProtocol {
+				ctx.SetState(StateReadTLSHeader)
+			}
 			if ctx.State() == StateReadTLSHeader {
 				ctx.SetState(StateReadTLSPayload)
-			}
-			if ctx.State() == StateReadTLSPayload {
-				ctx.SetState(StateReadO2Frame)
 			}
 		}()
 
@@ -461,7 +461,7 @@ func TestConnContext_StateTransitionRace(t *testing.T) {
 			defer wg.Done()
 			state := ctx.State()
 			// Verify state is valid
-			if state < StateReadProxyProto || state > StateClosed {
+			if state < StateDetectProtocol || state > StateClosed {
 				t.Errorf("invalid state: %d", state)
 			}
 		}()
