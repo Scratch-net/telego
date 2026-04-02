@@ -155,10 +155,11 @@ func (h *ProxyHandler) OnShutdown(eng gnet.Engine) {
 func (h *ProxyHandler) OnOpen(c gnet.Conn) ([]byte, gnet.Action) {
 	ctx := NewConnContext()
 
-	// Start with PROXY protocol parsing if enabled
+	// Start with PROXY protocol parsing if enabled, otherwise detect protocol
 	if h.config.ProxyProtocol {
 		ctx.SetState(StateReadProxyProto)
 	}
+	// Otherwise keep default StateDetectProtocol from NewConnContext
 
 	c.SetContext(ctx)
 
@@ -240,6 +241,8 @@ func (h *ProxyHandler) OnTraffic(c gnet.Conn) gnet.Action {
 
 	// Lock-free state read
 	switch ctx.State() {
+	case StateDetectProtocol:
+		return h.handleDetectProtocol(c, ctx)
 	case StateReadProxyProto:
 		return h.handleProxyProto(c, ctx)
 	case StateReadTLSHeader:
@@ -248,6 +251,8 @@ func (h *ProxyHandler) OnTraffic(c gnet.Conn) gnet.Action {
 		return h.handleTLSPayload(c, ctx)
 	case StateReadO2Frame:
 		return h.handleO2Frame(c, ctx)
+	case StateReadDDFrame:
+		return h.handleDDFrame(c, ctx)
 	case StateDialingDC:
 		// Still waiting for DC connection, buffer data
 		return gnet.None
@@ -269,12 +274,12 @@ func (h *ProxyHandler) handleProxyProto(c gnet.Conn, ctx *ConnContext) gnet.Acti
 		return gnet.None // Need data
 	}
 
-	// Quick check: if first byte can't start a PROXY header, skip to TLS immediately
+	// Quick check: if first byte can't start a PROXY header, skip to detection immediately
 	// This prevents slowloris-style attacks with tiny payloads
 	// PROXY v1 starts with 'P' (0x50), v2 starts with 0x0D
 	if data[0] != 'P' && data[0] != 0x0D {
-		ctx.SetState(StateReadTLSHeader)
-		return h.handleTLSHeader(c, ctx)
+		ctx.SetState(StateDetectProtocol)
+		return h.handleDetectProtocol(c, ctx)
 	}
 
 	// Need minimum bytes to determine protocol type
@@ -295,9 +300,9 @@ func (h *ProxyHandler) handleProxyProto(c gnet.Conn, ctx *ConnContext) gnet.Acti
 	}
 
 	if result == nil {
-		// Not a PROXY protocol header, proceed to TLS
-		ctx.SetState(StateReadTLSHeader)
-		return h.handleTLSHeader(c, ctx)
+		// Not a PROXY protocol header, proceed to protocol detection
+		ctx.SetState(StateDetectProtocol)
+		return h.handleDetectProtocol(c, ctx)
 	}
 
 	// Discard the PROXY header bytes
@@ -309,9 +314,9 @@ func (h *ProxyHandler) handleProxyProto(c gnet.Conn, ctx *ConnContext) gnet.Acti
 		h.logger.Debug("[#%d] PROXY protocol: real client %s", ctx.id, result.SrcAddr)
 	}
 
-	// Proceed to TLS handshake
-	ctx.SetState(StateReadTLSHeader)
-	return h.handleTLSHeader(c, ctx)
+	// Proceed to protocol detection
+	ctx.SetState(StateDetectProtocol)
+	return h.handleDetectProtocol(c, ctx)
 }
 
 // Logger interface for proxy logging.
