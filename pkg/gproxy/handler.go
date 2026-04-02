@@ -257,6 +257,9 @@ func (h *ProxyHandler) OnTraffic(c gnet.Conn) gnet.Action {
 		// Still waiting for DC connection, buffer data
 		return gnet.None
 	case StateRelaying:
+		if ctx.ProtocolMode() == ModeDD {
+			return h.handleRelayDD(c, ctx)
+		}
 		return h.handleRelay(c, ctx)
 	case StateSplicing:
 		return h.handleSplice(c, ctx)

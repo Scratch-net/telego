@@ -171,3 +171,94 @@ func (h *ProxyHandler) handleRelay(c gnet.Conn, ctx *ConnContext) gnet.Action {
 
 	return gnet.None
 }
+
+// handleRelayDD processes data from client in DD mode (raw stream, no TLS framing).
+func (h *ProxyHandler) handleRelayDD(c gnet.Conn, ctx *ConnContext) gnet.Action {
+	relay := ctx.Relay()
+	if relay == nil {
+		return gnet.None
+	}
+
+	dcConn := relay.DCConn
+	decryptor := relay.Decryptor
+	dcEncrypt := relay.DCEncrypt
+
+	dcBuffered := dcConn.OutboundBuffered()
+
+	data, _ := c.Peek(-1)
+	if len(data) == 0 {
+		return gnet.None
+	}
+
+	// Rate limiting with hysteresis (same as TLS relay)
+	wasThrottled := ctx.throttledToDC.Load()
+	var maxProcess int
+
+	if dcBuffered > h.maxWriteBuffer {
+		maxProcess = 16 * 1024
+		ctx.throttledToDC.Store(true)
+		if h.logger.DebugEnabled() {
+			h.logger.Debug("[%s] backpressure: DC buffer %dMB > hard limit, trickle mode",
+				ctx.LogPrefix(), dcBuffered/1024/1024)
+		}
+	} else if dcBuffered > h.bpSoftLimit {
+		maxProcess = 64 * 1024
+		ctx.throttledToDC.Store(true)
+		if h.logger.DebugEnabled() {
+			h.logger.Debug("[%s] backpressure: DC buffer %dKB > soft limit, throttling",
+				ctx.LogPrefix(), dcBuffered/1024)
+		}
+	} else if wasThrottled && dcBuffered > h.bpResumeAt {
+		maxProcess = 256 * 1024
+	} else {
+		maxProcess = len(data)
+		if wasThrottled {
+			ctx.throttledToDC.Store(false)
+		}
+	}
+
+	// Limit data to process
+	if len(data) > maxProcess {
+		data = data[:maxProcess]
+	}
+
+	// Get pooled buffer
+	batchBufPtr := h.dcBufPool.Get()
+	batchBuf := *batchBufPtr
+
+	// Ensure buffer is large enough
+	if len(data) > len(batchBuf) {
+		h.dcBufPool.Put(batchBufPtr)
+		// Process in smaller chunk
+		data = data[:len(batchBuf)]
+	}
+
+	// Decrypt from client, encrypt for DC
+	decryptor.XORKeyStream(batchBuf[:len(data)], data)
+	dcEncrypt.XORKeyStream(batchBuf[:len(data)], batchBuf[:len(data)])
+
+	// Count traffic
+	if counter := ctx.TrafficIn(); counter != nil {
+		counter.Add(int64(len(data)))
+	}
+
+	// Send to DC
+	err := dcConn.AsyncWrite(batchBuf[:len(data)], func(_ gnet.Conn, _ error) error {
+		h.dcBufPool.Put(batchBufPtr)
+		return nil
+	})
+	if err != nil {
+		h.dcBufPool.Put(batchBufPtr)
+		return gnet.Close
+	}
+
+	c.Discard(len(data))
+
+	// Wake if more data to process
+	remaining, _ := c.Peek(-1)
+	if len(remaining) > 0 {
+		c.Wake(nil)
+	}
+
+	return gnet.None
+}
