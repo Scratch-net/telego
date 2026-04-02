@@ -18,19 +18,31 @@ import (
 type ConnState int32
 
 const (
-	StateReadProxyProto ConnState = iota // Need PROXY protocol header (optional)
+	StateDetectProtocol ConnState = iota // Detect ee vs dd protocol from first bytes
+	StateReadProxyProto                  // Need PROXY protocol header (optional)
 	StateReadTLSHeader                   // Need 5 bytes for TLS record header
 	StateReadTLSPayload                  // Need header.length bytes for payload
-	StateReadO2Frame                     // Need 64 bytes for obfuscated2 frame
+	StateReadO2Frame                     // Need 64 bytes for obfuscated2 frame (TLS-wrapped)
+	StateReadDDFrame                     // Need 64 bytes for raw obfuscated2 frame (DD mode)
 	StateDialingDC                       // Async dial in progress
 	StateRelaying                        // Bidirectional relay active
 	StateSplicing                        // Forward to mask host (invalid client)
 	StateClosed                          // Connection is closing
 )
 
+// ProtocolMode indicates the MTProxy protocol variant.
+type ProtocolMode uint8
+
+const (
+	ModeEE ProtocolMode = iota // FakeTLS + Obfuscated2 (ee prefix)
+	ModeDD                     // Raw Obfuscated2 (dd prefix)
+)
+
 // String returns the state name for debugging.
 func (s ConnState) String() string {
 	switch s {
+	case StateDetectProtocol:
+		return "DetectProtocol"
 	case StateReadProxyProto:
 		return "ReadProxyProto"
 	case StateReadTLSHeader:
@@ -39,6 +51,8 @@ func (s ConnState) String() string {
 		return "ReadTLSPayload"
 	case StateReadO2Frame:
 		return "ReadO2Frame"
+	case StateReadDDFrame:
+		return "ReadDDFrame"
 	case StateDialingDC:
 		return "DialingDC"
 	case StateRelaying:
@@ -75,6 +89,9 @@ type ConnContext struct {
 
 	// Atomic state - no lock needed for reads
 	state atomic.Int32
+
+	// Protocol mode (ee or dd) - set during detection, immutable after
+	protocolMode ProtocolMode
 
 	// Mutex protects handshake-phase fields only
 	mu sync.Mutex
@@ -135,7 +152,7 @@ func NewConnContext() *ConnContext {
 		id:       connIDCounter.Add(1),
 		connTime: time.Now(),
 	}
-	ctx.state.Store(int32(StateReadTLSHeader))
+	ctx.state.Store(int32(StateDetectProtocol))
 	return ctx
 }
 
@@ -167,6 +184,16 @@ func (c *ConnContext) State() ConnState {
 // SetState sets the connection state (lock-free).
 func (c *ConnContext) SetState(state ConnState) {
 	c.state.Store(int32(state))
+}
+
+// ProtocolMode returns the protocol mode (ModeEE or ModeDD).
+func (c *ConnContext) ProtocolMode() ProtocolMode {
+	return c.protocolMode
+}
+
+// SetProtocolMode sets the protocol mode.
+func (c *ConnContext) SetProtocolMode(mode ProtocolMode) {
+	c.protocolMode = mode
 }
 
 // Relay returns the relay context (lock-free, may be nil).
