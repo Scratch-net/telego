@@ -246,6 +246,15 @@ func BuildFullSecret(key []byte, host string) string {
 	return hex.EncodeToString(full)
 }
 
+// BuildDDSecret builds the dd secret string: dd + key (no hostname)
+func BuildDDSecret(key []byte) string {
+	// [0xdd][16 bytes key]
+	full := make([]byte, 1+16)
+	full[0] = 0xdd
+	copy(full[1:17], key)
+	return hex.EncodeToString(full)
+}
+
 // GenerateKey generates a new random 16-byte key (returned as 32 hex chars).
 func GenerateKey() (string, error) {
 	key := make([]byte, 16)
