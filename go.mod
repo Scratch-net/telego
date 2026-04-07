@@ -3,7 +3,7 @@ module github.com/scratch-net/telego
 go 1.26
 
 require (
-	github.com/alecthomas/kong v1.14.0
+	github.com/alecthomas/kong v1.15.0
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/gotd/td v0.142.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
