@@ -483,6 +483,13 @@ func (h *ProxyHandler) startSplice(c gnet.Conn, ctx *ConnContext) gnet.Action {
 
 	ctx.SetState(StateSplicing)
 
+	// Clear handshake deadline, set splice idle timeout
+	spliceTimeout := h.config.SpliceIdleTimeout
+	if spliceTimeout <= 0 {
+		spliceTimeout = 30 * time.Second
+	}
+	c.SetReadDeadline(time.Now().Add(spliceTimeout))
+
 	h.logger.Debug("[#%d] splicing to %s:%d", ctx.id, h.config.SpliceHost, h.config.SplicePort)
 
 	// Dial mask host asynchronously

@@ -47,7 +47,8 @@ type Config struct {
 	// Defaults to MaskHost:MaskPort if not set
 	SpliceHost          string
 	SplicePort          int
-	SpliceProxyProtocol int // 0 = off, 1 = v1 (text), 2 = v2 (binary)
+	SpliceProxyProtocol int           // 0 = off, 1 = v1 (text), 2 = v2 (binary)
+	SpliceIdleTimeout   time.Duration // Idle timeout for splice connections (default 30s)
 
 	// Performance
 	IPPreference      dc.IPPreference
@@ -79,7 +80,7 @@ func DefaultConfig() Config {
 	return Config{
 		MaskPort:          443,
 		CertRefreshHours:  5,
-		HandshakeTimeout:  30 * time.Second,
+		HandshakeTimeout:  5 * time.Second,
 		IdleTimeout:       5 * time.Minute,
 		TimeSkewTolerance: 3 * time.Second,
 		IPPreference:      dc.PreferIPv4,

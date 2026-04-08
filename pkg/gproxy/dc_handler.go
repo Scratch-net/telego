@@ -368,7 +368,10 @@ func (h *ProxyHandler) relaySpliceToClientLoop(spliceConn net.Conn, clientConn g
 
 	// Cache config and set initial deadline
 	// Only update deadline when half the timeout has elapsed to reduce syscalls
-	idleTimeout := h.IdleTimeout()
+	idleTimeout := h.config.SpliceIdleTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = 30 * time.Second
+	}
 	var lastDeadlineSet time.Time
 	deadlineRefreshThreshold := idleTimeout / 2
 	if idleTimeout > 0 {

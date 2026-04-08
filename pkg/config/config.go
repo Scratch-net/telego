@@ -40,6 +40,7 @@ type GeneralConfig struct {
 	MaxConnectionsPerIP int      `toml:"max-connections-per-ip"` // Max connections per IP+secret, 0 = unlimited
 	MaxIPsPerUser       int      `toml:"max-ips-per-user"`       // Max unique IPs per user, 0 = unlimited
 	IPBlockTimeout      Duration `toml:"ip-block-timeout"`       // How long blocked IPs stay blocked
+	HandshakeTimeout    Duration `toml:"handshake-timeout"`      // Max time for handshake (default 5s)
 }
 
 // TLSFrontingConfig configures TLS fronting.
@@ -55,9 +56,10 @@ type TLSFrontingConfig struct {
 
 	// Splice target - where to forward unrecognized clients
 	// Defaults to mask-host:mask-port if not set
-	SpliceHost          string `toml:"splice-host"`
-	SplicePort          int    `toml:"splice-port"`
-	SpliceProxyProtocol int    `toml:"splice-proxy-protocol"` // 0=off, 1=v1, 2=v2
+	SpliceHost          string   `toml:"splice-host"`
+	SplicePort          int      `toml:"splice-port"`
+	SpliceProxyProtocol int      `toml:"splice-proxy-protocol"` // 0=off, 1=v1, 2=v2
+	SpliceIdleTimeout   Duration `toml:"splice-idle-timeout"`   // Idle timeout for splice connections (default 30s)
 }
 
 // PerformanceConfig configures performance settings.
@@ -179,6 +181,7 @@ func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
 		cfg.SplicePort = cfg.MaskPort
 	}
 	cfg.SpliceProxyProtocol = c.TLSFronting.SpliceProxyProtocol
+	cfg.SpliceIdleTimeout = c.TLSFronting.SpliceIdleTimeout.Duration()
 
 	// Performance
 	cfg.IdleTimeout = c.Performance.IdleTimeout.Duration()
@@ -206,6 +209,7 @@ func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
 	// General settings
 	cfg.ProxyProtocol = c.General.ProxyProtocol || c.ProxyProtocol
 	cfg.MaxConnectionsPerIP = c.General.MaxConnectionsPerIP
+	cfg.HandshakeTimeout = c.General.HandshakeTimeout.Duration()
 	cfg.MaxIPsPerUser = c.General.MaxIPsPerUser
 	cfg.IPBlockTimeout = c.General.IPBlockTimeout.Duration()
 	if cfg.IPBlockTimeout == 0 {

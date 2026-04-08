@@ -187,7 +187,7 @@ func (h *ProxyHandler) OnOpen(c gnet.Conn) ([]byte, gnet.Action) {
 	// Set read deadline for handshake
 	handshakeTimeout := h.config.HandshakeTimeout
 	if handshakeTimeout <= 0 {
-		handshakeTimeout = 30 * time.Second
+		handshakeTimeout = 5 * time.Second
 	}
 	c.SetReadDeadline(time.Now().Add(handshakeTimeout))
 

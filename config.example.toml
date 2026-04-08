@@ -15,10 +15,14 @@ log-level = "info"
 # When enabled, parses PROXY protocol v1/v2 to get real client IP
 # proxy-protocol = false
 
-# Maximum connections per IP+user (0 = unlimited)
-# Limits how many connections one IP can have for each user.
-# Useful when many users share one IP (NAT, corporate VPN).
+# Maximum connections per IP (0 = unlimited)
+# Applies to ALL connections (including unauthenticated) from a single IP.
+# Protects against connection floods from scanners/probes.
 # max-connections-per-ip = 100
+
+# Max time to complete handshake before closing (default: 5s)
+# Connections that don't authenticate within this time are dropped.
+# handshake-timeout = "5s"
 
 # Maximum unique IP addresses per user/secret (0 = unlimited)
 # When exceeded, oldest IP is evicted and blocked. Protects against secret sharing.
@@ -59,6 +63,10 @@ mask-host = "www.google.com"
 # Allows backend (nginx/haproxy) to see real client IP
 # 0 = off (default), 1 = v1 (text), 2 = v2 (binary)
 # splice-proxy-protocol = 1
+
+# Idle timeout for spliced (unrecognized) connections (default: 30s)
+# Shorter than authenticated connections since these are just decoy traffic.
+# splice-idle-timeout = "30s"
 
 # Performance tuning (all optional)
 [performance]

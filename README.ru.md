@@ -101,9 +101,10 @@ bind-to = "0.0.0.0:443"
 log-level = "info"
 
 # Защита от абьюза
-max-connections-per-ip = 100  # Макс. подключений с одного IP
+max-connections-per-ip = 100  # Макс. подключений с одного IP (включая неавторизованные)
 max-ips-per-user = 3          # Макс. IP на один секрет
 ip-block-timeout = "5m"       # Время блокировки IP
+# handshake-timeout = "5s"    # Таймаут хэндшейка (по умолчанию 5с)
 
 [secrets]
 user1 = "0123456789abcdef0123456789abcdef"
@@ -113,6 +114,7 @@ user2 = "fedcba9876543210fedcba9876543210"
 mask-host = "www.google.com"
 # splice-host = "127.0.0.1"   # Куда перенаправлять нераспознанных клиентов
 # splice-port = 8080
+# splice-idle-timeout = "30s" # Таймаут бездействия для splice-соединений (по умолчанию 30с)
 
 [performance]
 prefer-ip = "prefer-ipv4"

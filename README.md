@@ -159,9 +159,12 @@ log-level = "info"
 # Accept incoming PROXY protocol headers (from HAProxy/nginx)
 # proxy-protocol = false
 
-# Maximum connections per IP+user (0 = unlimited)
-# Protects against abuse when many users share one IP (NAT, VPN)
+# Maximum connections per IP (0 = unlimited)
+# Applies to ALL connections (including unauthenticated) from a single IP
 # max-connections-per-ip = 100
+
+# Max time for handshake before dropping connection (default: 5s)
+# handshake-timeout = "5s"
 
 # Maximum unique IPs per user (0 = unlimited)
 # Prevents secret sharing - limits how many devices/locations can use one secret
@@ -185,6 +188,7 @@ mask-host = "www.google.com"  # Host to mimic (SNI validation, proxy links)
 # splice-host = "127.0.0.1"   # Forward unrecognized clients here (default: mask-host)
 # splice-port = 8080          # Splice port (default: mask-port)
 # splice-proxy-protocol = 1   # PROXY protocol to splice: 0=off, 1=v1(text), 2=v2(binary)
+# splice-idle-timeout = "30s" # Idle timeout for spliced connections (default: 30s)
 
 # Performance tuning (all optional)
 [performance]
@@ -329,7 +333,7 @@ kill -HUP $(pidof telego)
 - `idle-timeout` — Applies to new connections
 
 **Require restart:**
-- `bind-to`, `secrets`, `tls-fronting.*`, `proxy-protocol`, `max-connections-per-ip`, `max-ips-per-user`
+- `bind-to`, `secrets`, `tls-fronting.*`, `proxy-protocol`, `max-connections-per-ip`, `max-ips-per-user`, `handshake-timeout`
 
 ---
 
