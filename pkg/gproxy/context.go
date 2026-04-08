@@ -129,6 +129,8 @@ type ConnContext struct {
 	realClientAddr net.Addr
 
 	// Connection limit tracking (protected by mu)
+	ipLimitTracked   bool   // Whether this connection is tracked in per-IP limiter (set in OnOpen)
+	ipLimitKey       string // Cached key for per-IP limiter release
 	connLimitTracked bool   // Whether this connection is tracked in conn limiter
 	connLimitKey     string // Cached key for conn limiter release
 	limitTracked     bool   // Whether this connection is tracked in user IP limiter

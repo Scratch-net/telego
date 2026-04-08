@@ -3,6 +3,7 @@ package gproxy
 import (
 	"errors"
 	"io"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -164,10 +165,43 @@ func (h *ProxyHandler) OnOpen(c gnet.Conn) ([]byte, gnet.Action) {
 	c.SetContext(ctx)
 
 	conns := atomic.AddInt64(&h.activeConns, 1)
-	h.logger.Debug("[#%d] new connection from %s (active: %d)", ctx.id, c.RemoteAddr(), conns)
+	h.logger.Info("[#%d] new connection from %s (active: %d)", ctx.id, c.RemoteAddr(), conns)
+
+	// Enforce per-IP connection limit before any protocol work
+	if h.connLimiter != nil {
+		var ip net.IP
+		if tcpAddr, ok := c.RemoteAddr().(*net.TCPAddr); ok {
+			ip = tcpAddr.IP
+		}
+		if ip != nil {
+			key, ok := h.connLimiter.TryAcquireIP(ip)
+			if !ok {
+				h.logger.Info("[#%d] per-IP connection limit exceeded for %s (active: %d)", ctx.id, ip, conns)
+				return nil, gnet.Close
+			}
+			ctx.ipLimitTracked = true
+			ctx.ipLimitKey = key
+		}
+	}
 
 	// Set read deadline for handshake
-	c.SetReadDeadline(time.Now().Add(30 * time.Second))
+	handshakeTimeout := h.config.HandshakeTimeout
+	if handshakeTimeout <= 0 {
+		handshakeTimeout = 30 * time.Second
+	}
+	c.SetReadDeadline(time.Now().Add(handshakeTimeout))
+
+	// Active handshake timeout: close connection if still in pre-auth state.
+	// gnet's SetReadDeadline only triggers on read attempts; silent connections
+	// (no data sent) never trigger a read, so the deadline is never checked.
+	time.AfterFunc(handshakeTimeout, func() {
+		state := ctx.State()
+		if state != StateClosed && state != StateRelaying && state != StateSplicing && state != StateDialingDC {
+			h.logger.Info("[#%d] handshake timeout from %s in state %s (active: %d)",
+				ctx.id, c.RemoteAddr(), state, atomic.LoadInt64(&h.activeConns))
+			c.Close()
+		}
+	})
 
 	return nil, gnet.None
 }
@@ -198,6 +232,10 @@ func (h *ProxyHandler) OnClose(c gnet.Conn, err error) gnet.Action {
 	// Release connection limit slots and check if authenticated
 	ctx.mu.Lock()
 	authenticated := ctx.secret != nil
+	if ctx.ipLimitTracked && h.connLimiter != nil {
+		h.connLimiter.Release(ctx.ipLimitKey)
+		ctx.ipLimitTracked = false
+	}
 	if ctx.connLimitTracked && h.connLimiter != nil {
 		h.connLimiter.Release(ctx.connLimitKey)
 		ctx.connLimitTracked = false

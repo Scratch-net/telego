@@ -59,6 +59,7 @@ type Config struct {
 
 	// Incoming connection handling
 	ProxyProtocol       bool          // Accept incoming PROXY protocol headers
+	HandshakeTimeout    time.Duration // Max time for handshake before closing (default 30s)
 	MaxConnectionsPerIP int           // Max concurrent connections per IP+secret, 0 = unlimited
 	MaxIPsPerUser       int           // Max unique IPs per user, 0 = unlimited
 	IPBlockTimeout      time.Duration // How long blocked IPs stay blocked (default 5m)
@@ -78,6 +79,7 @@ func DefaultConfig() Config {
 	return Config{
 		MaskPort:          443,
 		CertRefreshHours:  5,
+		HandshakeTimeout:  30 * time.Second,
 		IdleTimeout:       5 * time.Minute,
 		TimeSkewTolerance: 3 * time.Second,
 		IPPreference:      dc.PreferIPv4,

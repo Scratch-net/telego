@@ -55,15 +55,36 @@ func (l *ConnLimiter) TryAcquire(ip net.IP, secret []byte) (key string, ok bool)
 
 	// Compute key: blake3(ip || secret), truncated to limiterKeySize bytes
 	// Blake3 is ~3x faster than SHA256 and highly optimized
+	keyArr := l.hashKey(ip, secret)
+	return l.tryAcquire(keyArr)
+}
+
+// TryAcquireIP attempts to acquire a connection slot for the given IP only.
+// Used in OnOpen to limit total connections per IP before authentication.
+func (l *ConnLimiter) TryAcquireIP(ip net.IP) (key string, ok bool) {
+	if l.maxConns <= 0 {
+		return "", true
+	}
+
+	keyArr := l.hashKey(ip, nil)
+	return l.tryAcquire(keyArr)
+}
+
+func (l *ConnLimiter) hashKey(ip net.IP, secret []byte) [limiterKeySize]byte {
 	var keyArr [limiterKeySize]byte
 	h := hasherPool.Get().(*blake3.Hasher)
 	h.Reset()
 	h.Write(ip)
-	h.Write(secret)
+	if len(secret) > 0 {
+		h.Write(secret)
+	}
 	hash := h.Sum(nil)
 	copy(keyArr[:], hash[:limiterKeySize])
 	hasherPool.Put(h)
+	return keyArr
+}
 
+func (l *ConnLimiter) tryAcquire(keyArr [limiterKeySize]byte) (key string, ok bool) {
 	// Select shard based on first byte of key
 	shardIdx := int(keyArr[0]) & limiterShardMask
 	s := &l.shards[shardIdx]
