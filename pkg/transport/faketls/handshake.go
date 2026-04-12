@@ -341,32 +341,43 @@ func BuildServerHelloWithOptions(secret []byte, clientHello *ClientHello, opts *
 	return buildSyntheticServerHello(secret, clientHello, opts)
 }
 
-// buildHybridServerHello uses a real ServerHello template from a mask host,
-// patching only the random field with our HMAC. This provides authentic TLS
-// fingerprints while maintaining client authentication.
+// buildHybridServerHello uses a real ServerHello record from a mask host,
+// then appends synthetic ChangeCipherSpec + ApplicationData.
+// This gives authentic TLS fingerprint on the ServerHello while maintaining
+// the packet structure the Telegram client expects.
 func buildHybridServerHello(secret []byte, clientHello *ClientHello, opts *ServerHelloOptions) ([]byte, error) {
 	if opts.RealServerHelloRandomOffset < 11 || opts.RealServerHelloRandomOffset+32 > len(opts.RealServerHello) {
 		return nil, fmt.Errorf("invalid RealServerHelloRandomOffset: %d (response len: %d)",
 			opts.RealServerHelloRandomOffset, len(opts.RealServerHello))
 	}
 
-	// Make a copy of the real ServerHello response
-	packet := make([]byte, len(opts.RealServerHello))
-	copy(packet, opts.RealServerHello)
+	buf := &bytes.Buffer{}
 
-	// Zero out the random field for HMAC computation
+	// Write the real ServerHello record (with zeroed random for now)
+	serverHelloRecord := make([]byte, len(opts.RealServerHello))
+	copy(serverHelloRecord, opts.RealServerHello)
 	randomOffset := opts.RealServerHelloRandomOffset
 	for i := range 32 {
-		packet[randomOffset+i] = 0
+		serverHelloRecord[randomOffset+i] = 0
 	}
+	buf.Write(serverHelloRecord)
 
-	// Compute HMAC: SHA256(secret, client_random || packet_with_zeroed_random)
+	// Append synthetic ChangeCipherSpec + ApplicationData (same as legacy)
+	writeRecordTLS12(buf, RecordTypeChangeCipherSpec, []byte{0x01})
+
+	paddingLen := 1024 + int(time.Now().UnixNano()%3092)
+	encryptedData := make([]byte, paddingLen)
+	rand.Read(encryptedData)
+	writeApplicationDataChunked(buf, encryptedData)
+
+	// Compute HMAC over the entire packet
+	packet := buf.Bytes()
 	mac := hmac.New(sha256.New, secret)
 	mac.Write(clientHello.Random[:])
 	mac.Write(packet)
 	serverRandom := mac.Sum(nil)
 
-	// Patch the random field with our HMAC
+	// Patch the random field
 	copy(packet[randomOffset:], serverRandom)
 
 	return packet, nil

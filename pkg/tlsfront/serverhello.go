@@ -116,6 +116,17 @@ func (f *ServerHelloFetcher) fetchAndCache() ([]byte, int, error) {
 		return nil, 0, fmt.Errorf("parse ServerHello: %w", parseErr)
 	}
 
+	// Extract ONLY the first TLS record (ServerHello).
+	// The full response may contain Certificate, ServerKeyExchange, etc.
+	// which the Telegram client doesn't expect. We'll append synthetic
+	// ChangeCipherSpec + ApplicationData in buildHybridServerHello.
+	if len(response) >= 5 {
+		firstRecordLen := 5 + int(binary.BigEndian.Uint16(response[3:5]))
+		if firstRecordLen <= len(response) {
+			response = response[:firstRecordLen]
+		}
+	}
+
 	// Cache it
 	f.cachedFull = make([]byte, len(response))
 	copy(f.cachedFull, response)
