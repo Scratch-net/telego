@@ -80,7 +80,7 @@ release:
     name: telego
   draft: false
   prerelease: auto
-  mode: replace
+  mode: keep-existing
   header: |
     ## TeleGO {{ .Tag }}
 
