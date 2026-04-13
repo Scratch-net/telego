@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="docs/logo.jpg" alt="TeleGO Logo" width="200">
+  <img src="docs/logo.jpg" alt="telEgo Logo" width="200">
 </p>
 
-<h1 align="center">TeleGO</h1> <!-- Название проекта читается "ТелЕго", см https://ru.wikipedia.org/wiki/%D0%96%D0%B0%D1%80%D0%B3%D0%BE%D0%BD_%D0%BF%D0%B0%D0%B4%D0%BE%D0%BD%D0%BA%D0%BE%D0%B2 -->
+<h1 align="center">telEgo</h1> <!-- Название проекта читается "ТелЕго", см https://ru.wikipedia.org/wiki/%D0%96%D0%B0%D1%80%D0%B3%D0%BE%D0%BD_%D0%BF%D0%B0%D0%B4%D0%BE%D0%BD%D0%BA%D0%BE%D0%B2 -->
 
 <p align="center">
   <strong>High-performance Telegram MTProxy in Go with TLS fronting</strong>
@@ -33,7 +33,7 @@
 
 ---
 
-> **Telegram blocked in your country?** TeleGO's TLS fronting makes your proxy indistinguishable from regular HTTPS traffic to censors. [Get started in 2 minutes](#quick-start)
+> **Telegram blocked in your country?** telEgo's TLS fronting makes your proxy indistinguishable from regular HTTPS traffic to censors. [Get started in 2 minutes](#quick-start)
 
 ---
 
@@ -128,7 +128,7 @@ The `-l` flag prints Telegram proxy links with auto-detected public IP.
 
 ## Protocol Modes
 
-TeleGO supports two MTProxy protocol variants on a single port with auto-detection:
+telEgo supports two MTProxy protocol variants on a single port with auto-detection:
 
 | Mode | Secret Prefix | Description | Best For |
 |------|---------------|-------------|----------|
@@ -139,7 +139,7 @@ TeleGO supports two MTProxy protocol variants on a single port with auto-detecti
 
 **Raw (dd)** sends Obfuscated2 directly without TLS wrapping. Lower overhead but easier to fingerprint. Useful for compatibility with older clients or when TLS fronting isn't needed.
 
-Both modes use the same 16-byte secret key. The `ee` or `dd` prefix in the client link determines which mode the client uses. TeleGO auto-detects the protocol from the first bytes of each connection.
+Both modes use the same 16-byte secret key. The `ee` or `dd` prefix in the client link determines which mode the client uses. telEgo auto-detects the protocol from the first bytes of each connection.
 
 ---
 
@@ -264,7 +264,7 @@ docker run -d -p 443:443 -v ./config.toml:/config.toml telego
 
 ## Behind a Reverse Proxy
 
-TeleGO can run behind HAProxy or nginx using Unix sockets and PROXY protocol:
+telEgo can run behind HAProxy or nginx using Unix sockets and PROXY protocol:
 
 **config.toml:**
 ```toml
@@ -319,7 +319,7 @@ Service file is installed to `/etc/systemd/system/telego.service`.
 
 ## Config Hot-Reload
 
-TeleGO supports runtime configuration reloading without restart:
+telEgo supports runtime configuration reloading without restart:
 
 **Via SIGHUP:**
 ```bash
@@ -386,7 +386,7 @@ WRN [#2:bob] DC 4 closed (30s): i/o timeout (active: 0)
 
 ## Metrics
 
-TeleGO exposes Prometheus metrics when configured:
+telEgo exposes Prometheus metrics when configured:
 
 ```toml
 [metrics]
@@ -413,7 +413,7 @@ All metrics include a `user` label for per-user breakdown.
 
 ```
 ┌─────────────┐     ┌──────────────────────────────────────┐     ┌──────────┐
-│   Client    │────▶│              TeleGO                  │────▶│ Telegram │
+│   Client    │────▶│              telEgo                  │────▶│ Telegram │
 │ (Telegram)  │◀────│      Auto-detect ee/dd protocol      │◀────│    DC    │
 └─────────────┘     │                                      │     └──────────┘
                     │  ee: FakeTLS ─▶ Obfuscated2 ─▶ Relay │
