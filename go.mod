@@ -11,7 +11,7 @@ require (
 	github.com/pelletier/go-toml/v2 v2.3.0
 	github.com/pion/stun/v3 v3.1.2
 	github.com/prometheus/client_golang v1.23.2
-	github.com/rs/zerolog v1.35.0
+	github.com/rs/zerolog v1.35.1
 	github.com/zeebo/blake3 v0.2.4
 	go.opentelemetry.io/otel v1.43.0
 	go.opentelemetry.io/otel/exporters/prometheus v0.65.0
