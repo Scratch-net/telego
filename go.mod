@@ -18,7 +18,7 @@ require (
 	go.opentelemetry.io/otel/metric v1.43.0
 	go.opentelemetry.io/otel/sdk/metric v1.43.0
 	golang.org/x/net v0.53.0
-	golang.org/x/sys v0.43.0
+	golang.org/x/sys v0.44.0
 )
 
 require (
