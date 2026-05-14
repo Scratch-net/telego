@@ -24,6 +24,7 @@
   <a href="#quick-start">Quick Start</a> •
   <a href="#configuration">Configuration</a> •
   <a href="#docker">Docker</a> •
+  <a href="#nginx--lets-encrypt-real-certificate-tls">Nginx + LE</a> •
   <a href="#performance">Performance</a>
 </p>
 
@@ -300,6 +301,79 @@ server {
     proxy_protocol on;
 }
 ```
+
+---
+
+## Nginx + Let's Encrypt (Real Certificate TLS)
+
+Some censorship systems (e.g., TSPU) validate the TLS certificate against the SNI hostname. If your proxy gets blocked on mobile or connects intermittently, you may need a **real** certificate for your domain instead of borrowing one from a mask host.
+
+The `deploy-nginx.sh` script sets up nginx with a Let's Encrypt certificate alongside telego in Docker:
+
+```
+Port 443 (host) --> telego (MTProxy TLS fronting)
+                      |-- valid client  --> Telegram DCs
+                      |-- cert fetch    --> nginx:8443 (real LE cert)
+                      +-- probe/unknown --> nginx:8443 (decoy website)
+Port 80  (host) --> nginx (ACME challenges + HTTPS redirect)
+```
+
+Censors and probes see a valid certificate for your domain and a real HTTPS website.
+
+### Prerequisites
+
+- VPS with Docker
+- A domain pointing to your VPS IP (e.g., via [FreeDNS](https://freedns.afraid.org/))
+- Ports 80 and 443 free
+- Telego config file already in place
+
+### Usage
+
+```bash
+./deploy-nginx.sh -d <domain> -e <email> [options]
+```
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-d` | Domain name (required) | |
+| `-e` | Email for Let's Encrypt (required) | |
+| `-D` | Telego directory | `~/telego` |
+| `-c` | Telego config filename | `config.toml` |
+| `-p` | Telego port | `443` |
+
+Example:
+
+```bash
+./deploy-nginx.sh -d myproxy.example.com -e admin@example.com -c config.toml
+```
+
+### What it does
+
+1. If no telego config exists, creates one with the correct `[tls-fronting]` settings and exits -- add your secrets and re-run
+2. Stops any existing `telego` and `telego-nginx` containers
+3. Obtains a Let's Encrypt certificate (standalone mode, skips if cert exists)
+4. Starts nginx (port 80 for ACME, internal port 8443 with the real cert)
+5. Pulls and starts telego on a shared Docker network with nginx
+6. Adds a daily cron job for certificate renewal
+
+### First run
+
+On a fresh server, the first run creates the config and exits:
+
+```bash
+./deploy-nginx.sh -d myproxy.example.com -e admin@example.com
+# Config created at: ~/telego/config.toml
+# Add at least one secret before running again
+```
+
+Generate a secret and add it to the config:
+
+```bash
+docker run --rm scratchnet/telego:latest generate myproxy.example.com
+# Paste the hex string into [secrets] section of config.toml
+```
+
+Then run the script again to deploy:
 
 ---
 
