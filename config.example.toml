@@ -68,6 +68,14 @@ mask-host = "www.google.com"
 # Shorter than authenticated connections since these are just decoy traffic.
 # splice-idle-timeout = "30s"
 
+# Anti-DPI record shaping on the proxy -> client direction.
+# Both default to true. Set to false to disable.
+# enable-drs = true        # Chrome-style probe-then-ramp record sizer:
+#                          # outbound ApplicationData starts at 1369-byte records,
+#                          # ramps to 16384 after 8 records or 128 KB.
+# enable-split-tls = true  # Emit first outbound ApplicationData record as 1 byte
+#                          # to defeat passive signatures keyed on the first record.
+
 # Performance tuning (all optional)
 [performance]
 # IP preference for DC connections: prefer-ipv4, prefer-ipv6, only-ipv4, only-ipv6

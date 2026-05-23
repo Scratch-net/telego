@@ -53,6 +53,8 @@
 - **Key Zeroization** — Sensitive data (session IDs, random bytes) zeroed on connection close
 - **Desync Detection** — Detects crypto state divergence via abnormal frame sizes
 - **Dual Protocol Support** — FakeTLS (ee) and raw Obfuscated2 (dd) with auto-detection on single port
+- **Dynamic Record Sizer (DRS)** — Outbound TLS ApplicationData starts with 1369-byte records and ramps to full size after 8 records or 128 KB, mimicking Chrome/Firefox steady-state record patterns
+- **Split-TLS** — First outbound ApplicationData record is emitted as a 1-byte record to defeat passive signatures keyed on the first record
 
 ### Operations
 - **Multi-user Support** — Named secrets with per-user tracking and logging
@@ -190,6 +192,10 @@ mask-host = "www.google.com"  # Host to mimic (SNI validation, proxy links)
 # splice-port = 8080          # Splice port (default: mask-port)
 # splice-proxy-protocol = 1   # PROXY protocol to splice: 0=off, 1=v1(text), 2=v2(binary)
 # splice-idle-timeout = "30s" # Idle timeout for spliced connections (default: 30s)
+
+# Anti-DPI record shaping (proxy -> client direction)
+# enable-drs = true        # Probe-then-ramp record sizing (1369 -> 16384 bytes after 8 records or 128 KB)
+# enable-split-tls = true  # Emit first ApplicationData record as 1 byte
 
 # Performance tuning (all optional)
 [performance]
