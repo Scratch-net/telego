@@ -52,6 +52,11 @@ type DCConnContext struct {
 	// Backpressure state for hysteresis (avoids oscillation at threshold boundaries)
 	// Once throttled, stays throttled until buffer drops below resumeAt
 	throttledToClient atomic.Bool // DC->Client direction is throttled
+
+	// drs shapes outbound TLS ApplicationData records for anti-DPI.
+	// Mutated only from the dcClient event loop (single goroutine), so no
+	// synchronization is needed. nil = legacy fixed-size chunking.
+	drs *faketls.DRSState
 }
 
 // OnTraffic handles data arriving from DC.
@@ -165,9 +170,16 @@ func (h *ProxyHandler) handleDCTraffic(dcConn gnet.Conn, dcCtx *DCConnContext) g
 		counter.Add(int64(len(processData)))
 	}
 
-	// Calculate TLS output size
-	numRecords := (len(processData) + faketls.MaxRecordPayload - 1) / faketls.MaxRecordPayload
-	tlsSize := len(processData) + numRecords*faketls.RecordHeaderSize
+	// Calculate TLS output size.
+	// With DRS/split-TLS active, record sizes vary so PlanSize simulates the
+	// upcoming chunking. Without DRS the formula is identical to the legacy one.
+	var tlsSize int
+	if dcCtx.drs != nil {
+		tlsSize = dcCtx.drs.PlanSize(len(processData))
+	} else {
+		numRecords := (len(processData) + faketls.MaxRecordPayload - 1) / faketls.MaxRecordPayload
+		tlsSize = len(processData) + numRecords*faketls.RecordHeaderSize
+	}
 
 	// Get buffer from pool
 	tlsBufPtr := h.dcBufPool.Get()
@@ -185,7 +197,13 @@ func (h *ProxyHandler) handleDCTraffic(dcConn gnet.Conn, dcCtx *DCConnContext) g
 	srcOffset := 0
 	dstOffset := 0
 	for srcOffset < len(processData) {
-		chunk := min(faketls.MaxRecordPayload, len(processData)-srcOffset)
+		remaining := len(processData) - srcOffset
+		var chunk int
+		if dcCtx.drs != nil {
+			chunk = dcCtx.drs.NextChunk(remaining)
+		} else {
+			chunk = min(faketls.MaxRecordPayload, remaining)
+		}
 
 		// Write TLS header
 		tlsBuf[dstOffset] = faketls.RecordTypeApplicationData
@@ -201,6 +219,9 @@ func (h *ProxyHandler) handleDCTraffic(dcConn gnet.Conn, dcCtx *DCConnContext) g
 		// Encrypt for client (in-place)
 		dcCtx.ClientEncrypt.XORKeyStream(tlsBuf[dstOffset:dstOffset+chunk], tlsBuf[dstOffset:dstOffset+chunk])
 
+		if dcCtx.drs != nil {
+			dcCtx.drs.Advance(chunk)
+		}
 		dstOffset += chunk
 		srcOffset += chunk
 	}
@@ -213,10 +234,17 @@ func (h *ProxyHandler) handleDCTraffic(dcConn gnet.Conn, dcCtx *DCConnContext) g
 	// but c.loop is the SERVER event loop while we're on DC goroutine.
 	// This causes concurrent map writes in server's connMatrix.
 	// AsyncWrite queues to owning event loop via poller.Trigger().
+	//
+	// Slice to dstOffset rather than the pre-sized tlsBuf: the two are equal
+	// under current code (PlanSize and the real loop run in lockstep), but
+	// slicing defensively guards against any future drift between predicted
+	// and actual record output, and ensures we never send unwritten pool
+	// buffer bytes past the real data.
+	out := tlsBuf[:dstOffset]
 	var err error
 	if tlsBufPtr != nil {
 		poolRef := tlsBufPtr
-		err = clientConn.AsyncWrite(tlsBuf, func(_ gnet.Conn, _ error) error {
+		err = clientConn.AsyncWrite(out, func(_ gnet.Conn, _ error) error {
 			h.dcBufPool.Put(poolRef)
 			return nil
 		})
@@ -224,7 +252,7 @@ func (h *ProxyHandler) handleDCTraffic(dcConn gnet.Conn, dcCtx *DCConnContext) g
 			h.dcBufPool.Put(poolRef)
 		}
 	} else {
-		err = clientConn.AsyncWrite(tlsBuf, nil)
+		err = clientConn.AsyncWrite(out, nil)
 	}
 	if err != nil {
 		return gnet.Close

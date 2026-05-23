@@ -68,6 +68,16 @@ type Config struct {
 	// Backpressure
 	MaxWriteBuffer int // Max pending bytes per connection before closing (0 = 4MB default)
 
+	// Anti-DPI record shaping (proxy -> client direction).
+	// EnableDRS turns on the Chrome-style probe-then-ramp record sizer:
+	// outbound TLS ApplicationData starts with 1369-byte records and ramps
+	// to full size after 8 records or 128 KB.
+	EnableDRS bool
+	// EnableSplitTLS emits the first outbound ApplicationData record as a
+	// 1-byte record before continuing normally. Defeats passive signatures
+	// keyed on the first record.
+	EnableSplitTLS bool
+
 	// gnet-specific
 	Multicore    bool // Use multiple event loops
 	ReusePort    bool // Enable SO_REUSEPORT
@@ -87,6 +97,8 @@ func DefaultConfig() Config {
 		Multicore:         true,
 		ReusePort:         true,
 		LockOSThread:      true,
+		EnableDRS:         true,
+		EnableSplitTLS:    true,
 	}
 }
 

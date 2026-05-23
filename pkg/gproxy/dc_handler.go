@@ -12,6 +12,7 @@ import (
 
 	"github.com/scratch-net/telego/pkg/dc"
 	"github.com/scratch-net/telego/pkg/netx"
+	"github.com/scratch-net/telego/pkg/transport/faketls"
 	"github.com/scratch-net/telego/pkg/transport/obfuscated2"
 )
 
@@ -102,6 +103,15 @@ func (h *ProxyHandler) dialDC(clientConn gnet.Conn, ctx *ConnContext) {
 		DCDecrypt:     ddc.decryptor,
 		ClientEncrypt: clientEncryptor,
 		// DCConn set below after Enroll
+	}
+
+	// DRS / Split-TLS only apply to FakeTLS (EE) mode — DD mode is a raw stream.
+	if ctx.ProtocolMode() == ModeEE && (h.config.EnableDRS || h.config.EnableSplitTLS) {
+		dcCtx.drs = faketls.NewDRSState(
+			h.config.EnableDRS,
+			h.config.EnableSplitTLS,
+			faketls.MaxRecordPayload,
+		)
 	}
 
 	// Get fd and store context in map BEFORE Enroll - eliminates race completely

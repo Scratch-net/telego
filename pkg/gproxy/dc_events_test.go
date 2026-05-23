@@ -1,8 +1,11 @@
 package gproxy
 
 import (
+	"encoding/binary"
 	"testing"
 	"time"
+
+	"github.com/scratch-net/telego/pkg/transport/faketls"
 )
 
 func TestDCConnContext_Fields(t *testing.T) {
@@ -524,5 +527,148 @@ func BenchmarkHandleDCTraffic(b *testing.B) {
 		b.StartTimer()
 
 		handler.handleDCTraffic(mockDCConn, dcCtx)
+	}
+}
+
+// parseTLSRecordSizes walks a sequence of TLS records and returns the
+// sequence of ApplicationData payload sizes. Fails the test on malformed input.
+func parseTLSRecordSizes(t *testing.T, buf []byte) []int {
+	t.Helper()
+	var sizes []int
+	for len(buf) > 0 {
+		if len(buf) < faketls.RecordHeaderSize {
+			t.Fatalf("trailing %d bytes < record header", len(buf))
+		}
+		if buf[0] != faketls.RecordTypeApplicationData {
+			t.Fatalf("unexpected record type 0x%02x", buf[0])
+		}
+		size := int(binary.BigEndian.Uint16(buf[3:5]))
+		if size+faketls.RecordHeaderSize > len(buf) {
+			t.Fatalf("record claims %d bytes but only %d remain", size, len(buf)-faketls.RecordHeaderSize)
+		}
+		sizes = append(sizes, size)
+		buf = buf[faketls.RecordHeaderSize+size:]
+	}
+	return sizes
+}
+
+// TestHandleDCTraffic_DRSChunking verifies that the DC->client write path
+// emits the expected record sizes when DRS + Split-TLS are active.
+func TestHandleDCTraffic_DRSChunking(t *testing.T) {
+	logger := &testLogger{}
+	handler := NewProxyHandler(&Config{
+		MaxWriteBuffer: 4 * 1024 * 1024,
+	}, logger)
+
+	mockDCConn := newTestMockGnetConn()
+	mockClientConn := newTestMockGnetConn()
+
+	clientCtx := NewConnContext()
+	clientCtx.SetState(StateRelaying)
+	clientCtx.SetProtocolMode(ModeEE)
+
+	dcCtx := &DCConnContext{
+		ClientConn:    mockClientConn,
+		ClientCtx:     clientCtx,
+		DCDecrypt:     &mockStream{},
+		ClientEncrypt: &mockStream{},
+		drs:           faketls.NewDRSState(true, true, faketls.MaxRecordPayload),
+	}
+	mockDCConn.SetContext(dcCtx)
+
+	// Send enough data to clear the probe phase: 1 split-byte + 7 probe records
+	// (1369 bytes each) + a remainder in the full-size regime.
+	const payloadLen = 50000
+	payload := make([]byte, payloadLen)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	mockDCConn.SetReadData(payload)
+
+	if action := handler.handleDCTraffic(mockDCConn, dcCtx); action != 0 {
+		t.Fatalf("expected gnet.None, got %d", action)
+	}
+
+	asyncWrites := mockClientConn.GetAsyncWrites()
+	if len(asyncWrites) != 1 {
+		t.Fatalf("expected exactly 1 AsyncWrite call, got %d", len(asyncWrites))
+	}
+
+	sizes := parseTLSRecordSizes(t, asyncWrites[0])
+
+	// Expected: [1, 1369, 1369, 1369, 1369, 1369, 1369, 1369, 16640, 16640, ...]
+	// Split first record = 1 byte. Then 7 probe records at 1369 (reaching
+	// DRSRampRecords = 8 total). Probe payload total: 1 + 7*1369 = 9584.
+	// Remaining: 50000 - 9584 = 40416. Full-size records: 16640, 16640, 7136.
+	expected := []int{
+		1,
+		faketls.DRSProbeSize, faketls.DRSProbeSize, faketls.DRSProbeSize,
+		faketls.DRSProbeSize, faketls.DRSProbeSize, faketls.DRSProbeSize,
+		faketls.DRSProbeSize,
+		faketls.MaxRecordPayload, faketls.MaxRecordPayload, 7136,
+	}
+	if len(sizes) != len(expected) {
+		t.Fatalf("record count: got %d, want %d (sizes: %v)", len(sizes), len(expected), sizes)
+	}
+	for i, want := range expected {
+		if sizes[i] != want {
+			t.Errorf("record[%d]: got %d, want %d", i, sizes[i], want)
+		}
+	}
+
+	// Total payload bytes across records must equal input.
+	total := 0
+	for _, s := range sizes {
+		total += s
+	}
+	if total != payloadLen {
+		t.Errorf("payload total: got %d, want %d", total, payloadLen)
+	}
+}
+
+// TestHandleDCTraffic_NoDRS_LegacyChunking verifies that with drs=nil the
+// chunking matches the original single-size MaxRecordPayload behavior.
+func TestHandleDCTraffic_NoDRS_LegacyChunking(t *testing.T) {
+	logger := &testLogger{}
+	handler := NewProxyHandler(&Config{
+		MaxWriteBuffer: 4 * 1024 * 1024,
+	}, logger)
+
+	mockDCConn := newTestMockGnetConn()
+	mockClientConn := newTestMockGnetConn()
+
+	clientCtx := NewConnContext()
+	clientCtx.SetState(StateRelaying)
+	clientCtx.SetProtocolMode(ModeEE)
+
+	dcCtx := &DCConnContext{
+		ClientConn:    mockClientConn,
+		ClientCtx:     clientCtx,
+		DCDecrypt:     &mockStream{},
+		ClientEncrypt: &mockStream{},
+		// drs intentionally nil — exercises the legacy fixed-size path.
+	}
+	mockDCConn.SetContext(dcCtx)
+
+	const payloadLen = 50000
+	payload := make([]byte, payloadLen)
+	mockDCConn.SetReadData(payload)
+
+	if action := handler.handleDCTraffic(mockDCConn, dcCtx); action != 0 {
+		t.Fatalf("expected gnet.None, got %d", action)
+	}
+
+	sizes := parseTLSRecordSizes(t, mockClientConn.GetAsyncWrites()[0])
+	// 50000 / 16640 = 3 records of 16640 + 1 record of 80.
+	expected := []int{
+		faketls.MaxRecordPayload, faketls.MaxRecordPayload, faketls.MaxRecordPayload, 80,
+	}
+	if len(sizes) != len(expected) {
+		t.Fatalf("record count: got %d, want %d (sizes: %v)", len(sizes), len(expected), sizes)
+	}
+	for i, want := range expected {
+		if sizes[i] != want {
+			t.Errorf("record[%d]: got %d, want %d", i, sizes[i], want)
+		}
 	}
 }

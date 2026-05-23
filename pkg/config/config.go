@@ -60,6 +60,11 @@ type TLSFrontingConfig struct {
 	SplicePort          int      `toml:"splice-port"`
 	SpliceProxyProtocol int      `toml:"splice-proxy-protocol"` // 0=off, 1=v1, 2=v2
 	SpliceIdleTimeout   Duration `toml:"splice-idle-timeout"`   // Idle timeout for splice connections (default 30s)
+
+	// Anti-DPI record shaping on the proxy->client direction.
+	// Pointers so an absent TOML key keeps the gproxy.DefaultConfig() default (true).
+	EnableDRS      *bool `toml:"enable-drs"`       // Chrome-style probe-then-ramp record sizer
+	EnableSplitTLS *bool `toml:"enable-split-tls"` // 1-byte first ApplicationData record
 }
 
 // PerformanceConfig configures performance settings.
@@ -182,6 +187,13 @@ func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
 	}
 	cfg.SpliceProxyProtocol = c.TLSFronting.SpliceProxyProtocol
 	cfg.SpliceIdleTimeout = c.TLSFronting.SpliceIdleTimeout.Duration()
+
+	if c.TLSFronting.EnableDRS != nil {
+		cfg.EnableDRS = *c.TLSFronting.EnableDRS
+	}
+	if c.TLSFronting.EnableSplitTLS != nil {
+		cfg.EnableSplitTLS = *c.TLSFronting.EnableSplitTLS
+	}
 
 	// Performance
 	cfg.IdleTimeout = c.Performance.IdleTimeout.Duration()
