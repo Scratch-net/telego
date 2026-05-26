@@ -7,7 +7,7 @@ require (
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/gotd/td v0.144.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
-	github.com/panjf2000/gnet/v2 v2.9.7
+	github.com/panjf2000/gnet/v2 v2.9.8
 	github.com/pelletier/go-toml/v2 v2.3.1
 	github.com/pion/stun/v3 v3.1.2
 	github.com/prometheus/client_golang v1.23.2
@@ -44,7 +44,7 @@ require (
 	github.com/mattn/go-isatty v0.0.22 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/ogen-go/ogen v1.20.3 // indirect
-	github.com/panjf2000/ants/v2 v2.12.0 // indirect
+	github.com/panjf2000/ants/v2 v2.12.1 // indirect
 	github.com/pion/dtls/v3 v3.1.2 // indirect
 	github.com/pion/logging v0.2.4 // indirect
 	github.com/pion/transport/v4 v4.0.1 // indirect
