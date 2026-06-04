@@ -5,7 +5,7 @@ go 1.26
 require (
 	github.com/alecthomas/kong v1.15.0
 	github.com/fsnotify/fsnotify v1.10.1
-	github.com/gotd/td v0.144.0
+	github.com/gotd/td v0.145.1
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/panjf2000/gnet/v2 v2.9.8
 	github.com/pelletier/go-toml/v2 v2.3.1
