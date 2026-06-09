@@ -9,7 +9,7 @@ require (
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/panjf2000/gnet/v2 v2.9.8
 	github.com/pelletier/go-toml/v2 v2.3.1
-	github.com/pion/stun/v3 v3.1.4
+	github.com/pion/stun/v3 v3.1.5
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rs/zerolog v1.35.1
 	github.com/zeebo/blake3 v0.2.4
@@ -45,7 +45,7 @@ require (
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/ogen-go/ogen v1.20.3 // indirect
 	github.com/panjf2000/ants/v2 v2.12.1 // indirect
-	github.com/pion/dtls/v3 v3.1.3 // indirect
+	github.com/pion/dtls/v3 v3.1.4 // indirect
 	github.com/pion/logging v0.2.4 // indirect
 	github.com/pion/transport/v4 v4.0.2 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
