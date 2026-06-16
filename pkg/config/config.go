@@ -41,6 +41,7 @@ type GeneralConfig struct {
 	MaxIPsPerUser       int      `toml:"max-ips-per-user"`       // Max unique IPs per user, 0 = unlimited
 	IPBlockTimeout      Duration `toml:"ip-block-timeout"`       // How long blocked IPs stay blocked
 	HandshakeTimeout    Duration `toml:"handshake-timeout"`      // Max time for handshake (default 5s)
+	ClockSyncURL        string   `toml:"clock-sync-url"`         // HTTPS URL whose Date header corrects a skewed server clock at startup
 }
 
 // TLSFrontingConfig configures TLS fronting.
@@ -53,6 +54,16 @@ type TLSFrontingConfig struct {
 	// Useful when cert must be fetched from local nginx bypassing front proxy
 	CertHost string `toml:"cert-host"`
 	CertPort int    `toml:"cert-port"`
+
+	// FakeCertSize sets the exact size of the fake encrypted-certificate record
+	// in the FakeTLS ServerHello. 0 = auto (match the mask backend's real cert
+	// record size). Set to the backend's first cert-record size to remove the
+	// accept-vs-mask cert-record-length tell.
+	FakeCertSize int `toml:"fake-cert-size"`
+
+	// MaskSNISafelist: opt-in extra domains an unauthenticated probe may be
+	// fronted to when its ClientHello SNI matches. Empty = off (never a relay).
+	MaskSNISafelist []string `toml:"mask-sni-safelist"`
 
 	// Splice target - where to forward unrecognized clients
 	// Defaults to mask-host:mask-port if not set
@@ -74,6 +85,11 @@ type PerformanceConfig struct {
 	PreferIP         string   `toml:"prefer-ip"`
 	IdleTimeout      Duration `toml:"idle-timeout"`
 	MaxWriteBufferMB int      `toml:"max-write-buffer-mb"` // Max pending bytes per connection (0 = 4MB)
+	// ClientSilenceClose: close a relay whose server reply has gone unanswered by
+	// the client for this long (breaks the iOS bad_salt "Updating" wedge).
+	// 0 = off. If enabled, keep it well above your slowest legitimate response;
+	// ~10-15s is a sane starting point.
+	ClientSilenceClose Duration `toml:"client-silence-close"`
 }
 
 // UpstreamConfig configures upstream (DC) connection settings.
@@ -175,6 +191,8 @@ func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
 	if cfg.CertPort == 0 {
 		cfg.CertPort = cfg.MaskPort
 	}
+	cfg.FakeCertSize = c.TLSFronting.FakeCertSize
+	cfg.MaskSNISafelist = c.TLSFronting.MaskSNISafelist
 
 	// Splice target (defaults to mask-host:mask-port if not set)
 	cfg.SpliceHost = c.TLSFronting.SpliceHost
@@ -200,6 +218,7 @@ func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
 	if cfg.IdleTimeout == 0 {
 		cfg.IdleTimeout = 5 * time.Minute
 	}
+	cfg.ClientSilenceClose = c.Performance.ClientSilenceClose.Duration()
 	cfg.NumEventLoop = c.Performance.NumEventLoops
 
 	switch strings.ToLower(c.Performance.PreferIP) {
@@ -223,6 +242,7 @@ func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
 	cfg.MaxConnectionsPerIP = c.General.MaxConnectionsPerIP
 	cfg.HandshakeTimeout = c.General.HandshakeTimeout.Duration()
 	cfg.MaxIPsPerUser = c.General.MaxIPsPerUser
+	cfg.ClockSyncURL = c.General.ClockSyncURL
 	cfg.IPBlockTimeout = c.General.IPBlockTimeout.Duration()
 	if cfg.IPBlockTimeout == 0 {
 		cfg.IPBlockTimeout = 5 * time.Minute

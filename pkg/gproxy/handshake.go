@@ -239,6 +239,17 @@ func (h *ProxyHandler) handleTLSPayload(c gnet.Conn, ctx *ConnContext) gnet.Acti
 			fmt.Fprintf(&hexDump, "%02x ", payload[i])
 		}
 		h.logger.Debug("[#%d] no matching secret found (payload len=%d, first bytes: %s)", ctx.id, len(payload), hexDump.String())
+
+		// SNI-following: if this probe's claimed SNI is on the mask safelist,
+		// front it to that domain's own server instead of the default target.
+		if len(h.maskSafelist) > 0 {
+			if sni := faketls.ExtractSNI(payload); sni != "" {
+				if target, ok := h.maskSafelist[strings.ToLower(sni)]; ok {
+					ctx.SetSpliceOverride(target)
+					h.logger.Debug("[#%d] SNI %q safelisted, fronting to %s", ctx.id, sni, target)
+				}
+			}
+		}
 		return h.startSplice(c, ctx)
 	}
 
@@ -316,9 +327,17 @@ func (h *ProxyHandler) handleTLSPayload(c gnet.Conn, ctx *ConnContext) gnet.Acti
 	if h.serverHelloFetcher != nil {
 		realHello, randomOffset, fetchErr := h.serverHelloFetcher.GetServerHelloTemplate()
 		if fetchErr == nil && len(realHello) > 0 {
+			// Size the fake cert record to match the mask backend (config override,
+			// else the captured real first cert-record size) so the accept path and
+			// the splice path show the same cert-record length.
+			certSize := h.config.FakeCertSize
+			if certSize == 0 {
+				certSize = h.serverHelloFetcher.CertRecordLen()
+			}
 			opts := &faketls.ServerHelloOptions{
 				RealServerHello:             realHello,
 				RealServerHelloRandomOffset: randomOffset,
+				FakeCertSize:                certSize,
 			}
 			response, err = faketls.BuildServerHelloWithOptions(matchedSecret.Key, hello, opts)
 			if err != nil {

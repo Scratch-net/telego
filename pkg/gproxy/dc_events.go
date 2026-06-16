@@ -170,6 +170,11 @@ func (h *ProxyHandler) handleDCTraffic(dcConn gnet.Conn, dcCtx *DCConnContext) g
 		counter.Add(int64(len(processData)))
 	}
 
+	// Record server downlink activity for the silence wedge breaker.
+	if h.clientSilenceCloseMs > 0 && len(processData) > 0 {
+		clientCtx.lastServerByteMs.Store(time.Now().UnixMilli())
+	}
+
 	// Calculate TLS output size.
 	// With DRS/split-TLS active, record sizes vary so PlanSize simulates the
 	// upcoming chunking. Without DRS the formula is identical to the legacy one.
@@ -311,6 +316,11 @@ func (h *ProxyHandler) handleDCTrafficDD(dcConn gnet.Conn, dcCtx *DCConnContext)
 	// Count traffic (DC -> client = download/out)
 	if counter := clientCtx.TrafficOut(); counter != nil {
 		counter.Add(int64(len(processData)))
+	}
+
+	// Record server downlink activity for the silence wedge breaker.
+	if h.clientSilenceCloseMs > 0 && len(processData) > 0 {
+		clientCtx.lastServerByteMs.Store(time.Now().UnixMilli())
 	}
 
 	// Get buffer from pool

@@ -31,6 +31,13 @@ log-level = "info"
 # How long evicted IPs stay blocked (refreshes on connection attempts)
 # ip-block-timeout = "5m"
 
+# Correct a skewed server clock at startup from a remote HTTP Date header.
+# The FakeTLS handshake check rejects clients whose timestamp is outside a few
+# seconds of the server clock; on a VPS without NTP a wrong clock locks out
+# everyone. When set, this URL is fetched once at boot and its Date header
+# offset (clamped to +-1 day) is applied to the check. Empty = off.
+# clock-sync-url = "https://www.cloudflare.com"
+
 # Named secrets (32 hex characters = 16 bytes)
 # Generate with: telego generate <hostname>
 [secrets]
@@ -68,6 +75,20 @@ mask-host = "www.google.com"
 # Shorter than authenticated connections since these are just decoy traffic.
 # splice-idle-timeout = "30s"
 
+# Size (bytes) of the fake encrypted-certificate record in the FakeTLS
+# ServerHello. 0 = auto: match the mask backend's real first cert-record size
+# (captured when fetching the ServerHello), so the accept path and the splice
+# (probe) path present the same cert-record length. Set an explicit value only
+# to override. Clamped to 256..16384.
+# fake-cert-size = 0
+
+# SNI-following mask safelist (opt-in active-probe robustness).
+# When an unauthenticated probe presents a ClientHello whose SNI is on this
+# list, it is fronted to THAT domain's own server (port 443) instead of the
+# default splice target, so the on-wire conversation matches the claimed SNI.
+# Empty = off; never an open relay (only these exact domains).
+# mask-sni-safelist = ["www.microsoft.com", "www.apple.com"]
+
 # Anti-DPI record shaping on the proxy -> client direction.
 # Both default to true. Set to false to disable.
 # enable-drs = true        # Chrome-style probe-then-ramp record sizer:
@@ -83,6 +104,18 @@ prefer-ip = "prefer-ipv4"
 
 # Connection idle timeout
 idle-timeout = "5m"
+
+# Break the iOS "Updating" wedge (bad_server_salt). After a long background, an
+# iOS client can discard the DC's salt and stop sending, hanging ~90-120s until
+# the DC closes the socket. When set, the proxy closes a relay whose last
+# relayed payload was server->client and has gone unanswered by the client for
+# this long, triggering an instant (~450ms) clean reconnect. A healthy idle
+# connection (whose last word was its own request/ack) is never touched.
+# Best-effort: a value below your slowest legitimate server response will
+# occasionally close a healthy connection too (just a brief reconnect). Keep it
+# well above that. 0 = off (default); ~10-15s is a sane starting point.
+# Requires a restart to change (enables the engine ticker).
+# client-silence-close = "12s"
 
 # Number of event loops (0 = auto, uses all CPU cores)
 num-event-loops = 0

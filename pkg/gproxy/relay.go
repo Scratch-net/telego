@@ -2,6 +2,7 @@ package gproxy
 
 import (
 	"encoding/binary"
+	"time"
 
 	"github.com/panjf2000/gnet/v2"
 
@@ -142,6 +143,11 @@ func (h *ProxyHandler) handleRelay(c gnet.Conn, ctx *ConnContext) gnet.Action {
 		counter.Add(int64(processed))
 	}
 
+	// Record client uplink activity for the silence wedge breaker.
+	if h.clientSilenceCloseMs > 0 && processed > 0 {
+		ctx.lastClientByteMs.Store(time.Now().UnixMilli())
+	}
+
 	// Flush remaining batch via AsyncWrite (cross-event-loop safe)
 	if batchOffset > 0 {
 		poolRef := batchBufPtr
@@ -240,6 +246,11 @@ func (h *ProxyHandler) handleRelayDD(c gnet.Conn, ctx *ConnContext) gnet.Action 
 	// Count traffic
 	if counter := ctx.TrafficIn(); counter != nil {
 		counter.Add(int64(len(data)))
+	}
+
+	// Record client uplink activity for the silence wedge breaker.
+	if h.clientSilenceCloseMs > 0 && len(data) > 0 {
+		ctx.lastClientByteMs.Store(time.Now().UnixMilli())
 	}
 
 	// Send to DC

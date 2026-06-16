@@ -144,6 +144,17 @@ type ConnContext struct {
 	// Once throttled, stays throttled until buffer drops below resumeAt
 	throttledToDC atomic.Bool // Client->DC direction is throttled
 
+	// Relay-direction activity timestamps (Unix millis), updated from different
+	// event loops so accessed atomically. Drive the client-silence wedge breaker:
+	// when the server spoke more recently than the client, the client has an
+	// unanswered reply. Both 0 until the first relayed payload in each direction.
+	lastClientByteMs atomic.Int64 // last client->DC relayed payload
+	lastServerByteMs atomic.Int64 // last DC->client relayed payload
+
+	// One-shot splice target override (resolved "host:port") set when an
+	// unauthenticated probe's SNI is on the mask safelist. Consumed by dialSplice.
+	spliceOverride string // protected by mu
+
 	// Timing
 	connTime time.Time
 }
@@ -240,6 +251,24 @@ func (c *ConnContext) SetRealClientAddr(addr net.Addr) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.realClientAddr = addr
+}
+
+// SetSpliceOverride records a one-shot splice target ("host:port") for an
+// unauthenticated probe whose SNI is on the mask safelist.
+func (c *ConnContext) SetSpliceOverride(addr string) {
+	c.mu.Lock()
+	c.spliceOverride = addr
+	c.mu.Unlock()
+}
+
+// consumeSpliceOverride returns and clears the one-shot splice override, so a
+// reused context never inherits a stale target.
+func (c *ConnContext) consumeSpliceOverride() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	addr := c.spliceOverride
+	c.spliceOverride = ""
+	return addr
 }
 
 // DCID returns the DC ID this connection is using (0 if not yet determined).

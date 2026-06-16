@@ -17,11 +17,21 @@ type ServerHelloFetcher struct {
 	port    int
 	timeout time.Duration
 
-	mu         sync.RWMutex
-	cachedFull []byte // Full response (ServerHello + ChangeCipherSpec + ApplicationData)
+	mu            sync.RWMutex
+	cachedFull    []byte // Full response (ServerHello + ChangeCipherSpec + ApplicationData)
 	randomOffset  int    // Offset of random field within cachedFull
+	certRecordLen int    // Payload length of the backend's first ApplicationData (cert) record
 	lastFetch     time.Time
 	refreshPeriod time.Duration
+}
+
+// CertRecordLen returns the payload length of the mask backend's first
+// ApplicationData (encrypted certificate) record from the last successful
+// fetch, or 0 if not yet captured. Used to size our fake cert record to match.
+func (f *ServerHelloFetcher) CertRecordLen() int {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.certRecordLen
 }
 
 // NewServerHelloFetcher creates a fetcher for the given mask host.
@@ -116,6 +126,11 @@ func (f *ServerHelloFetcher) fetchAndCache() ([]byte, int, error) {
 		return nil, 0, fmt.Errorf("parse ServerHello: %w", parseErr)
 	}
 
+	// Capture the size of the backend's first ApplicationData (encrypted cert
+	// flight) record from the FULL response before truncating. Matching our
+	// fake cert record to this removes the accept-vs-mask cert-record-size tell.
+	certRecordLen := firstAppDataRecordLen(response)
+
 	// Extract ONLY the first TLS record (ServerHello).
 	// The full response may contain Certificate, ServerKeyExchange, etc.
 	// which the Telegram client doesn't expect. We'll append synthetic
@@ -131,6 +146,7 @@ func (f *ServerHelloFetcher) fetchAndCache() ([]byte, int, error) {
 	f.cachedFull = make([]byte, len(response))
 	copy(f.cachedFull, response)
 	f.randomOffset = randomOffset
+	f.certRecordLen = certRecordLen
 	f.lastFetch = time.Now()
 
 	// Return a copy
@@ -162,6 +178,20 @@ func (r *recordingConn) GetServerData() []byte {
 	result := make([]byte, len(r.serverData))
 	copy(result, r.serverData)
 	return result
+}
+
+// firstAppDataRecordLen walks the TLS record stream and returns the payload
+// length of the first ApplicationData (0x17) record, or 0 if none is present.
+func firstAppDataRecordLen(data []byte) int {
+	pos := 0
+	for pos+5 <= len(data) {
+		recordLen := int(binary.BigEndian.Uint16(data[pos+3 : pos+5]))
+		if data[pos] == recordTypeApplicationData {
+			return recordLen
+		}
+		pos += 5 + recordLen
+	}
+	return 0
 }
 
 // findServerHelloRandomOffset parses TLS records to find the random field offset.

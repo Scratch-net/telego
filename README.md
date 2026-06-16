@@ -55,6 +55,9 @@
 - **Dual Protocol Support** — FakeTLS (ee) and raw Obfuscated2 (dd) with auto-detection on single port
 - **Dynamic Record Sizer (DRS)** — Outbound TLS ApplicationData starts with 1369-byte records and ramps to full size after 8 records or 128 KB, mimicking Chrome/Firefox steady-state record patterns
 - **Split-TLS** — First outbound ApplicationData record is emitted as a 1-byte record to defeat passive signatures keyed on the first record
+- **Profile-matched cert record** — The fake certificate record in the FakeTLS ServerHello is sized to match the mask host's real certificate record, so the accept path and the probe (splice) path present identical TLS record lengths
+- **Post-quantum key share** — When a client offers the hybrid X25519MLKEM768 group, the synthetic ServerHello answers with a matching key share instead of downgrading to classical x25519 (a passive group-downgrade tell)
+- **SNI-following mask** — Optional safelist of domains; an unrecognized probe whose SNI is safelisted is forwarded to that domain's own server, so the on-wire conversation matches the SNI it claimed
 
 ### Operations
 - **Multi-user Support** — Named secrets with per-user tracking and logging
@@ -63,6 +66,8 @@
 - **Prometheus Metrics** — Per-user connection counts, traffic, and blocked IP statistics
 - **DC Probing** — Automatic RTT-based DC address sorting at startup
 - **Config Hot-Reload** — SIGHUP and file watching for runtime config changes
+- **Clock Self-Correction** — Optional startup sync of the handshake time-skew window from a remote HTTP `Date` header, so a wrong server clock doesn't reject every client
+- **Stale-Connection Recovery** — Optional close of relays whose server reply goes unanswered by the client, recovering iOS clients stuck on "Updating" after a long background
 - **Graceful Shutdown** — Clean connection draining on SIGTERM/SIGINT
 - **Structured Logging** — JSON and text output with configurable levels
 
@@ -176,6 +181,10 @@ log-level = "info"
 # How long blocked IPs stay blocked (for max-ips-per-user)
 # ip-block-timeout = "5m"
 
+# Correct a skewed server clock at startup from a remote HTTP Date header
+# (offset clamped to +-1 day). A wrong VPS clock otherwise rejects every client.
+# clock-sync-url = "https://www.cloudflare.com"
+
 # Named secrets (hex format, 32 chars = 16 bytes)
 # Generate with: telego generate <hostname>
 [secrets]
@@ -192,6 +201,8 @@ mask-host = "www.google.com"  # Host to mimic (SNI validation, proxy links)
 # splice-port = 8080          # Splice port (default: mask-port)
 # splice-proxy-protocol = 1   # PROXY protocol to splice: 0=off, 1=v1(text), 2=v2(binary)
 # splice-idle-timeout = "30s" # Idle timeout for spliced connections (default: 30s)
+# fake-cert-size = 0          # Fake cert record size; 0 = auto-match mask host (clamp 256..16384)
+# mask-sni-safelist = ["www.microsoft.com"]  # Probes with these SNIs front to that domain (off = empty)
 
 # Anti-DPI record shaping (proxy -> client direction)
 # enable-drs = true        # Probe-then-ramp record sizing (1369 -> 16384 bytes after 8 records or 128 KB)
@@ -202,6 +213,7 @@ mask-host = "www.google.com"  # Host to mimic (SNI validation, proxy links)
 prefer-ip = "prefer-ipv4"    # prefer-ipv4, prefer-ipv6, only-ipv4, only-ipv6
 idle-timeout = "5m"          # Connection idle timeout (hot-reloadable)
 num-event-loops = 0          # 0 = auto (all CPU cores)
+# client-silence-close = "12s"  # Close relays whose server reply stays unanswered (fixes iOS "Updating"); 0 = off
 
 # Upstream (DC connection) settings
 [upstream]

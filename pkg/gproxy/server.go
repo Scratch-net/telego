@@ -12,6 +12,7 @@ import (
 
 	"github.com/scratch-net/telego/pkg/dc"
 	"github.com/scratch-net/telego/pkg/tlsfront"
+	"github.com/scratch-net/telego/pkg/transport/faketls"
 )
 
 // Secret represents a named proxy secret.
@@ -43,6 +44,21 @@ type Config struct {
 	CertHost string
 	CertPort int
 
+	// FakeCertSize sets the exact payload size of the fake encrypted-certificate
+	// ApplicationData record in the FakeTLS ServerHello. 0 = auto (match the mask
+	// backend's real first cert-record size, falling back to random padding).
+	FakeCertSize int
+
+	// MaskSNISafelist is an opt-in list of extra domains that an unauthenticated
+	// probe may be fronted to. When a bad-secret ClientHello's SNI is on this
+	// list, the connection is spliced to that domain (port 443) instead of the
+	// default splice target, so the on-wire conversation matches the claimed SNI.
+	MaskSNISafelist []string
+
+	// ClockSyncURL, when set, is fetched once at startup; its HTTP Date header
+	// corrects a skewed server clock for the handshake time-skew check.
+	ClockSyncURL string
+
 	// Splice target (where to forward unrecognized clients)
 	// Defaults to MaskHost:MaskPort if not set
 	SpliceHost          string
@@ -54,6 +70,11 @@ type Config struct {
 	IPPreference      dc.IPPreference
 	IdleTimeout       time.Duration
 	TimeSkewTolerance time.Duration
+
+	// ClientSilenceClose, when > 0, closes a relaying connection whose last
+	// relayed payload was server->client and has gone unanswered by the client
+	// for this long. Breaks an iOS MtProtoKit bad_salt "Updating" wedge. 0 = off.
+	ClientSilenceClose time.Duration
 
 	// Upstream (DC connection)
 	Socks5Addr string // SOCKS5 proxy for DC connections (e.g., "127.0.0.1:1080")
@@ -185,6 +206,16 @@ func RunWithHandler(cfg *Config, logger Logger) (shutdown func(), handler *Proxy
 			logger.Debug("DC client started with %d event loops", cfg.NumEventLoop)
 		}
 
+		// Correct a skewed server clock from an HTTP Date header (once, at startup)
+		// so the handshake time-skew check doesn't reject every client.
+		if cfg.ClockSyncURL != "" {
+			if off, err := faketls.SyncClock(cfg.ClockSyncURL, 0); err != nil {
+				logger.Warn("Clock sync from %s failed: %v (using local clock)", cfg.ClockSyncURL, err)
+			} else {
+				logger.Info("Clock sync from %s: offset %+ds applied", cfg.ClockSyncURL, off)
+			}
+		}
+
 		// Initialize TLS fronting if configured
 		if cfg.MaskHost != "" && cfg.FetchRealCert {
 			h.certFetcher = tlsfront.NewCertFetcher(cfg.CertRefreshHours, cfg.MaskHost)
@@ -228,6 +259,12 @@ func RunWithHandler(cfg *Config, logger Logger) (shutdown func(), handler *Proxy
 
 		if cfg.NumEventLoop > 0 {
 			opts = append(opts, gnet.WithNumEventLoop(cfg.NumEventLoop))
+		}
+
+		// Enable the engine ticker only when the client-silence wedge breaker is
+		// active; OnTick sweeps relaying connections for the iOS bad_salt wedge.
+		if cfg.ClientSilenceClose > 0 {
+			opts = append(opts, gnet.WithTicker(true))
 		}
 
 		addr, isUnix := parseBindAddress(cfg.BindAddr)

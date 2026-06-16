@@ -45,6 +45,7 @@ type ClientHello struct {
 	Host        string
 	CipherSuite uint16
 	ALPN        []string // ALPN protocols offered by client
+	OffersPQ    bool     // client offered the X25519MLKEM768 (0x11ec) key_share group
 }
 
 // ParseClientHello parses and validates a FakeTLS ClientHello.
@@ -123,6 +124,11 @@ func ParseClientHello(secret []byte, payload []byte) (*ClientHello, error) {
 	// Extract ALPN protocols from extensions
 	hello.ALPN = extractALPN(payload)
 
+	// Note whether the client offered the hybrid post-quantum key_share group
+	// (X25519MLKEM768, 0x11ec). Used to echo a matching group in the synthetic
+	// ServerHello so we don't emit a passive group-downgrade tell.
+	hello.OffersPQ = clientOffersPQKeyShare(payload)
+
 	return hello, nil
 }
 
@@ -158,8 +164,9 @@ func (h *ClientHello) Valid(expectedHost string, tolerance time.Duration) error 
 		return nil
 	}
 
-	// Normal Unix timestamp validation
-	now := time.Now()
+	// Normal Unix timestamp validation. correctedNow applies any startup clock
+	// correction so a skewed server clock doesn't reject every client.
+	now := correctedNow()
 	diff := now.Sub(h.Time)
 	if diff < 0 {
 		diff = -diff
@@ -302,6 +309,85 @@ func extractALPN(payload []byte) []string {
 	return nil
 }
 
+// ExtractSNI returns the SNI hostname from a ClientHello handshake payload
+// (the bytes after the 5-byte TLS record header), or "" if absent. Exported so
+// the splice path can read the claimed SNI of an unauthenticated probe.
+func ExtractSNI(payload []byte) string {
+	return extractSNI(payload)
+}
+
+// pqNamedGroup is the TLS named group for the hybrid X25519MLKEM768 key exchange.
+const pqNamedGroup = 0x11ec
+
+// clientOffersPQKeyShare reports whether the ClientHello carries a key_share
+// entry for X25519MLKEM768 (named group 0x11ec). It walks the same extension
+// layout as extractSNI/extractALPN and never panics on malformed input.
+func clientOffersPQKeyShare(payload []byte) bool {
+	offset := clientHelloSessionIDOffset
+	if offset >= len(payload) {
+		return false
+	}
+
+	// Skip session ID
+	sessionIDLen := int(payload[offset])
+	offset += 1 + sessionIDLen
+	if offset+2 > len(payload) {
+		return false
+	}
+
+	// Skip cipher suites
+	cipherSuitesLen := int(binary.BigEndian.Uint16(payload[offset:]))
+	offset += 2 + cipherSuitesLen
+	if offset+1 > len(payload) {
+		return false
+	}
+
+	// Skip compression methods
+	compressionLen := int(payload[offset])
+	offset += 1 + compressionLen
+	if offset+2 > len(payload) {
+		return false
+	}
+
+	// Extensions length
+	extensionsLen := int(binary.BigEndian.Uint16(payload[offset:]))
+	offset += 2
+	extensionsEnd := offset + extensionsLen
+
+	// Parse extensions looking for key_share (type 0x0033)
+	for offset+4 <= extensionsEnd && offset+4 <= len(payload) {
+		extType := binary.BigEndian.Uint16(payload[offset:])
+		extLen := int(binary.BigEndian.Uint16(payload[offset+2:]))
+		offset += 4
+
+		if extType == 0x0033 { // key_share
+			// key_share: 2-byte client_shares list length, then entries of
+			// [group(2)][key_len(2)][key].
+			if offset+2 > len(payload) {
+				return false
+			}
+			kp := offset + 2
+			ksEnd := offset + extLen
+			if ksEnd > len(payload) {
+				ksEnd = len(payload)
+			}
+			for kp+4 <= ksEnd {
+				group := binary.BigEndian.Uint16(payload[kp:])
+				if group == pqNamedGroup {
+					return true
+				}
+				keyLen := int(binary.BigEndian.Uint16(payload[kp+2:]))
+				kp += 4 + keyLen
+			}
+			return false
+		}
+
+		offset += extLen
+	}
+
+	return false
+}
+
 // WelcomePacketRandomOffset is the offset of server random in the welcome packet.
 // This is: record_header(5) + handshake_type(1) + handshake_length(3) + version(2) = 11
 const WelcomePacketRandomOffset = 11
@@ -322,6 +408,33 @@ type ServerHelloOptions struct {
 	// RealServerHelloRandomOffset is the offset within RealServerHello where
 	// the 32-byte random field starts. Required when RealServerHello is set.
 	RealServerHelloRandomOffset int
+
+	// FakeCertSize, when > 0, sets the exact payload length of the fake
+	// "encrypted certificate" ApplicationData record instead of the default
+	// random 1024+rand padding. Matching the mask backend's real first-flight
+	// cert-record size removes the accept-vs-mask cert-record-length tell.
+	// Clamped to [minFakeCertSize, maxFakeCertSize].
+	FakeCertSize int
+}
+
+// Fake-cert (ApplicationData) record size clamp bounds (sane TLS record sizes).
+const (
+	minFakeCertSize = 256
+	maxFakeCertSize = 16384
+)
+
+// fakeCertPadding returns the fake-cert ApplicationData payload. When size > 0
+// it produces exactly that many random bytes (clamped); otherwise it falls back
+// to the legacy 1024 + rand(0..3091) padding.
+func fakeCertPadding(size int) []byte {
+	if size > 0 {
+		size = min(max(size, minFakeCertSize), maxFakeCertSize)
+	} else {
+		size = 1024 + int(time.Now().UnixNano()%3092)
+	}
+	data := make([]byte, size)
+	rand.Read(data)
+	return data
 }
 
 // BuildServerHello creates a ServerHello response for FakeTLS.
@@ -365,9 +478,7 @@ func buildHybridServerHello(secret []byte, clientHello *ClientHello, opts *Serve
 	// Append synthetic ChangeCipherSpec + ApplicationData (same as legacy)
 	writeRecordTLS12(buf, RecordTypeChangeCipherSpec, []byte{0x01})
 
-	paddingLen := 1024 + int(time.Now().UnixNano()%3092)
-	encryptedData := make([]byte, paddingLen)
-	rand.Read(encryptedData)
+	encryptedData := fakeCertPadding(opts.FakeCertSize)
 	writeApplicationDataChunked(buf, encryptedData)
 
 	// Compute HMAC over the entire packet
@@ -403,10 +514,11 @@ func buildSyntheticServerHello(secret []byte, clientHello *ClientHello, opts *Se
 		// Format: fake "encrypted" handshake with real cert data
 		encryptedData = buildEncryptedHandshakeWithCert(opts.CertChain)
 	} else {
-		// Random padding (1024 + random 0-3091 bytes, per mtg)
-		paddingLen := 1024 + int(time.Now().UnixNano()%3092)
-		encryptedData = make([]byte, paddingLen)
-		rand.Read(encryptedData)
+		fakeCertSize := 0
+		if opts != nil {
+			fakeCertSize = opts.FakeCertSize
+		}
+		encryptedData = fakeCertPadding(fakeCertSize)
 	}
 
 	// Write ApplicationData records (split into max 16KB chunks per TLS spec)
@@ -570,13 +682,32 @@ func buildServerHelloMessage(clientHello *ClientHello) []byte {
 	extBuf.Write([]byte{0x00, 0x02}) // length
 	extBuf.Write([]byte{0x03, 0x04}) // TLS 1.3
 
-	// Extension: Key Share (X25519)
-	x25519Key := generateX25519Key()
-	extBuf.Write([]byte{0x00, 0x33}) // type
-	extBuf.Write([]byte{0x00, 0x24}) // length: 36 bytes
-	extBuf.Write([]byte{0x00, 0x1d}) // curve: x25519
-	extBuf.Write([]byte{0x00, 0x20}) // key length: 32
-	extBuf.Write(x25519Key)
+	// Extension: Key Share. Echo the client's offered group: when the client
+	// offered the hybrid post-quantum group X25519MLKEM768 (0x11ec), answer with
+	// a correctly-sized 0x11ec share, else classical x25519 (0x001d). Always
+	// answering x25519 to a PQ-offering client is a passive group-downgrade tell.
+	// The PQ share is high-entropy bytes, not a real ML-KEM encapsulation:
+	// FakeTLS clients validate only record framing + the server-random HMAC, and
+	// we are not a TLS terminator, so a valid ciphertext buys nothing.
+	if clientHello.OffersPQ {
+		// X25519MLKEM768 server share: ML-KEM-768 ciphertext (1088) || X25519 (32) = 1120.
+		const pqKeyLen = 1120
+		pqKey := make([]byte, pqKeyLen)
+		rand.Read(pqKey)
+		extBuf.Write([]byte{0x00, 0x33})                                 // type: key_share
+		extLen := 2 + 2 + pqKeyLen                                       // group(2)+key_len(2)+key
+		extBuf.Write([]byte{byte(extLen >> 8), byte(extLen)})            // ext length
+		extBuf.Write([]byte{0x11, 0xec})                                 // group: X25519MLKEM768
+		extBuf.Write([]byte{byte(pqKeyLen >> 8), byte(pqKeyLen & 0xff)}) // key length: 1120
+		extBuf.Write(pqKey)
+	} else {
+		x25519Key := generateX25519Key()
+		extBuf.Write([]byte{0x00, 0x33}) // type
+		extBuf.Write([]byte{0x00, 0x24}) // length: 36 bytes
+		extBuf.Write([]byte{0x00, 0x1d}) // curve: x25519
+		extBuf.Write([]byte{0x00, 0x20}) // key length: 32
+		extBuf.Write(x25519Key)
+	}
 
 	// Extension: ALPN (if client offered any)
 	// Safe to include - client only validates record headers, not ServerHello content

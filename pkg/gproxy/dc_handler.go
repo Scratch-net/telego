@@ -157,6 +157,11 @@ func (h *ProxyHandler) dialDC(clientConn gnet.Conn, ctx *ConnContext) {
 	// Atomically set relay context and state
 	ctx.SetRelay(relay)
 
+	// Register for the client-silence wedge sweep (OnTick) when enabled.
+	if h.clientSilenceCloseMs > 0 {
+		h.relayConns.Store(ctx.id, &relayEntry{conn: clientConn, ctx: ctx})
+	}
+
 	// Process any pending data from handshake
 	if len(pendingData) > 0 {
 		h.sendPendingDataGnet(dcGnetConn, relay, pendingData)
@@ -313,6 +318,13 @@ func (h *ProxyHandler) dialSplice(clientConn gnet.Conn, ctx *ConnContext) {
 	}
 
 	addr := fmt.Sprintf("%s:%d", h.config.SpliceHost, h.config.SplicePort)
+
+	// SNI-following: an unauthenticated probe whose SNI is on the mask safelist
+	// is fronted to that domain's own server instead of the default target.
+	if override := ctx.consumeSpliceOverride(); override != "" {
+		addr = override
+		h.logger.Debug("[#%d] splicing to safelisted SNI target %s", ctx.id, addr)
+	}
 
 	dialer := netx.NewDialer()
 	conn, err := dialer.Dial("tcp", addr)

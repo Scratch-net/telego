@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -68,7 +69,27 @@ type ProxyHandler struct {
 
 	// Pending DC contexts: keyed by fd, used to eliminate race between Enroll and SetContext
 	pendingDCContexts sync.Map // int (fd) -> *DCConnContext
+
+	// Mask SNI safelist: lowercased domain -> resolved "host:port" splice target.
+	// Empty when the feature is unconfigured.
+	maskSafelist map[string]string
+
+	// Client-silence wedge breaker. clientSilenceCloseMs is the threshold in
+	// millis (0 = disabled). relayConns tracks active relaying connections that
+	// OnTick sweeps. Both populated only when the feature is enabled.
+	clientSilenceCloseMs int64
+	relayConns           sync.Map // uint64 (conn id) -> *relayEntry
 }
+
+// relayEntry links an active relay's client connection to its context for the
+// OnTick silence sweep.
+type relayEntry struct {
+	conn gnet.Conn
+	ctx  *ConnContext
+}
+
+// silenceTickInterval is how often OnTick sweeps for wedged connections.
+const silenceTickInterval = time.Second
 
 // NewProxyHandler creates a new gnet proxy handler.
 func NewProxyHandler(cfg *Config, logger Logger) *ProxyHandler {
@@ -96,6 +117,30 @@ func NewProxyHandler(cfg *Config, logger Logger) *ProxyHandler {
 
 	// Initialize hot-reloadable config atomically
 	h.idleTimeoutNs.Store(int64(cfg.IdleTimeout))
+
+	// Client-silence wedge breaker threshold (ms); 0 keeps it fully disabled.
+	if cfg.ClientSilenceClose > 0 {
+		h.clientSilenceCloseMs = cfg.ClientSilenceClose.Milliseconds()
+		logger.Info("Client-silence wedge breaker enabled: close after %v of unanswered server reply", cfg.ClientSilenceClose)
+	}
+
+	// Resolve the opt-in SNI-following mask safelist (each domain -> host:443).
+	// Unresolvable entries are skipped, not fatal.
+	if len(cfg.MaskSNISafelist) > 0 {
+		h.maskSafelist = make(map[string]string, len(cfg.MaskSNISafelist))
+		for _, domain := range cfg.MaskSNISafelist {
+			domain = strings.TrimSpace(domain)
+			if domain == "" {
+				continue
+			}
+			if _, err := net.LookupHost(domain); err != nil {
+				logger.Warn("mask-sni-safelist: cannot resolve %q, skipping: %v", domain, err)
+				continue
+			}
+			h.maskSafelist[strings.ToLower(domain)] = net.JoinHostPort(domain, "443")
+			logger.Info("mask-sni-safelist: fronting %q enabled", domain)
+		}
+	}
 
 	// Initialize connection limiter if configured
 	if cfg.MaxConnectionsPerIP > 0 {
@@ -142,6 +187,44 @@ func (h *ProxyHandler) UserLimiter() *UserIPLimiter {
 func (h *ProxyHandler) OnBoot(eng gnet.Engine) gnet.Action {
 	h.logger.Info("gnet proxy started on %s", h.config.BindAddr)
 	return gnet.None
+}
+
+// OnTick runs periodically (only when the client-silence breaker is enabled,
+// via WithTicker) on event-loop 0. It closes relaying connections stuck in the
+// iOS bad_salt wedge: the last relayed payload was server->client and the client
+// has not answered for the configured threshold. A healthy connection whose last
+// word was its own request/ack (lastClientByteMs >= lastServerByteMs) is never
+// touched, and a connection where the client has not yet spoken in relay
+// (lastClientByteMs == 0) is never touched. conn.Close() is cross-loop safe: it
+// enqueues the close onto the connection's own event loop.
+func (h *ProxyHandler) OnTick() (time.Duration, gnet.Action) {
+	if h.clientSilenceCloseMs <= 0 {
+		return 0, gnet.None
+	}
+	now := time.Now().UnixMilli()
+	h.relayConns.Range(func(k, v any) bool {
+		e := v.(*relayEntry)
+		lc := e.ctx.lastClientByteMs.Load()
+		ls := e.ctx.lastServerByteMs.Load()
+		if silenceWedged(lc, ls, now, h.clientSilenceCloseMs) {
+			h.logger.Info("[#%d] closing relay: server reply unanswered %dms (iOS bad_salt wedge breaker)", e.ctx.id, now-ls)
+			e.conn.Close()
+			h.relayConns.Delete(k)
+		}
+		return true
+	})
+	return silenceTickInterval, gnet.None
+}
+
+// silenceWedged reports whether a relaying connection is in the iOS bad_salt
+// wedge: the client has spoken at least once (lastClientMs > 0), the server's
+// last payload is more recent than the client's (an unanswered reply), and that
+// reply has gone unanswered past the threshold. A healthy connection whose last
+// word was its own request/ack is never flagged.
+func silenceWedged(lastClientMs, lastServerMs, nowMs, thresholdMs int64) bool {
+	return lastClientMs > 0 &&
+		lastServerMs > lastClientMs &&
+		nowMs-lastServerMs > thresholdMs
 }
 
 // OnShutdown is called when the gnet engine shuts down.
@@ -218,6 +301,11 @@ func (h *ProxyHandler) OnClose(c gnet.Conn, err error) gnet.Action {
 
 	// Mark as closed FIRST - goroutines check this before proceeding
 	ctx.SetState(StateClosed)
+
+	// Drop from the silence-sweep registry if it was tracked.
+	if h.clientSilenceCloseMs > 0 {
+		h.relayConns.Delete(ctx.id)
+	}
 
 	// Close DC connection if active
 	if relay := ctx.Relay(); relay != nil && relay.DCConn != nil {
