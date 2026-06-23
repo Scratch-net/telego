@@ -5,7 +5,7 @@ go 1.26
 require (
 	github.com/alecthomas/kong v1.15.0
 	github.com/fsnotify/fsnotify v1.10.1
-	github.com/gotd/td v0.158.0
+	github.com/gotd/td v0.159.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/panjf2000/gnet/v2 v2.9.8
 	github.com/pelletier/go-toml/v2 v2.3.1
@@ -22,7 +22,7 @@ require (
 )
 
 require (
-	github.com/andybalholm/brotli v1.2.0 // indirect
+	github.com/andybalholm/brotli v1.2.1 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
@@ -45,7 +45,7 @@ require (
 	github.com/mattn/go-colorable v0.1.15 // indirect
 	github.com/mattn/go-isatty v0.0.22 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
-	github.com/ogen-go/ogen v1.20.3 // indirect
+	github.com/ogen-go/ogen v1.22.0 // indirect
 	github.com/panjf2000/ants/v2 v2.12.1 // indirect
 	github.com/pion/dtls/v3 v3.1.4 // indirect
 	github.com/pion/logging v0.2.4 // indirect
@@ -59,6 +59,7 @@ require (
 	github.com/shopspring/decimal v1.4.0 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
+	github.com/yuin/goldmark v1.8.2 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/otel/sdk v1.44.0 // indirect
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
