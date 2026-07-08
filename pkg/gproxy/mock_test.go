@@ -283,6 +283,20 @@ func (c *testMockGnetConn) SetContext(ctx any) {
 	c.context = ctx
 }
 
+// SafeContext / SetSafeContext (gnet v2.10.0): the mock's context access is
+// already mutex-guarded, so the concurrency-safe variants share the same field.
+func (c *testMockGnetConn) SafeContext() any {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.context
+}
+
+func (c *testMockGnetConn) SetSafeContext(ctx any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.context = ctx
+}
+
 func (c *testMockGnetConn) EventLoop() gnet.EventLoop {
 	c.mu.Lock()
 	defer c.mu.Unlock()
