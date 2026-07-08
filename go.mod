@@ -7,7 +7,7 @@ require (
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/gotd/td v0.158.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
-	github.com/panjf2000/gnet/v2 v2.9.8
+	github.com/panjf2000/gnet/v2 v2.10.0
 	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/pion/stun/v3 v3.1.5
 	github.com/prometheus/client_golang v1.23.2
