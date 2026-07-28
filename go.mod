@@ -10,7 +10,7 @@ require (
 	github.com/panjf2000/gnet/v2 v2.10.0
 	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/pion/stun/v3 v3.1.6
-	github.com/prometheus/client_golang v1.24.0
+	github.com/prometheus/client_golang v1.24.1
 	github.com/rs/zerolog v1.35.1
 	github.com/zeebo/blake3 v0.2.4
 	go.opentelemetry.io/otel v1.44.0
