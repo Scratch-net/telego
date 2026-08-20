@@ -2,7 +2,7 @@
 # Usage: docker build -f Dockerfile.build -t telego .
 # With version: docker build -f Dockerfile.build --build-arg VERSION=v1.0.0 -t telego .
 
-FROM golang:1.26-alpine AS builder
+FROM golang:1.27-alpine AS builder
 
 ARG BUILD_TAGS="poll_opt,gc_opt"
 ARG VERSION="dev"
