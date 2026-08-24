@@ -173,10 +173,12 @@ func (l *UserIPLimiter) TryAcquire(ip net.IP, secret []byte, secretName string) 
 	state := l.getOrCreateUserState(shard, secretKey, secretName)
 
 	// Check if IP is blocked (only when limiting is enabled)
-	if state.limitingEnabled && state.blockedIPs != nil && state.blockedIPs.Contains(ipStr) {
-		// Refresh TTL by re-adding
-		state.blockedIPs.Add(ipStr, struct{}{})
-		return "", false
+	if state.limitingEnabled && state.blockedIPs != nil {
+		if _, blocked := state.blockedIPs.Peek(ipStr); blocked {
+			// Refresh TTL by re-adding
+			state.blockedIPs.Add(ipStr, struct{}{})
+			return "", false
+		}
 	}
 
 	// Check if IP is already active
