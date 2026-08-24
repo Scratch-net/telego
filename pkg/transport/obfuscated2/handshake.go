@@ -13,12 +13,25 @@ const (
 	// FrameSize is the size of the obfuscated2 handshake frame.
 	FrameSize = 64
 
-	// Connection type for FakeTLS/Secure mode (0xdddddddd) - with random padding
-	ConnectionTypeFakeTLS = 0xdddddddd
+	// ConnectionTypeAbridged is the abridged MTProto transport marker.
+	ConnectionTypeAbridged = 0xefefefef
+
+	// ConnectionTypePaddedIntermediate is the padded-intermediate MTProto
+	// transport marker.
+	ConnectionTypePaddedIntermediate = 0xdddddddd
+
+	// ConnectionTypeFakeTLS is retained for source compatibility.
+	// Deprecated: use ConnectionTypePaddedIntermediate. FakeTLS is an outer
+	// transport and is independent of the inner MTProto packet framing.
+	ConnectionTypeFakeTLS = ConnectionTypePaddedIntermediate
 
 	// Connection type for Intermediate mode (0xeeeeeeee) - without random padding
 	ConnectionTypeIntermediate = 0xeeeeeeee
 )
+
+// ConnectionType identifies the MTProto packet framing carried inside an
+// obfuscated2 connection.
+type ConnectionType uint32
 
 var (
 	ErrInvalidFrame          = errors.New("invalid handshake frame")
@@ -41,14 +54,25 @@ var reservedMagic = []uint32{
 //	[0:8]   - Random noise
 //	[8:40]  - AES-256 key (32 bytes)
 //	[40:56] - AES-256 IV (16 bytes)
-//	[56:60] - Connection type (0xdddddddd for FakeTLS)
+//	[56:60] - MTProto packet framing connection type
 //	[60:62] - DC ID (little-endian int16)
 //	[62:64] - Random noise
 type HandshakeFrame [FrameSize]byte
 
-// generateServerFrame creates a valid handshake frame for connecting to Telegram.
+// generateServerFrame creates a padded-intermediate handshake frame for
+// connecting to Telegram. It preserves the legacy default used by
+// GenerateServerFrame.
 func generateServerFrame(dc int) (HandshakeFrame, error) {
+	return generateServerFrameWithType(dc, ConnectionTypePaddedIntermediate)
+}
+
+// generateServerFrameWithType creates a valid handshake frame for connecting
+// to Telegram using the requested MTProto packet framing.
+func generateServerFrameWithType(dc int, connectionType ConnectionType) (HandshakeFrame, error) {
 	var frame HandshakeFrame
+	if !connectionType.valid() {
+		return frame, ErrUnsupportedConnection
+	}
 
 	for {
 		if _, err := rand.Read(frame[:]); err != nil {
@@ -76,12 +100,18 @@ func generateServerFrame(dc int) (HandshakeFrame, error) {
 	}
 
 	// Set connection type
-	binary.LittleEndian.PutUint32(frame[56:60], ConnectionTypeFakeTLS)
+	binary.LittleEndian.PutUint32(frame[56:60], uint32(connectionType))
 
 	// Set DC ID (little-endian int16) - can be negative for media DCs
 	binary.LittleEndian.PutUint16(frame[60:62], uint16(int16(dc)))
 
 	return frame, nil
+}
+
+func (c ConnectionType) valid() bool {
+	return c == ConnectionTypeAbridged ||
+		c == ConnectionTypePaddedIntermediate ||
+		c == ConnectionTypeIntermediate
 }
 
 // deriveKey derives an AES key from the secret and handshake data.
@@ -105,8 +135,17 @@ func reverseKeyIV(b []byte) [48]byte {
 // This is the buffer-based version for use with gnet.
 // The secret is the 16-byte proxy secret.
 func ParseClientFrame(secret, frame []byte) (int, cipher.Stream, cipher.Stream, error) {
+	dcID, _, encryptor, decryptor, err := ParseClientFrameWithType(secret, frame)
+	return dcID, encryptor, decryptor, err
+}
+
+// ParseClientFrameWithType parses a client's handshake frame and returns the
+// MTProto packet framing selected by the client. Callers that relay decrypted
+// bytes without translating packet framing must use the same connection type
+// for their upstream Telegram connection.
+func ParseClientFrameWithType(secret, frame []byte) (int, ConnectionType, cipher.Stream, cipher.Stream, error) {
 	if len(frame) < FrameSize {
-		return 0, nil, nil, ErrInvalidFrame
+		return 0, 0, nil, nil, ErrInvalidFrame
 	}
 
 	// Work with a stack-allocated copy to avoid modifying the original
@@ -129,33 +168,40 @@ func ParseClientFrame(secret, frame []byte) (int, cipher.Stream, cipher.Stream, 
 	// Create both ciphers BEFORE decryption (matching mtg behavior)
 	decryptor, err := NewAESCTR(decKey, decIV[:])
 	if err != nil {
-		return 0, nil, nil, err
+		return 0, 0, nil, nil, err
 	}
 	encryptor, err := NewAESCTR(encKey, encIVData)
 	if err != nil {
-		return 0, nil, nil, err
+		return 0, 0, nil, nil, err
 	}
 
 	// NOW decrypt the frame in place
 	decryptor.XORKeyStream(frameCopy[:], frameCopy[:])
 
-	// Validate connection type - accept both Secure (padded) and Intermediate (unpadded)
-	connType := binary.LittleEndian.Uint32(frameCopy[56:60])
-	if connType != ConnectionTypeFakeTLS && connType != ConnectionTypeIntermediate {
-		return 0, nil, nil, ErrUnsupportedConnection
+	// Validate the abridged, intermediate, or padded-intermediate connection type.
+	connectionType := ConnectionType(binary.LittleEndian.Uint32(frameCopy[56:60]))
+	if !connectionType.valid() {
+		return 0, 0, nil, nil, ErrUnsupportedConnection
 	}
 
 	// Extract DC ID (little-endian int16)
 	dcID := int(int16(binary.LittleEndian.Uint16(frameCopy[60:62])))
 
-	return dcID, encryptor, decryptor, nil
+	return dcID, connectionType, encryptor, decryptor, nil
 }
 
 // GenerateServerFrame creates a valid handshake frame for connecting to Telegram.
 // Returns the frame bytes and the encryption/decryption ciphers.
 // This is the buffer-based version of ServerHandshake for use with gnet.
 func GenerateServerFrame(dc int) ([]byte, cipher.Stream, cipher.Stream, error) {
-	frame, err := generateServerFrame(dc)
+	return GenerateServerFrameWithType(dc, ConnectionTypePaddedIntermediate)
+}
+
+// GenerateServerFrameWithType creates a valid handshake frame for connecting
+// to Telegram using the requested MTProto packet framing. It returns the frame
+// bytes and the encryption/decryption ciphers for the connection.
+func GenerateServerFrameWithType(dc int, connectionType ConnectionType) ([]byte, cipher.Stream, cipher.Stream, error) {
+	frame, err := generateServerFrameWithType(dc, connectionType)
 	if err != nil {
 		return nil, nil, nil, err
 	}

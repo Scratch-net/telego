@@ -2,13 +2,17 @@ package config
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/scratch-net/telego/pkg/dc"
+	"github.com/scratch-net/telego/pkg/webproxy"
 )
 
 // TestLoad_Valid tests loading a valid TOML configuration.
@@ -685,5 +689,346 @@ func TestBuildFullSecret_EE(t *testing.T) {
 
 	if result != expected {
 		t.Errorf("BuildFullSecret() = %q, want %q", result, expected)
+	}
+}
+
+func TestWebProxyDisabledPreservesLegacyConfig(t *testing.T) {
+	cfg := Config{
+		Secrets: map[string]string{"alice": "0123456789abcdef0123456789abcdef"},
+		TLSFronting: TLSFrontingConfig{
+			MaskHost: "www.google.com",
+		},
+		WebProxy: WebProxyConfig{
+			Enabled:       false,
+			Hostname:      "INVALID HOSTNAME",
+			Backend:       "not an address",
+			NumEventLoops: -1,
+		},
+	}
+
+	legacy, err := cfg.ToGProxyConfig()
+	if err != nil {
+		t.Fatalf("ToGProxyConfig: %v", err)
+	}
+	if legacy.MaskHost != "www.google.com" || len(legacy.Secrets) != 1 {
+		t.Fatalf("legacy config changed: %+v", legacy)
+	}
+	runtime, err := cfg.ToWebProxyRuntimeConfig("0.0.0.0:443")
+	if err != nil {
+		t.Fatalf("disabled ToWebProxyRuntimeConfig: %v", err)
+	}
+	if runtime.Enabled || len(runtime.Profiles) != 0 {
+		t.Fatalf("disabled runtime = %+v, want zero value", runtime)
+	}
+}
+
+func TestLoadAndConvertWebProxyConfig(t *testing.T) {
+	content := `
+[general]
+bind-to = "0.0.0.0:443"
+
+[secrets]
+alice = "0123456789abcdef0123456789abcdef"
+
+[tls-fronting]
+mask-host = "www.google.com"
+
+[web-proxy]
+enabled = true
+bind-to = "127.0.0.1:9080"
+hostname = "proxy.example.com"
+trusted-proxy-cidrs = ["127.0.0.1/32"]
+num-event-loops = 2
+`
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	proxyConfig, err := cfg.ToGProxyConfig()
+	if err != nil {
+		t.Fatalf("ToGProxyConfig: %v", err)
+	}
+	if !proxyConfig.InternalProxyProtocol || proxyConfig.WebProxyFingerprint == "" {
+		t.Fatalf("gproxy WEB integration = internal %t fingerprint %q", proxyConfig.InternalProxyProtocol, proxyConfig.WebProxyFingerprint)
+	}
+	runtime, err := cfg.ToWebProxyRuntimeConfig(cfg.General.BindTo)
+	if err != nil {
+		t.Fatalf("ToWebProxyRuntimeConfig: %v", err)
+	}
+	if !runtime.Enabled || runtime.BindAddr != "127.0.0.1:9080" ||
+		runtime.Hostname != "proxy.example.com" || runtime.Backend != "127.0.0.1:443" ||
+		runtime.NumEventLoops != 2 || !runtime.BackendProxyProtocol {
+		t.Fatalf("runtime = %+v", runtime)
+	}
+	if len(runtime.TrustedProxyCIDRs) != 1 || runtime.TrustedProxyCIDRs[0] != "127.0.0.1/32" {
+		t.Fatalf("trusted proxies = %v", runtime.TrustedProxyCIDRs)
+	}
+	if len(runtime.Profiles) != 2 {
+		t.Fatalf("profiles = %d, want 2", len(runtime.Profiles))
+	}
+	if runtime.Profiles[0].Name() != "alice" || runtime.Profiles[0].Mode() != webproxy.SecretPlain ||
+		runtime.Profiles[0].SecretHex() != "0123456789abcdef0123456789abcdef" {
+		t.Fatalf("plain profile = name %q mode %v secret %q", runtime.Profiles[0].Name(), runtime.Profiles[0].Mode(), runtime.Profiles[0].SecretHex())
+	}
+	if runtime.Profiles[1].Name() != "alice" || runtime.Profiles[1].Mode() != webproxy.SecretDD ||
+		runtime.Profiles[1].SecretHex() != "dd0123456789abcdef0123456789abcdef" {
+		t.Fatalf("dd profile = name %q mode %v secret %q", runtime.Profiles[1].Name(), runtime.Profiles[1].Mode(), runtime.Profiles[1].SecretHex())
+	}
+}
+
+func TestWebProxyConfigDefaults(t *testing.T) {
+	cfg := Config{
+		Secrets: map[string]string{"alice": "0123456789abcdef0123456789abcdef"},
+		WebProxy: WebProxyConfig{
+			Enabled:  true,
+			Hostname: "proxy.example.com",
+		},
+	}
+	runtime, err := cfg.ToWebProxyRuntimeConfig("tcp://0.0.0.0:8443")
+	if err != nil {
+		t.Fatalf("ToWebProxyRuntimeConfig: %v", err)
+	}
+	if runtime.BindAddr != "127.0.0.1:8080" || runtime.Backend != "127.0.0.1:8443" {
+		t.Fatalf("defaults = bind %q backend %q", runtime.BindAddr, runtime.Backend)
+	}
+}
+
+func TestWebProxyConfigDerivesUnixMTProxyBackend(t *testing.T) {
+	cfg := Config{
+		Secrets:  map[string]string{"alice": "0123456789abcdef0123456789abcdef"},
+		WebProxy: WebProxyConfig{Enabled: true, Hostname: "proxy.example.com"},
+	}
+	runtime, err := cfg.ToWebProxyRuntimeConfig("unix:///run/telego/telego.sock")
+	if err != nil {
+		t.Fatalf("ToWebProxyRuntimeConfig: %v", err)
+	}
+	if runtime.Backend != "unix:///run/telego/telego.sock" {
+		t.Fatalf("backend = %q", runtime.Backend)
+	}
+}
+
+func TestWebProxyProfilesAreSortedAndDeduplicated(t *testing.T) {
+	cfg := Config{
+		Secrets: map[string]string{
+			"zulu":  "fedcba9876543210fedcba9876543210",
+			"copy":  "0123456789abcdef0123456789abcdef",
+			"alice": "0123456789abcdef0123456789abcdef",
+		},
+		WebProxy: WebProxyConfig{Enabled: true, Hostname: "proxy.example.com"},
+	}
+	runtime, err := cfg.ToWebProxyRuntimeConfig("0.0.0.0:443")
+	if err != nil {
+		t.Fatalf("ToWebProxyRuntimeConfig: %v", err)
+	}
+	if len(runtime.Profiles) != 4 {
+		t.Fatalf("profiles = %d, want four unique capabilities", len(runtime.Profiles))
+	}
+	wantNames := []string{"alice", "alice", "zulu", "zulu"}
+	for index, want := range wantNames {
+		if runtime.Profiles[index].Name() != want {
+			t.Fatalf("profile %d name = %q, want %q", index, runtime.Profiles[index].Name(), want)
+		}
+	}
+	if runtime.Profiles[0].Mode() != webproxy.SecretPlain || runtime.Profiles[1].Mode() != webproxy.SecretDD {
+		t.Fatalf("alice modes = %v, %v", runtime.Profiles[0].Mode(), runtime.Profiles[1].Mode())
+	}
+}
+
+func TestGProxySecretsAreSortedDeterministically(t *testing.T) {
+	first := Config{
+		Secrets: map[string]string{
+			"zulu":  "fedcba9876543210fedcba9876543210",
+			"alice": "0123456789abcdef0123456789abcdef",
+		},
+		TLSFronting: TLSFrontingConfig{MaskHost: "proxy.example.com"},
+	}
+	second := Config{
+		Secrets: map[string]string{
+			"alice": "0123456789abcdef0123456789abcdef",
+			"zulu":  "fedcba9876543210fedcba9876543210",
+		},
+		TLSFronting: TLSFrontingConfig{MaskHost: "proxy.example.com"},
+	}
+	firstRuntime, err := first.ToGProxyConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRuntime, err := second.ToGProxyConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(firstRuntime.Secrets, secondRuntime.Secrets) {
+		t.Fatalf("secret order differs: %#v != %#v", firstRuntime.Secrets, secondRuntime.Secrets)
+	}
+	if got := []string{firstRuntime.Secrets[0].Name, firstRuntime.Secrets[1].Name}; !reflect.DeepEqual(got, []string{"alice", "zulu"}) {
+		t.Fatalf("secret order = %v", got)
+	}
+}
+
+func TestDisabledWebProxyFingerprintIgnoresInactiveFields(t *testing.T) {
+	base := Config{
+		Secrets:     map[string]string{"alice": "0123456789abcdef0123456789abcdef"},
+		TLSFronting: TLSFrontingConfig{MaskHost: "proxy.example.com"},
+	}
+	withInactiveValues := base
+	withInactiveValues.WebProxy = WebProxyConfig{
+		Hostname:          "ignored.example.com",
+		BindTo:            "127.0.0.1:9999",
+		Backend:           "unix:///ignored.sock",
+		TrustedProxyCIDRs: []string{"192.0.2.0/24"},
+		NumEventLoops:     8,
+	}
+	firstRuntime, err := base.ToGProxyConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRuntime, err := withInactiveValues.ToGProxyConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstRuntime.WebProxyFingerprint != "enabled=false" || secondRuntime.WebProxyFingerprint != firstRuntime.WebProxyFingerprint {
+		t.Fatalf("disabled fingerprints = %q and %q", firstRuntime.WebProxyFingerprint, secondRuntime.WebProxyFingerprint)
+	}
+}
+
+func TestDockerWebProxyExampleConfig(t *testing.T) {
+	cfg, err := Load("../../examples/web-proxy/telego.toml")
+	if err != nil {
+		t.Fatalf("Load example: %v", err)
+	}
+	proxyConfig, err := cfg.ToGProxyConfig()
+	if err != nil {
+		t.Fatalf("ToGProxyConfig: %v", err)
+	}
+	runtime, err := cfg.ToWebProxyRuntimeConfig(proxyConfig.BindAddr)
+	if err != nil {
+		t.Fatalf("ToWebProxyRuntimeConfig: %v", err)
+	}
+	manager, err := webproxy.NewManager(webproxy.DefaultManagerConfig(runtime.Profiles, runtime.Backend))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	shutdownContext, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	defer func() {
+		if err := manager.Shutdown(shutdownContext); err != nil {
+			t.Errorf("Shutdown: %v", err)
+		}
+	}()
+	if _, err := webproxy.NewHTTPServer(webproxy.HTTPServerConfig{
+		Bind:              runtime.BindAddr,
+		Hostname:          runtime.Hostname,
+		Manager:           manager,
+		TrustedProxyCIDRs: runtime.TrustedProxyCIDRs,
+	}); err != nil {
+		t.Fatalf("NewHTTPServer: %v", err)
+	}
+}
+
+func TestDockerWebProxyOperationalContracts(t *testing.T) {
+	nginxConfig, err := os.ReadFile("../../examples/web-proxy/nginx/nginx.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nginxText := string(nginxConfig)
+	if strings.Contains(nginxText, "client_max_body_size 2m") {
+		t.Fatal("example hard-caps candidate requests at the carrier limit")
+	}
+	if strings.Count(nginxText, "client_max_body_size 16m") != 2 {
+		t.Fatal("example must apply the same 16m policy at public ingress and the public site")
+	}
+	if strings.Count(nginxText, "proxy_pass http://telego_web;") != 1 ||
+		!strings.Contains(nginxText, "location / {\n            proxy_pass http://telego_web;") {
+		t.Fatal("example must route every public TLS path through Telego WEB")
+	}
+	if strings.Contains(nginxText, "location = / {") || strings.Contains(nginxText, "location ^~ /api/v1/ {") {
+		t.Fatal("example contains a path-specific WEB route that lets other paths bypass classification")
+	}
+	for _, required := range []string{
+		"error_page 418 = @telego_ordinary;",
+		"error_page 419 = @telego_sanitized;",
+		"proxy_set_header Authorization \"\";",
+		"proxy_set_header Cookie \"\";",
+		"proxy_set_header X-Down-Cursor \"\";",
+		"proxy_set_header X-Session-Token \"\";",
+	} {
+		if !strings.Contains(nginxText, required) {
+			t.Fatalf("example lacks required arbitrary-path fallback directive %q", required)
+		}
+	}
+
+	renewScript, err := os.ReadFile("../../examples/web-proxy/renew-certificate.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	renewText := string(renewScript)
+	renewIndex := strings.Index(renewText, "certbot renew --webroot")
+	validateIndex := strings.Index(renewText, "nginx -t")
+	reloadIndex := strings.Index(renewText, "nginx -s reload")
+	if renewIndex < 0 || validateIndex <= renewIndex || reloadIndex <= validateIndex {
+		t.Fatal("renewal script must renew, validate Nginx, and reload Nginx in order")
+	}
+
+	composeConfig, err := os.ReadFile("../../examples/web-proxy/docker-compose.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(composeConfig), "- proxy.example.com") {
+		t.Fatal("example lacks the certificate-host Docker DNS alias")
+	}
+
+	setupGuide, err := os.ReadFile("../../docs/web-proxy.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	setupText := string(setupGuide)
+	if !strings.Contains(setupText, "legacy mode intentionally trusts PROXY headers") {
+		t.Fatal("setup guide does not qualify legacy public PROXY trust")
+	}
+	if !strings.Contains(setupText, "Send every TLS request to this listener") ||
+		strings.Count(setupText, "include /etc/nginx/snippets/telego-web-ingress.conf;") != 1 {
+		t.Fatal("setup guide does not route every TLS path through WEB classification")
+	}
+	if strings.Count(setupText, "docker compose up -d --force-recreate telego") < 2 {
+		t.Fatal("setup guide lacks explicit Telego recreation for configuration changes and rollback")
+	}
+}
+
+func TestWebProxyConfigRequiresExplicitValuesWhenNotDerivable(t *testing.T) {
+	base := Config{
+		Secrets:  map[string]string{"alice": "0123456789abcdef0123456789abcdef"},
+		WebProxy: WebProxyConfig{Enabled: true},
+	}
+	tests := []struct {
+		name    string
+		mutate  func(*Config)
+		bind    string
+		wantErr string
+	}{
+		{name: "hostname", bind: "0.0.0.0:443", wantErr: "web-proxy.hostname is required"},
+		{name: "canonical hostname", bind: "0.0.0.0:443", mutate: func(c *Config) { c.WebProxy.Hostname = "Proxy.Example.com" }, wantErr: "invalid web-proxy.hostname"},
+		{name: "event loops", bind: "0.0.0.0:443", mutate: func(c *Config) { c.WebProxy.Hostname = "proxy.example.com"; c.WebProxy.NumEventLoops = -1 }, wantErr: "cannot be negative"},
+		{name: "interface backend", bind: "192.0.2.1:443", mutate: func(c *Config) { c.WebProxy.Hostname = "proxy.example.com" }, wantErr: "not wildcard or loopback"},
+		{name: "unix HTTP bind", bind: "0.0.0.0:443", mutate: func(c *Config) {
+			c.WebProxy.Hostname = "proxy.example.com"
+			c.WebProxy.BindTo = "unix:///run/telego-web.sock"
+		}, wantErr: "must be a TCP address"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := base
+			cfg.WebProxy = base.WebProxy
+			if test.mutate != nil {
+				test.mutate(&cfg)
+			}
+			_, err := cfg.ToWebProxyRuntimeConfig(test.bind)
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("error = %v, want containing %q", err, test.wantErr)
+			}
+		})
 	}
 }

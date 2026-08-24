@@ -11,7 +11,188 @@ import (
 	"time"
 
 	"github.com/scratch-net/telego/pkg/transport/faketls"
+	"github.com/scratch-net/telego/pkg/transport/obfuscated2"
 )
+
+func buildDeterministicO2ClientFrame(
+	t *testing.T,
+	secret []byte,
+	dcID int,
+	connectionType obfuscated2.ConnectionType,
+) []byte {
+	t.Helper()
+
+	plain := make([]byte, obfuscated2.FrameSize)
+	for i := range plain {
+		plain[i] = byte(i + 1)
+	}
+	binary.LittleEndian.PutUint32(plain[56:60], uint32(connectionType))
+	binary.LittleEndian.PutUint16(plain[60:62], uint16(int16(dcID)))
+
+	hash := sha256.New()
+	hash.Write(plain[8:40])
+	hash.Write(secret)
+	encryptor, err := obfuscated2.NewAESCTR(hash.Sum(nil), plain[40:56])
+	if err != nil {
+		t.Fatalf("create deterministic O2 client encryptor: %v", err)
+	}
+
+	wire := make([]byte, len(plain))
+	encryptor.XORKeyStream(wire, plain)
+	copy(wire[8:56], plain[8:56])
+	return wire
+}
+
+type capturedOutboundHandshake struct {
+	dcID           int
+	connectionType obfuscated2.ConnectionType
+	wire           []byte
+	err            error
+}
+
+func captureOutboundHandshake(handler *ProxyHandler) <-chan capturedOutboundHandshake {
+	captured := make(chan capturedOutboundHandshake, 1)
+	handler.directDCDial = func(dcID int, connectionType obfuscated2.ConnectionType) (*directDCConn, error) {
+		var wire bytes.Buffer
+		_, _, err := writeDCHandshake(&wire, dcID, connectionType)
+		captured <- capturedOutboundHandshake{
+			dcID:           dcID,
+			connectionType: connectionType,
+			wire:           bytes.Clone(wire.Bytes()),
+			err:            err,
+		}
+		if err != nil {
+			return nil, err
+		}
+		return nil, net.ErrClosed
+	}
+	return captured
+}
+
+func waitForOutboundHandshake(t *testing.T, captured <-chan capturedOutboundHandshake) capturedOutboundHandshake {
+	t.Helper()
+	select {
+	case result := <-captured:
+		if result.err != nil {
+			t.Fatalf("generate captured outbound handshake: %v", result.err)
+		}
+		return result
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for outbound DC handshake")
+		return capturedOutboundHandshake{}
+	}
+}
+
+func assertOutboundFraming(
+	t *testing.T,
+	ctx *ConnContext,
+	captured capturedOutboundHandshake,
+	wantType obfuscated2.ConnectionType,
+	wantDC int,
+) {
+	t.Helper()
+
+	if got := ctx.o2Framing(); got != wantType {
+		t.Errorf("ConnContext framing = 0x%08x, want 0x%08x", got, wantType)
+	}
+	if captured.connectionType != wantType {
+		t.Errorf("outbound dial framing = 0x%08x, want 0x%08x", captured.connectionType, wantType)
+	}
+	if captured.dcID != wantDC {
+		t.Errorf("outbound dial DC ID = %d, want %d", captured.dcID, wantDC)
+	}
+	gotType, gotDC, _, _ := decodeFakeDCHandshake(t, captured.wire)
+	if gotType != wantType {
+		t.Errorf("outbound wire framing = 0x%08x, want 0x%08x", gotType, wantType)
+	}
+	if gotDC != wantDC {
+		t.Errorf("outbound wire DC ID = %d, want %d", gotDC, wantDC)
+	}
+}
+
+func TestRawHandlerChain_PreservesO2FramingToDC(t *testing.T) {
+	secret := []byte("0123456789abcdef")
+	tests := []struct {
+		name           string
+		connectionType obfuscated2.ConnectionType
+	}{
+		{name: "abridged EF", connectionType: obfuscated2.ConnectionTypeAbridged},
+		{name: "intermediate EE", connectionType: obfuscated2.ConnectionTypeIntermediate},
+		{name: "legacy padded intermediate DD", connectionType: obfuscated2.ConnectionTypePaddedIntermediate},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := NewProxyHandler(&Config{
+				Secrets: []Secret{{Name: "test", Key: secret}},
+			}, &testLogger{})
+			captured := captureOutboundHandshake(handler)
+
+			frame := buildDeterministicO2ClientFrame(t, secret, -2, tc.connectionType)
+			if frame[0] == faketls.RecordTypeHandshake {
+				version := binary.BigEndian.Uint16(frame[1:3])
+				if version == faketls.VersionTLS10 || version == faketls.VersionTLS11 || version == faketls.VersionTLS12 {
+					t.Fatal("raw deterministic frame accidentally matches the FakeTLS detector")
+				}
+			}
+
+			conn := newTestMockGnetConn()
+			ctx := NewConnContext()
+			conn.SetContext(ctx)
+			conn.SetReadData(frame)
+
+			handler.handleDetectProtocol(conn, ctx)
+			if got := ctx.ProtocolMode(); got != ModeDD {
+				t.Errorf("protocol mode = %v, want ModeDD", got)
+			}
+			assertOutboundFraming(t, ctx, waitForOutboundHandshake(t, captured), tc.connectionType, -2)
+		})
+	}
+}
+
+func TestFakeTLSHandlerChain_PreservesO2FramingToDC(t *testing.T) {
+	secret := []byte("0123456789abcdef")
+	const host = "example.com"
+	tests := []struct {
+		name           string
+		connectionType obfuscated2.ConnectionType
+	}{
+		{name: "abridged EF", connectionType: obfuscated2.ConnectionTypeAbridged},
+		{name: "intermediate EE", connectionType: obfuscated2.ConnectionTypeIntermediate},
+		{name: "legacy padded intermediate DD", connectionType: obfuscated2.ConnectionTypePaddedIntermediate},
+	}
+
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := NewProxyHandler(&Config{
+				Secrets:           []Secret{{Name: "test", Key: secret, Host: host}},
+				TimeSkewTolerance: time.Minute,
+			}, &testLogger{})
+			captured := captureOutboundHandshake(handler)
+
+			sessionID := bytes.Repeat([]byte{byte(i + 1)}, 32)
+			clientHello := buildTLSRecord(
+				faketls.RecordTypeHandshake,
+				buildValidClientHello(secret, host, sessionID),
+			)
+			o2Frame := buildTLSRecord(
+				faketls.RecordTypeApplicationData,
+				buildDeterministicO2ClientFrame(t, secret, 3, tc.connectionType),
+			)
+
+			conn := newTestMockGnetConn()
+			ctx := NewConnContext()
+			conn.SetContext(ctx)
+			conn.SetReadData(append(clientHello, o2Frame...))
+
+			handler.handleDetectProtocol(conn, ctx)
+			if got := ctx.ProtocolMode(); got != ModeEE {
+				t.Errorf("protocol mode = %v, want ModeEE", got)
+			}
+			assertOutboundFraming(t, ctx, waitForOutboundHandshake(t, captured), tc.connectionType, 3)
+		})
+	}
+}
 
 // buildValidClientHello constructs a valid FakeTLS ClientHello for testing.
 func buildValidClientHello(secret []byte, host string, sessionID []byte) []byte {
@@ -531,10 +712,10 @@ func TestHandleTLSHeader_ValidVersions(t *testing.T) {
 
 			// Valid TLS record with specified version
 			record := []byte{
-				0x16,                       // Handshake
-				byte(tt.version >> 8),      // Version high
-				byte(tt.version),           // Version low
-				0x00, 0x64,                 // Length: 100
+				0x16,                  // Handshake
+				byte(tt.version >> 8), // Version high
+				byte(tt.version),      // Version low
+				0x00, 0x64,            // Length: 100
 			}
 			mockConn.SetReadData(record)
 

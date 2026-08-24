@@ -37,12 +37,17 @@ type HotReloadConfig struct {
 
 // NewHotReloader creates a new hot reloader.
 func NewHotReloader(cfg HotReloadConfig) *HotReloader {
+	var initialConfig *Config
+	if cfg.Handler != nil {
+		initialConfig = cfg.Handler.config
+	}
 	return &HotReloader{
 		configPath: cfg.ConfigPath,
 		loadConfig: cfg.LoadConfig,
 		handler:    cfg.Handler,
 		logger:     cfg.Logger,
 		setLogFn:   cfg.SetLogFn,
+		lastCfg:    initialConfig,
 		stopCh:     make(chan struct{}),
 	}
 }
@@ -155,23 +160,31 @@ func (r *HotReloader) reload() {
 	}
 
 	// Warn about non-hot changes
+	restartRequired := false
 	if oldCfg != nil {
-		r.warnNonHotChanges(oldCfg, newCfg)
+		restartRequired = r.warnNonHotChanges(oldCfg, newCfg)
 	}
 
 	// Apply hot config to handler
 	r.handler.ApplyHotConfig(newCfg)
-	r.logger.Info("config reloaded successfully")
+	if restartRequired {
+		r.logger.Warn("hot settings applied; restart required for other config changes")
+	} else {
+		r.logger.Info("config reloaded successfully")
+	}
 }
 
 // warnNonHotChanges logs warnings for config changes that require restart.
-func (r *HotReloader) warnNonHotChanges(old, new *Config) {
+func (r *HotReloader) warnNonHotChanges(old, new *Config) bool {
+	restartRequired := false
 	if old.BindAddr != new.BindAddr {
 		r.logger.Warn("bind address changed (%s -> %s) but requires restart", old.BindAddr, new.BindAddr)
+		restartRequired = true
 	}
 
 	if len(old.Secrets) != len(new.Secrets) {
 		r.logger.Warn("secrets count changed (%d -> %d) but requires restart", len(old.Secrets), len(new.Secrets))
+		restartRequired = true
 	} else {
 		// Check if secrets changed
 		for i := range old.Secrets {
@@ -181,6 +194,7 @@ func (r *HotReloader) warnNonHotChanges(old, new *Config) {
 			if old.Secrets[i].Name != new.Secrets[i].Name ||
 				string(old.Secrets[i].Key) != string(new.Secrets[i].Key) {
 				r.logger.Warn("secrets changed but requires restart")
+				restartRequired = true
 				break
 			}
 		}
@@ -188,18 +202,33 @@ func (r *HotReloader) warnNonHotChanges(old, new *Config) {
 
 	if old.MaskHost != new.MaskHost || old.MaskPort != new.MaskPort {
 		r.logger.Warn("TLS fronting settings changed but requires restart")
+		restartRequired = true
 	}
 
 	if old.ProxyProtocol != new.ProxyProtocol {
 		r.logger.Warn("proxy-protocol setting changed but requires restart")
+		restartRequired = true
+	}
+
+	if old.InternalProxyProtocol != new.InternalProxyProtocol {
+		r.logger.Warn("internal WEB PROXY protocol setting changed but requires restart")
+		restartRequired = true
+	}
+
+	if old.WebProxyFingerprint != new.WebProxyFingerprint {
+		r.logger.Warn("WEB proxy settings changed but require restart")
+		restartRequired = true
 	}
 
 	if old.MaxIPsPerUser != new.MaxIPsPerUser {
 		r.logger.Warn("max-ips-per-user changed (%d -> %d) but requires restart",
 			old.MaxIPsPerUser, new.MaxIPsPerUser)
+		restartRequired = true
 	}
 
 	if old.NumEventLoop != new.NumEventLoop {
 		r.logger.Warn("num-event-loops changed but requires restart")
+		restartRequired = true
 	}
+	return restartRequired
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -17,6 +18,7 @@ import (
 	"github.com/scratch-net/telego/pkg/gproxy"
 	"github.com/scratch-net/telego/pkg/log"
 	"github.com/scratch-net/telego/pkg/metrics"
+	"github.com/scratch-net/telego/pkg/webproxy"
 )
 
 // Build-time variables injected via ldflags.
@@ -73,12 +75,35 @@ func (c *RunCmd) Run() error {
 		cfg.BindAddr = "0.0.0.0:443"
 	}
 
+	var webRuntimeConfig config.WebProxyRuntimeConfig
+	var webRuntime *webProxyRuntime
+	if fileCfg.WebProxy.Enabled {
+		webRuntimeConfig, err = fileCfg.ToWebProxyRuntimeConfig(cfg.BindAddr)
+		if err != nil {
+			log.Error().Err(err).Msg("invalid WEB proxy config")
+			return err
+		}
+		internalAuth, authErr := gproxy.NewInternalProxyAuth()
+		if authErr != nil {
+			return fmt.Errorf("initialize WEB backend authentication: %w", authErr)
+		}
+		cfg.InternalProxyAuth = internalAuth
+		webRuntime, err = newWebProxyRuntime(webRuntimeConfig, internalAuth)
+		if err != nil {
+			log.Error().Err(err).Msg("failed to initialize WEB proxy")
+			return err
+		}
+	}
+
 	// Print Telegram links if requested (skip for Unix sockets)
 	if c.Link {
 		if gproxy.IsUnixSocket(cfg.BindAddr) {
 			log.Warn().Msg("Telegram links not available for Unix socket binding")
 		} else if err := printTelegramLinks(cfg.Secrets, cfg.BindAddr); err != nil {
 			log.Warn().Err(err).Msg("failed to generate Telegram links")
+		}
+		if webRuntime != nil {
+			printWebProxyLinks(webRuntimeConfig.Hostname, webRuntimeConfig.Profiles)
 		}
 	}
 
@@ -94,6 +119,23 @@ func (c *RunCmd) Run() error {
 
 	logger := &zerologAdapter{}
 	shutdown, handler, errCh := gproxy.RunWithHandler(&cfg, logger)
+	if webRuntime != nil {
+		startCtx, cancel := context.WithTimeout(context.Background(), webProxyLifecycleTimeout)
+		err := webRuntime.Start(startCtx)
+		cancel()
+		if err != nil {
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), webProxyLifecycleTimeout)
+			_ = webRuntime.Shutdown(shutdownCtx)
+			shutdownCancel()
+			shutdown()
+			log.Error().Err(err).Msg("failed to start WEB proxy")
+			return err
+		}
+		log.Info().
+			Str("bind", webRuntimeConfig.BindAddr).
+			Str("hostname", webRuntimeConfig.Hostname).
+			Msg("WEB proxy started")
+	}
 
 	// Start metrics server if configured
 	var metricsServer *metrics.Server
@@ -126,6 +168,17 @@ func (c *RunCmd) Run() error {
 			if err != nil {
 				return nil, "", err
 			}
+			if c.Bind != "" {
+				proxyCfg.BindAddr = c.Bind
+			}
+			if proxyCfg.BindAddr == "" {
+				proxyCfg.BindAddr = "0.0.0.0:443"
+			}
+			if fileCfg.WebProxy.Enabled {
+				if _, err := fileCfg.ToWebProxyRuntimeConfig(proxyCfg.BindAddr); err != nil {
+					return nil, "", err
+				}
+			}
 			logLevel := fileCfg.General.LogLevel
 			if logLevel == "" {
 				logLevel = fileCfg.LogLevel
@@ -138,25 +191,37 @@ func (c *RunCmd) Run() error {
 	})
 	hotReloader.Start()
 
-	select {
-	case sig := <-sigCh:
-		log.Info().Str("signal", sig.String()).Msg("shutting down")
+	cleanup := func() {
+		if webRuntime != nil {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), webProxyLifecycleTimeout)
+			if err := webRuntime.Shutdown(shutdownCtx); err != nil {
+				log.Warn().Err(err).Msg("failed to shut down WEB proxy cleanly")
+			}
+			cancel()
+		}
 		if metricsServer != nil {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			metricsServer.Shutdown(shutdownCtx)
+			_ = metricsServer.Shutdown(shutdownCtx)
 			cancel()
 		}
 		hotReloader.Stop()
 		shutdown()
+	}
+
+	select {
+	case sig := <-sigCh:
+		log.Info().Str("signal", sig.String()).Msg("shutting down")
+		cleanup()
 		return nil
 	case err := <-errCh:
-		if metricsServer != nil {
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			metricsServer.Shutdown(shutdownCtx)
-			cancel()
-		}
-		hotReloader.Stop()
+		cleanup()
 		return err
+	case err, ok := <-webRuntime.Errors():
+		cleanup()
+		if !ok || err == nil {
+			return fmt.Errorf("WEB HTTP server stopped unexpectedly")
+		}
+		return fmt.Errorf("WEB HTTP server failed: %w", err)
 	}
 }
 
@@ -190,6 +255,31 @@ func printTelegramLinks(secrets []gproxy.Secret, bindAddr string) error {
 	}
 
 	return nil
+}
+
+type webProxyLinks struct {
+	Telegram string
+	HTTPS    string
+}
+
+func buildWebProxyLinks(hostname, secret string) webProxyLinks {
+	query := "server=" + url.QueryEscape(hostname) + "&secret=" + url.QueryEscape(secret)
+	return webProxyLinks{
+		Telegram: "tg://webproxy?" + query,
+		HTTPS:    "https://t.me/webproxy?" + query,
+	}
+}
+
+func printWebProxyLinks(hostname string, profiles []webproxy.Profile) {
+	for _, profile := range profiles {
+		links := buildWebProxyLinks(hostname, profile.SecretHex())
+		log.Info().
+			Str("name", profile.Name()).
+			Str("mode", profile.Mode().String()).
+			Str("tg_link", links.Telegram).
+			Str("https_link", links.HTTPS).
+			Msg("Telegram WEB proxy links")
+	}
 }
 
 // getPublicIP discovers the public IP address using STUN.

@@ -23,6 +23,7 @@
   <a href="#installation">Installation</a> •
   <a href="#quick-start">Quick Start</a> •
   <a href="#configuration">Configuration</a> •
+  <a href="#native-telegram-web-proxy">WEB Proxy</a> •
   <a href="#docker">Docker</a> •
   <a href="#nginx--lets-encrypt-real-certificate-tls">Nginx + LE</a> •
   <a href="#performance">Performance</a>
@@ -42,6 +43,7 @@
 
 ### Networking
 - **Event-driven I/O** — Built on [gnet](https://github.com/panjf2000/gnet) with epoll/kqueue for maximum efficiency
+- **Native WEB Proxy** — Optional gnet HTTPS carrier for Telegram Desktop behind Nginx
 - **Zero-copy relaying** — Direct buffer manipulation without intermediate copies
 - **Buffer pooling** — Striped sync.Pool design eliminates allocations in hot paths
 - **Optimized TCP** — `TCP_NODELAY`, `TCP_QUICKACK`, 64KB buffers, `SO_REUSEPORT`
@@ -151,6 +153,37 @@ Both modes use the same 16-byte secret key. The `ee` or `dd` prefix in the clien
 
 ---
 
+## Native Telegram WEB Proxy
+
+Telego includes an optional WEB proxy for Telegram Desktop. It uses a separate private gnet HTTP/1.1 listener behind Nginx.
+
+Nginx keeps the real TLS certificate and the ordinary website. The existing MTProxy listener stays on public port 443.
+
+Add this section to enable WEB for existing secrets:
+
+```toml
+[web-proxy]
+enabled = true
+hostname = "proxy.example.com"
+bind-to = "127.0.0.1:8080"
+trusted-proxy-cidrs = ["127.0.0.1/32"]
+```
+
+You must route every request from the Nginx TLS server to this listener. This rule prevents carrier headers from bypassing Telego.
+
+The setup uses two private fallback statuses.
+
+- Status 418 preserves an ordinary website request.
+- Status 419 removes carrier credentials before public-site delivery.
+
+Run Telego with `-l` to print the plain and `dd` WEB links. Telego derives both links from each existing base secret.
+
+Read the [native WEB proxy setup guide](docs/web-proxy.md) for the complete Nginx configuration, Docker setup, and rollback procedure.
+
+The WEB configuration is inactive by default. Configurations without `[web-proxy]` continue to use the existing MTProxy startup path.
+
+---
+
 ## Configuration
 
 ### Config Reference
@@ -207,6 +240,15 @@ mask-host = "www.google.com"  # Host to mimic (SNI validation, proxy links)
 # Anti-DPI record shaping (proxy -> client direction)
 # enable-drs = true        # Probe-then-ramp record sizing (1369 -> 16384 bytes after 8 records or 128 KB)
 # enable-split-tls = true  # Emit first ApplicationData record as 1 byte
+
+# Native Telegram Desktop WEB proxy (optional; requires Nginx with real TLS)
+[web-proxy]
+enabled = false
+# hostname = "proxy.example.com"            # Required public certificate hostname
+# bind-to = "127.0.0.1:8080"               # Private HTTP/1.1 listener
+# backend = "127.0.0.1:443"                # Derived TCP or Unix MTProxy backend
+# trusted-proxy-cidrs = ["127.0.0.1/32"]   # Nginx peers allowed to send X-Forwarded-For
+# num-event-loops = 0                       # 0 = automatic
 
 # Performance tuning (all optional)
 [performance]
@@ -425,7 +467,7 @@ kill -HUP $(pidof telego)
 - `idle-timeout` — Applies to new connections
 
 **Require restart:**
-- `bind-to`, `secrets`, `tls-fronting.*`, `proxy-protocol`, `max-connections-per-ip`, `max-ips-per-user`, `handshake-timeout`
+- `bind-to`, `secrets`, `tls-fronting.*`, `proxy-protocol`, `web-proxy.*`, `max-connections-per-ip`, `max-ips-per-user`, `handshake-timeout`
 
 ---
 

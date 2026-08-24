@@ -12,6 +12,7 @@ import (
 	"github.com/panjf2000/gnet/v2"
 
 	"github.com/scratch-net/telego/pkg/transport/faketls"
+	"github.com/scratch-net/telego/pkg/transport/obfuscated2"
 )
 
 // ConnState represents the current state of a client connection.
@@ -108,6 +109,10 @@ type ConnContext struct {
 	encryptor cipher.Stream
 	decryptor cipher.Stream
 	dcID      int
+	// Inner MTProto packet framing selected in the obfuscated2 handshake.
+	// This must also be used for the upstream Telegram DC handshake because
+	// Telego relays decrypted packet bytes without translating their framing.
+	o2ConnectionType obfuscated2.ConnectionType
 
 	// Relay context - set once atomically when entering relay state
 	// After set, read without locking
@@ -123,10 +128,30 @@ type ConnContext struct {
 	// Splice flow control: signaled when client buffer has space
 	// Used to avoid busy-wait sleep in relaySpliceToClientLoop
 	spliceResume chan struct{}
+	spliceFlowMu sync.Mutex
+	// pending counts AsyncWrite submissions not processed by the event loop;
+	// outbound is the latest event-loop-owned gnet buffer measurement.
+	splicePendingBytes  int
+	spliceOutboundBytes int
+
+	// Splice shutdown is requested by the upstream reader goroutine after a
+	// clean EOF, then owned by the client connection's event loop until every
+	// queued byte has left gnet's outbound buffer.
+	spliceDrainRequested atomic.Bool
+	spliceDrainMu        sync.Mutex
+	spliceDraining       bool
+	spliceDrainID        uint64
+	spliceDrainDeadline  *time.Timer
+	spliceDrainWake      *time.Timer
 
 	// Real client address from PROXY protocol (if parsed)
 	// Protected by mu during handshake, immutable after
 	realClientAddr net.Addr
+
+	// The private WEB hop starts as an unauthenticated local candidate. Only a
+	// matching process-local preface changes it to an authenticated internal hop.
+	internalProxyCandidate     bool
+	internalProxyAuthenticated bool
 
 	// Connection limit tracking (protected by mu)
 	ipLimitTracked   bool   // Whether this connection is tracked in per-IP limiter (set in OnOpen)
@@ -278,6 +303,13 @@ func (c *ConnContext) DCID() int {
 	return c.dcID
 }
 
+// o2Framing returns the MTProto packet framing selected by the client.
+func (c *ConnContext) o2Framing() obfuscated2.ConnectionType {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.o2ConnectionType
+}
+
 // Cleanup zeros sensitive data in the connection context.
 // Should be called when the connection is closed.
 // Note: cipher.Stream internal state cannot be zeroed (opaque Go types).
@@ -301,6 +333,7 @@ func (c *ConnContext) Cleanup() {
 	// Clear references (cipher streams can't be zeroed but break reference)
 	c.encryptor = nil
 	c.decryptor = nil
+	c.o2ConnectionType = 0
 	c.secret = nil
 }
 

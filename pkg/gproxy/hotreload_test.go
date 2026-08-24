@@ -234,6 +234,12 @@ func TestHotReloader_WarnNonHotChanges(t *testing.T) {
 			wantWarn: true,
 		},
 		{
+			name:     "WEB_proxy_changed",
+			old:      &Config{WebProxyFingerprint: "old"},
+			new:      &Config{WebProxyFingerprint: "new"},
+			wantWarn: true,
+		},
+		{
 			name:     "no_changes",
 			old:      &Config{BindAddr: ":8080"},
 			new:      &Config{BindAddr: ":8080"},
@@ -251,6 +257,38 @@ func TestHotReloader_WarnNonHotChanges(t *testing.T) {
 					len(logger.warnings), tt.wantWarn)
 			}
 		})
+	}
+}
+
+func TestHotReloaderWEBChangeRequiresRestartWithoutSuccessLog(t *testing.T) {
+	logger := &testLogger{}
+	handler := NewProxyHandler(&Config{IdleTimeout: time.Minute, WebProxyFingerprint: "old"}, logger)
+	reloader := NewHotReloader(HotReloadConfig{
+		ConfigPath: "/tmp/test.conf",
+		LoadConfig: func() (*Config, string, error) {
+			return &Config{IdleTimeout: 2 * time.Minute, WebProxyFingerprint: "new"}, "", nil
+		},
+		Handler: handler,
+		Logger:  logger,
+	})
+
+	reloader.reload()
+	if handler.IdleTimeout() != 2*time.Minute {
+		t.Fatalf("hot timeout = %v", handler.IdleTimeout())
+	}
+	for _, message := range logger.infos {
+		if message == "config reloaded successfully" {
+			t.Fatal("restart-only WEB change was logged as a successful reload")
+		}
+	}
+	warnedWEB := false
+	warnedRestart := false
+	for _, message := range logger.warnings {
+		warnedWEB = warnedWEB || message == "WEB proxy settings changed but require restart"
+		warnedRestart = warnedRestart || message == "hot settings applied; restart required for other config changes"
+	}
+	if !warnedWEB || !warnedRestart {
+		t.Fatalf("warnings = %v", logger.warnings)
 	}
 }
 

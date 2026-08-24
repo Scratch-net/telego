@@ -1,11 +1,334 @@
 package gproxy
 
 import (
+	"bytes"
+	"context"
+	"crypto/cipher"
+	"encoding/binary"
+	"errors"
+	"io"
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/panjf2000/gnet/v2"
 
 	"github.com/scratch-net/telego/pkg/dc"
+	"github.com/scratch-net/telego/pkg/transport/obfuscated2"
 )
+
+type spliceRelayTestHandler struct {
+	*ProxyHandler
+	upstream  net.Conn
+	engine    atomic.Pointer[gnet.Engine]
+	ready     chan struct{}
+	closed    chan struct{}
+	relayDone chan struct{}
+	closeOnce sync.Once
+}
+
+type spliceReadErrorConn struct {
+	net.Conn
+	err error
+}
+
+func (c *spliceReadErrorConn) Read([]byte) (int, error) { return 0, c.err }
+
+type spliceReadStartedConn struct {
+	net.Conn
+	started chan struct{}
+	once    sync.Once
+}
+
+func (c *spliceReadStartedConn) Read(buffer []byte) (int, error) {
+	c.once.Do(func() { close(c.started) })
+	return c.Conn.Read(buffer)
+}
+
+func (h *spliceRelayTestHandler) OnBoot(engine gnet.Engine) gnet.Action {
+	h.engine.Store(&engine)
+	close(h.ready)
+	return gnet.None
+}
+
+func (h *spliceRelayTestHandler) OnOpen(connection gnet.Conn) ([]byte, gnet.Action) {
+	ctx := NewConnContext()
+	ctx.SetState(StateSplicing)
+	ctx.SetSpliceConn(h.upstream)
+	connection.SetContext(ctx)
+	atomic.AddInt64(&h.activeConns, 1)
+	go func() {
+		h.relaySpliceToClientLoop(h.upstream, connection, ctx)
+		close(h.relayDone)
+	}()
+	return nil, gnet.None
+}
+
+func (h *spliceRelayTestHandler) OnClose(connection gnet.Conn, err error) gnet.Action {
+	action := h.ProxyHandler.OnClose(connection, err)
+	h.closeOnce.Do(func() { close(h.closed) })
+	return action
+}
+
+func runSpliceRelayTestServer(t *testing.T, upstream net.Conn) (*spliceRelayTestHandler, string) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	handler := &spliceRelayTestHandler{
+		ProxyHandler: NewProxyHandler(&Config{
+			SpliceIdleTimeout: 5 * time.Second,
+			MaxWriteBuffer:    4 * 1024 * 1024,
+		}, &testLogger{}),
+		upstream:  upstream,
+		ready:     make(chan struct{}),
+		closed:    make(chan struct{}),
+		relayDone: make(chan struct{}),
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- gnet.Run(handler, "tcp://"+address,
+			gnet.WithNumEventLoop(1),
+			gnet.WithSocketSendBuffer(4096),
+			gnet.WithWriteBufferCap(4096),
+		)
+	}()
+	select {
+	case <-handler.ready:
+	case err := <-errCh:
+		t.Fatalf("start splice test server: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out starting splice test server")
+	}
+	t.Cleanup(func() {
+		if engine := handler.engine.Load(); engine != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if err := (*engine).Stop(ctx); err != nil {
+				t.Errorf("stop splice test server: %v", err)
+			}
+		}
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Errorf("splice test server: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("splice test server did not stop")
+		}
+	})
+	return handler, address
+}
+
+func waitForSpliceRelaySignal(t *testing.T, signal <-chan struct{}, name string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s", name)
+	}
+}
+
+func TestRelaySpliceToClientDrainsBeforeClose(t *testing.T) {
+	proxyUpstream, backend := net.Pipe()
+	defer backend.Close()
+	payload := bytes.Repeat([]byte("telego-splice-drain-"), 128*1024)
+	writeErr := make(chan error, 1)
+	go func() {
+		_, err := backend.Write(payload)
+		if closeErr := backend.Close(); err == nil {
+			err = closeErr
+		}
+		writeErr <- err
+	}()
+
+	handler, address := runSpliceRelayTestServer(t, proxyUpstream)
+	connection, err := net.Dial("tcp", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	if tcp, ok := connection.(*net.TCPConn); ok {
+		if err := tcp.SetReadBuffer(1024); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Keep the receive window constrained while the upstream reaches EOF.
+	time.Sleep(100 * time.Millisecond)
+	if err := connection.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(connection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("splice payload bytes = %d, want exact %d", len(got), len(payload))
+	}
+	if err := <-writeErr; err != nil {
+		t.Fatalf("write splice payload: %v", err)
+	}
+	waitForSpliceRelaySignal(t, handler.relayDone, "splice relay exit")
+	waitForSpliceRelaySignal(t, handler.closed, "client close")
+}
+
+func TestRelaySpliceReadErrorClosesWithoutLeak(t *testing.T) {
+	proxyUpstream, backend := net.Pipe()
+	defer backend.Close()
+	readErr := errors.New("test splice read failure")
+	handler, address := runSpliceRelayTestServer(t, &spliceReadErrorConn{Conn: proxyUpstream, err: readErr})
+	connection, err := net.Dial("tcp", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	waitForSpliceRelaySignal(t, handler.relayDone, "splice relay exit")
+	waitForSpliceRelaySignal(t, handler.closed, "client close")
+	if active := atomic.LoadInt64(&handler.activeConns); active != 0 {
+		t.Fatalf("active splice connections = %d, want 0", active)
+	}
+}
+
+func TestRelaySpliceClientCancellationStopsBlockedRead(t *testing.T) {
+	proxyUpstream, backend := net.Pipe()
+	defer backend.Close()
+	started := make(chan struct{})
+	upstream := &spliceReadStartedConn{Conn: proxyUpstream, started: started}
+	handler, address := runSpliceRelayTestServer(t, upstream)
+	connection, err := net.Dial("tcp", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForSpliceRelaySignal(t, started, "splice upstream read")
+	if err := connection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitForSpliceRelaySignal(t, handler.closed, "client close")
+	waitForSpliceRelaySignal(t, handler.relayDone, "splice relay exit")
+	if active := atomic.LoadInt64(&handler.activeConns); active != 0 {
+		t.Fatalf("active splice connections = %d, want 0", active)
+	}
+}
+
+func decodeFakeDCHandshake(
+	t *testing.T,
+	wire []byte,
+) (obfuscated2.ConnectionType, int, cipher.Stream, cipher.Stream) {
+	t.Helper()
+
+	dcDecryptor, err := obfuscated2.NewAESCTR(wire[8:40], wire[40:56])
+	if err != nil {
+		t.Fatalf("create fake DC decryptor: %v", err)
+	}
+	plain := make([]byte, obfuscated2.FrameSize)
+	dcDecryptor.XORKeyStream(plain, wire)
+
+	var reversed [48]byte
+	for i := range reversed {
+		reversed[47-i] = wire[8+i]
+	}
+	dcEncryptor, err := obfuscated2.NewAESCTR(reversed[:32], reversed[32:48])
+	if err != nil {
+		t.Fatalf("create fake DC encryptor: %v", err)
+	}
+
+	connectionType := obfuscated2.ConnectionType(binary.LittleEndian.Uint32(plain[56:60]))
+	dcID := int(int16(binary.LittleEndian.Uint16(plain[60:62])))
+	return connectionType, dcID, dcDecryptor, dcEncryptor
+}
+
+func TestWriteDCHandshake_PreservesPacketFraming(t *testing.T) {
+	tests := []struct {
+		name           string
+		connectionType obfuscated2.ConnectionType
+		packet         []byte
+	}{
+		{
+			name:           "abridged EF",
+			connectionType: obfuscated2.ConnectionTypeAbridged,
+			packet:         []byte{0x01, 0xde, 0xad, 0xbe, 0xef},
+		},
+		{
+			name:           "intermediate EE",
+			connectionType: obfuscated2.ConnectionTypeIntermediate,
+			packet:         []byte{0x04, 0x00, 0x00, 0x00, 0xde, 0xad, 0xbe, 0xef},
+		},
+		{
+			name:           "padded intermediate DD",
+			connectionType: obfuscated2.ConnectionTypePaddedIntermediate,
+			packet:         []byte{0x06, 0x00, 0x00, 0x00, 0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			proxyConn, fakeDC := net.Pipe()
+			defer proxyConn.Close()
+			defer fakeDC.Close()
+			if err := fakeDC.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				t.Fatalf("set fake DC deadline: %v", err)
+			}
+
+			type result struct {
+				encryptor cipher.Stream
+				decryptor cipher.Stream
+				err       error
+			}
+			resultCh := make(chan result, 1)
+			go func() {
+				encryptor, decryptor, err := writeDCHandshake(proxyConn, -3, tc.connectionType)
+				resultCh <- result{encryptor: encryptor, decryptor: decryptor, err: err}
+			}()
+
+			wire := make([]byte, obfuscated2.FrameSize)
+			if _, err := io.ReadFull(fakeDC, wire); err != nil {
+				t.Fatalf("fake DC read handshake: %v", err)
+			}
+			gotType, gotDC, dcDecryptor, dcEncryptor := decodeFakeDCHandshake(t, wire)
+			if gotType != tc.connectionType {
+				t.Errorf("connection type = 0x%08x, want 0x%08x", gotType, tc.connectionType)
+			}
+			if gotDC != -3 {
+				t.Errorf("DC ID = %d, want -3", gotDC)
+			}
+
+			gotResult := <-resultCh
+			if gotResult.err != nil {
+				t.Fatalf("writeDCHandshake: %v", gotResult.err)
+			}
+
+			toDC := make([]byte, len(tc.packet))
+			gotResult.encryptor.XORKeyStream(toDC, tc.packet)
+			gotAtDC := make([]byte, len(tc.packet))
+			dcDecryptor.XORKeyStream(gotAtDC, toDC)
+			if !bytes.Equal(gotAtDC, tc.packet) {
+				t.Errorf("relayed packet at fake DC = %x, want unchanged %x", gotAtDC, tc.packet)
+			}
+
+			toProxy := make([]byte, len(tc.packet))
+			dcEncryptor.XORKeyStream(toProxy, tc.packet)
+			gotAtProxy := make([]byte, len(tc.packet))
+			gotResult.decryptor.XORKeyStream(gotAtProxy, toProxy)
+			if !bytes.Equal(gotAtProxy, tc.packet) {
+				t.Errorf("fake DC response at proxy = %x, want unchanged %x", gotAtProxy, tc.packet)
+			}
+		})
+	}
+}
+
+func TestWriteDCHandshake_RejectsUnsupportedPacketFraming(t *testing.T) {
+	_, _, err := writeDCHandshake(io.Discard, 2, obfuscated2.ConnectionType(0xabababab))
+	if err != obfuscated2.ErrUnsupportedConnection {
+		t.Fatalf("error = %v, want %v", err, obfuscated2.ErrUnsupportedConnection)
+	}
+}
 
 // TestBuildProxyProtocolV1_IPv4 tests building v1 header for IPv4.
 func TestBuildProxyProtocolV1_IPv4(t *testing.T) {

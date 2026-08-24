@@ -53,13 +53,14 @@ func (h *ProxyHandler) handleDDFrame(c gnet.Conn, ctx *ConnContext) gnet.Action 
 
 	// Try each secret until one matches
 	var dcID int
+	var connectionType obfuscated2.ConnectionType
 	var encryptor, decryptor cipher.Stream
 	var matchedSecret *Secret
 	var err error
 
 	for i := range h.config.Secrets {
 		s := &h.config.Secrets[i]
-		dcID, encryptor, decryptor, err = obfuscated2.ParseClientFrame(s.Key, data[:obfuscated2.FrameSize])
+		dcID, connectionType, encryptor, decryptor, err = obfuscated2.ParseClientFrameWithType(s.Key, data[:obfuscated2.FrameSize])
 		if err == nil {
 			matchedSecret = s
 			break
@@ -140,6 +141,7 @@ func (h *ProxyHandler) handleDDFrame(c gnet.Conn, ctx *ConnContext) gnet.Action 
 	// Store ciphers and DC ID
 	ctx.mu.Lock()
 	ctx.dcID = dcID
+	ctx.o2ConnectionType = connectionType
 	ctx.encryptor = encryptor
 	ctx.decryptor = decryptor
 	ctx.mu.Unlock()
@@ -441,7 +443,7 @@ func (h *ProxyHandler) handleO2Frame(c gnet.Conn, ctx *ConnContext) gnet.Action 
 			}
 
 			// Parse obfuscated2 handshake frame
-			dcID, encryptor, decryptor, err := obfuscated2.ParseClientFrame(secret.Key, payload[:obfuscated2.FrameSize])
+			dcID, connectionType, encryptor, decryptor, err := obfuscated2.ParseClientFrameWithType(secret.Key, payload[:obfuscated2.FrameSize])
 			if err != nil {
 				h.logger.Debug("ParseClientFrame failed: %v", err)
 				return gnet.Close
@@ -461,6 +463,7 @@ func (h *ProxyHandler) handleO2Frame(c gnet.Conn, ctx *ConnContext) gnet.Action 
 			// Store ciphers and DC ID
 			ctx.mu.Lock()
 			ctx.dcID = dcID
+			ctx.o2ConnectionType = connectionType
 			ctx.encryptor = encryptor
 			ctx.decryptor = decryptor
 			ctx.pendingData = pendingData
@@ -519,6 +522,10 @@ func (h *ProxyHandler) startSplice(c gnet.Conn, ctx *ConnContext) gnet.Action {
 
 // handleSplice forwards data to the splice target.
 func (h *ProxyHandler) handleSplice(c gnet.Conn, ctx *ConnContext) gnet.Action {
+	if ctx.spliceDrainRequested.Load() {
+		return h.handleSpliceDrain(c, ctx)
+	}
+
 	// Lock-free read of splice connection
 	spliceConn := ctx.SpliceConn()
 	if spliceConn == nil {
@@ -543,4 +550,21 @@ func (h *ProxyHandler) handleSplice(c gnet.Conn, ctx *ConnContext) gnet.Action {
 	}
 
 	return gnet.None
+}
+
+// handleSpliceDrain runs only on the client connection's event loop. A wake
+// timer keeps checking until gnet has flushed every queued upstream byte.
+func (h *ProxyHandler) handleSpliceDrain(c gnet.Conn, ctx *ConnContext) gnet.Action {
+	if buffered := c.InboundBuffered(); buffered > 0 {
+		_, _ = c.Discard(buffered)
+	}
+	if !ctx.isSpliceDraining() {
+		return gnet.None
+	}
+	if c.OutboundBuffered() != 0 {
+		ctx.armSpliceDrainWake(c)
+		return gnet.None
+	}
+	ctx.finishSpliceDrain()
+	return gnet.Close
 }

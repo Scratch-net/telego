@@ -12,6 +12,7 @@ import (
 	"github.com/panjf2000/gnet/v2"
 
 	"github.com/scratch-net/telego/pkg/tlsfront"
+	"github.com/scratch-net/telego/pkg/transport/obfuscated2"
 )
 
 // Buffer limit for OOM protection
@@ -70,6 +71,11 @@ type ProxyHandler struct {
 	// Pending DC contexts: keyed by fd, used to eliminate race between Enroll and SetContext
 	pendingDCContexts sync.Map // int (fd) -> *DCConnContext
 
+	// directDCDial is the outbound connection seam. Production initializes it
+	// to dialDirectDC; tests replace it to verify handshake propagation without
+	// contacting Telegram.
+	directDCDial func(int, obfuscated2.ConnectionType) (*directDCConn, error)
+
 	// Mask SNI safelist: lowercased domain -> resolved "host:port" splice target.
 	// Empty when the feature is unconfigured.
 	maskSafelist map[string]string
@@ -114,6 +120,7 @@ func NewProxyHandler(cfg *Config, logger Logger) *ProxyHandler {
 		relayBufPool:   NewBufferPool(16 * 1024),     // 16KB TLS record
 		desyncDetector: NewDesyncDetector(),
 	}
+	h.directDCDial = h.dialDirectDC
 
 	// Initialize hot-reloadable config atomically
 	h.idleTimeoutNs.Store(int64(cfg.IdleTimeout))
@@ -239,8 +246,15 @@ func (h *ProxyHandler) OnShutdown(eng gnet.Engine) {
 func (h *ProxyHandler) OnOpen(c gnet.Conn) ([]byte, gnet.Action) {
 	ctx := NewConnContext()
 
-	// Start with PROXY protocol parsing if enabled, otherwise detect protocol
-	if h.config.ProxyProtocol {
+	// A local WEB connection remains only a candidate until its process-local
+	// authentication preface is validated. Public PROXY acceptance remains an
+	// independent operator setting.
+	internalProxy := h.config.InternalProxyProtocol &&
+		h.config.InternalProxyAuth != nil &&
+		trustedInternalProxyPeer(c.RemoteAddr())
+	ctx.internalProxyCandidate = internalProxy
+	parseProxy := h.config.ProxyProtocol || ctx.internalProxyCandidate
+	if parseProxy {
 		ctx.SetState(StateReadProxyProto)
 	}
 	// Otherwise keep default StateDetectProtocol from NewConnContext
@@ -250,21 +264,16 @@ func (h *ProxyHandler) OnOpen(c gnet.Conn) ([]byte, gnet.Action) {
 	conns := atomic.AddInt64(&h.activeConns, 1)
 	h.logger.Info("[#%d] new connection from %s (active: %d)", ctx.id, c.RemoteAddr(), conns)
 
-	// Enforce per-IP connection limit before any protocol work
-	if h.connLimiter != nil {
-		var ip net.IP
-		if tcpAddr, ok := c.RemoteAddr().(*net.TCPAddr); ok {
-			ip = tcpAddr.IP
+	// Every peer consumes admission immediately. Unix WEB candidates use a
+	// synthetic loopback address because Unix peer addresses contain no IP.
+	admissionAddress := c.RemoteAddr()
+	if ctx.internalProxyCandidate {
+		if _, unixPeer := admissionAddress.(*net.UnixAddr); unixPeer {
+			admissionAddress = internalUnixAdmissionAddress
 		}
-		if ip != nil {
-			key, ok := h.connLimiter.TryAcquireIP(ip)
-			if !ok {
-				h.logger.Info("[#%d] per-IP connection limit exceeded for %s (active: %d)", ctx.id, ip, conns)
-				return nil, gnet.Close
-			}
-			ctx.ipLimitTracked = true
-			ctx.ipLimitKey = key
-		}
+	}
+	if !h.acquireInitialIPLimit(ctx, admissionAddress, conns) {
+		return nil, gnet.Close
 	}
 
 	// Set read deadline for handshake
@@ -301,6 +310,7 @@ func (h *ProxyHandler) OnClose(c gnet.Conn, err error) gnet.Action {
 
 	// Mark as closed FIRST - goroutines check this before proceeding
 	ctx.SetState(StateClosed)
+	ctx.cancelSpliceDrain()
 
 	// Drop from the silence-sweep registry if it was tracked.
 	if h.clientSilenceCloseMs > 0 {
@@ -403,23 +413,46 @@ func (h *ProxyHandler) handleProxyProto(c gnet.Conn, ctx *ConnContext) gnet.Acti
 		return gnet.None // Need data
 	}
 
-	// Quick check: if first byte can't start a PROXY header, skip to detection immediately
-	// This prevents slowloris-style attacks with tiny payloads
-	// PROXY v1 starts with 'P' (0x50), v2 starts with 0x0D
-	if data[0] != 'P' && data[0] != 0x0D {
-		ctx.SetState(StateDetectProtocol)
-		return h.handleDetectProtocol(c, ctx)
+	if ctx.internalProxyCandidate {
+		switch h.config.InternalProxyAuth.prefaceStatus(data) {
+		case internalPrefaceIncomplete:
+			return gnet.None
+		case internalPrefaceRejected:
+			if !h.acquireInitialIPLimit(ctx, c.RemoteAddr(), atomic.LoadInt64(&h.activeConns)) {
+				return gnet.Close
+			}
+			h.logger.Debug("[#%d] rejected unauthenticated internal WEB preface", ctx.id)
+			return gnet.Close
+		case internalPrefaceAccepted:
+			c.Discard(h.config.InternalProxyAuth.prefaceLen())
+			ctx.internalProxyCandidate = false
+			ctx.internalProxyAuthenticated = true
+			data, _ = c.Peek(-1)
+			if len(data) == 0 {
+				return gnet.None
+			}
+		case internalPrefaceNoMatch:
+			ctx.internalProxyCandidate = false
+			if !h.config.ProxyProtocol {
+				return h.fallbackFromProxyProtocol(c, ctx)
+			}
+		}
 	}
 
-	// Need minimum bytes to determine protocol type
-	// v1: need 6 bytes for "PROXY " prefix
-	// v2: need 12 bytes for signature
-	minBytes := 6
-	if data[0] == 0x0D {
-		minBytes = 12
+	frameStatus, err := inspectProxyProtocolFrame(data)
+	if err != nil {
+		h.logger.Debug("[#%d] PROXY protocol error: %v", ctx.id, err)
+		return gnet.Close
 	}
-	if len(data) < minBytes {
-		return gnet.None // Need more data to determine
+	if frameStatus == proxyProtoIncomplete {
+		return gnet.None
+	}
+	if frameStatus == proxyProtoNotPresent {
+		if ctx.internalProxyAuthenticated {
+			h.logger.Debug("[#%d] authenticated internal WEB preface without PROXY header", ctx.id)
+			return gnet.Close
+		}
+		return h.fallbackFromProxyProtocol(c, ctx)
 	}
 
 	result, err := ParseProxyProtocol(data)
@@ -429,23 +462,114 @@ func (h *ProxyHandler) handleProxyProto(c gnet.Conn, ctx *ConnContext) gnet.Acti
 	}
 
 	if result == nil {
-		// Not a PROXY protocol header, proceed to protocol detection
-		ctx.SetState(StateDetectProtocol)
-		return h.handleDetectProtocol(c, ctx)
+		return h.fallbackFromProxyProtocol(c, ctx)
 	}
 
 	// Discard the PROXY header bytes
 	c.Discard(result.HeaderLen)
 
-	// Store real client address if provided
+	// An authenticated WEB connection transfers its provisional loopback slot
+	// to the validated client IP. Acquire the new slot before releasing the old
+	// one so saturation cannot create an uncharged window.
+	if ctx.internalProxyAuthenticated {
+		if result.SrcAddr == nil || !h.transferInitialIPLimit(ctx, result.SrcAddr, atomic.LoadInt64(&h.activeConns)) {
+			return gnet.Close
+		}
+	}
+
+	// Store real client address if provided.
 	if result.SrcAddr != nil {
 		ctx.SetRealClientAddr(result.SrcAddr)
 		h.logger.Debug("[#%d] PROXY protocol: real client %s", ctx.id, result.SrcAddr)
+	}
+	clientAddr := result.SrcAddr
+	if clientAddr == nil {
+		clientAddr = c.RemoteAddr()
+	}
+	if !h.acquireInitialIPLimit(ctx, clientAddr, atomic.LoadInt64(&h.activeConns)) {
+		return gnet.Close
 	}
 
 	// Proceed to protocol detection
 	ctx.SetState(StateDetectProtocol)
 	return h.handleDetectProtocol(c, ctx)
+}
+
+func (h *ProxyHandler) fallbackFromProxyProtocol(c gnet.Conn, ctx *ConnContext) gnet.Action {
+	if !h.acquireInitialIPLimit(ctx, c.RemoteAddr(), atomic.LoadInt64(&h.activeConns)) {
+		return gnet.Close
+	}
+	ctx.SetState(StateDetectProtocol)
+	return h.handleDetectProtocol(c, ctx)
+}
+
+func trustedInternalProxyPeer(address net.Addr) bool {
+	switch typed := address.(type) {
+	case *net.TCPAddr:
+		return typed.IP != nil && typed.IP.IsLoopback()
+	case *net.UnixAddr:
+		return true
+	default:
+		return false
+	}
+}
+
+var internalUnixAdmissionAddress = &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)}
+
+func (h *ProxyHandler) acquireInitialIPLimit(ctx *ConnContext, address net.Addr, active int64) bool {
+	if h.connLimiter == nil || ctx.ipLimitTracked {
+		return true
+	}
+	ip := limiterIP(address)
+	if ip == nil {
+		return true
+	}
+	key, ok := h.connLimiter.TryAcquireIP(ip)
+	if !ok {
+		h.logger.Info("[#%d] per-IP connection limit exceeded for %s (active: %d)", ctx.id, ip, active)
+		return false
+	}
+	ctx.ipLimitTracked = true
+	ctx.ipLimitKey = key
+	return true
+}
+
+func (h *ProxyHandler) transferInitialIPLimit(ctx *ConnContext, address net.Addr, active int64) bool {
+	if h.connLimiter == nil {
+		return true
+	}
+	ip := limiterIP(address)
+	if ip == nil {
+		return false
+	}
+	if !ctx.ipLimitTracked {
+		return h.acquireInitialIPLimit(ctx, address, active)
+	}
+	keyArray := h.connLimiter.hashKey(ip, nil)
+	if ctx.ipLimitKey == string(keyArray[:]) {
+		return true
+	}
+	newKey, ok := h.connLimiter.TryAcquireIP(ip)
+	if !ok {
+		h.logger.Info("[#%d] per-IP connection limit exceeded for %s (active: %d)", ctx.id, ip, active)
+		return false
+	}
+	oldKey := ctx.ipLimitKey
+	ctx.ipLimitKey = newKey
+	h.connLimiter.Release(oldKey)
+	return true
+}
+
+func limiterIP(address net.Addr) net.IP {
+	if tcpAddress, ok := address.(*net.TCPAddr); ok {
+		return tcpAddress.IP
+	}
+	if address != nil {
+		if host, _, err := net.SplitHostPort(address.String()); err == nil {
+			return net.ParseIP(host)
+		}
+	}
+	return nil
 }
 
 // Logger interface for proxy logging.

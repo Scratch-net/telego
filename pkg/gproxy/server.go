@@ -80,11 +80,16 @@ type Config struct {
 	Socks5Addr string // SOCKS5 proxy for DC connections (e.g., "127.0.0.1:1080")
 
 	// Incoming connection handling
-	ProxyProtocol       bool          // Accept incoming PROXY protocol headers
-	HandshakeTimeout    time.Duration // Max time for handshake before closing (default 30s)
-	MaxConnectionsPerIP int           // Max concurrent connections per IP+secret, 0 = unlimited
-	MaxIPsPerUser       int           // Max unique IPs per user, 0 = unlimited
-	IPBlockTimeout      time.Duration // How long blocked IPs stay blocked (default 5m)
+	ProxyProtocol bool // Accept incoming PROXY protocol headers
+	// InternalProxyProtocol accepts PROXY headers only from loopback TCP or Unix
+	// peers that authenticate with the process-local token. Native WEB backends
+	// use it to retain the validated browser IP.
+	InternalProxyProtocol bool
+	InternalProxyAuth     *InternalProxyAuth
+	HandshakeTimeout      time.Duration // Max time for handshake before closing (default 30s)
+	MaxConnectionsPerIP   int           // Max concurrent connections per IP+secret, 0 = unlimited
+	MaxIPsPerUser         int           // Max unique IPs per user, 0 = unlimited
+	IPBlockTimeout        time.Duration // How long blocked IPs stay blocked (default 5m)
 
 	// Backpressure
 	MaxWriteBuffer int // Max pending bytes per connection before closing (0 = 4MB default)
@@ -104,6 +109,10 @@ type Config struct {
 	ReusePort    bool // Enable SO_REUSEPORT
 	LockOSThread bool // Lock goroutines to OS threads
 	NumEventLoop int  // Number of event loops (0 = auto)
+
+	// WebProxyFingerprint changes when restart-only [web-proxy] settings change.
+	// It contains no secret values and exists only for hot-reload diagnostics.
+	WebProxyFingerprint string
 }
 
 // DefaultConfig returns sensible defaults.

@@ -1,8 +1,11 @@
 package gproxy
 
 import (
+	"context"
 	"crypto/cipher"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"syscall"
@@ -23,6 +26,8 @@ var spliceReadBufPool = sync.Pool{
 		return &buf
 	},
 }
+
+const spliceDrainCheckInterval = 5 * time.Millisecond
 
 // getFd extracts the file descriptor from a net.Conn.
 // Returns -1 if the fd cannot be obtained.
@@ -53,6 +58,7 @@ func (h *ProxyHandler) dialDC(clientConn gnet.Conn, ctx *ConnContext) {
 	// or we read nil (Cleanup already ran). No in-between state possible.
 	ctx.mu.Lock()
 	dcID := ctx.dcID
+	connectionType := ctx.o2ConnectionType
 	userName := ""
 	if ctx.secret != nil {
 		userName = ctx.secret.Name
@@ -70,7 +76,7 @@ func (h *ProxyHandler) dialDC(clientConn gnet.Conn, ctx *ConnContext) {
 	}
 
 	// Direct DC connection (simple, reliable)
-	ddc, err := h.dialDirectDC(dcID)
+	ddc, err := h.directDCDial(dcID, connectionType)
 	if err != nil {
 		h.logger.Debug("[#%d:%s] failed to dial DC %d: %v", ctx.id, userName, dcID, err)
 		clientConn.Close()
@@ -173,7 +179,7 @@ func (h *ProxyHandler) dialDC(clientConn gnet.Conn, ctx *ConnContext) {
 }
 
 // dialDirectDC connects directly to Telegram DC with obfuscated2 handshake.
-func (h *ProxyHandler) dialDirectDC(dcID int) (*directDCConn, error) {
+func (h *ProxyHandler) dialDirectDC(dcID int, connectionType obfuscated2.ConnectionType) (*directDCConn, error) {
 	// Get DC addresses (sorted by RTT if probing was done)
 	addrs, known := dc.GetProbedAddresses(dcID)
 
@@ -236,14 +242,11 @@ func (h *ProxyHandler) dialDirectDC(dcID int) (*directDCConn, error) {
 		netx.TuneConn(tcpConn)
 	}
 
-	// Generate and send server handshake frame
-	frame, encryptor, decryptor, err := obfuscated2.GenerateServerFrame(dcID)
+	// Generate and send the server handshake using the client's packet framing.
+	// Relay code forwards the decrypted packet bytes unchanged, so selecting a
+	// different framing here would make Telegram parse those bytes incorrectly.
+	encryptor, decryptor, err := writeDCHandshake(conn, dcID, connectionType)
 	if err != nil {
-		conn.Close()
-		return nil, err
-	}
-
-	if _, err := conn.Write(frame); err != nil {
 		conn.Close()
 		return nil, err
 	}
@@ -255,6 +258,28 @@ func (h *ProxyHandler) dialDirectDC(dcID int) (*directDCConn, error) {
 		encryptor: encryptor,
 		decryptor: decryptor,
 	}, nil
+}
+
+// writeDCHandshake writes a complete obfuscated2 handshake and returns the
+// continued cipher streams for the upstream connection.
+func writeDCHandshake(w io.Writer, dcID int, connectionType obfuscated2.ConnectionType) (cipher.Stream, cipher.Stream, error) {
+	frame, encryptor, decryptor, err := obfuscated2.GenerateServerFrameWithType(dcID, connectionType)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	for len(frame) > 0 {
+		n, writeErr := w.Write(frame)
+		if writeErr != nil {
+			return nil, nil, writeErr
+		}
+		if n == 0 {
+			return nil, nil, io.ErrShortWrite
+		}
+		frame = frame[n:]
+	}
+
+	return encryptor, decryptor, nil
 }
 
 // directDCConn wraps a direct DC connection with its ciphers.
@@ -386,7 +411,6 @@ func (h *ProxyHandler) dialSplice(clientConn gnet.Conn, ctx *ConnContext) {
 // Implements flow control by waiting for buffer space instead of busy-polling.
 func (h *ProxyHandler) relaySpliceToClientLoop(spliceConn net.Conn, clientConn gnet.Conn, ctx *ConnContext) {
 	defer spliceConn.Close()
-	defer clientConn.Close()
 
 	// Cache config and set initial deadline
 	// Only update deadline when half the timeout has elapsed to reduce syscalls
@@ -410,20 +434,19 @@ func (h *ProxyHandler) relaySpliceToClientLoop(spliceConn net.Conn, clientConn g
 			return
 		}
 
-		// NOTE: OutboundBuffered is not concurrency-safe per gnet docs.
-		// We call it from goroutine (clientConn belongs to server event loop).
-		// This is acceptable for approximate flow control decisions.
-		buffered := clientConn.OutboundBuffered()
+		buffered := ctx.spliceBufferedBytes()
 
 		// HARD LIMIT: Close if client buffer exceeds max
 		if buffered > h.maxWriteBuffer {
 			h.logger.Warn("splice: client write buffer exceeded %dMB, closing slow client",
 				h.maxWriteBuffer/1024/1024)
+			clientConn.Close()
 			return
 		}
 
 		// Throttle when buffer is getting full - wait for signal instead of sleeping
 		if buffered > h.bpSoftLimit {
+			h.sampleSpliceBuffer(clientConn, ctx)
 			select {
 			case <-resumeCh:
 				// Buffer drained, continue
@@ -444,23 +467,23 @@ func (h *ProxyHandler) relaySpliceToClientLoop(spliceConn net.Conn, clientConn g
 		bufPtr := spliceReadBufPool.Get().(*[]byte)
 		buf := *bufPtr
 
-		n, err := spliceConn.Read(buf)
-		if err != nil {
-			spliceReadBufPool.Put(bufPtr)
-			return
-		}
+		n, readErr := spliceConn.Read(buf)
 
 		if n > 0 {
 			// Capture variables for callback closure
 			poolBuf := bufPtr
 			resume := resumeCh
 			softLimit := h.bpSoftLimit
+			writeSize := n
 
 			// Buffer ownership transfers to gnet until callback fires
-			err = clientConn.AsyncWrite(buf[:n], func(c gnet.Conn, _ error) error {
+			ctx.addSplicePendingBytes(writeSize)
+			err := clientConn.AsyncWrite(buf[:n], func(c gnet.Conn, _ error) error {
 				spliceReadBufPool.Put(poolBuf)
-				// Signal resume if buffer dropped below soft limit
-				if c.OutboundBuffered() < softLimit {
+				// This callback runs on the owning event loop. Its buffer read is
+				// only a flow-control snapshot, never a flush-completion signal.
+				buffered := ctx.completeSpliceWrite(writeSize, c.OutboundBuffered())
+				if buffered < softLimit {
 					select {
 					case resume <- struct{}{}:
 					default:
@@ -470,13 +493,170 @@ func (h *ProxyHandler) relaySpliceToClientLoop(spliceConn net.Conn, clientConn g
 				return nil
 			})
 			if err != nil {
+				ctx.cancelSplicePendingBytes(writeSize)
 				spliceReadBufPool.Put(bufPtr)
+				clientConn.Close()
 				return
 			}
 		} else {
 			spliceReadBufPool.Put(bufPtr)
 		}
+
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				h.beginSpliceClientDrain(clientConn, ctx, idleTimeout)
+			} else {
+				clientConn.Close()
+			}
+			return
+		}
 	}
+}
+
+func (h *ProxyHandler) sampleSpliceBuffer(clientConn gnet.Conn, ctx *ConnContext) {
+	_ = clientConn.EventLoop().Execute(context.Background(), gnet.RunnableFunc(func(context.Context) error {
+		buffered := ctx.updateSpliceOutboundBytes(clientConn.OutboundBuffered())
+		if buffered < h.bpSoftLimit {
+			select {
+			case ctx.spliceResume <- struct{}{}:
+			default:
+			}
+		}
+		return nil
+	}))
+}
+
+func (ctx *ConnContext) spliceBufferedBytes() int {
+	ctx.spliceFlowMu.Lock()
+	defer ctx.spliceFlowMu.Unlock()
+	return ctx.splicePendingBytes + ctx.spliceOutboundBytes
+}
+
+func (ctx *ConnContext) addSplicePendingBytes(n int) {
+	ctx.spliceFlowMu.Lock()
+	ctx.splicePendingBytes += n
+	ctx.spliceFlowMu.Unlock()
+}
+
+func (ctx *ConnContext) cancelSplicePendingBytes(n int) {
+	ctx.spliceFlowMu.Lock()
+	ctx.splicePendingBytes -= n
+	ctx.spliceFlowMu.Unlock()
+}
+
+func (ctx *ConnContext) completeSpliceWrite(n, outbound int) int {
+	ctx.spliceFlowMu.Lock()
+	ctx.splicePendingBytes -= n
+	ctx.spliceOutboundBytes = outbound
+	buffered := ctx.splicePendingBytes + ctx.spliceOutboundBytes
+	ctx.spliceFlowMu.Unlock()
+	return buffered
+}
+
+func (ctx *ConnContext) updateSpliceOutboundBytes(outbound int) int {
+	ctx.spliceFlowMu.Lock()
+	ctx.spliceOutboundBytes = outbound
+	buffered := ctx.splicePendingBytes + ctx.spliceOutboundBytes
+	ctx.spliceFlowMu.Unlock()
+	return buffered
+}
+
+// beginSpliceClientDrain transfers a clean upstream EOF to the client event
+// loop. AsyncWrite uses gnet's high-priority queue while Execute uses the
+// low-priority queue, so this runnable observes every write submitted before
+// the EOF. Only the event loop decides when the outbound buffer is empty.
+func (h *ProxyHandler) beginSpliceClientDrain(clientConn gnet.Conn, ctx *ConnContext, timeout time.Duration) {
+	ctx.spliceDrainRequested.Store(true)
+	err := clientConn.EventLoop().Execute(context.Background(), gnet.RunnableFunc(func(context.Context) error {
+		if ctx.State() == StateClosed {
+			return nil
+		}
+		ctx.beginSpliceDrain(clientConn, timeout)
+		if h.handleSpliceDrain(clientConn, ctx) == gnet.Close {
+			return clientConn.EventLoop().Close(clientConn)
+		}
+		return nil
+	}))
+	if err != nil {
+		ctx.spliceDrainRequested.Store(false)
+		clientConn.Close()
+	}
+}
+
+func (ctx *ConnContext) beginSpliceDrain(clientConn gnet.Conn, timeout time.Duration) {
+	ctx.spliceDrainMu.Lock()
+	defer ctx.spliceDrainMu.Unlock()
+	if ctx.spliceDraining {
+		return
+	}
+	ctx.spliceDraining = true
+	ctx.spliceDrainID++
+	id := ctx.spliceDrainID
+	ctx.spliceDrainDeadline = time.AfterFunc(timeout, func() {
+		err := clientConn.EventLoop().Execute(context.Background(), gnet.RunnableFunc(func(context.Context) error {
+			ctx.spliceDrainMu.Lock()
+			if !ctx.spliceDraining || ctx.spliceDrainID != id {
+				ctx.spliceDrainMu.Unlock()
+				return nil
+			}
+			ctx.finishSpliceDrainLocked()
+			ctx.spliceDrainMu.Unlock()
+			return clientConn.EventLoop().Close(clientConn)
+		}))
+		if err != nil && ctx.State() != StateClosed {
+			clientConn.Close()
+		}
+	})
+}
+
+func (ctx *ConnContext) isSpliceDraining() bool {
+	ctx.spliceDrainMu.Lock()
+	defer ctx.spliceDrainMu.Unlock()
+	return ctx.spliceDraining
+}
+
+func (ctx *ConnContext) armSpliceDrainWake(clientConn gnet.Conn) {
+	ctx.spliceDrainMu.Lock()
+	if !ctx.spliceDraining || ctx.spliceDrainWake != nil {
+		ctx.spliceDrainMu.Unlock()
+		return
+	}
+	id := ctx.spliceDrainID
+	ctx.spliceDrainWake = time.AfterFunc(spliceDrainCheckInterval, func() {
+		ctx.spliceDrainMu.Lock()
+		if !ctx.spliceDraining || ctx.spliceDrainID != id {
+			ctx.spliceDrainMu.Unlock()
+			return
+		}
+		ctx.spliceDrainWake = nil
+		ctx.spliceDrainMu.Unlock()
+		_ = clientConn.Wake(nil)
+	})
+	ctx.spliceDrainMu.Unlock()
+}
+
+func (ctx *ConnContext) finishSpliceDrain() {
+	ctx.spliceDrainMu.Lock()
+	ctx.finishSpliceDrainLocked()
+	ctx.spliceDrainMu.Unlock()
+}
+
+func (ctx *ConnContext) finishSpliceDrainLocked() {
+	ctx.spliceDraining = false
+	ctx.spliceDrainRequested.Store(false)
+	ctx.spliceDrainID++
+	if ctx.spliceDrainDeadline != nil {
+		ctx.spliceDrainDeadline.Stop()
+		ctx.spliceDrainDeadline = nil
+	}
+	if ctx.spliceDrainWake != nil {
+		ctx.spliceDrainWake.Stop()
+		ctx.spliceDrainWake = nil
+	}
+}
+
+func (ctx *ConnContext) cancelSpliceDrain() {
+	ctx.finishSpliceDrain()
 }
 
 // buildProxyProtocolHeader builds a PROXY protocol header.

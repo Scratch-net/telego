@@ -58,6 +58,13 @@ func (c *testMockGnetConn) SetReadData(data []byte) {
 	copy(c.readBuf, data)
 }
 
+// AppendReadData adds bytes as a later fragmented network read.
+func (c *testMockGnetConn) AppendReadData(data []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.readBuf = append(c.readBuf, data...)
+}
+
 // GetWrittenData returns all written data.
 func (c *testMockGnetConn) GetWrittenData() []byte {
 	c.mu.Lock()

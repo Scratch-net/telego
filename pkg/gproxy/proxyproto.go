@@ -12,6 +12,13 @@ import (
 // Reused from dc_handler.go for consistency.
 var proxyProtoV2Sig = []byte{0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A}
 
+var proxyProtoV1Prefix = []byte("PROXY ")
+
+const (
+	maxProxyProtoV1Header = 107
+	maxProxyProtoV2Header = 16 + int(^uint16(0))
+)
+
 // ProxyProtoResult holds the parsed PROXY protocol header result.
 type ProxyProtoResult struct {
 	SrcAddr   net.Addr // Source (client) address
@@ -42,16 +49,75 @@ func ParseProxyProtocol(data []byte) (*ProxyProtoResult, error) {
 	return nil, nil
 }
 
+type proxyProtoFrameStatus uint8
+
+const (
+	proxyProtoNotPresent proxyProtoFrameStatus = iota
+	proxyProtoIncomplete
+	proxyProtoComplete
+)
+
+// inspectProxyProtocolFrame determines whether the buffered prefix can still
+// be a PROXY header and whether the complete bounded header is available.
+func inspectProxyProtocolFrame(data []byte) (proxyProtoFrameStatus, error) {
+	if len(data) == 0 {
+		return proxyProtoIncomplete, nil
+	}
+
+	switch data[0] {
+	case proxyProtoV1Prefix[0]:
+		compared := min(len(data), len(proxyProtoV1Prefix))
+		if !bytes.Equal(data[:compared], proxyProtoV1Prefix[:compared]) {
+			return proxyProtoNotPresent, nil
+		}
+		if len(data) < len(proxyProtoV1Prefix) {
+			return proxyProtoIncomplete, nil
+		}
+		if end := bytes.Index(data, []byte("\r\n")); end >= 0 {
+			if end+2 > maxProxyProtoV1Header {
+				return proxyProtoNotPresent, fmt.Errorf("proxy protocol v1: header too long")
+			}
+			return proxyProtoComplete, nil
+		}
+		if len(data) >= maxProxyProtoV1Header {
+			return proxyProtoNotPresent, fmt.Errorf("proxy protocol v1: header too long")
+		}
+		return proxyProtoIncomplete, nil
+
+	case proxyProtoV2Sig[0]:
+		compared := min(len(data), len(proxyProtoV2Sig))
+		if !bytes.Equal(data[:compared], proxyProtoV2Sig[:compared]) {
+			return proxyProtoNotPresent, nil
+		}
+		if len(data) < 16 {
+			return proxyProtoIncomplete, nil
+		}
+		total := 16 + int(binary.BigEndian.Uint16(data[14:16]))
+		if total > maxProxyProtoV2Header {
+			return proxyProtoNotPresent, fmt.Errorf("proxy protocol v2: header too long")
+		}
+		if len(data) < total {
+			return proxyProtoIncomplete, nil
+		}
+		return proxyProtoComplete, nil
+	default:
+		return proxyProtoNotPresent, nil
+	}
+}
+
 // parseProxyProtoV1 parses a PROXY protocol v1 (text) header.
 // Format: "PROXY TCP4 192.168.0.1 192.168.0.11 56324 443\r\n"
 func parseProxyProtoV1(data []byte) (*ProxyProtoResult, error) {
 	// Find the end of line
 	idx := bytes.Index(data, []byte("\r\n"))
 	if idx == -1 {
-		if len(data) > 107 { // Max v1 header is 107 bytes
+		if len(data) >= maxProxyProtoV1Header {
 			return nil, fmt.Errorf("proxy protocol v1: header too long")
 		}
 		return nil, fmt.Errorf("proxy protocol v1: incomplete header")
+	}
+	if idx+2 > maxProxyProtoV1Header {
+		return nil, fmt.Errorf("proxy protocol v1: header too long")
 	}
 
 	parts := bytes.Fields(data[:idx])

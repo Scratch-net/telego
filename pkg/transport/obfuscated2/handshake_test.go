@@ -2,10 +2,231 @@ package obfuscated2
 
 import (
 	"bytes"
+	"crypto/cipher"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"testing"
 )
+
+func buildDeterministicClientFrame(
+	t *testing.T,
+	secret []byte,
+	dcID int,
+	connectionType ConnectionType,
+) ([]byte, cipher.Stream, cipher.Stream) {
+	t.Helper()
+
+	var plain HandshakeFrame
+	for i := range plain {
+		plain[i] = byte(i + 1)
+	}
+	binary.LittleEndian.PutUint32(plain[56:60], uint32(connectionType))
+	binary.LittleEndian.PutUint16(plain[60:62], uint16(int16(dcID)))
+
+	clientEncryptor, err := NewAESCTR(deriveKey(secret, plain[8:40]), plain[40:56])
+	if err != nil {
+		t.Fatalf("create client encryptor: %v", err)
+	}
+	reversed := reverseKeyIV(plain[8:56])
+	clientDecryptor, err := NewAESCTR(deriveKey(secret, reversed[:32]), reversed[32:48])
+	if err != nil {
+		t.Fatalf("create client decryptor: %v", err)
+	}
+
+	wire := make([]byte, FrameSize)
+	clientEncryptor.XORKeyStream(wire, plain[:])
+	copy(wire[8:56], plain[8:56])
+	return wire, clientEncryptor, clientDecryptor
+}
+
+func decodeServerFrame(t *testing.T, wire []byte) (HandshakeFrame, cipher.Stream, cipher.Stream) {
+	t.Helper()
+	if len(wire) != FrameSize {
+		t.Fatalf("server frame length = %d, want %d", len(wire), FrameSize)
+	}
+
+	dcDecryptor, err := NewAESCTR(wire[8:40], wire[40:56])
+	if err != nil {
+		t.Fatalf("create DC decryptor: %v", err)
+	}
+	var plain HandshakeFrame
+	dcDecryptor.XORKeyStream(plain[:], wire)
+
+	reversed := reverseKeyIV(wire[8:56])
+	dcEncryptor, err := NewAESCTR(reversed[:32], reversed[32:48])
+	if err != nil {
+		t.Fatalf("create DC encryptor: %v", err)
+	}
+	return plain, dcDecryptor, dcEncryptor
+}
+
+func TestParseClientFrameWithType_AllSupportedFramings(t *testing.T) {
+	secret := []byte("0123456789abcdef")
+	tests := []struct {
+		name           string
+		connectionType ConnectionType
+		packet         []byte
+	}{
+		{
+			name:           "abridged EF",
+			connectionType: ConnectionTypeAbridged,
+			packet:         []byte{0x01, 0xde, 0xad, 0xbe, 0xef},
+		},
+		{
+			name:           "intermediate EE",
+			connectionType: ConnectionTypeIntermediate,
+			packet:         []byte{0x04, 0x00, 0x00, 0x00, 0xde, 0xad, 0xbe, 0xef},
+		},
+		{
+			name:           "padded intermediate DD",
+			connectionType: ConnectionTypePaddedIntermediate,
+			packet:         []byte{0x06, 0x00, 0x00, 0x00, 0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			wire, clientEncryptor, clientDecryptor := buildDeterministicClientFrame(
+				t,
+				secret,
+				-4,
+				tc.connectionType,
+			)
+			originalWire := bytes.Clone(wire)
+
+			dcID, gotType, proxyEncryptor, proxyDecryptor, err := ParseClientFrameWithType(secret, wire)
+			if err != nil {
+				t.Fatalf("ParseClientFrameWithType: %v", err)
+			}
+			if dcID != -4 {
+				t.Errorf("DC ID = %d, want -4", dcID)
+			}
+			if gotType != tc.connectionType {
+				t.Errorf("connection type = 0x%08x, want 0x%08x", gotType, tc.connectionType)
+			}
+			if !bytes.Equal(wire, originalWire) {
+				t.Fatal("ParseClientFrameWithType modified its input")
+			}
+
+			toProxy := make([]byte, len(tc.packet))
+			clientEncryptor.XORKeyStream(toProxy, tc.packet)
+			gotAtProxy := make([]byte, len(tc.packet))
+			proxyDecryptor.XORKeyStream(gotAtProxy, toProxy)
+			if !bytes.Equal(gotAtProxy, tc.packet) {
+				t.Errorf("client-to-proxy packet = %x, want %x", gotAtProxy, tc.packet)
+			}
+
+			toClient := make([]byte, len(tc.packet))
+			proxyEncryptor.XORKeyStream(toClient, tc.packet)
+			gotAtClient := make([]byte, len(tc.packet))
+			clientDecryptor.XORKeyStream(gotAtClient, toClient)
+			if !bytes.Equal(gotAtClient, tc.packet) {
+				t.Errorf("proxy-to-client packet = %x, want %x", gotAtClient, tc.packet)
+			}
+		})
+	}
+}
+
+func TestParseClientFrameWithType_UnsupportedFraming(t *testing.T) {
+	secret := []byte("0123456789abcdef")
+	wire, _, _ := buildDeterministicClientFrame(t, secret, 2, ConnectionType(0xabababab))
+
+	_, _, _, _, err := ParseClientFrameWithType(secret, wire)
+	if !errors.Is(err, ErrUnsupportedConnection) {
+		t.Fatalf("error = %v, want %v", err, ErrUnsupportedConnection)
+	}
+}
+
+func TestGenerateServerFrameWithType_AllSupportedFramings(t *testing.T) {
+	tests := []ConnectionType{
+		ConnectionTypeAbridged,
+		ConnectionTypeIntermediate,
+		ConnectionTypePaddedIntermediate,
+	}
+
+	for _, connectionType := range tests {
+		t.Run(fmt.Sprintf("0x%08x", connectionType), func(t *testing.T) {
+			wire, proxyEncryptor, proxyDecryptor, err := GenerateServerFrameWithType(-5, connectionType)
+			if err != nil {
+				t.Fatalf("GenerateServerFrameWithType: %v", err)
+			}
+
+			plain, dcDecryptor, dcEncryptor := decodeServerFrame(t, wire)
+			gotType := ConnectionType(binary.LittleEndian.Uint32(plain[56:60]))
+			if gotType != connectionType {
+				t.Errorf("connection type = 0x%08x, want 0x%08x", gotType, connectionType)
+			}
+			gotDC := int(int16(binary.LittleEndian.Uint16(plain[60:62])))
+			if gotDC != -5 {
+				t.Errorf("DC ID = %d, want -5", gotDC)
+			}
+
+			packet := []byte{0x01, 0xde, 0xad, 0xbe, 0xef}
+			toDC := make([]byte, len(packet))
+			proxyEncryptor.XORKeyStream(toDC, packet)
+			gotAtDC := make([]byte, len(packet))
+			dcDecryptor.XORKeyStream(gotAtDC, toDC)
+			if !bytes.Equal(gotAtDC, packet) {
+				t.Errorf("proxy-to-DC packet = %x, want %x", gotAtDC, packet)
+			}
+
+			toProxy := make([]byte, len(packet))
+			dcEncryptor.XORKeyStream(toProxy, packet)
+			gotAtProxy := make([]byte, len(packet))
+			proxyDecryptor.XORKeyStream(gotAtProxy, toProxy)
+			if !bytes.Equal(gotAtProxy, packet) {
+				t.Errorf("DC-to-proxy packet = %x, want %x", gotAtProxy, packet)
+			}
+		})
+	}
+}
+
+func TestGenerateServerFrameWithType_UnsupportedFraming(t *testing.T) {
+	_, _, _, err := GenerateServerFrameWithType(2, ConnectionType(0xabababab))
+	if !errors.Is(err, ErrUnsupportedConnection) {
+		t.Fatalf("error = %v, want %v", err, ErrUnsupportedConnection)
+	}
+}
+
+func TestLegacyParseClientFrame_PreservesExistingBehavior(t *testing.T) {
+	secret := []byte("0123456789abcdef")
+	for _, connectionType := range []ConnectionType{
+		ConnectionTypeIntermediate,
+		ConnectionTypePaddedIntermediate,
+	} {
+		t.Run(fmt.Sprintf("0x%08x", connectionType), func(t *testing.T) {
+			wire, _, _ := buildDeterministicClientFrame(t, secret, 4, connectionType)
+			dcID, encryptor, decryptor, err := ParseClientFrame(secret, wire)
+			if err != nil {
+				t.Fatalf("ParseClientFrame: %v", err)
+			}
+			if dcID != 4 {
+				t.Errorf("DC ID = %d, want 4", dcID)
+			}
+			if encryptor == nil || decryptor == nil {
+				t.Fatal("ParseClientFrame returned a nil cipher")
+			}
+		})
+	}
+}
+
+func TestLegacyGenerateServerFrame_DefaultsToPaddedIntermediate(t *testing.T) {
+	wire, encryptor, decryptor, err := GenerateServerFrame(2)
+	if err != nil {
+		t.Fatalf("GenerateServerFrame: %v", err)
+	}
+	if encryptor == nil || decryptor == nil {
+		t.Fatal("GenerateServerFrame returned a nil cipher")
+	}
+
+	plain, _, _ := decodeServerFrame(t, wire)
+	gotType := ConnectionType(binary.LittleEndian.Uint32(plain[56:60]))
+	if gotType != ConnectionTypePaddedIntermediate {
+		t.Errorf("connection type = 0x%08x, want legacy default 0x%08x", gotType, ConnectionTypePaddedIntermediate)
+	}
+}
 
 // TestParseClientFrame_Valid tests parsing a valid 64-byte frame with correct DC ID extraction.
 func TestParseClientFrame_Valid(t *testing.T) {
@@ -339,10 +560,21 @@ func TestFrameSize(t *testing.T) {
 	}
 }
 
-// TestConnectionTypeFakeTLS tests the connection type constant.
-func TestConnectionTypeFakeTLS(t *testing.T) {
-	if ConnectionTypeFakeTLS != 0xdddddddd {
-		t.Errorf("ConnectionTypeFakeTLS should be 0xdddddddd, got 0x%x", ConnectionTypeFakeTLS)
+// TestConnectionTypePaddedIntermediate tests the accurately named connection type constant.
+func TestConnectionTypePaddedIntermediate(t *testing.T) {
+	if ConnectionTypePaddedIntermediate != 0xdddddddd {
+		t.Errorf("ConnectionTypePaddedIntermediate should be 0xdddddddd, got 0x%x", ConnectionTypePaddedIntermediate)
+	}
+}
+
+// TestConnectionTypeFakeTLSAlias preserves the deprecated source-compatible name.
+func TestConnectionTypeFakeTLSAlias(t *testing.T) {
+	if ConnectionTypeFakeTLS != ConnectionTypePaddedIntermediate {
+		t.Errorf(
+			"ConnectionTypeFakeTLS = 0x%08x, want alias of ConnectionTypePaddedIntermediate 0x%08x",
+			ConnectionTypeFakeTLS,
+			ConnectionTypePaddedIntermediate,
+		)
 	}
 }
 
@@ -353,11 +585,14 @@ func TestConnectionTypeIntermediate(t *testing.T) {
 	}
 }
 
-// TestConnectionTypeConstants verifies both connection type constants have correct values.
+// TestConnectionTypeConstants verifies all supported connection type constants.
 func TestConnectionTypeConstants(t *testing.T) {
-	// Verify the connection type constants have correct values
-	if ConnectionTypeFakeTLS != 0xdddddddd {
-		t.Errorf("ConnectionTypeFakeTLS = 0x%08x, want 0xdddddddd", ConnectionTypeFakeTLS)
+	if ConnectionTypeAbridged != 0xefefefef {
+		t.Errorf("ConnectionTypeAbridged = 0x%08x, want 0xefefefef", ConnectionTypeAbridged)
+	}
+
+	if ConnectionTypePaddedIntermediate != 0xdddddddd {
+		t.Errorf("ConnectionTypePaddedIntermediate = 0x%08x, want 0xdddddddd", ConnectionTypePaddedIntermediate)
 	}
 
 	if ConnectionTypeIntermediate != 0xeeeeeeee {

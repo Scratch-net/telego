@@ -97,6 +97,33 @@ mask-host = "www.google.com"
 # enable-split-tls = true  # Emit first outbound ApplicationData record as 1 byte
 #                          # to defeat passive signatures keyed on the first record.
 
+# Native Telegram Desktop WEB proxy (optional, requires Nginx with real TLS).
+# This section has no effect while enabled is false. Changes require a restart.
+[web-proxy]
+enabled = false
+
+# Public DNS hostname on the real TLS certificate. Do not include a scheme,
+# port, path, or trailing dot. This value is required when WEB is enabled.
+# hostname = "proxy.example.com"
+
+# Private HTTP/1.1 listener for Nginx. The default is safe for Nginx on the
+# same host. For Docker, use 0.0.0.0:8080 and expose it only on a private network.
+# bind-to = "127.0.0.1:8080"
+
+# Local MTProxy backend for WEB streams. Telego derives numeric loopback TCP
+# from wildcard or loopback TCP binds. It also derives an MTProxy Unix socket.
+# Every WEB stream includes an authenticated internal PROXY header with the
+# client IP. Telego creates the process-local authentication token in memory.
+# backend = "127.0.0.1:443"
+# backend = "unix:///run/telego/telego.sock"
+
+# Nginx peers that can supply one canonical X-Forwarded-For address. Leave this
+# empty to ignore X-Forwarded-For. Never add an untrusted public network.
+# trusted-proxy-cidrs = ["127.0.0.1/32"]
+
+# gnet event loops for the private WEB HTTP listener (0 = automatic).
+# num-event-loops = 0
+
 # Performance tuning (all optional)
 [performance]
 # IP preference for DC connections: prefer-ipv4, prefer-ipv6, only-ipv4, only-ipv6

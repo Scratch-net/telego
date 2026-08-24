@@ -6,7 +6,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
+	"net"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -14,6 +17,7 @@ import (
 
 	"github.com/scratch-net/telego/pkg/dc"
 	"github.com/scratch-net/telego/pkg/gproxy"
+	"github.com/scratch-net/telego/pkg/webproxy"
 )
 
 // Config is the TOML configuration structure.
@@ -30,6 +34,7 @@ type Config struct {
 	Performance PerformanceConfig `toml:"performance"`
 	Upstream    UpstreamConfig    `toml:"upstream"`
 	Metrics     MetricsConfig     `toml:"metrics"`
+	WebProxy    WebProxyConfig    `toml:"web-proxy"`
 }
 
 // GeneralConfig contains general server settings.
@@ -103,6 +108,30 @@ type MetricsConfig struct {
 	Path   string `toml:"path"`    // Metrics path (default: /metrics)
 }
 
+// WebProxyConfig configures the optional private WEB carrier listener. Nginx
+// terminates public TLS and forwards candidate requests to this listener.
+type WebProxyConfig struct {
+	Enabled           bool     `toml:"enabled"`
+	BindTo            string   `toml:"bind-to"`
+	Hostname          string   `toml:"hostname"`
+	Backend           string   `toml:"backend"`
+	TrustedProxyCIDRs []string `toml:"trusted-proxy-cidrs"`
+	NumEventLoops     int      `toml:"num-event-loops"`
+}
+
+// WebProxyRuntimeConfig is the validated, immutable input used to construct
+// the native WEB manager and its private gnet HTTP listener.
+type WebProxyRuntimeConfig struct {
+	Enabled              bool
+	BindAddr             string
+	Hostname             string
+	Backend              string
+	TrustedProxyCIDRs    []string
+	NumEventLoops        int
+	Profiles             []webproxy.Profile
+	BackendProxyProtocol bool
+}
+
 // Duration is a TOML-parseable duration.
 type Duration time.Duration
 
@@ -155,7 +184,8 @@ func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
 		return gproxy.Config{}, errors.New("mask-host is required")
 	}
 
-	for name, keyHex := range c.Secrets {
+	for _, name := range slices.Sorted(maps.Keys(c.Secrets)) {
+		keyHex := c.Secrets[name]
 		key, err := ParseKey(keyHex)
 		if err != nil {
 			return gproxy.Config{}, fmt.Errorf("invalid secret %q: %w", name, err)
@@ -253,7 +283,124 @@ func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
 		cfg.MaxWriteBuffer = c.Performance.MaxWriteBufferMB * 1024 * 1024
 	}
 
+	// The native WEB backend always supplies a validated internal PROXY header.
+	// Public PROXY behavior remains controlled by [general].proxy-protocol.
+	cfg.InternalProxyProtocol = c.WebProxy.Enabled
+	cfg.WebProxyFingerprint = c.webProxyFingerprint()
+
 	return cfg, nil
+}
+
+// ToWebProxyRuntimeConfig validates the optional WEB listener and derives its
+// plain and dd profiles from the existing 16-byte [secrets]. Disabled WEB
+// configuration is deliberately ignored so legacy configurations retain their
+// exact startup behavior.
+func (c *Config) ToWebProxyRuntimeConfig(mtProxyBind string) (WebProxyRuntimeConfig, error) {
+	if !c.WebProxy.Enabled {
+		return WebProxyRuntimeConfig{}, nil
+	}
+
+	hostname := c.WebProxy.Hostname
+	if hostname == "" {
+		return WebProxyRuntimeConfig{}, errors.New("web-proxy.hostname is required when WEB proxy is enabled")
+	}
+	if err := webproxy.ValidateHostname(hostname); err != nil {
+		return WebProxyRuntimeConfig{}, fmt.Errorf("invalid web-proxy.hostname: %w", err)
+	}
+	if c.WebProxy.NumEventLoops < 0 {
+		return WebProxyRuntimeConfig{}, errors.New("web-proxy.num-event-loops cannot be negative")
+	}
+
+	bindAddr := c.WebProxy.BindTo
+	if bindAddr == "" {
+		bindAddr = "127.0.0.1:8080"
+	}
+	if strings.HasPrefix(bindAddr, "unix://") || strings.HasPrefix(bindAddr, "/") {
+		return WebProxyRuntimeConfig{}, errors.New("web-proxy.bind-to must be a TCP address; Unix sockets cannot authenticate the Nginx peer")
+	}
+	backend := c.WebProxy.Backend
+	if backend == "" {
+		var err error
+		backend, err = deriveLocalWebBackend(mtProxyBind)
+		if err != nil {
+			return WebProxyRuntimeConfig{}, fmt.Errorf("web-proxy.backend is required: %w", err)
+		}
+	}
+
+	profiles := make([]webproxy.Profile, 0, len(c.Secrets)*2)
+	capabilities := make(map[webproxy.Capability]struct{}, len(c.Secrets)*2)
+	for _, name := range slices.Sorted(maps.Keys(c.Secrets)) {
+		keyHex := c.Secrets[name]
+		key, err := ParseKey(keyHex)
+		if err != nil {
+			return WebProxyRuntimeConfig{}, fmt.Errorf("invalid secret %q for WEB proxy: %w", name, err)
+		}
+		derived, err := webproxy.DeriveProfiles(name, hostname, key)
+		if err != nil {
+			return WebProxyRuntimeConfig{}, fmt.Errorf("derive WEB profiles for secret %q: %w", name, err)
+		}
+		for _, profile := range derived {
+			if _, duplicate := capabilities[profile.Capability()]; duplicate {
+				continue
+			}
+			capabilities[profile.Capability()] = struct{}{}
+			profiles = append(profiles, profile)
+		}
+	}
+
+	return WebProxyRuntimeConfig{
+		Enabled:              true,
+		BindAddr:             bindAddr,
+		Hostname:             hostname,
+		Backend:              backend,
+		TrustedProxyCIDRs:    append([]string(nil), c.WebProxy.TrustedProxyCIDRs...),
+		NumEventLoops:        c.WebProxy.NumEventLoops,
+		Profiles:             profiles,
+		BackendProxyProtocol: true,
+	}, nil
+}
+
+func deriveLocalWebBackend(bindAddr string) (string, error) {
+	address := strings.TrimPrefix(bindAddr, "tcp://")
+	if strings.HasPrefix(address, "unix://") || strings.HasPrefix(address, "/") {
+		path := strings.TrimPrefix(address, "unix://")
+		if !strings.HasPrefix(path, "/") || path == "/" {
+			return "", fmt.Errorf("invalid MTProxy Unix-socket bind %q", bindAddr)
+		}
+		return "unix://" + path, nil
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", fmt.Errorf("cannot derive a TCP port from MTProxy bind %q", bindAddr)
+	}
+	switch host {
+	case "", "0.0.0.0", "127.0.0.1":
+		return net.JoinHostPort("127.0.0.1", port), nil
+	case "::", "::1":
+		return net.JoinHostPort("::1", port), nil
+	default:
+		ip := net.ParseIP(host)
+		if ip != nil && ip.IsLoopback() {
+			return net.JoinHostPort(host, port), nil
+		}
+		return "", fmt.Errorf("MTProxy bind %q is not wildcard or loopback", bindAddr)
+	}
+}
+
+func (c *Config) webProxyFingerprint() string {
+	if !c.WebProxy.Enabled {
+		return "enabled=false"
+	}
+	trusted := strings.Join(c.WebProxy.TrustedProxyCIDRs, ",")
+	return fmt.Sprintf(
+		"enabled=%t\x00bind=%s\x00hostname=%s\x00backend=%s\x00trusted=%s\x00loops=%d",
+		c.WebProxy.Enabled,
+		c.WebProxy.BindTo,
+		c.WebProxy.Hostname,
+		c.WebProxy.Backend,
+		trusted,
+		c.WebProxy.NumEventLoops,
+	)
 }
 
 // ParseKey parses a 16-byte hex-encoded key (32 hex chars).
