@@ -464,7 +464,7 @@ func TestHTTPServerConnectionCloseDrainsLargeDownlink(t *testing.T) {
 	connection := dialHTTPTest(t, application.address)
 	defer connection.Close()
 	if tcp, ok := connection.(*net.TCPConn); ok {
-		if err := tcp.SetReadBuffer(1024); err != nil {
+		if err := tcp.SetReadBuffer(64 * 1024); err != nil {
 			t.Fatal(err)
 		}
 	}
