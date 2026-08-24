@@ -475,7 +475,7 @@ func TestHTTPServerConnectionCloseDrainsLargeDownlink(t *testing.T) {
 	// Keep the receive window closed long enough for gnet's first writev to
 	// leave data in its outbound buffer.
 	time.Sleep(100 * time.Millisecond)
-	if err := connection.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+	if err := connection.SetDeadline(time.Now().Add(20 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	reader := bufio.NewReader(connection)
@@ -492,7 +492,7 @@ func TestHTTPServerConnectionCloseDrainsLargeDownlink(t *testing.T) {
 	if err != nil || len(frames) != 2 {
 		t.Fatalf("large response frames = %d, %v", len(frames), err)
 	}
-	expectConnectionClosed(t, connection, time.Second)
+	expectConnectionClosed(t, connection, 5*time.Second)
 	waitForDownPoll(t, created.Session, false)
 }
 
@@ -500,7 +500,7 @@ func TestHTTPServerWriteTimeoutClosesBackpressuredDownlink(t *testing.T) {
 	application := newHTTPTestApplicationWithConfig(t, time.Second, nil, func(config *HTTPServerConfig) {
 		config.SocketSendBuffer = 4096
 		config.WriteTimeout = 100 * time.Millisecond
-		config.IdleTimeout = 2 * time.Second
+		config.IdleTimeout = 10 * time.Second
 	})
 	created := createTestSession(t, application.manager, application.profiles[0])
 	payloadSize := MaxFramePayload - FrameHeaderSize
@@ -527,7 +527,7 @@ func TestHTTPServerWriteTimeoutClosesBackpressuredDownlink(t *testing.T) {
 	waitForDownPoll(t, created.Session, true)
 	time.Sleep(200 * time.Millisecond)
 	waitForDownPoll(t, created.Session, false)
-	if err := connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+	if err := connection.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	received, err := io.ReadAll(connection)

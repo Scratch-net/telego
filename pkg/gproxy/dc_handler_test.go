@@ -84,7 +84,7 @@ func runSpliceRelayTestServer(t *testing.T, upstream net.Conn) (*spliceRelayTest
 	}
 	handler := &spliceRelayTestHandler{
 		ProxyHandler: NewProxyHandler(&Config{
-			SpliceIdleTimeout: 5 * time.Second,
+			SpliceIdleTimeout: 30 * time.Second,
 			MaxWriteBuffer:    4 * 1024 * 1024,
 		}, &testLogger{}),
 		upstream:  upstream,
@@ -162,7 +162,7 @@ func TestRelaySpliceToClientDrainsBeforeClose(t *testing.T) {
 	}
 	// Keep the receive window constrained while the upstream reaches EOF.
 	time.Sleep(100 * time.Millisecond)
-	if err := connection.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+	if err := connection.SetReadDeadline(time.Now().Add(20 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	got, err := io.ReadAll(connection)

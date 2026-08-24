@@ -178,7 +178,7 @@ func parseLocalBackend(address string) (network, target string, err error) {
 	if strings.HasPrefix(address, "unix://") || strings.HasPrefix(address, "/") {
 		target = strings.TrimPrefix(address, "unix://")
 		if !filepath.IsAbs(target) || target == "/" {
-			return "", "", errors.New("Unix backend must use an absolute socket path")
+			return "", "", errors.New("unix backend must use an absolute socket path")
 		}
 		return "unix", target, nil
 	}

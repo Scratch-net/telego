@@ -848,9 +848,10 @@ func (s *Session) reservePendingLocked(cost, items int, class pendingClass) bool
 	}
 	costLimit := s.limits.MaxPendingPerSession
 	itemLimit := s.limits.MaxPendingItemsPerSession
-	if class == pendingUplink {
+	switch class {
+	case pendingUplink:
 		costLimit, itemLimit = s.uplinkPendingLimits()
-	} else if class == pendingDownlink {
+	case pendingDownlink:
 		costLimit, itemLimit = s.downlinkPendingLimits()
 	}
 	if cost <= 0 || items < 0 || cost > costLimit || items > itemLimit ||

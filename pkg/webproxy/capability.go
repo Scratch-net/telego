@@ -206,7 +206,7 @@ func lastLabelIsNumeric(label string) bool {
 	for _, character := range digits {
 		decimal := character >= '0' && character <= '9'
 		hexLetter := character >= 'a' && character <= 'f'
-		if !decimal && !(hexadecimal && hexLetter) {
+		if !decimal && (!hexadecimal || !hexLetter) {
 			return false
 		}
 	}

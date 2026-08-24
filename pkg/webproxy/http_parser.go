@@ -132,7 +132,7 @@ func parseCarrierRequestHeader(data []byte) (carrierRequest, int, error) {
 }
 
 func parseRequestTarget(request *carrierRequest, target []byte) error {
-	if len(target) == 0 || target[0] != '/' || bytes.IndexAny(target, "#\r\n\x00") >= 0 {
+	if len(target) == 0 || target[0] != '/' || bytes.ContainsAny(target, "#\r\n\x00") {
 		return fmt.Errorf("%w: invalid request target", errHTTPMalformed)
 	}
 	path, query, found := bytes.Cut(target, []byte{'?'})

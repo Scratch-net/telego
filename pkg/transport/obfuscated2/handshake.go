@@ -21,6 +21,7 @@ const (
 	ConnectionTypePaddedIntermediate = 0xdddddddd
 
 	// ConnectionTypeFakeTLS is retained for source compatibility.
+	//
 	// Deprecated: use ConnectionTypePaddedIntermediate. FakeTLS is an outer
 	// transport and is independent of the inner MTProto packet framing.
 	ConnectionTypeFakeTLS = ConnectionTypePaddedIntermediate
