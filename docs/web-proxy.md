@@ -266,7 +266,17 @@ If systemd manages Telego, restart Telego after `nginx -t` succeeds. Telego reje
 
 Then reload Nginx. Make sure that the Telego log contains `WEB proxy started`.
 
-Add `-l` to the Telego service command to print both WEB links during startup:
+For a new secret, use `--web-host` to print the MTProxy and WEB links:
+
+```bash
+telego generate proxy.example.com --web-host proxy.example.com
+```
+
+The positional hostname is the FakeTLS mask hostname. The `--web-host` value is the public WEB proxy hostname.
+
+The `--web-host` value must match `[web-proxy].hostname` and the TLS certificate in Nginx.
+
+For configured secrets, add `-l` to the Telego service command. This option prints the links during startup:
 
 ```bash
 telego run -c /etc/telego/config.toml -l

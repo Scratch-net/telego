@@ -178,6 +178,16 @@ The setup uses two private fallback statuses.
 
 Run Telego with `-l` to print the plain and `dd` WEB links. Telego derives both links from each existing base secret.
 
+Use `--web-host` to print WEB links when you generate a new secret:
+
+```bash
+telego generate www.google.com --web-host proxy.example.com
+```
+
+The positional hostname is the FakeTLS mask hostname. The `--web-host` value is the public WEB proxy hostname.
+
+The `--web-host` value must match `[web-proxy].hostname` and the TLS certificate in Nginx.
+
 Read the [native WEB proxy setup guide](docs/web-proxy.md) for the complete Nginx configuration, Docker setup, and rollback procedure.
 
 The WEB configuration is inactive by default. Configurations without `[web-proxy]` continue to use the existing MTProxy startup path.
@@ -277,8 +287,10 @@ telego run       Start the proxy server
   -b, --bind     Override bind address
   -l, --link     Print Telegram proxy links on startup (both ee and dd)
 
-telego generate <hostname>   Generate a new secret for hostname
-                             Outputs both ee (FakeTLS) and dd (raw) links
+telego generate <mask-host> [--web-host <hostname>]
+                             Generate a new secret
+                             Print ee (FakeTLS) and dd (raw) MTProxy links
+  --web-host <hostname>      Print plain and dd WEB proxy links
 
 telego version   Show version information
 ```

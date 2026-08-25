@@ -319,7 +319,8 @@ func getPublicIP() (string, error) {
 
 // GenerateCmd generates a new secret key.
 type GenerateCmd struct {
-	Host string `arg:"" help:"Hostname for the secret (e.g., www.google.com)"`
+	Host    string `arg:"" help:"FakeTLS mask hostname (e.g., www.google.com)"`
+	WebHost string `name:"web-host" help:"Public WEB proxy hostname; print WEB proxy links"`
 }
 
 func (c *GenerateCmd) Run() error {
@@ -332,15 +333,29 @@ func (c *GenerateCmd) Run() error {
 		return err
 	}
 
-	key, _ := config.ParseKey(keyHex)
+	key, err := config.ParseKey(keyHex)
+	if err != nil {
+		return fmt.Errorf("parse generated key: %w", err)
+	}
 	eeSecret := config.BuildFullSecret(key, c.Host)
 	ddSecret := config.BuildDDSecret(key)
+
+	var webProfiles [2]webproxy.Profile
+	if c.WebHost != "" {
+		webProfiles, err = webproxy.DeriveProfiles("generated", c.WebHost, key)
+		if err != nil {
+			return fmt.Errorf("--web-host: %w", err)
+		}
+	}
 
 	log.Info().
 		Str("secret", keyHex).
 		Str("ee_link", "tg://proxy?server=YOUR_IP&port=443&secret="+eeSecret).
 		Str("dd_link", "tg://proxy?server=YOUR_IP&port=443&secret="+ddSecret).
 		Msg("generated secret (use ee for FakeTLS, dd for raw)")
+	if c.WebHost != "" {
+		printWebProxyLinks(c.WebHost, webProfiles[:])
+	}
 
 	return nil
 }
