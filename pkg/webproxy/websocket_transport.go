@@ -13,9 +13,11 @@ import (
 )
 
 const (
-	maxWebSocketOutboundMessages      = 16
-	maxWebSocketInboundItemsPerSocket = 1
-	maxWebSocketPendingSuffixBytes    = maxWebSocketPayloadBytesPerTraffic
+	maxWebSocketOutboundMessages = 16
+	// Telegram Desktop can place up to 512 frames in its WebView boundary.
+	// Decode those frames into the existing session/global budgets instead of
+	// letting gnet accumulate uncharged socket bytes while one uplink runs.
+	maxWebSocketInboundItemsPerSocket = 512
 	// The private gnet server reads and the decoder transforms one 64 KiB
 	// quantum at a time. Retain at most one unread quantum when frame-count,
 	// rather than payload work, exhausts the decoder callback, or after a
@@ -212,32 +214,30 @@ type webSocketConnection struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	phase                 webSocketPhase
-	handshakeWritten      bool
-	asyncWritePending     bool
-	uplinkPending         bool
-	livenessExpired       bool
-	pendingSuffixOverflow bool
-	outputInputOverflow   bool
-	controlInputBytes     int
-	controlOutputItems    int
-	current               *webSocketOutbound
-	fragmentReservation   *webSocketOwnedInput
-	inboundBudget         *webSocketInboundBudget
-	decoderOwnedLimit     int
-	inbound               chan webSocketInbound
-	uplinkResults         chan webSocketUplinkResult
-	outbound              chan *webSocketOutbound
-	failures              chan webSocketFailure
-	liveness              *time.Timer
-	livenessID            uint64
-	workers               sync.WaitGroup
-	closeOnce             sync.Once
-	queueMu               sync.Mutex
-	closed                bool
-	metricsActive         bool
-	backpressureTimeout   time.Duration
-	backpressureRetry     time.Duration
+	phase               webSocketPhase
+	handshakeWritten    bool
+	asyncWritePending   bool
+	uplinkPending       int
+	livenessExpired     bool
+	controlInputBytes   int
+	controlOutputItems  int
+	current             *webSocketOutbound
+	fragmentReservation *webSocketOwnedInput
+	inboundBudget       *webSocketInboundBudget
+	decoderOwnedLimit   int
+	inbound             chan webSocketInbound
+	uplinkResults       chan webSocketUplinkResult
+	outbound            chan *webSocketOutbound
+	failures            chan webSocketFailure
+	liveness            *time.Timer
+	livenessID          uint64
+	workers             sync.WaitGroup
+	closeOnce           sync.Once
+	queueMu             sync.Mutex
+	closed              bool
+	metricsActive       bool
+	backpressureTimeout time.Duration
+	backpressureRetry   time.Duration
 }
 
 func newWebSocketConnection(
@@ -262,7 +262,7 @@ func newWebSocketConnection(
 		},
 		decoderOwnedLimit:   2 * messageLimit,
 		inbound:             make(chan webSocketInbound, maxWebSocketInboundItemsPerSocket),
-		uplinkResults:       make(chan webSocketUplinkResult, 1),
+		uplinkResults:       make(chan webSocketUplinkResult, maxWebSocketInboundItemsPerSocket),
 		outbound:            make(chan *webSocketOutbound, maxWebSocketOutboundMessages),
 		failures:            make(chan webSocketFailure, 1),
 		backpressureTimeout: webSocketBackpressureTimeout,
@@ -292,36 +292,21 @@ func (w *webSocketConnection) reserveDecodedPayload(size int) bool {
 	return w.fragmentReservation.resize(size)
 }
 
-func (w *webSocketConnection) boundPendingSuffix(connection webSocketInboundBuffer) error {
-	buffered := connection.InboundBuffered()
-	if buffered == 0 {
-		return nil
-	}
-	if !w.pendingSuffixOverflow && buffered <= maxWebSocketPendingSuffixBytes {
-		return nil
-	}
-	w.pendingSuffixOverflow = true
-	_, err := connection.Discard(buffered)
-	return err
-}
-
-func (w *webSocketConnection) boundBlockedOutputInput(connection webSocketInboundBuffer) error {
-	buffered := connection.InboundBuffered()
-	if buffered == 0 {
-		return nil
-	}
-	if !w.outputInputOverflow && buffered <= maxWebSocketPendingSuffixBytes {
-		return nil
-	}
-	w.outputInputOverflow = true
-	_, err := connection.Discard(buffered)
-	return err
-}
-
 func (w *webSocketConnection) resetControlBurstIfDrained(connection webSocketInboundBuffer) {
 	if connection.InboundBuffered() == 0 && w.controlOutputItems == 0 {
 		w.controlInputBytes = 0
 	}
+}
+
+func (w *webSocketConnection) canDecodeWhileUplinkPending(input []byte) bool {
+	if w.uplinkPending == 0 || w.decoder.pending != nil {
+		return true
+	}
+	header, _, complete, err := decodeWebSocketHeader(input)
+	if err != nil || !complete || ws.CheckHeader(header, w.decoder.state) != nil {
+		return false
+	}
+	return header.OpCode == ws.OpBinary || header.OpCode == ws.OpContinuation
 }
 
 func (w *webSocketConnection) boundUnreadInput(
@@ -567,7 +552,7 @@ func (w *webSocketConnection) touchLiveness(connection gnet.Conn) {
 			if w.phase != webSocketOpen || w.livenessID != id {
 				return nil
 			}
-			if w.uplinkPending {
+			if w.uplinkPending != 0 {
 				w.livenessExpired = true
 				return nil
 			}
@@ -747,12 +732,6 @@ func (h *httpEventHandler) onWebSocketTraffic(
 		state.invalidateDeadline()
 		transport.start(connection)
 	}
-	if transport.uplinkPending {
-		if err := transport.boundPendingSuffix(connection); err != nil {
-			return gnet.Close
-		}
-	}
-
 	select {
 	case failure := <-transport.failures:
 		if !transport.beginClose(connection, failure.code, nil) {
@@ -760,34 +739,31 @@ func (h *httpEventHandler) onWebSocketTraffic(
 		}
 	default:
 	}
-	select {
-	case result := <-transport.uplinkResults:
-		transport.uplinkPending = false
-		if result.code != 0 && !transport.beginClose(connection, result.code, nil) {
-			return gnet.Close
-		}
-		if result.code == 0 && transport.pendingSuffixOverflow {
-			if !transport.beginClose(connection, ws.StatusInternalServerError, nil) {
+uplinkResults:
+	for {
+		select {
+		case result := <-transport.uplinkResults:
+			if transport.uplinkPending <= 0 {
 				return gnet.Close
 			}
+			transport.uplinkPending--
+			if result.code != 0 {
+				if !transport.beginClose(connection, result.code, nil) {
+					return gnet.Close
+				}
+			}
+		default:
+			break uplinkResults
 		}
-		if result.code == 0 && transport.livenessExpired &&
-			!transport.pendingSuffixOverflow && !transport.outputInputOverflow {
-			return gnet.Close
-		}
-	default:
+	}
+	if transport.livenessExpired && transport.uplinkPending == 0 && transport.phase == webSocketOpen {
+		return gnet.Close
 	}
 	if action := h.pumpWebSocketWrites(connection, state, transport); action != gnet.None {
 		return action
 	}
 	transport.resetControlBurstIfDrained(connection)
-	if transport.current != nil {
-		return gnet.None
-	}
 	if transport.phase != webSocketOpen {
-		return gnet.None
-	}
-	if transport.uplinkPending {
 		return gnet.None
 	}
 
@@ -798,6 +774,9 @@ func (h *httpEventHandler) onWebSocketTraffic(
 	peeked, err := connection.Peek(min(buffered, maxWebSocketPayloadBytesPerTraffic))
 	if err != nil {
 		return gnet.Close
+	}
+	if !transport.canDecodeWhileUplinkPending(peeked) {
+		return gnet.None
 	}
 	consumed, work, message, emitted, decodeErr := transport.decoder.decodeWindow(
 		peeked,
@@ -854,7 +833,7 @@ func (h *httpEventHandler) onWebSocketTraffic(
 			transport.fragmentReservation = nil
 			select {
 			case transport.inbound <- input:
-				transport.uplinkPending = true
+				transport.uplinkPending++
 				transport.touchLiveness(connection)
 			default:
 				input.reservation.Release()
@@ -872,14 +851,19 @@ func (h *httpEventHandler) onWebSocketTraffic(
 			}
 		}
 	}
-	if transport.uplinkPending {
-		if err := transport.boundPendingSuffix(connection); err != nil {
+	if consumed != 0 && connection.InboundBuffered() != 0 && transport.phase == webSocketOpen {
+		buffered := connection.InboundBuffered()
+		peeked, peekErr := connection.Peek(min(buffered, maxWebSocketPayloadBytesPerTraffic))
+		if peekErr != nil {
 			return gnet.Close
 		}
-	}
-	if consumed != 0 && connection.InboundBuffered() != 0 &&
-		transport.phase == webSocketOpen && !transport.uplinkPending {
-		state.armDrainWake(connection)
+		if transport.canDecodeWhileUplinkPending(peeked) {
+			if work.limit == webSocketDecodeFrameLimit {
+				state.armDrainWake(connection)
+			} else {
+				_ = connection.Wake(nil)
+			}
+		}
 	}
 	action := h.pumpWebSocketWrites(connection, state, transport)
 	transport.resetControlBurstIfDrained(connection)
@@ -907,9 +891,6 @@ func (h *httpEventHandler) pumpWebSocketWrites(
 	transport *webSocketConnection,
 ) gnet.Action {
 	if transport.current != nil {
-		if err := transport.boundBlockedOutputInput(connection); err != nil {
-			return gnet.Close
-		}
 		if transport.asyncWritePending {
 			return gnet.None
 		}
@@ -919,11 +900,6 @@ func (h *httpEventHandler) pumpWebSocketWrites(
 		}
 		state.invalidateDeadline()
 		if transport.finishCurrent(nil) {
-			return gnet.Close
-		}
-	}
-	if transport.outputInputOverflow && !transport.uplinkPending && transport.phase == webSocketOpen {
-		if !transport.beginClose(connection, ws.StatusInternalServerError, nil) {
 			return gnet.Close
 		}
 	}
@@ -958,9 +934,6 @@ func (h *httpEventHandler) pumpWebSocketWrites(
 		return current.Wake(nil)
 	}); err != nil {
 		transport.finishCurrent(err)
-		return gnet.Close
-	}
-	if err := transport.boundBlockedOutputInput(connection); err != nil {
 		return gnet.Close
 	}
 	return gnet.None

@@ -344,16 +344,10 @@ func TestHTTPServerWebSocketFragmentationControlAndMasking(t *testing.T) {
 	partialPayload := testFrameBatch(t,
 		Frame{Type: FrameData, StreamID: 5, Payload: []byte("split TCP frame")},
 	)
-	baseline := application.manager.Capacity()
 	partialHeader := maskedClientHeader(t, ws.OpBinary, true, len(partialPayload))
 	if _, err := client.connection.Write(partialHeader); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, 3*time.Second, func() bool {
-		capacity := application.manager.Capacity()
-		return capacity.PendingBytes >= baseline.PendingBytes+int64(len(partialPayload)+queueItemCost) &&
-			capacity.PendingItems >= baseline.PendingItems+1
-	})
 	maskedPayload := bytes.Clone(partialPayload)
 	ws.Cipher(maskedPayload, [4]byte{1, 2, 3, 4}, 0)
 	if _, err := client.connection.Write(maskedPayload); err != nil {
@@ -697,31 +691,6 @@ func TestHTTPServerWebSocketCommitsBinaryBeforeCoalescedSuffix(t *testing.T) {
 	}
 }
 
-func TestWebSocketPendingSuffixBound(t *testing.T) {
-	transport := &webSocketConnection{}
-	buffer := &webSocketTestInboundBuffer{data: make([]byte, maxWebSocketPendingSuffixBytes)}
-	if err := transport.boundPendingSuffix(buffer); err != nil {
-		t.Fatal(err)
-	}
-	if transport.pendingSuffixOverflow || len(buffer.data) != maxWebSocketPendingSuffixBytes {
-		t.Fatalf("at-limit suffix: overflow=%t bytes=%d", transport.pendingSuffixOverflow, len(buffer.data))
-	}
-	buffer.data = append(buffer.data, 1)
-	if err := transport.boundPendingSuffix(buffer); err != nil {
-		t.Fatal(err)
-	}
-	if !transport.pendingSuffixOverflow || len(buffer.data) != 0 {
-		t.Fatalf("overflow suffix: overflow=%t bytes=%d", transport.pendingSuffixOverflow, len(buffer.data))
-	}
-	buffer.data = make([]byte, 32)
-	if err := transport.boundPendingSuffix(buffer); err != nil {
-		t.Fatal(err)
-	}
-	if len(buffer.data) != 0 {
-		t.Fatalf("post-overflow suffix retained %d bytes", len(buffer.data))
-	}
-}
-
 func TestWebSocketUnreadInputBoundAppliesAtFrameLimitOrControlEvent(t *testing.T) {
 	decoder := testWebSocketDecoder(t, maxWebSocketMessageBytes)
 	start := maskedClientFrame(t, ws.OpBinary, false, []byte("start"))
@@ -799,38 +768,11 @@ func TestWebSocketControlInputCounterResetsBetweenDrainedBursts(t *testing.T) {
 	}
 }
 
-func TestWebSocketBlockedOutputInputBound(t *testing.T) {
-	transport := &webSocketConnection{}
-	buffer := &webSocketTestInboundBuffer{data: make([]byte, maxWebSocketPendingSuffixBytes)}
-	if err := transport.boundBlockedOutputInput(buffer); err != nil {
-		t.Fatal(err)
-	}
-	if transport.outputInputOverflow || len(buffer.data) != maxWebSocketPendingSuffixBytes {
-		t.Fatalf("at-limit blocked input: overflow=%t bytes=%d",
-			transport.outputInputOverflow, len(buffer.data))
-	}
-	buffer.data = append(buffer.data, 1)
-	if err := transport.boundBlockedOutputInput(buffer); err != nil {
-		t.Fatal(err)
-	}
-	if !transport.outputInputOverflow || len(buffer.data) != 0 {
-		t.Fatalf("overflow blocked input: overflow=%t bytes=%d",
-			transport.outputInputOverflow, len(buffer.data))
-	}
-	buffer.data = make([]byte, 32)
-	if err := transport.boundBlockedOutputInput(buffer); err != nil {
-		t.Fatal(err)
-	}
-	if len(buffer.data) != 0 {
-		t.Fatalf("post-overflow blocked input retained %d bytes", len(buffer.data))
-	}
-}
-
-func TestHTTPServerWebSocketSuffixOverflowCommitsAcceptedUplinkThenCloses(t *testing.T) {
+func TestHTTPServerWebSocketQueuesDesktopBurstDuringBackpressure(t *testing.T) {
 	application := newHTTPTestApplicationWithConfig(t, 2*time.Second, func(config *ManagerConfig) {
 		config.Carrier = CarrierWebSocket
 	}, nil)
-	backend := newWebSocketRecordingBackend()
+	backend := newWebSocketRecordingBackendWithCapacity(128)
 	application.manager.dialBackend = func(context.Context, string, string, string) (net.Conn, error) {
 		return backend, nil
 	}
@@ -856,32 +798,73 @@ func TestHTTPServerWebSocketSuffixOverflowCommitsAcceptedUplinkThenCloses(t *tes
 		}
 		created.Session.mu.Unlock()
 	})
-	client.write(t, ws.OpBinary, true, testFrameBatch(t,
-		Frame{Type: FrameData, StreamID: 94, Payload: []byte("commit before overflow close")},
-	))
+	const (
+		desktopPendingBytes = 4 * 1024 * 1024
+		desktopFrameBytes   = 64 * 1024
+		desktopFrameCount   = desktopPendingBytes / desktopFrameBytes
+	)
+	client.write(t, ws.OpBinary, true, testFrameBatch(t, Frame{
+		Type: FrameData, StreamID: 94, Payload: bytes.Repeat([]byte{0}, desktopFrameBytes),
+	}))
 	eventually(t, time.Second, func() bool {
 		return application.manager.backpressure[carrierOperationUplink].Load() != 0
 	})
-	ping := maskedClientFrame(t, ws.OpPing, true, nil)
-	suffix := bytes.Repeat(ping, maxWebSocketPendingSuffixBytes/len(ping)+2)
-	client.writeRaw(t, suffix)
+	pendingBeforeBurst := application.manager.Capacity()
+	burst := make([]byte, 0, desktopPendingBytes)
+	for index := 1; index < desktopFrameCount; index++ {
+		body := testFrameBatch(t, Frame{
+			Type: FrameData, StreamID: 94, Payload: bytes.Repeat([]byte{byte(index)}, desktopFrameBytes),
+		})
+		burst = append(burst, maskedClientFrame(t, ws.OpBinary, true, body)...)
+	}
+	if err := client.connection.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	client.writeRaw(t, burst)
+	if err := client.connection.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	queuedDeadline := time.Now().Add(2 * time.Second)
+	for {
+		capacity := application.manager.Capacity()
+		if capacity.PendingBytes >= pendingBeforeBurst.PendingBytes+desktopPendingBytes/2 {
+			break
+		}
+		if time.Now().After(queuedDeadline) {
+			t.Fatalf("decoded burst reserved %d additional bytes and %d items",
+				capacity.PendingBytes-pendingBeforeBurst.PendingBytes,
+				capacity.PendingItems-pendingBeforeBurst.PendingItems)
+		}
+		time.Sleep(time.Millisecond)
+	}
 	fallback := application.do(t, &http.Client{Timeout: time.Second}, http.MethodGet, "/health", nil, nil)
 	_ = readHTTPBody(t, fallback)
 	if fallback.StatusCode != defaultPassthroughStatus {
-		t.Fatalf("fallback while suffix pending = %d", fallback.StatusCode)
+		t.Fatalf("fallback while desktop burst is queued = %d", fallback.StatusCode)
 	}
 	created.Session.mu.Lock()
 	created.Session.carrierLanes[0].upActive = false
 	created.Session.mu.Unlock()
-	select {
-	case written := <-backend.writes:
-		if string(written) != "commit before overflow close" {
-			t.Fatalf("backend received %q", written)
+	for index := range desktopFrameCount {
+		select {
+		case written := <-backend.writes:
+			if len(written) != desktopFrameBytes || !bytes.Equal(written, bytes.Repeat([]byte{byte(index)}, desktopFrameBytes)) {
+				t.Fatalf("backend write %d was corrupted", index)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("backend write %d did not arrive", index)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("accepted uplink was dropped before suffix-overflow close")
 	}
-	expectWebSocketCloseCode(t, client, ws.StatusInternalServerError, time.Second)
+	client.write(t, ws.OpPing, true, []byte("still open"))
+	foundPong := false
+	for !foundPong {
+		opcode, payload := client.read(t, 2*time.Second)
+		if opcode == ws.OpPong && bytes.Equal(payload, []byte("still open")) {
+			foundPong = true
+		} else if opcode == ws.OpPing {
+			client.write(t, ws.OpPong, true, payload)
+		}
+	}
 }
 
 func TestHTTPServerWebSocketPendingUplinkOutlivesLivenessDeadline(t *testing.T) {
@@ -1441,6 +1424,11 @@ func TestHTTPServerWebSocketSlowReaderHoldsPollLeaseUntilDrain(t *testing.T) {
 	if duringDrain.PendingBytes != queuedCapacity.PendingBytes || duringDrain.PendingItems != queuedCapacity.PendingItems {
 		t.Fatalf("slow-reader lease released before drain: capacity %#v, want %#v", duringDrain, queuedCapacity)
 	}
+	if tcp, ok := client.connection.(*net.TCPConn); ok {
+		if err := tcp.SetReadBuffer(4 * maxWebSocketMessageBytes); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	opcode, payload := client.read(t, 30*time.Second)
 	if opcode != ws.OpBinary || len(payload) != 2*(FrameHeaderSize+payloadSize) {
@@ -1461,7 +1449,7 @@ func TestHTTPServerWebSocketSlowReaderHoldsPollLeaseUntilDrain(t *testing.T) {
 	})
 }
 
-func TestHTTPServerWebSocketSlowReaderBoundsInboundUntilPollLeaseDrain(t *testing.T) {
+func TestHTTPServerWebSocketSlowReaderRemainsFullDuplexUntilPollLeaseDrain(t *testing.T) {
 	application := newHTTPTestApplicationWithConfig(t, 30*time.Second, func(config *ManagerConfig) {
 		config.Carrier = CarrierWebSocket
 	}, func(config *HTTPServerConfig) {
@@ -1497,10 +1485,18 @@ func TestHTTPServerWebSocketSlowReaderBoundsInboundUntilPollLeaseDrain(t *testin
 	if err := client.connection.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	client.writeRaw(t, maskedClientFrame(t, ws.OpBinary, true,
-		bytes.Repeat([]byte{0x55}, maxWebSocketPendingSuffixBytes+1)))
+	uplinkPayload := bytes.Repeat([]byte{0x55}, 2*maxWebSocketPayloadBytesPerTraffic)
+	client.writeRaw(t, maskedClientFrame(t, ws.OpBinary, true, testFrameBatch(t,
+		Frame{Type: FrameOpen, StreamID: 3},
+		Frame{Type: FrameData, StreamID: 3, Payload: uplinkPayload},
+	)))
 	if err := client.connection.SetWriteDeadline(time.Time{}); err != nil {
 		t.Fatal(err)
+	}
+	if tcp, ok := client.connection.(*net.TCPConn); ok {
+		if err := tcp.SetReadBuffer(4 * maxWebSocketMessageBytes); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	opcode, payload := client.read(t, 30*time.Second)
@@ -1514,7 +1510,17 @@ func TestHTTPServerWebSocketSlowReaderBoundsInboundUntilPollLeaseDrain(t *testin
 	if len(frames) != 2 || frames[0].StreamID != 1 || frames[1].StreamID != 2 ||
 		!bytes.Equal(frames[0].Payload, bytes.Repeat([]byte{0x71}, payloadSize)) ||
 		!bytes.Equal(frames[1].Payload, bytes.Repeat([]byte{0x72}, payloadSize)) {
-		t.Fatal("blocked-input handling corrupted the leased downlink payload")
+		t.Fatal("full-duplex input corrupted the leased downlink payload")
+	}
+	frames = readWebSocketUntilData(t, client, 3, 5*time.Second)
+	foundUplink := false
+	for _, frame := range frames {
+		if frame.Type == FrameData && frame.StreamID == 3 && bytes.Equal(frame.Payload, uplinkPayload) {
+			foundUplink = true
+		}
+	}
+	if !foundUplink {
+		t.Fatal("uplink did not remain active while the downlink PollLease drained")
 	}
 	eventually(t, time.Second, func() bool {
 		capacity := application.manager.Capacity()
@@ -1523,7 +1529,16 @@ func TestHTTPServerWebSocketSlowReaderBoundsInboundUntilPollLeaseDrain(t *testin
 	if queuedCapacity.PendingBytes <= before.PendingBytes {
 		t.Fatal("test did not reserve a PollLease-backed downlink")
 	}
-	expectWebSocketCloseCode(t, client, ws.StatusInternalServerError, 2*time.Second)
+	client.write(t, ws.OpPing, true, []byte("full duplex"))
+	for {
+		opcode, controlPayload := client.read(t, 2*time.Second)
+		if opcode == ws.OpPong && bytes.Equal(controlPayload, []byte("full duplex")) {
+			break
+		}
+		if opcode == ws.OpPing {
+			client.write(t, ws.OpPong, true, controlPayload)
+		}
+	}
 }
 
 func TestHTTPServerWebSocketBackpressureRetryDoesNotBlockEventLoop(t *testing.T) {
@@ -1852,8 +1867,12 @@ func (b *webSocketTestInboundBuffer) Discard(size int) (int, error) {
 }
 
 func newWebSocketRecordingBackend() *webSocketRecordingBackend {
+	return newWebSocketRecordingBackendWithCapacity(4)
+}
+
+func newWebSocketRecordingBackendWithCapacity(writeCapacity int) *webSocketRecordingBackend {
 	return &webSocketRecordingBackend{
-		writes: make(chan []byte, 4),
+		writes: make(chan []byte, writeCapacity),
 		ready:  make(chan struct{}),
 		closed: make(chan struct{}),
 	}
