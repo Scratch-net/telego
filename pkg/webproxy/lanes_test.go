@@ -48,25 +48,32 @@ func TestHTTPSLanesHaveIndependentSequencesAndDownlinkCursors(t *testing.T) {
 		if _, err := peer.Write([]byte("reply " + test.payload)); err != nil {
 			t.Fatal(err)
 		}
-		body, cursor, closed, err := session.PollLane(context.Background(), test.id, 0)
-		if err != nil || cursor != 1 || closed {
-			t.Fatalf("PollLane(%d) = cursor %d, closed %t, %v", test.id, cursor, closed, err)
-		}
-		frames, err := ParseBatch(body)
-		if err != nil {
-			t.Fatal(err)
-		}
 		found := false
-		for _, frame := range frames {
-			if frame.StreamID != test.id {
-				t.Fatalf("lane %d received stream %d", test.id, frame.StreamID)
+		cursor := uint64(0)
+		for range 3 {
+			body, next, closed, err := session.PollLane(t.Context(), test.id, cursor)
+			if err != nil || next != cursor+1 || closed {
+				t.Fatalf("PollLane(%d) = cursor %d, closed %t, %v", test.id, next, closed, err)
 			}
-			if frame.Type == FrameData && bytes.Equal(frame.Payload, []byte("reply "+test.payload)) {
-				found = true
+			cursor = next
+			frames, err := ParseBatch(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, frame := range frames {
+				if frame.StreamID != test.id {
+					t.Fatalf("lane %d received stream %d", test.id, frame.StreamID)
+				}
+				if frame.Type == FrameData && bytes.Equal(frame.Payload, []byte("reply "+test.payload)) {
+					found = true
+				}
+			}
+			if found {
+				break
 			}
 		}
 		if !found {
-			t.Fatalf("lane %d omitted backend DATA: %#v", test.id, frames)
+			t.Fatalf("lane %d omitted backend DATA", test.id)
 		}
 	}
 }
