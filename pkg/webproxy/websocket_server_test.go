@@ -1410,7 +1410,7 @@ func TestHTTPServerWebSocketSlowReaderHoldsPollLeaseUntilDrain(t *testing.T) {
 	}
 	defer client.close()
 	if tcp, ok := client.connection.(*net.TCPConn); ok {
-		if err := tcp.SetReadBuffer(1024); err != nil {
+		if err := tcp.SetReadBuffer(maxWebSocketPayloadBytesPerTraffic); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1473,7 +1473,7 @@ func TestHTTPServerWebSocketSlowReaderRemainsFullDuplexUntilPollLeaseDrain(t *te
 	}
 	defer client.close()
 	if tcp, ok := client.connection.(*net.TCPConn); ok {
-		if err := tcp.SetReadBuffer(1024); err != nil {
+		if err := tcp.SetReadBuffer(maxWebSocketPayloadBytesPerTraffic); err != nil {
 			t.Fatal(err)
 		}
 	}
