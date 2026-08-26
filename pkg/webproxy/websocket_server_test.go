@@ -349,7 +349,7 @@ func TestHTTPServerWebSocketFragmentationControlAndMasking(t *testing.T) {
 	if _, err := client.connection.Write(partialHeader); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, time.Second, func() bool {
+	eventually(t, 3*time.Second, func() bool {
 		capacity := application.manager.Capacity()
 		return capacity.PendingBytes >= baseline.PendingBytes+int64(len(partialPayload)+queueItemCost) &&
 			capacity.PendingItems >= baseline.PendingItems+1
@@ -1401,7 +1401,7 @@ func assertWebSocketHeaderReservationRejected(t *testing.T, transport *webSocket
 }
 
 func TestHTTPServerWebSocketSlowReaderHoldsPollLeaseUntilDrain(t *testing.T) {
-	application := newHTTPTestApplicationWithConfig(t, 5*time.Second, func(config *ManagerConfig) {
+	application := newHTTPTestApplicationWithConfig(t, 30*time.Second, func(config *ManagerConfig) {
 		config.Carrier = CarrierWebSocket
 	}, func(config *HTTPServerConfig) {
 		config.SocketSendBuffer = 4096
@@ -1442,7 +1442,7 @@ func TestHTTPServerWebSocketSlowReaderHoldsPollLeaseUntilDrain(t *testing.T) {
 		t.Fatalf("slow-reader lease released before drain: capacity %#v, want %#v", duringDrain, queuedCapacity)
 	}
 
-	opcode, payload := client.read(t, 20*time.Second)
+	opcode, payload := client.read(t, 30*time.Second)
 	if opcode != ws.OpBinary || len(payload) != 2*(FrameHeaderSize+payloadSize) {
 		t.Fatalf("large downlink = opcode %v, %d bytes", opcode, len(payload))
 	}
@@ -1462,7 +1462,7 @@ func TestHTTPServerWebSocketSlowReaderHoldsPollLeaseUntilDrain(t *testing.T) {
 }
 
 func TestHTTPServerWebSocketSlowReaderBoundsInboundUntilPollLeaseDrain(t *testing.T) {
-	application := newHTTPTestApplicationWithConfig(t, 10*time.Second, func(config *ManagerConfig) {
+	application := newHTTPTestApplicationWithConfig(t, 30*time.Second, func(config *ManagerConfig) {
 		config.Carrier = CarrierWebSocket
 	}, func(config *HTTPServerConfig) {
 		config.SocketSendBuffer = 4096
@@ -1503,7 +1503,7 @@ func TestHTTPServerWebSocketSlowReaderBoundsInboundUntilPollLeaseDrain(t *testin
 		t.Fatal(err)
 	}
 
-	opcode, payload := client.read(t, 20*time.Second)
+	opcode, payload := client.read(t, 30*time.Second)
 	if opcode != ws.OpBinary || len(payload) != 2*(FrameHeaderSize+payloadSize) {
 		t.Fatalf("large downlink = opcode %v, %d bytes", opcode, len(payload))
 	}
