@@ -15,6 +15,9 @@ func TestRenderBridgeHTTPSContractAndSecurityHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := string(page.Body)
+	if !strings.Contains(body, `carrier="https"`) {
+		t.Fatal("serialized bridge omitted its carrier mode")
+	}
 	for _, required := range []string{
 		`nonce="` + page.Nonce + `"`,
 		`bootstrap="` + token + `"`,
@@ -61,6 +64,7 @@ func TestRenderBridgeHTTPSContractAndSecurityHeaders(t *testing.T) {
 		"document.cookie",
 		"__NONCE__",
 		"__BOOTSTRAP__",
+		"__CARRIER__",
 		"__BATCH_LIMIT__",
 	} {
 		if strings.Contains(body, forbidden) {
@@ -84,6 +88,30 @@ func TestRenderBridgeHTTPSContractAndSecurityHeaders(t *testing.T) {
 	}
 	if !strings.Contains(PermissionsPolicy, "camera=()") || !strings.Contains(PermissionsPolicy, "clipboard-read=()") {
 		t.Fatalf("Permissions-Policy is incomplete: %q", PermissionsPolicy)
+	}
+}
+
+func TestRenderBridgeHTTPSLanesContract(t *testing.T) {
+	token, _, err := newToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := RenderBridgeForCarrier("proxy.example.com", token, 2*1024*1024, CarrierHTTPSLanes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(page.Body)
+	for _, required := range []string{
+		`carrier="https-lanes"`,
+		`X-Lane-ID`,
+		`X-Lane-Closed`,
+		`lane did not begin with OPEN`,
+		`cross-lane frame`,
+		`ensureLane(0)`,
+	} {
+		if !strings.Contains(body, required) {
+			t.Errorf("lanes bridge omitted %q", required)
+		}
 	}
 }
 

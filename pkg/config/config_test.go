@@ -737,6 +737,7 @@ mask-host = "www.google.com"
 enabled = true
 bind-to = "127.0.0.1:9080"
 hostname = "proxy.example.com"
+carrier = "https-lanes"
 trusted-proxy-cidrs = ["127.0.0.1/32"]
 num-event-loops = 2
 `
@@ -761,7 +762,7 @@ num-event-loops = 2
 	}
 	if !runtime.Enabled || runtime.BindAddr != "127.0.0.1:9080" ||
 		runtime.Hostname != "proxy.example.com" || runtime.Backend != "127.0.0.1:443" ||
-		runtime.NumEventLoops != 2 || !runtime.BackendProxyProtocol {
+		runtime.Carrier != webproxy.CarrierHTTPSLanes || runtime.NumEventLoops != 2 || !runtime.BackendProxyProtocol {
 		t.Fatalf("runtime = %+v", runtime)
 	}
 	if len(runtime.TrustedProxyCIDRs) != 1 || runtime.TrustedProxyCIDRs[0] != "127.0.0.1/32" {
@@ -792,8 +793,9 @@ func TestWebProxyConfigDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToWebProxyRuntimeConfig: %v", err)
 	}
-	if runtime.BindAddr != "127.0.0.1:8080" || runtime.Backend != "127.0.0.1:8443" {
-		t.Fatalf("defaults = bind %q backend %q", runtime.BindAddr, runtime.Backend)
+	if runtime.BindAddr != "127.0.0.1:8080" || runtime.Backend != "127.0.0.1:8443" ||
+		runtime.Carrier != webproxy.CarrierHTTPS {
+		t.Fatalf("defaults = bind %q backend %q carrier %q", runtime.BindAddr, runtime.Backend, runtime.Carrier)
 	}
 }
 
@@ -908,7 +910,12 @@ func TestDockerWebProxyExampleConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToWebProxyRuntimeConfig: %v", err)
 	}
-	manager, err := webproxy.NewManager(webproxy.DefaultManagerConfig(runtime.Profiles, runtime.Backend))
+	if runtime.Carrier != webproxy.CarrierHTTPSLanes {
+		t.Fatalf("example carrier = %q", runtime.Carrier)
+	}
+	managerConfig := webproxy.DefaultManagerConfig(runtime.Profiles, runtime.Backend)
+	managerConfig.Carrier = runtime.Carrier
+	manager, err := webproxy.NewManager(managerConfig)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -949,6 +956,7 @@ func TestDockerWebProxyOperationalContracts(t *testing.T) {
 		t.Fatal("example contains a path-specific WEB route that lets other paths bypass classification")
 	}
 	for _, required := range []string{
+		"http2 on;",
 		"error_page 418 = @telego_ordinary;",
 		"error_page 419 = @telego_sanitized;",
 		"proxy_set_header Authorization \"\";",
@@ -986,6 +994,10 @@ func TestDockerWebProxyOperationalContracts(t *testing.T) {
 		t.Fatal(err)
 	}
 	setupText := string(setupGuide)
+	if !strings.Contains(setupText, "carrier = \"https-lanes\"") ||
+		!strings.Contains(setupText, "http2 on;") {
+		t.Fatal("setup guide does not enable the recommended lanes carrier with public HTTP/2")
+	}
 	if !strings.Contains(setupText, "legacy mode intentionally trusts PROXY headers") {
 		t.Fatal("setup guide does not qualify legacy public PROXY trust")
 	}
@@ -1012,6 +1024,7 @@ func TestWebProxyConfigRequiresExplicitValuesWhenNotDerivable(t *testing.T) {
 		{name: "hostname", bind: "0.0.0.0:443", wantErr: "web-proxy.hostname is required"},
 		{name: "canonical hostname", bind: "0.0.0.0:443", mutate: func(c *Config) { c.WebProxy.Hostname = "Proxy.Example.com" }, wantErr: "invalid web-proxy.hostname"},
 		{name: "event loops", bind: "0.0.0.0:443", mutate: func(c *Config) { c.WebProxy.Hostname = "proxy.example.com"; c.WebProxy.NumEventLoops = -1 }, wantErr: "cannot be negative"},
+		{name: "carrier", bind: "0.0.0.0:443", mutate: func(c *Config) { c.WebProxy.Hostname = "proxy.example.com"; c.WebProxy.Carrier = "websocket" }, wantErr: "unsupported WEB carrier mode"},
 		{name: "interface backend", bind: "192.0.2.1:443", mutate: func(c *Config) { c.WebProxy.Hostname = "proxy.example.com" }, wantErr: "not wildcard or loopback"},
 		{name: "unix HTTP bind", bind: "0.0.0.0:443", mutate: func(c *Config) {
 			c.WebProxy.Hostname = "proxy.example.com"

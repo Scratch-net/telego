@@ -101,7 +101,7 @@ func (h *ProxyHandler) handleDDFrame(c gnet.Conn, ctx *ConnContext) gnet.Action 
 		key, ok := h.connLimiter.TryAcquire(clientIP, matchedSecret.Key)
 		if !ok {
 			h.logger.Info("[#%d:%s] connection limit exceeded for IP: %s", ctx.id, matchedSecret.Name, clientIP)
-			return gnet.Close
+			return h.failHandshake(ctx, handshakeFailureAdmission)
 		}
 		ctx.mu.Lock()
 		ctx.connLimitTracked = true
@@ -123,7 +123,7 @@ func (h *ProxyHandler) handleDDFrame(c gnet.Conn, ctx *ConnContext) gnet.Action 
 				ctx.mu.Unlock()
 			}
 			h.logger.Info("[#%d:%s] IP blocked for user (too many unique IPs): %s", ctx.id, matchedSecret.Name, clientIP)
-			return gnet.Close
+			return h.failHandshake(ctx, handshakeFailureAdmission)
 		}
 		// Store tracking info for cleanup in OnClose
 		ctx.mu.Lock()
@@ -284,7 +284,7 @@ func (h *ProxyHandler) handleTLSPayload(c gnet.Conn, ctx *ConnContext) gnet.Acti
 		key, ok := h.connLimiter.TryAcquire(clientIP, matchedSecret.Key)
 		if !ok {
 			h.logger.Info("[#%d:%s] connection limit exceeded for IP: %s", ctx.id, matchedSecret.Name, clientIP)
-			return gnet.Close
+			return h.failHandshake(ctx, handshakeFailureAdmission)
 		}
 		ctx.mu.Lock()
 		ctx.connLimitTracked = true
@@ -306,7 +306,7 @@ func (h *ProxyHandler) handleTLSPayload(c gnet.Conn, ctx *ConnContext) gnet.Acti
 				ctx.mu.Unlock()
 			}
 			h.logger.Info("[#%d:%s] IP blocked for user (too many unique IPs): %s", ctx.id, matchedSecret.Name, clientIP)
-			return gnet.Close
+			return h.failHandshake(ctx, handshakeFailureAdmission)
 		}
 		// Store tracking info for cleanup in OnClose
 		ctx.mu.Lock()
@@ -344,7 +344,7 @@ func (h *ProxyHandler) handleTLSPayload(c gnet.Conn, ctx *ConnContext) gnet.Acti
 			response, err = faketls.BuildServerHelloWithOptions(matchedSecret.Key, hello, opts)
 			if err != nil {
 				h.logger.Debug("BuildServerHelloWithOptions (hybrid) failed: %v", err)
-				return gnet.Close
+				return h.failHandshake(ctx, handshakeFailureTLSServerHello)
 			}
 			h.logger.Debug("[#%d] using hybrid ServerHello (real TLS fingerprint)", ctx.id)
 		} else {
@@ -369,7 +369,7 @@ func (h *ProxyHandler) handleTLSPayload(c gnet.Conn, ctx *ConnContext) gnet.Acti
 		}
 		if err != nil {
 			h.logger.Debug("BuildServerHello failed: %v", err)
-			return gnet.Close
+			return h.failHandshake(ctx, handshakeFailureTLSServerHello)
 		}
 	}
 
@@ -429,7 +429,7 @@ func (h *ProxyHandler) handleO2Frame(c gnet.Conn, ctx *ConnContext) gnet.Action 
 
 			if len(payload) < obfuscated2.FrameSize {
 				h.logger.Debug("O2 frame too short: %d bytes", len(payload))
-				return gnet.Close
+				return h.failHandshake(ctx, handshakeFailureTLSMTProto)
 			}
 
 			// Get matched secret from context
@@ -439,14 +439,14 @@ func (h *ProxyHandler) handleO2Frame(c gnet.Conn, ctx *ConnContext) gnet.Action 
 
 			if secret == nil {
 				h.logger.Debug("no secret in context")
-				return gnet.Close
+				return h.failHandshake(ctx, handshakeFailureTLSMTProto)
 			}
 
 			// Parse obfuscated2 handshake frame
 			dcID, connectionType, encryptor, decryptor, err := obfuscated2.ParseClientFrameWithType(secret.Key, payload[:obfuscated2.FrameSize])
 			if err != nil {
 				h.logger.Debug("ParseClientFrame failed: %v", err)
-				return gnet.Close
+				return h.failHandshake(ctx, handshakeFailureTLSMTProto)
 			}
 
 			// Check for extra data after the O2 frame in the same TLS record
@@ -486,7 +486,7 @@ func (h *ProxyHandler) handleO2Frame(c gnet.Conn, ctx *ConnContext) gnet.Action 
 
 		// Unknown record type - close connection
 		h.logger.Debug("Unexpected record type 0x%02x while waiting for O2 frame", recordType)
-		return gnet.Close
+		return h.failHandshake(ctx, handshakeFailureTLSMTProto)
 	}
 
 	// Need more data
@@ -500,7 +500,7 @@ func (h *ProxyHandler) handleO2Frame(c gnet.Conn, ctx *ConnContext) gnet.Action 
 func (h *ProxyHandler) startSplice(c gnet.Conn, ctx *ConnContext) gnet.Action {
 	if h.config.SpliceHost == "" {
 		h.logger.Debug("[#%d] no splice host configured, closing", ctx.id)
-		return gnet.Close
+		return h.failHandshake(ctx, handshakeStageForState(ctx.State()))
 	}
 
 	ctx.SetState(StateSplicing)

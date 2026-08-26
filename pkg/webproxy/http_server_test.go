@@ -90,6 +90,87 @@ func TestHTTPServerRouteSessionEndToEnd(t *testing.T) {
 	}
 }
 
+func TestHTTPServerHTTPSLanesCarrierEndToEnd(t *testing.T) {
+	application := newHTTPTestApplicationWithConfig(t, 500*time.Millisecond, func(config *ManagerConfig) {
+		config.Carrier = CarrierHTTPSLanes
+	}, nil)
+	client := &http.Client{Timeout: 3 * time.Second}
+
+	bridgeResponse := application.do(t, client, "GET", "/?bridge="+application.profiles[0].Capability().String(), nil, nil)
+	bridgeBody := readHTTPBody(t, bridgeResponse)
+	if bridgeResponse.StatusCode != http.StatusOK || !bytes.Contains(bridgeBody, []byte(`carrier="https-lanes"`)) {
+		t.Fatalf("lanes bridge response = %d", bridgeResponse.StatusCode)
+	}
+	bootstrap := extractBridgeBootstrap(t, bridgeBody)
+	hello := testFrameBatch(t, Frame{Type: FrameHello, Payload: []byte{1}})
+	createResponse := application.do(t, client, "POST", "/api/v1/session", hello, map[string]string{
+		"Authorization": "Bearer " + bootstrap,
+		"Content-Type":  "application/octet-stream",
+	})
+	_ = readHTTPBody(t, createResponse)
+	if createResponse.StatusCode != http.StatusOK || createResponse.Header.Get("X-Carrier-Mode") != string(CarrierHTTPSLanes) {
+		t.Fatalf("lanes create response = %d, mode %q", createResponse.StatusCode, createResponse.Header.Get("X-Carrier-Mode"))
+	}
+	sessionToken := createResponse.Header.Get("X-Session-Token")
+
+	missingLane := application.do(t, client, "POST", "/api/v1/up", testFrameBatch(t, Frame{Type: FrameOpen, StreamID: 71}), map[string]string{
+		"Authorization": "Bearer " + sessionToken,
+		"Content-Type":  "application/octet-stream",
+		"X-Up-Seq":      "1",
+	})
+	_ = readHTTPBody(t, missingLane)
+	if missingLane.StatusCode != defaultSanitizedFallbackStatus {
+		t.Fatalf("missing lane status = %d", missingLane.StatusCode)
+	}
+
+	const laneID = 71
+	payload := []byte("lane echo")
+	uplinkBody := testFrameBatch(t,
+		Frame{Type: FrameOpen, StreamID: laneID},
+		Frame{Type: FrameData, StreamID: laneID, Payload: payload},
+	)
+	uplinkResponse := application.do(t, client, "POST", "/api/v1/up", uplinkBody, map[string]string{
+		"Authorization": "Bearer " + sessionToken,
+		"Content-Type":  "application/octet-stream",
+		"X-Up-Seq":      "1",
+		"X-Lane-ID":     strconv.Itoa(laneID),
+	})
+	_ = readHTTPBody(t, uplinkResponse)
+	if uplinkResponse.StatusCode != http.StatusNoContent || uplinkResponse.Header.Get("X-Up-Ack") != "1" {
+		t.Fatalf("lanes uplink response = %d, ack %q", uplinkResponse.StatusCode, uplinkResponse.Header.Get("X-Up-Ack"))
+	}
+
+	foundEcho := false
+	cursor := "0"
+	for poll := 0; poll < 3 && !foundEcho; poll++ {
+		downlinkResponse := application.do(t, client, "POST", "/api/v1/down", nil, map[string]string{
+			"Authorization": "Bearer " + sessionToken,
+			"X-Down-Cursor": cursor,
+			"X-Lane-ID":     strconv.Itoa(laneID),
+		})
+		downlinkBody := readHTTPBody(t, downlinkResponse)
+		if downlinkResponse.StatusCode != http.StatusOK {
+			t.Fatalf("lanes downlink response = %d, cursor %q", downlinkResponse.StatusCode, downlinkResponse.Header.Get("X-Down-Cursor"))
+		}
+		cursor = downlinkResponse.Header.Get("X-Down-Cursor")
+		frames, err := ParseBatch(downlinkBody)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, frame := range frames {
+			if frame.StreamID != laneID {
+				t.Fatalf("cross-lane response frame = %d", frame.StreamID)
+			}
+			if frame.Type == FrameData && bytes.Equal(frame.Payload, payload) {
+				foundEcho = true
+			}
+		}
+	}
+	if !foundEcho {
+		t.Fatal("lanes response omitted echoed DATA")
+	}
+}
+
 func TestHTTPServerAuthenticatesBeforeReadingBody(t *testing.T) {
 	application := newHTTPTestApplication(t, 200*time.Millisecond)
 	connection, err := net.Dial("tcp", application.address)
@@ -455,7 +536,8 @@ func waitForDownPoll(t *testing.T, session *Session, active bool) {
 	eventually(t, time.Second, func() bool {
 		session.mu.Lock()
 		defer session.mu.Unlock()
-		return session.downActive == active
+		lane := session.carrierLanes[0]
+		return (lane != nil && lane.downActive) == active
 	})
 }
 

@@ -272,6 +272,7 @@ func TestManagerRejectsInvalidConfigAndDuplicateCapabilities(t *testing.T) {
 		{"hostname backend", func(config *ManagerConfig) { config.Backend = "localhost:443" }},
 		{"relative Unix backend", func(config *ManagerConfig) { config.Backend = "unix://relative.sock" }},
 		{"root Unix backend", func(config *ManagerConfig) { config.Backend = "/" }},
+		{"unsupported carrier", func(config *ManagerConfig) { config.Carrier = "websocket" }},
 		{"zero limit", func(config *ManagerConfig) { config.Limits.MaxSessions = 0 }},
 		{"oversized carrier", func(config *ManagerConfig) { config.Limits.CarrierBatchBytes = maxCarrierBatchBytes + 1 }},
 		{"small global streams", func(config *ManagerConfig) { config.Limits.MaxStreams = config.Limits.MaxStreamsPerSession - 1 }},
@@ -286,6 +287,19 @@ func TestManagerRejectsInvalidConfigAndDuplicateCapabilities(t *testing.T) {
 				t.Fatalf("NewManager = %p, %v", manager, err)
 			}
 		})
+	}
+}
+
+func TestManagerEmptyCarrierPreservesSerializedHTTPS(t *testing.T) {
+	config := DefaultManagerConfig(testProfiles(t), "127.0.0.1:443")
+	config.Carrier = ""
+	manager, err := NewManager(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Shutdown(context.Background()) })
+	if manager.CarrierMode() != CarrierHTTPS {
+		t.Fatalf("carrier = %q", manager.CarrierMode())
 	}
 }
 

@@ -79,6 +79,7 @@ func (h *ProxyHandler) dialDC(clientConn gnet.Conn, ctx *ConnContext) {
 	ddc, err := h.directDCDial(dcID, connectionType)
 	if err != nil {
 		h.logger.Debug("[#%d:%s] failed to dial DC %d: %v", ctx.id, userName, dcID, err)
+		h.recordHandshakeFailure(ctx, handshakeFailureBackendDial)
 		clientConn.Close()
 		return
 	}
@@ -133,6 +134,7 @@ func (h *ProxyHandler) dialDC(clientConn gnet.Conn, ctx *ConnContext) {
 			h.pendingDCContexts.Delete(fd)
 		}
 		h.logger.Debug("[#%d:%s] failed to enroll DC connection: %v", ctx.id, userName, err)
+		h.recordHandshakeFailure(ctx, handshakeFailureBackendDial)
 		ddc.Close()
 		clientConn.Close()
 		return

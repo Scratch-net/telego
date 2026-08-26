@@ -31,6 +31,9 @@ func newWebProxyRuntime(runtimeConfig config.WebProxyRuntimeConfig, internalAuth
 	}
 
 	managerConfig := webproxy.DefaultManagerConfig(runtimeConfig.Profiles, runtimeConfig.Backend)
+	if runtimeConfig.Carrier != "" {
+		managerConfig.Carrier = runtimeConfig.Carrier
+	}
 	if runtimeConfig.BackendProxyProtocol {
 		managerConfig.BackendDialContext = webProxyBackendDialer((&net.Dialer{}).DialContext, internalAuth)
 	}

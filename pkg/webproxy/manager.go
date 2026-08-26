@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -75,6 +76,7 @@ type Capacity struct {
 // stream and queue budgets.
 type Manager struct {
 	profiles    []Profile
+	carrier     CarrierMode
 	backendNet  string
 	backend     string
 	limits      Limits
@@ -95,10 +97,18 @@ type Manager struct {
 	cleanupDone  chan struct{}
 	shutdownDone chan struct{}
 	shutdownOnce sync.Once
+
+	sessionsCreated atomic.Uint64
+	sessionsClosed  [sessionCloseReasonCount]atomic.Uint64
+	carrierRetries  [carrierOperationCount]atomic.Uint64
+	backpressure    [carrierOperationCount]atomic.Uint64
 }
 
 // NewManager validates and copies config before starting its expiry worker.
 func NewManager(config ManagerConfig) (*Manager, error) {
+	if config.Carrier == "" {
+		config.Carrier = CarrierHTTPS
+	}
 	if err := validateManagerConfig(config); err != nil {
 		return nil, err
 	}
@@ -115,6 +125,7 @@ func NewManager(config ManagerConfig) (*Manager, error) {
 	}
 	manager := &Manager{
 		profiles:     append([]Profile(nil), config.Profiles...),
+		carrier:      config.Carrier,
 		backendNet:   backendNetwork,
 		backend:      backendAddress,
 		limits:       config.Limits,
@@ -167,6 +178,7 @@ func (m *Manager) IssueBootstrap(capability Capability, clientIP string) (string
 	}
 	m.removeExpiredLocked(now)
 	if len(m.bootstraps) >= m.limits.MaxBootstraps && !m.evictOldestUnusedBootstrapLocked() {
+		m.recordBackpressure(carrierOperationBridge)
 		return "", ErrLimit
 	}
 	for m.tokenHashUsedLocked(hash) {
@@ -234,6 +246,7 @@ func (a *BootstrapAuthorization) Create(clientIP string, body []byte) (CreateRes
 		if subtle.ConstantTimeCompare(entry.bodyDigest[:], bodyDigest[:]) != 1 || entry.session == nil {
 			return CreateResult{}, ErrAuthentication
 		}
+		m.recordCarrierRetry(carrierOperationCreate)
 		return CreateResult{
 			Token:   entry.sessionToken,
 			Welcome: welcomeFrame(),
@@ -244,6 +257,7 @@ func (a *BootstrapAuthorization) Create(clientIP string, body []byte) (CreateRes
 		return CreateResult{}, ErrClosed
 	}
 	if len(m.sessions) >= m.limits.MaxSessions {
+		m.recordBackpressure(carrierOperationCreate)
 		return CreateResult{}, ErrLimit
 	}
 
@@ -259,6 +273,7 @@ func (a *BootstrapAuthorization) Create(clientIP string, body []byte) (CreateRes
 	}
 	created := newSession(sessionOptions{
 		profile:               entry.profile,
+		carrier:               m.carrier,
 		clientIP:              clientIP,
 		backendNet:            m.backendNet,
 		backend:               m.backend,
@@ -266,14 +281,17 @@ func (a *BootstrapAuthorization) Create(clientIP string, body []byte) (CreateRes
 		timeouts:              m.timeouts,
 		dialBackend:           m.dialBackend,
 		budget:                m.changePendingBudget,
+		onCarrierRetry:        m.recordCarrierRetry,
+		onBackpressure:        m.recordBackpressure,
 		acquireStream:         m.acquireStream,
 		onBackendDialFinished: m.backendDialFinished,
 		onStreamFinished:      m.streamFinished,
 	})
-	created.onFinished = func(session *Session) {
-		m.sessionFinished(sessionHash, session)
+	created.onFinished = func(session *Session, reason sessionCloseReason) {
+		m.sessionFinished(sessionHash, session, reason)
 	}
 	m.sessions[sessionHash] = created
+	m.sessionsCreated.Add(1)
 	entry.used = true
 	entry.bodyDigest = bodyDigest
 	entry.sessionToken = sessionToken
@@ -284,6 +302,9 @@ func (a *BootstrapAuthorization) Create(clientIP string, body []byte) (CreateRes
 		Session: created,
 	}, nil
 }
+
+// CarrierMode returns the transport used for newly created sessions.
+func (m *Manager) CarrierMode() CarrierMode { return m.carrier }
 
 func (m *Manager) bootstrapAuthenticated(hash [sha256.Size]byte, now time.Time) bool {
 	m.mu.Lock()
@@ -331,7 +352,7 @@ func (m *Manager) Close(token string) error {
 		}
 		return ErrAuthentication
 	}
-	session.Close()
+	session.closeWithReason(sessionCloseClient)
 	return nil
 }
 
@@ -364,7 +385,7 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 		m.mu.Unlock()
 
 		for _, session := range sessions {
-			session.Close()
+			session.closeWithReason(sessionCloseShutdown)
 		}
 		go func() {
 			for _, session := range sessions {
@@ -439,7 +460,7 @@ func (m *Manager) changePendingBudget(byteDelta, itemDelta int, class pendingCla
 	return true
 }
 
-func (m *Manager) sessionFinished(hash [sha256.Size]byte, session *Session) {
+func (m *Manager) sessionFinished(hash [sha256.Size]byte, session *Session, reason sessionCloseReason) {
 	m.mu.Lock()
 	if m.sessions[hash] == session {
 		delete(m.sessions, hash)
@@ -451,6 +472,9 @@ func (m *Manager) sessionFinished(hash [sha256.Size]byte, session *Session) {
 		}
 	}
 	m.mu.Unlock()
+	if reason < sessionCloseReasonCount {
+		m.sessionsClosed[reason].Add(1)
+	}
 }
 
 func (m *Manager) rememberClosedTokenLocked(hash [sha256.Size]byte, expires time.Time) {
@@ -519,7 +543,7 @@ func (m *Manager) cleanupLoop() {
 			m.mu.Unlock()
 			for _, session := range sessions {
 				if now.Sub(session.LastActivity()) >= m.timeouts.ReconnectGrace {
-					session.Close()
+					session.closeWithReason(sessionCloseExpired)
 				}
 			}
 		case <-m.stop:

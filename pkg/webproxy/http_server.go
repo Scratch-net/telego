@@ -68,12 +68,12 @@ type HTTPServerConfig struct {
 	TrustedProxyCIDRs       []string
 }
 
-// HTTPServer is an independent gnet engine for the serialized HTTPS WEB
-// carrier. Constructing it has no listener or process-global side effects.
+// HTTPServer is an independent gnet engine for HTTPS WEB carriers.
+// Constructing it has no listener or process-global side effects.
 type HTTPServer struct {
 	config       HTTPServerConfig
 	handler      *httpEventHandler
-	renderBridge func(string, string, int) (BridgePage, error)
+	renderBridge func(string, string, int, CarrierMode) (BridgePage, error)
 
 	lifecycleMu    sync.Mutex
 	started        bool
@@ -148,7 +148,7 @@ func NewHTTPServer(config HTTPServerConfig) (*HTTPServer, error) {
 
 	server := &HTTPServer{
 		config:         config,
-		renderBridge:   RenderBridge,
+		renderBridge:   RenderBridgeForCarrier,
 		ready:          make(chan struct{}),
 		done:           make(chan struct{}),
 		errors:         make(chan error, 1),
@@ -653,6 +653,7 @@ type preparedRequest struct {
 	token         string
 	sequence      uint64
 	cursor        uint64
+	laneID        uint32
 	clientIP      string
 }
 
@@ -679,7 +680,7 @@ func (h *httpEventHandler) prepare(request carrierRequest, peerIP string) (*prep
 		}
 		return nil, requestSanitizedFallback
 	}
-	if headerPresent(request, "cookie") {
+	if cookie, present := request.headers["cookie"]; present && cookie != "" {
 		return nil, requestSanitizedFallback
 	}
 	if request.query != "" || request.path != "/api/v1/session" &&
@@ -715,7 +716,11 @@ func (h *httpEventHandler) prepare(request carrierRequest, peerIP string) (*prep
 	case "/api/v1/up":
 		if request.method != "POST" || request.headers["content-type"] != "application/octet-stream" ||
 			!request.hasContentLength || request.contentLength > uint64(min(config.Manager.limits.MaxBodyBytes, maxCarrierBatchBytes)) ||
-			anyHeaderPresent(request, "x-down-cursor", "x-lane-id", "x-session-token", "x-carrier-mode", "x-up-ack") {
+			anyHeaderPresent(request, "x-down-cursor", "x-session-token", "x-carrier-mode", "x-up-ack") {
+			return nil, requestSanitizedFallback
+		}
+		laneID, ok := requestCarrierLane(request, config.Manager.CarrierMode())
+		if !ok {
 			return nil, requestSanitizedFallback
 		}
 		sequence, ok := canonicalDecimal(request.headers["x-up-seq"])
@@ -726,12 +731,16 @@ func (h *httpEventHandler) prepare(request carrierRequest, peerIP string) (*prep
 		if err != nil {
 			return nil, requestSanitizedFallback
 		}
-		return &preparedRequest{request: request, kind: requestUp, session: session, sequence: sequence, clientIP: clientIP}, requestCarrier
+		return &preparedRequest{request: request, kind: requestUp, session: session, sequence: sequence, laneID: laneID, clientIP: clientIP}, requestCarrier
 
 	case "/api/v1/down":
 		if request.method != "POST" || !request.hasContentLength || request.contentLength != 0 ||
 			headerPresent(request, "content-type") ||
-			anyHeaderPresent(request, "x-up-seq", "x-lane-id", "x-session-token", "x-carrier-mode", "x-up-ack") {
+			anyHeaderPresent(request, "x-up-seq", "x-session-token", "x-carrier-mode", "x-up-ack") {
+			return nil, requestSanitizedFallback
+		}
+		laneID, ok := requestCarrierLane(request, config.Manager.CarrierMode())
+		if !ok {
 			return nil, requestSanitizedFallback
 		}
 		cursor, ok := canonicalDecimal(request.headers["x-down-cursor"])
@@ -742,10 +751,25 @@ func (h *httpEventHandler) prepare(request carrierRequest, peerIP string) (*prep
 		if err != nil {
 			return nil, requestSanitizedFallback
 		}
-		return &preparedRequest{request: request, kind: requestDown, session: session, cursor: cursor, clientIP: clientIP}, requestCarrier
+		return &preparedRequest{request: request, kind: requestDown, session: session, cursor: cursor, laneID: laneID, clientIP: clientIP}, requestCarrier
 	default:
 		return nil, requestSanitizedFallback
 	}
+}
+
+func requestCarrierLane(request carrierRequest, carrier CarrierMode) (uint32, bool) {
+	value, present := request.headers["x-lane-id"]
+	if carrier == CarrierHTTPS {
+		return 0, !present
+	}
+	if carrier != CarrierHTTPSLanes || !present {
+		return 0, false
+	}
+	lane, ok := canonicalDecimal(value)
+	if !ok || lane > MaxStreamID {
+		return 0, false
+	}
+	return uint32(lane), true
 }
 
 func reservedCarrierRequest(request carrierRequest) bool {
@@ -913,7 +937,12 @@ func (h *httpEventHandler) serve(
 			}
 			return rejectResponse(500)
 		}
-		page, err := h.server.renderBridge(h.server.config.Hostname, bootstrap, manager.limits.CarrierBatchBytes)
+		page, err := h.server.renderBridge(
+			h.server.config.Hostname,
+			bootstrap,
+			manager.limits.CarrierBatchBytes,
+			manager.CarrierMode(),
+		)
 		if err != nil {
 			return rejectResponse(500)
 		}
@@ -939,12 +968,18 @@ func (h *httpEventHandler) serve(
 			{"Content-Type", "application/octet-stream"},
 			{"Cache-Control", "no-store"},
 			{"X-Session-Token", result.Token},
-			{"X-Carrier-Mode", "https"},
+			{"X-Carrier-Mode", string(manager.CarrierMode())},
 			{"X-Down-Cursor", "0"},
 		}, result.Welcome)
 
 	case requestUp:
-		ack, err := request.session.ProcessUp(request.sequence, body)
+		var ack uint64
+		var err error
+		if manager.CarrierMode() == CarrierHTTPSLanes {
+			ack, err = request.session.ProcessUpLane(request.laneID, request.sequence, body)
+		} else {
+			ack, err = request.session.ProcessUp(request.sequence, body)
+		}
 		if err != nil {
 			if errors.Is(err, ErrBackpressure) {
 				return retryResponse()
@@ -957,7 +992,20 @@ func (h *httpEventHandler) serve(
 		}}
 
 	case requestDown:
-		body, cursor, lease, err := request.session.PollCarrier(ctx, request.cursor)
+		var responseBody []byte
+		var cursor uint64
+		var laneClosed bool
+		var lease *PollLease
+		var err error
+		if manager.CarrierMode() == CarrierHTTPSLanes {
+			responseBody, cursor, laneClosed, lease, err = request.session.PollCarrierLane(
+				ctx,
+				request.laneID,
+				request.cursor,
+			)
+		} else {
+			responseBody, cursor, lease, err = request.session.PollCarrier(ctx, request.cursor)
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				return carrierResponse{status: 204}
@@ -968,11 +1016,14 @@ func (h *httpEventHandler) serve(
 			{"Cache-Control", "no-store"},
 			{"X-Down-Cursor", strconv.FormatUint(cursor, 10)},
 		}
-		if len(body) == 0 {
+		if laneClosed {
+			headers = append(headers, responseHeader{"X-Lane-Closed", "1"})
+		}
+		if len(responseBody) == 0 {
 			return carrierResponse{status: 204, headers: headers, lease: lease}
 		}
 		headers = append(headers, responseHeader{"Content-Type", "application/octet-stream"})
-		response := newCarrierResponse(200, headers, body)
+		response := newCarrierResponse(200, headers, responseBody)
 		response.lease = lease
 		return response
 

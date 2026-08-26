@@ -15,6 +15,7 @@ splice-proxy-protocol = 2
 [web-proxy]
 enabled = true
 hostname = "proxy.example.com"
+carrier = "https-lanes"
 bind-to = "0.0.0.0:8080"
 backend = "127.0.0.1:443"
 trusted-proxy-cidrs = ["172.28.0.2/32"]

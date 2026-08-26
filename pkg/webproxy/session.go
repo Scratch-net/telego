@@ -23,6 +23,7 @@ const (
 
 type sessionOptions struct {
 	profile               Profile
+	carrier               CarrierMode
 	clientIP              string
 	backendNet            string
 	backend               string
@@ -30,7 +31,9 @@ type sessionOptions struct {
 	timeouts              Timeouts
 	dialBackend           BackendDialContextFunc
 	budget                func(int, int, pendingClass) bool
-	onFinished            func(*Session)
+	onFinished            func(*Session, sessionCloseReason)
+	onCarrierRetry        func(carrierOperation)
+	onBackpressure        func(carrierOperation)
 	acquireStream         func() bool
 	onBackendDialFinished func()
 	onStreamFinished      func()
@@ -66,10 +69,38 @@ type downBatch struct {
 	items int
 }
 
-// Session is one authenticated serialized-HTTPS carrier session. Its methods
-// are safe for one concurrent uplink and downlink request.
+type carrierLane struct {
+	pendingFrames  []queuedFrame
+	pendingWindows map[uint32]int
+	unacked        []byte
+	unackedCost    int
+	unackedItems   int
+	unackedBase    uint64
+	downCursor     uint64
+	lastUpSequence uint64
+	lastUpDigest   [sha256.Size]byte
+	upActive       bool
+	downActive     bool
+	superseded     chan struct{}
+	downSlot       chan struct{}
+	notify         chan struct{}
+}
+
+func newCarrierLane() *carrierLane {
+	lane := &carrierLane{
+		pendingWindows: make(map[uint32]int),
+		downSlot:       make(chan struct{}, 1),
+		notify:         make(chan struct{}),
+	}
+	lane.downSlot <- struct{}{}
+	return lane
+}
+
+// Session is one authenticated HTTPS carrier session. The serialized carrier
+// permits one uplink and downlink. The lanes carrier permits one pair per lane.
 type Session struct {
 	profile     Profile
+	carrier     CarrierMode
 	clientIP    string
 	backendNet  string
 	backend     string
@@ -82,39 +113,34 @@ type Session struct {
 	streams        map[uint32]*streamState
 	usedStreams    streamIDHistory
 	tombstones     boundedSet[uint32]
-	pendingFrames  []queuedFrame
-	pendingWindows map[uint32]int
+	carrierLanes   map[uint32]*carrierLane
 	pendingCost    int
 	pendingItems   int
-	unacked        []byte
-	unackedCost    int
-	unackedItems   int
-	unackedBase    uint64
-	downCursor     uint64
-	lastUpSequence uint64
-	lastUpDigest   [sha256.Size]byte
-	upActive       bool
-	downActive     bool
-	superseded     chan struct{}
-	downSlot       chan struct{}
 	closed         bool
+	closeReason    sessionCloseReason
 	lastActivity   time.Time
-	notify         chan struct{}
 	budgetNotify   chan struct{}
 	done           chan struct{}
 	finishNotified chan struct{}
 	finishOnce     sync.Once
 	backendWG      sync.WaitGroup
 
-	onFinished            func(*Session)
+	onFinished            func(*Session, sessionCloseReason)
+	onCarrierRetry        func(carrierOperation)
+	onBackpressure        func(carrierOperation)
 	acquireStream         func() bool
 	onBackendDialFinished func()
 	onStreamFinished      func()
 }
 
 func newSession(options sessionOptions) *Session {
+	carrier := options.carrier
+	if carrier == "" {
+		carrier = CarrierHTTPS
+	}
 	session := &Session{
 		profile:               options.profile,
+		carrier:               carrier,
 		clientIP:              options.clientIP,
 		backendNet:            options.backendNet,
 		backend:               options.backend,
@@ -124,28 +150,45 @@ func newSession(options sessionOptions) *Session {
 		budget:                options.budget,
 		streams:               make(map[uint32]*streamState),
 		tombstones:            newBoundedSet[uint32](options.limits.MaxClosedStreamIDs),
-		pendingWindows:        make(map[uint32]int),
+		carrierLanes:          map[uint32]*carrierLane{0: newCarrierLane()},
 		lastActivity:          time.Now(),
-		notify:                make(chan struct{}),
 		budgetNotify:          make(chan struct{}),
 		done:                  make(chan struct{}),
 		finishNotified:        make(chan struct{}),
 		onFinished:            options.onFinished,
+		onCarrierRetry:        options.onCarrierRetry,
+		onBackpressure:        options.onBackpressure,
 		acquireStream:         options.acquireStream,
 		onBackendDialFinished: options.onBackendDialFinished,
 		onStreamFinished:      options.onStreamFinished,
 	}
-	session.downSlot = make(chan struct{}, 1)
-	session.downSlot <- struct{}{}
 	return session
 }
 
 // Profile returns the immutable WEB credential associated with the session.
 func (s *Session) Profile() Profile { return s.profile }
 
+// CarrierMode returns the immutable transport selected for this session.
+func (s *Session) CarrierMode() CarrierMode { return s.carrier }
+
 // ProcessUp applies the next serialized uplink batch or acknowledges a
 // byte-identical retry of the last committed sequence.
 func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
+	if s.carrier != CarrierHTTPS {
+		return 0, ErrProtocol
+	}
+	return s.processUp(0, sequence, body, false)
+}
+
+// ProcessUpLane applies one uplink batch to an independent stream lane.
+func (s *Session) ProcessUpLane(laneID uint32, sequence uint64, body []byte) (uint64, error) {
+	if s.carrier != CarrierHTTPSLanes || laneID > MaxStreamID {
+		return 0, ErrProtocol
+	}
+	return s.processUp(laneID, sequence, body, true)
+}
+
+func (s *Session) processUp(laneID uint32, sequence uint64, body []byte, lanes bool) (uint64, error) {
 	digest := sha256.Sum256(body)
 	s.mu.Lock()
 	if s.closed {
@@ -153,52 +196,65 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 		return 0, ErrClosed
 	}
 	s.lastActivity = time.Now()
-	if sequence == s.lastUpSequence && sequence != 0 {
-		matches := bytes.Equal(digest[:], s.lastUpDigest[:])
+	if sequence == 0 || len(body) > s.limits.MaxBodyBytes {
+		backends := s.closeLocked(sessionCloseProtocol)
+		s.mu.Unlock()
+		requestBackendCloses(backends)
+		return 0, ErrProtocol
+	}
+	lane := s.carrierLanes[laneID]
+	if lane == nil {
+		if !lanes || laneID == 0 || !batchStartsWithOpen(body, laneID) {
+			s.mu.Unlock()
+			frames, err := parseUplinkBatch(body, laneID, lanes)
+			if lanes && err == nil && onlyLateLaneFrames(frames) {
+				s.recordCarrierRetry(carrierOperationUplink)
+				return sequence, nil
+			}
+			s.protocolFailure()
+			return 0, ErrProtocol
+		}
+		lane = newCarrierLane()
+		s.carrierLanes[laneID] = lane
+	}
+	if sequence == lane.lastUpSequence {
+		matches := bytes.Equal(digest[:], lane.lastUpDigest[:])
 		s.mu.Unlock()
 		if !matches {
 			s.protocolFailure()
 			return 0, ErrProtocol
 		}
+		s.recordCarrierRetry(carrierOperationUplink)
 		return sequence, nil
 	}
-	if sequence == 0 || sequence != s.lastUpSequence+1 {
-		backends := s.closeLocked()
+	if sequence != lane.lastUpSequence+1 {
+		backends := s.closeLocked(sessionCloseProtocol)
 		s.mu.Unlock()
 		requestBackendCloses(backends)
 		return 0, ErrProtocol
 	}
-	if s.upActive {
+	if lane.upActive {
 		s.mu.Unlock()
+		s.recordBackpressure(carrierOperationUplink)
 		return 0, ErrBackpressure
 	}
-	if len(body) > s.limits.MaxBodyBytes {
-		backends := s.closeLocked()
-		s.mu.Unlock()
-		requestBackendCloses(backends)
-		return 0, ErrProtocol
-	}
-	s.upActive = true
+	lane.upActive = true
 	s.mu.Unlock()
 
-	frames, parseErr := ParseBatch(body)
-	if parseErr == nil {
-		for _, frame := range frames {
-			if err := ValidateClientFrame(frame); err != nil {
-				parseErr = err
-				break
-			}
-		}
-	}
+	frames, parseErr := parseUplinkBatch(body, laneID, lanes)
 
 	s.mu.Lock()
-	s.upActive = false
+	if current := s.carrierLanes[laneID]; current != lane {
+		s.mu.Unlock()
+		return 0, ErrClosed
+	}
+	lane.upActive = false
 	if s.closed {
 		s.mu.Unlock()
 		return 0, ErrClosed
 	}
 	if parseErr != nil || !s.validateBatchLocked(frames) {
-		backends := s.closeLocked()
+		backends := s.closeLocked(sessionCloseProtocol)
 		s.mu.Unlock()
 		requestBackendCloses(backends)
 		return 0, ErrProtocol
@@ -207,6 +263,7 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 	if !ok || ((reservedCost != 0 || reservedItems != 0) &&
 		!s.reservePendingLocked(reservedCost, reservedItems, pendingUplink)) {
 		s.mu.Unlock()
+		s.recordBackpressure(carrierOperationUplink)
 		return 0, ErrBackpressure
 	}
 	opened, closed, unusedCost, unusedItems, applied := s.applyBatchLocked(
@@ -219,8 +276,8 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 	}
 	s.backendWG.Add(len(opened))
 	if applied {
-		s.lastUpSequence = sequence
-		s.lastUpDigest = digest
+		lane.lastUpSequence = sequence
+		lane.lastUpDigest = digest
 	}
 	s.mu.Unlock()
 
@@ -229,16 +286,50 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 		go s.runBackend(backend)
 	}
 	if !applied {
-		s.Close()
+		s.closeWithReason(sessionCloseResource)
 		return 0, ErrClosed
 	}
 	return sequence, nil
+}
+
+func parseUplinkBatch(body []byte, laneID uint32, lanes bool) ([]Frame, error) {
+	frames, err := ParseBatch(body)
+	if err != nil {
+		return nil, err
+	}
+	for _, frame := range frames {
+		if lanes && frame.StreamID != laneID {
+			return nil, ErrInvalidFrame
+		}
+		if err := ValidateClientFrame(frame); err != nil {
+			return nil, err
+		}
+	}
+	return frames, nil
+}
+
+func batchStartsWithOpen(body []byte, laneID uint32) bool {
+	return len(body) >= FrameHeaderSize && FrameType(body[0]) == FrameOpen &&
+		uint32(body[1])<<16|uint32(body[2])<<8|uint32(body[3]) == laneID
+}
+
+func onlyLateLaneFrames(frames []Frame) bool {
+	if len(frames) == 0 {
+		return false
+	}
+	for _, frame := range frames {
+		if frame.Type != FrameData && frame.Type != FrameWindow && frame.Type != FrameClose {
+			return false
+		}
+	}
+	return true
 }
 
 // PollLease keeps one completed carrier response as the active downlink poll
 // until the HTTP layer has drained that response. A newer poll supersedes it.
 type PollLease struct {
 	session  *Session
+	lane     *carrierLane
 	claim    chan struct{}
 	ownsSlot bool
 	once     sync.Once
@@ -273,12 +364,12 @@ func (l *PollLease) releaseLocked() {
 		return
 	}
 	l.once.Do(func() {
-		if l.session.superseded == l.claim {
-			l.session.downActive = false
-			l.session.superseded = nil
+		if l.lane.superseded == l.claim {
+			l.lane.downActive = false
+			l.lane.superseded = nil
 		}
 		if l.ownsSlot {
-			l.session.downSlot <- struct{}{}
+			l.lane.downSlot <- struct{}{}
 			l.ownsSlot = false
 		}
 	})
@@ -292,25 +383,69 @@ func (s *Session) Poll(ctx context.Context, cursor uint64) ([]byte, uint64, erro
 	return body, next, err
 }
 
+// PollLane acknowledges and polls one independent stream lane.
+func (s *Session) PollLane(ctx context.Context, laneID uint32, cursor uint64) ([]byte, uint64, bool, error) {
+	body, next, closed, lease, err := s.PollCarrierLane(ctx, laneID, cursor)
+	lease.Release()
+	return body, next, closed, err
+}
+
 // PollCarrier retains the newest-poll claim until the returned lease is
 // released by the carrier after its HTTP response drains.
 func (s *Session) PollCarrier(ctx context.Context, cursor uint64) ([]byte, uint64, *PollLease, error) {
+	if s.carrier != CarrierHTTPS {
+		return nil, cursor, nil, ErrProtocol
+	}
+	body, next, _, lease, err := s.pollCarrier(ctx, 0, cursor, false)
+	return body, next, lease, err
+}
+
+// PollCarrierLane retains the per-lane response claim until HTTP drains it.
+func (s *Session) PollCarrierLane(
+	ctx context.Context,
+	laneID uint32,
+	cursor uint64,
+) ([]byte, uint64, bool, *PollLease, error) {
+	if s.carrier != CarrierHTTPSLanes || laneID > MaxStreamID {
+		return nil, cursor, false, nil, ErrProtocol
+	}
+	return s.pollCarrier(ctx, laneID, cursor, true)
+}
+
+func (s *Session) pollCarrier(
+	ctx context.Context,
+	laneID uint32,
+	cursor uint64,
+	lanes bool,
+) ([]byte, uint64, bool, *PollLease, error) {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
-		return nil, cursor, nil, ErrClosed
+		return nil, cursor, false, nil, ErrClosed
+	}
+	lane := s.carrierLanes[laneID]
+	if lane == nil {
+		closed := lanes && s.usedStreams.Contains(laneID)
+		if !closed {
+			backends := s.closeLocked(sessionCloseProtocol)
+			s.mu.Unlock()
+			requestBackendCloses(backends)
+			return nil, cursor, false, nil, ErrProtocol
+		}
+		s.mu.Unlock()
+		return nil, cursor, true, nil, nil
 	}
 	s.lastActivity = time.Now()
 	// Claim newest-poll ownership before cursor replay. Otherwise every
 	// concurrent old-cursor request can bypass downActive and independently
 	// materialize the same replay response.
-	if s.downActive && s.superseded != nil {
-		close(s.superseded)
+	if lane.downActive && lane.superseded != nil {
+		close(lane.superseded)
 	}
 	mine := make(chan struct{})
-	s.superseded = mine
-	s.downActive = true
-	lease := &PollLease{session: s, claim: mine}
+	lane.superseded = mine
+	lane.downActive = true
+	lease := &PollLease{session: s, lane: lane, claim: mine}
 	s.mu.Unlock()
 
 	// Only the lease holding downSlot may materialize or wait on a carrier
@@ -318,82 +453,100 @@ func (s *Session) PollCarrier(ctx context.Context, cursor uint64) ([]byte, uint6
 	// an unacknowledged batch until the superseded response has drained and
 	// released this slot.
 	select {
-	case <-s.downSlot:
+	case <-lane.downSlot:
 		lease.ownsSlot = true
 	case <-ctx.Done():
 		lease.Release()
-		return nil, cursor, nil, ctx.Err()
+		return nil, cursor, false, nil, ctx.Err()
 	case <-mine:
 		lease.Release()
-		return nil, cursor, nil, nil
+		return nil, cursor, false, nil, nil
 	case <-s.done:
 		lease.Release()
-		return nil, cursor, nil, ErrClosed
+		return nil, cursor, false, nil, ErrClosed
 	}
 
 	s.mu.Lock()
-	if s.superseded != mine {
+	if lane.superseded != mine {
 		lease.releaseLocked()
 		s.mu.Unlock()
-		return nil, cursor, nil, nil
+		return nil, cursor, false, nil, nil
 	}
 	if s.closed {
 		lease.releaseLocked()
 		s.mu.Unlock()
-		return nil, cursor, nil, ErrClosed
+		return nil, cursor, false, nil, ErrClosed
+	}
+	if s.carrierLanes[laneID] != lane {
+		lease.releaseLocked()
+		s.mu.Unlock()
+		return nil, cursor, lanes, nil, nil
 	}
 	timer := time.NewTimer(s.timeouts.LongPoll)
 	defer timer.Stop()
-	if len(s.unacked) != 0 {
-		if cursor == s.unackedBase {
-			body := bytes.Clone(s.unacked)
-			next := s.downCursor
+	if len(lane.unacked) != 0 {
+		if cursor == lane.unackedBase {
+			body := bytes.Clone(lane.unacked)
+			next := lane.downCursor
 			s.mu.Unlock()
-			return body, next, lease, nil
+			s.recordCarrierRetry(carrierOperationDownlink)
+			return body, next, false, lease, nil
 		}
-		if cursor != s.downCursor {
-			backends := s.closeLocked()
+		if cursor != lane.downCursor {
+			backends := s.closeLocked(sessionCloseProtocol)
 			lease.releaseLocked()
 			s.mu.Unlock()
 			requestBackendCloses(backends)
-			return nil, cursor, nil, ErrProtocol
+			return nil, cursor, false, nil, ErrProtocol
 		}
-		s.releasePendingLocked(s.unackedCost, s.unackedItems)
-		s.unacked = nil
-		s.unackedCost = 0
-		s.unackedItems = 0
-	} else if cursor != s.downCursor {
-		backends := s.closeLocked()
+		s.releasePendingLocked(lane.unackedCost, lane.unackedItems)
+		lane.unacked = nil
+		lane.unackedCost = 0
+		lane.unackedItems = 0
+	} else if cursor != lane.downCursor {
+		backends := s.closeLocked(sessionCloseProtocol)
 		lease.releaseLocked()
 		s.mu.Unlock()
 		requestBackendCloses(backends)
-		return nil, cursor, nil, ErrProtocol
+		return nil, cursor, false, nil, ErrProtocol
 	}
 
 	for {
-		if s.superseded != mine {
+		if lane.superseded != mine {
 			lease.releaseLocked()
 			s.mu.Unlock()
-			return nil, cursor, nil, nil
+			return nil, cursor, false, nil, nil
 		}
-		if len(s.pendingFrames) != 0 {
-			batch := s.takeDownBatchLocked()
-			s.downCursor++
-			s.unackedBase = cursor
-			s.unacked = batch.body
-			s.unackedCost = batch.cost
-			s.unackedItems = batch.items
-			next := s.downCursor
+		if len(lane.pendingFrames) != 0 {
+			if lane.downCursor == math.MaxUint64 {
+				backends := s.closeLocked(sessionCloseProtocol)
+				lease.releaseLocked()
+				s.mu.Unlock()
+				requestBackendCloses(backends)
+				return nil, cursor, false, nil, ErrProtocol
+			}
+			batch := s.takeDownBatchLocked(lane)
+			lane.downCursor++
+			lane.unackedBase = cursor
+			lane.unacked = batch.body
+			lane.unackedCost = batch.cost
+			lane.unackedItems = batch.items
+			next := lane.downCursor
 			body := bytes.Clone(batch.body)
 			s.mu.Unlock()
-			return body, next, lease, nil
+			return body, next, false, lease, nil
+		}
+		if lanes && laneID != 0 && s.streams[laneID] == nil && s.tombstones.Contains(laneID) {
+			lease.releaseLocked()
+			s.mu.Unlock()
+			return nil, cursor, true, nil, nil
 		}
 		if s.closed {
 			lease.releaseLocked()
 			s.mu.Unlock()
-			return nil, cursor, nil, ErrClosed
+			return nil, cursor, false, nil, ErrClosed
 		}
-		pollNotify := s.notify
+		pollNotify := lane.notify
 		s.mu.Unlock()
 
 		select {
@@ -401,28 +554,38 @@ func (s *Session) PollCarrier(ctx context.Context, cursor uint64) ([]byte, uint6
 			s.mu.Lock()
 			lease.releaseLocked()
 			s.mu.Unlock()
-			return nil, cursor, nil, ctx.Err()
+			return nil, cursor, false, nil, ctx.Err()
 		case <-mine:
 			s.mu.Lock()
 			lease.releaseLocked()
 			s.mu.Unlock()
-			return nil, cursor, nil, nil
+			return nil, cursor, false, nil, nil
 		case <-s.done:
 			lease.Release()
-			return nil, cursor, nil, ErrClosed
+			return nil, cursor, false, nil, ErrClosed
 		case <-timer.C:
 			s.mu.Lock()
-			if s.superseded != mine {
+			if lane.superseded != mine {
 				lease.releaseLocked()
 				s.mu.Unlock()
-				return nil, cursor, nil, nil
+				return nil, cursor, false, nil, nil
 			}
-			if len(s.pendingFrames) != 0 {
+			if s.carrierLanes[laneID] != lane {
+				lease.releaseLocked()
+				s.mu.Unlock()
+				return nil, cursor, lanes, nil, nil
+			}
+			if len(lane.pendingFrames) != 0 {
 				continue
+			}
+			if lanes && laneID != 0 && s.streams[laneID] == nil && s.tombstones.Contains(laneID) {
+				lease.releaseLocked()
+				s.mu.Unlock()
+				return nil, cursor, true, nil, nil
 			}
 			s.lastActivity = time.Now()
 			s.mu.Unlock()
-			return nil, cursor, lease, nil
+			return nil, cursor, false, lease, nil
 		case <-pollNotify:
 			s.mu.Lock()
 		}
@@ -438,8 +601,12 @@ func (s *Session) LastActivity() time.Time {
 
 // Close aborts all logical streams and wakes parked carrier operations.
 func (s *Session) Close() {
+	s.closeWithReason(sessionCloseClient)
+}
+
+func (s *Session) closeWithReason(reason sessionCloseReason) {
 	s.mu.Lock()
-	backends := s.closeLocked()
+	backends := s.closeLocked(reason)
 	s.mu.Unlock()
 	requestBackendCloses(backends)
 }
@@ -744,7 +911,7 @@ func (s *Session) backendClosed(streamID uint32, backend *backendStream) {
 		delete(s.streams, streamID)
 		s.rememberClosedLocked(streamID)
 		if !s.queueFrameLocked(FrameClose, streamID, nil) {
-			detached = s.closeLocked()
+			detached = s.closeLocked(sessionCloseResource)
 		}
 	}
 	s.mu.Unlock()
@@ -753,21 +920,29 @@ func (s *Session) backendClosed(streamID uint32, backend *backendStream) {
 }
 
 func (s *Session) queueFrameLocked(frameType FrameType, streamID uint32, payload []byte) bool {
+	laneID := uint32(0)
+	if s.carrier == CarrierHTTPSLanes {
+		laneID = streamID
+	}
+	lane := s.carrierLanes[laneID]
+	if lane == nil {
+		return false
+	}
 	if frameType == FrameWindow {
-		if index, exists := s.pendingWindows[streamID]; exists {
-			queued := &s.pendingFrames[index]
+		if index, exists := lane.pendingWindows[streamID]; exists {
+			queued := &lane.pendingFrames[index]
 			previous, _ := WindowDelta(queued.encoded[FrameHeaderSize:])
 			delta, _ := WindowDelta(payload)
 			total := uint64(previous) + uint64(delta)
 			if total <= math.MaxUint32 {
 				binary.BigEndian.PutUint32(queued.encoded[FrameHeaderSize:], uint32(total))
-				s.signalPollLocked()
+				s.signalPollLocked(lane)
 				return true
 			}
 		}
 	}
-	if len(s.pendingFrames) != 0 {
-		last := &s.pendingFrames[len(s.pendingFrames)-1]
+	if len(lane.pendingFrames) != 0 {
+		last := &lane.pendingFrames[len(lane.pendingFrames)-1]
 		if last.frameType == FrameData && frameType == FrameData && last.streamID == streamID &&
 			len(last.encoded)-FrameHeaderSize+len(payload) <= MaxFramePayload {
 			if !s.reservePendingLocked(len(payload), 0, pendingDownlink) {
@@ -776,7 +951,7 @@ func (s *Session) queueFrameLocked(frameType FrameType, streamID uint32, payload
 			last.encoded = append(last.encoded, payload...)
 			last.cost += len(payload)
 			binary.BigEndian.PutUint32(last.encoded[4:FrameHeaderSize], uint32(len(last.encoded)-FrameHeaderSize))
-			s.signalPollLocked()
+			s.signalPollLocked(lane)
 			return true
 		}
 	}
@@ -795,16 +970,16 @@ func (s *Session) queueFrameLocked(frameType FrameType, streamID uint32, payload
 	if !s.reservePendingLocked(cost, 1, class) {
 		return false
 	}
-	s.pendingFrames = append(s.pendingFrames, queuedFrame{
+	lane.pendingFrames = append(lane.pendingFrames, queuedFrame{
 		encoded:   encoded,
 		frameType: frameType,
 		streamID:  streamID,
 		cost:      cost,
 	})
 	if frameType == FrameWindow {
-		s.pendingWindows[streamID] = len(s.pendingFrames) - 1
+		lane.pendingWindows[streamID] = len(lane.pendingFrames) - 1
 	}
-	s.signalPollLocked()
+	s.signalPollLocked(lane)
 	return true
 }
 
@@ -882,69 +1057,112 @@ func (s *Session) releasePendingLocked(cost, items int) {
 	s.budgetNotify = make(chan struct{})
 }
 
-func (s *Session) takeDownBatchLocked() downBatch {
+func (s *Session) takeDownBatchLocked(lane *carrierLane) downBatch {
 	size := 0
 	cost := 0
 	count := 0
-	for count < len(s.pendingFrames) && count < MaxBatchFrames {
-		next := len(s.pendingFrames[count].encoded)
+	for count < len(lane.pendingFrames) && count < MaxBatchFrames {
+		next := len(lane.pendingFrames[count].encoded)
 		if count != 0 && size+next > s.limits.CarrierBatchBytes {
 			break
 		}
 		size += next
-		cost += s.pendingFrames[count].cost
+		cost += lane.pendingFrames[count].cost
 		count++
 	}
 	body := make([]byte, 0, size)
 	for index := range count {
-		frame := s.pendingFrames[index]
-		if frame.frameType == FrameWindow && s.pendingWindows[frame.streamID] == index {
-			delete(s.pendingWindows, frame.streamID)
+		frame := lane.pendingFrames[index]
+		if frame.frameType == FrameWindow && lane.pendingWindows[frame.streamID] == index {
+			delete(lane.pendingWindows, frame.streamID)
 		}
 		body = append(body, frame.encoded...)
-		s.pendingFrames[index] = queuedFrame{}
+		lane.pendingFrames[index] = queuedFrame{}
 	}
-	s.pendingFrames = s.pendingFrames[count:]
-	for streamID, index := range s.pendingWindows {
-		s.pendingWindows[streamID] = index - count
+	lane.pendingFrames = lane.pendingFrames[count:]
+	for streamID, index := range lane.pendingWindows {
+		lane.pendingWindows[streamID] = index - count
 	}
-	if len(s.pendingFrames) == 0 {
-		s.pendingFrames = nil
+	if len(lane.pendingFrames) == 0 {
+		lane.pendingFrames = nil
 	}
 	return downBatch{body: body, cost: cost, items: count}
 }
 
 func (s *Session) rememberClosedLocked(streamID uint32) {
-	s.tombstones.Add(streamID)
+	evicted, ok := s.tombstones.Add(streamID)
+	if s.carrier == CarrierHTTPSLanes {
+		if ok {
+			s.releaseCarrierLaneLocked(evicted)
+		}
+		if lane := s.carrierLanes[streamID]; lane != nil {
+			s.signalPollLocked(lane)
+		}
+	}
 }
 
 func (s *Session) dropPendingStreamFramesLocked(streamID uint32) {
-	kept := s.pendingFrames[:0]
+	laneID := uint32(0)
+	if s.carrier == CarrierHTTPSLanes {
+		laneID = streamID
+	}
+	lane := s.carrierLanes[laneID]
+	if lane == nil {
+		return
+	}
+	kept := lane.pendingFrames[:0]
 	releasedCost := 0
 	releasedItems := 0
-	for index := range s.pendingFrames {
-		frame := s.pendingFrames[index]
+	for index := range lane.pendingFrames {
+		frame := lane.pendingFrames[index]
 		if frame.streamID == streamID {
 			releasedCost += frame.cost
 			releasedItems++
-			s.pendingFrames[index] = queuedFrame{}
+			lane.pendingFrames[index] = queuedFrame{}
 			continue
 		}
 		kept = append(kept, frame)
 	}
-	s.pendingFrames = kept
-	clear(s.pendingWindows)
-	for index := range s.pendingFrames {
-		frame := s.pendingFrames[index]
+	lane.pendingFrames = kept
+	clear(lane.pendingWindows)
+	for index := range lane.pendingFrames {
+		frame := lane.pendingFrames[index]
 		if frame.frameType == FrameWindow {
-			s.pendingWindows[frame.streamID] = index
+			lane.pendingWindows[frame.streamID] = index
 		}
 	}
-	if len(s.pendingFrames) == 0 {
-		s.pendingFrames = nil
+	if len(lane.pendingFrames) == 0 {
+		lane.pendingFrames = nil
 	}
 	if releasedCost != 0 || releasedItems != 0 {
 		s.releasePendingLocked(releasedCost, releasedItems)
+	}
+}
+
+func (s *Session) releaseCarrierLaneLocked(laneID uint32) {
+	if laneID == 0 {
+		return
+	}
+	lane := s.carrierLanes[laneID]
+	if lane == nil {
+		return
+	}
+	delete(s.carrierLanes, laneID)
+	cost := lane.unackedCost
+	items := lane.unackedItems
+	for index := range lane.pendingFrames {
+		cost += lane.pendingFrames[index].cost
+		items++
+		lane.pendingFrames[index] = queuedFrame{}
+	}
+	lane.pendingFrames = nil
+	lane.pendingWindows = nil
+	lane.unacked = nil
+	lane.unackedCost = 0
+	lane.unackedItems = 0
+	s.signalPollLocked(lane)
+	if cost != 0 || items != 0 {
+		s.releasePendingLocked(cost, items)
 	}
 }
 
@@ -963,16 +1181,17 @@ func (s *Session) releaseStreamWritesLocked(state *streamState) {
 
 func (s *Session) protocolFailure() {
 	s.mu.Lock()
-	backends := s.closeLocked()
+	backends := s.closeLocked(sessionCloseProtocol)
 	s.mu.Unlock()
 	requestBackendCloses(backends)
 }
 
-func (s *Session) closeLocked() []*backendStream {
+func (s *Session) closeLocked(reason sessionCloseReason) []*backendStream {
 	if s.closed {
 		return nil
 	}
 	s.closed = true
+	s.closeReason = reason
 	close(s.done)
 	backends := make([]*backendStream, 0, len(s.streams))
 	for _, state := range s.streams {
@@ -987,17 +1206,21 @@ func (s *Session) closeLocked() []*backendStream {
 		s.pendingCost = 0
 		s.pendingItems = 0
 	}
-	s.pendingFrames = nil
-	s.pendingWindows = nil
-	s.unacked = nil
-	s.unackedCost = 0
-	s.unackedItems = 0
-	s.signalPollLocked()
+	for _, lane := range s.carrierLanes {
+		lane.pendingFrames = nil
+		lane.pendingWindows = nil
+		lane.unacked = nil
+		lane.unackedCost = 0
+		lane.unackedItems = 0
+		s.signalPollLocked(lane)
+	}
+	s.carrierLanes = nil
+	closeReason := s.closeReason
 	s.finishOnce.Do(func() {
 		go func() {
 			s.backendWG.Wait()
 			if s.onFinished != nil {
-				s.onFinished(s)
+				s.onFinished(s, closeReason)
 			}
 			close(s.finishNotified)
 		}()
@@ -1005,9 +1228,21 @@ func (s *Session) closeLocked() []*backendStream {
 	return backends
 }
 
-func (s *Session) signalPollLocked() {
-	close(s.notify)
-	s.notify = make(chan struct{})
+func (s *Session) recordCarrierRetry(operation carrierOperation) {
+	if s.onCarrierRetry != nil {
+		s.onCarrierRetry(operation)
+	}
+}
+
+func (s *Session) recordBackpressure(operation carrierOperation) {
+	if s.onBackpressure != nil {
+		s.onBackpressure(operation)
+	}
+}
+
+func (s *Session) signalPollLocked(lane *carrierLane) {
+	close(lane.notify)
+	lane.notify = make(chan struct{})
 }
 
 func (s *Session) runBackend(backend *backendStream) {

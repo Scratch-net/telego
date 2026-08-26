@@ -35,14 +35,14 @@ func TestSessionUplinkSequenceAndByteIdenticalRetry(t *testing.T) {
 	}
 
 	session.mu.Lock()
-	session.upActive = true
+	session.carrierLanes[0].upActive = true
 	session.mu.Unlock()
 	pong := testFrameBatch(t, Frame{Type: FramePong, Payload: []byte("probe")})
 	if _, err := session.ProcessUp(2, pong); !errors.Is(err, ErrBackpressure) {
 		t.Fatalf("concurrent next sequence error = %v", err)
 	}
 	session.mu.Lock()
-	session.upActive = false
+	session.carrierLanes[0].upActive = false
 	session.mu.Unlock()
 	if acknowledged, err := session.ProcessUp(2, pong); err != nil || acknowledged != 2 {
 		t.Fatalf("second ProcessUp = %d, %v", acknowledged, err)
@@ -442,10 +442,10 @@ func TestSessionNewestPollWinsAndStreamIDsNeverReuse(t *testing.T) {
 	eventually(t, time.Second, func() bool {
 		session.mu.Lock()
 		defer session.mu.Unlock()
-		return session.downActive
+		return session.carrierLanes[0].downActive
 	})
 	session.mu.Lock()
-	oldPoll := session.superseded
+	oldPoll := session.carrierLanes[0].superseded
 	session.mu.Unlock()
 	go func() {
 		body, cursor, err := session.Poll(context.Background(), 0)
@@ -454,7 +454,8 @@ func TestSessionNewestPollWinsAndStreamIDsNeverReuse(t *testing.T) {
 	eventually(t, time.Second, func() bool {
 		session.mu.Lock()
 		defer session.mu.Unlock()
-		return session.downActive && session.superseded != oldPoll
+		lane := session.carrierLanes[0]
+		return lane.downActive && lane.superseded != oldPoll
 	})
 	session.mu.Lock()
 	if !session.queueFrameLocked(FrameClose, 1, nil) {

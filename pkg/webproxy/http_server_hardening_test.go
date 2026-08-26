@@ -226,7 +226,7 @@ func TestHTTPServerMatchedBridgeRenderErrorNeverFallsThrough(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server.renderBridge = func(string, string, int) (BridgePage, error) {
+	server.renderBridge = func(string, string, int, CarrierMode) (BridgePage, error) {
 		return BridgePage{}, errors.New("injected render failure")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -611,6 +611,69 @@ func TestHTTPServerRouteMethodContentTypeAndCookieMatrix(t *testing.T) {
 				t.Fatalf("response = %d, headers %#v", response.StatusCode, response.Header)
 			}
 		})
+	}
+}
+
+func TestHTTPServerAcceptsOneEmptyCarrierCookie(t *testing.T) {
+	application := newHTTPTestApplication(t, 20*time.Millisecond)
+	bootstrap, err := application.manager.IssueBootstrap(application.profiles[0].Capability(), "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hello := testFrameBatch(t, Frame{Type: FrameHello, Payload: []byte{1}})
+
+	perform := func(method, request string) *http.Response {
+		t.Helper()
+		connection := dialHTTPTest(t, application.address)
+		t.Cleanup(func() { _ = connection.Close() })
+		if _, err := io.WriteString(connection, request); err != nil {
+			t.Fatal(err)
+		}
+		if err := connection.SetDeadline(time.Now().Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		response, err := http.ReadResponse(bufio.NewReader(connection), &http.Request{Method: method})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+
+	create := "POST /api/v1/session HTTP/1.1\r\nHost: proxy.example.com\r\nAuthorization: Bearer " + bootstrap +
+		"\r\nContent-Type: application/octet-stream\r\nCookie:\r\nContent-Length: " + strconv.Itoa(len(hello)) + "\r\nConnection: close\r\n\r\n" + string(hello)
+	createResponse := perform("POST", create)
+	_ = readHTTPBody(t, createResponse)
+	if createResponse.StatusCode != http.StatusOK {
+		t.Fatalf("empty-Cookie create status = %d", createResponse.StatusCode)
+	}
+	sessionToken := createResponse.Header.Get("X-Session-Token")
+	if sessionToken == "" {
+		t.Fatal("empty-Cookie create omitted session token")
+	}
+
+	pong := testFrameBatch(t, Frame{Type: FramePong, Payload: []byte("probe")})
+	uplink := "POST /api/v1/up HTTP/1.1\r\nHost: proxy.example.com\r\nAuthorization: Bearer " + sessionToken +
+		"\r\nContent-Type: application/octet-stream\r\nCookie:\r\nX-Up-Seq: 1\r\nContent-Length: " + strconv.Itoa(len(pong)) + "\r\nConnection: close\r\n\r\n" + string(pong)
+	uplinkResponse := perform("POST", uplink)
+	_ = readHTTPBody(t, uplinkResponse)
+	if uplinkResponse.StatusCode != http.StatusNoContent {
+		t.Fatalf("empty-Cookie uplink status = %d", uplinkResponse.StatusCode)
+	}
+
+	downlink := "POST /api/v1/down HTTP/1.1\r\nHost: proxy.example.com\r\nAuthorization: Bearer " + sessionToken +
+		"\r\nCookie:\r\nX-Down-Cursor: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+	downlinkResponse := perform("POST", downlink)
+	_ = readHTTPBody(t, downlinkResponse)
+	if downlinkResponse.StatusCode != http.StatusNoContent {
+		t.Fatalf("empty-Cookie downlink status = %d", downlinkResponse.StatusCode)
+	}
+
+	deleteRequest := "DELETE /api/v1/session HTTP/1.1\r\nHost: proxy.example.com\r\nAuthorization: Bearer " + sessionToken +
+		"\r\nCookie:\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+	deleteResponse := perform("DELETE", deleteRequest)
+	_ = readHTTPBody(t, deleteResponse)
+	if deleteResponse.StatusCode != http.StatusNoContent {
+		t.Fatalf("empty-Cookie delete status = %d", deleteResponse.StatusCode)
 	}
 }
 

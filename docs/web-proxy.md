@@ -1,6 +1,6 @@
 # Native Telegram WEB proxy
 
-Telego includes an optional WEB proxy for Telegram Desktop. The first release supports the serialized `https` carrier.
+Telego includes an optional WEB proxy for Telegram Desktop. It supports the `https` and `https-lanes` carriers.
 
 The WEB listener uses gnet and accepts private HTTP/1.1 traffic. Nginx keeps the real TLS certificate and the public website.
 
@@ -34,6 +34,7 @@ Do not publish the WEB listener to the Internet. Nginx is the only permitted cli
 - Keep port 443 assigned to Telego.
 - Configure Nginx as the TLS splice target.
 - Use Nginx request buffering for all requests to the WEB listener.
+- Use HTTP/2 on the public Nginx TLS server with `https-lanes`.
 - Use HTTP/1.1 between Nginx and the WEB listener.
 
 The WEB carrier does not terminate TLS. It does not replace Nginx or certificate renewal.
@@ -60,11 +61,16 @@ splice-proxy-protocol = 2
 [web-proxy]
 enabled = true
 hostname = "proxy.example.com"
+carrier = "https-lanes"
 bind-to = "127.0.0.1:8080"
 trusted-proxy-cidrs = ["127.0.0.1/32"]
 ```
 
 Replace the hostname and secret. The `hostname` value must match the public TLS certificate.
+
+`https-lanes` is the recommended carrier. It gives each Telegram stream an independent sequence, cursor, queue, and long poll.
+
+If `carrier` is absent, Telego uses serialized `https`. Existing configurations keep their current behavior after an upgrade.
 
 Telego derives `127.0.0.1:443` from the wildcard MTProxy bind. A Unix MTProxy bind produces the same Unix socket as the backend.
 
@@ -150,6 +156,7 @@ server {
 
 server {
     listen 127.0.0.1:8443 ssl proxy_protocol;
+    http2 on;
     server_name proxy.example.com;
     client_max_body_size 16m;
 
@@ -200,6 +207,10 @@ server {
     }
 }
 ```
+
+The `http2 on;` directive requires Nginx 1.25.1 or later. With an older Nginx version, add `http2` to the `listen` directive.
+
+The private Nginx connection to Telego stays on HTTP/1.1. Only the public TLS connection uses HTTP/2.
 
 Set `client_max_body_size` to the public-site upload limit. The value must be at least `2m`.
 
@@ -405,11 +416,12 @@ docker compose up -d --force-recreate telego
 
 An existing MTProxy installation needs no secret migration. Complete these actions:
 
-1. Add the `[web-proxy]` section.
-2. Add the Nginx WEB ingress and fallback locations.
-3. Restart Telego.
-4. Reload Nginx.
-5. Add one of the printed WEB links to Telegram Desktop.
+1. Add the `[web-proxy]` section with `carrier = "https-lanes"`.
+2. Enable HTTP/2 on the public Nginx TLS server.
+3. Add the Nginx WEB ingress and fallback locations.
+4. Restart Telego.
+5. Reload Nginx.
+6. Add one of the printed WEB links to Telegram Desktop.
 
 The existing `ee` and `dd` MTProxy links continue to use the public gnet listener. WEB configuration changes require a Telego restart.
 
@@ -428,4 +440,4 @@ If you migrate from `tproxy-server`, keep its old Nginx upstream during the firs
 
 ## Current scope
 
-The native implementation supports the `https` carrier. It does not support `https-lanes`, `websocket`, or `websocket-lanes`.
+The native implementation supports `https` and `https-lanes`. It does not support `websocket` or `websocket-lanes`.

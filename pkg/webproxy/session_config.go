@@ -90,6 +90,7 @@ func DefaultTimeouts() Timeouts {
 type ManagerConfig struct {
 	Profiles           []Profile
 	Backend            string
+	Carrier            CarrierMode
 	Limits             Limits
 	Timeouts           Timeouts
 	DialContext        DialContextFunc
@@ -102,6 +103,7 @@ func DefaultManagerConfig(profiles []Profile, backend string) ManagerConfig {
 	return ManagerConfig{
 		Profiles: profiles,
 		Backend:  backend,
+		Carrier:  CarrierHTTPS,
 		Limits:   DefaultLimits(),
 		Timeouts: DefaultTimeouts(),
 	}
@@ -121,6 +123,9 @@ func validateManagerConfig(config ManagerConfig) error {
 	}
 	if _, _, err := parseLocalBackend(config.Backend); err != nil {
 		return fmt.Errorf("%w: backend: %v", ErrInvalidManagerConfig, err)
+	}
+	if !config.Carrier.valid() {
+		return fmt.Errorf("%w: unsupported carrier mode %q", ErrInvalidManagerConfig, config.Carrier)
 	}
 
 	limits := config.Limits
@@ -254,16 +259,19 @@ func (s *boundedSet[T]) Contains(value T) bool {
 	return exists
 }
 
-func (s *boundedSet[T]) Add(value T) {
+func (s *boundedSet[T]) Add(value T) (evicted T, didEvict bool) {
 	if s.Contains(value) {
-		return
+		return evicted, false
 	}
 	if len(s.order) < cap(s.order) {
 		s.order = append(s.order, value)
 	} else {
-		delete(s.values, s.order[s.next])
+		evicted = s.order[s.next]
+		delete(s.values, evicted)
 		s.order[s.next] = value
 		s.next = (s.next + 1) % len(s.order)
+		didEvict = true
 	}
 	s.values[value] = struct{}{}
+	return evicted, didEvict
 }

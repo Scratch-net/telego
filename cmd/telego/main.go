@@ -141,10 +141,15 @@ func (c *RunCmd) Run() error {
 	var metricsServer *metrics.Server
 	if fileCfg.Metrics.BindTo != "" {
 		var err error
-		metricsServer, err = metrics.NewServer(metrics.Config{
-			BindAddr: fileCfg.Metrics.BindTo,
-			Path:     fileCfg.Metrics.Path,
-		}, handler.UserLimiter())
+		metricsConfig := metrics.Config{
+			BindAddr:   fileCfg.Metrics.BindTo,
+			Path:       fileCfg.Metrics.Path,
+			ProxyStats: handler,
+		}
+		if webRuntime != nil {
+			metricsConfig.WebStats = webRuntime.manager
+		}
+		metricsServer, err = metrics.NewServer(metricsConfig, handler.UserLimiter())
 		if err != nil {
 			log.Error().Err(err).Msg("failed to create metrics server")
 		} else {

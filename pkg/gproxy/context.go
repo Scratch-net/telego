@@ -90,6 +90,8 @@ type ConnContext struct {
 
 	// Atomic state - no lock needed for reads
 	state atomic.Int32
+	// handshakeFailureRecorded makes explicit failure accounting one-shot.
+	handshakeFailureRecorded atomic.Bool
 
 	// Protocol mode (ee or dd) - set during detection, immutable after
 	protocolMode ProtocolMode

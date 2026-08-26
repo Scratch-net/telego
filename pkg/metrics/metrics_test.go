@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/scratch-net/telego/pkg/gproxy"
+	"github.com/scratch-net/telego/pkg/webproxy"
 )
 
 // mockStatsProvider implements StatsProvider for testing.
@@ -26,6 +27,24 @@ type countingStatsProvider struct {
 	stats     []gproxy.UserIPStats
 }
 
+type mockProxyStatsProvider struct{}
+
+func (mockProxyStatsProvider) HandshakeFailureStats() []gproxy.HandshakeFailureStat {
+	return []gproxy.HandshakeFailureStat{{Stage: "tls_mtproto", Total: 3}}
+}
+
+type mockWebStatsProvider struct{}
+
+func (mockWebStatsProvider) RuntimeStats() webproxy.RuntimeStats {
+	return webproxy.RuntimeStats{
+		Capacity:        webproxy.Capacity{Sessions: 2, Streams: 4, BackendDials: 1, PendingBytes: 128, PendingItems: 3},
+		SessionsCreated: 5,
+		SessionsClosed:  []webproxy.RuntimeCounter{{Label: "client", Total: 2}},
+		CarrierRetries:  []webproxy.RuntimeCounter{{Label: "uplink", Total: 7}},
+		Backpressure:    []webproxy.RuntimeCounter{{Label: "uplink", Total: 1}},
+	}
+}
+
 func (c *countingStatsProvider) Stats() []gproxy.UserIPStats {
 	*c.callCount++
 	return c.stats
@@ -35,8 +54,10 @@ func (c *countingStatsProvider) Stats() []gproxy.UserIPStats {
 // It runs first to avoid global state issues with Prometheus registry.
 func TestMetricsIntegration(t *testing.T) {
 	cfg := Config{
-		BindAddr: "127.0.0.1:19280",
-		Path:     "/metrics",
+		BindAddr:   "127.0.0.1:19280",
+		Path:       "/metrics",
+		ProxyStats: mockProxyStatsProvider{},
+		WebStats:   mockWebStatsProvider{},
 	}
 
 	// Provider that tracks Stats() calls
@@ -113,6 +134,16 @@ func TestMetricsIntegration(t *testing.T) {
 		"telego_blocked_total",
 		"telego_traffic_in_bytes_total",
 		"telego_traffic_out_bytes_total",
+		"telego_handshake_failures_total",
+		"telego_web_sessions_active",
+		"telego_web_streams_active",
+		"telego_web_backend_dials_active",
+		"telego_web_pending_bytes",
+		"telego_web_pending_items",
+		"telego_web_sessions_created_total",
+		"telego_web_sessions_closed_total",
+		"telego_web_carrier_retries_total",
+		"telego_web_backpressure_total",
 	}
 
 	for _, metric := range expectedMetrics {

@@ -165,6 +165,7 @@ Add this section to enable WEB for existing secrets:
 [web-proxy]
 enabled = true
 hostname = "proxy.example.com"
+carrier = "https-lanes"
 bind-to = "127.0.0.1:8080"
 trusted-proxy-cidrs = ["127.0.0.1/32"]
 ```
@@ -191,6 +192,10 @@ The `--web-host` value must match `[web-proxy].hostname` and the TLS certificate
 Read the [native WEB proxy setup guide](docs/web-proxy.md) for the complete Nginx configuration, Docker setup, and rollback procedure.
 
 The WEB configuration is inactive by default. Configurations without `[web-proxy]` continue to use the existing MTProxy startup path.
+
+The recommended `https-lanes` carrier gives each Telegram stream an independent HTTP carrier. It requires HTTP/2 on the public Nginx server.
+
+Existing configurations that omit `carrier` continue to use serialized `https`. This default prevents an upgrade from changing the Nginx requirements.
 
 ---
 
@@ -254,6 +259,7 @@ mask-host = "www.google.com"  # Host to mimic (SNI validation, proxy links)
 # Native Telegram Desktop WEB proxy (optional; requires Nginx with real TLS)
 [web-proxy]
 enabled = false
+# carrier = "https-lanes"                  # Recommended. Requires public HTTP/2.
 # hostname = "proxy.example.com"            # Required public certificate hostname
 # bind-to = "127.0.0.1:8080"               # Private HTTP/1.1 listener
 # backend = "127.0.0.1:443"                # Derived TCP or Unix MTProxy backend
@@ -550,8 +556,18 @@ bind-to = "127.0.0.1:9090"
 | `telego_blocked_total` | Counter | Total IP block events per user |
 | `telego_traffic_in_bytes_total` | Counter | Bytes received from clients |
 | `telego_traffic_out_bytes_total` | Counter | Bytes sent to clients |
+| `telego_handshake_failures_total` | Counter | MTProxy handshake failures by `stage` |
+| `telego_web_sessions_active` | Gauge | Active WEB sessions |
+| `telego_web_streams_active` | Gauge | Active WEB backend streams |
+| `telego_web_backend_dials_active` | Gauge | WEB backend dials in progress |
+| `telego_web_pending_bytes` | Gauge | Bytes charged to WEB pending queues |
+| `telego_web_pending_items` | Gauge | Items charged to WEB pending queues |
+| `telego_web_sessions_created_total` | Counter | WEB sessions created |
+| `telego_web_sessions_closed_total` | Counter | WEB sessions closed by `reason` |
+| `telego_web_carrier_retries_total` | Counter | WEB retries and replays by `operation` |
+| `telego_web_backpressure_total` | Counter | WEB backpressure events by `operation` |
 
-All metrics include a `user` label for per-user breakdown.
+Connection, IP, block, and traffic metrics include a `user` label. Diagnostic metrics use the labels in the table.
 
 ---
 

@@ -102,6 +102,10 @@ mask-host = "www.google.com"
 [web-proxy]
 enabled = false
 
+# Carrier for new WEB sessions. Use https-lanes with public HTTP/2 to remove
+# carrier head-of-line blocking. Omit this value to keep serialized https.
+carrier = "https-lanes"
+
 # Public DNS hostname on the real TLS certificate. Do not include a scheme,
 # port, path, or trailing dot. This value is required when WEB is enabled.
 # hostname = "proxy.example.com"

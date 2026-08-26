@@ -52,7 +52,8 @@ type ProxyHandler struct {
 	logger Logger
 
 	// Metrics
-	activeConns int64
+	activeConns       int64
+	handshakeFailures [handshakeFailureStageCount]atomic.Uint64
 
 	// Hard limit for OOM protection (bytes per connection)
 	maxWriteBuffer int
@@ -273,7 +274,7 @@ func (h *ProxyHandler) OnOpen(c gnet.Conn) ([]byte, gnet.Action) {
 		}
 	}
 	if !h.acquireInitialIPLimit(ctx, admissionAddress, conns) {
-		return nil, gnet.Close
+		return nil, h.failHandshake(ctx, handshakeFailureAdmission)
 	}
 
 	// Set read deadline for handshake
@@ -289,6 +290,7 @@ func (h *ProxyHandler) OnOpen(c gnet.Conn) ([]byte, gnet.Action) {
 	time.AfterFunc(handshakeTimeout, func() {
 		state := ctx.State()
 		if state != StateClosed && state != StateRelaying && state != StateSplicing && state != StateDialingDC {
+			h.recordHandshakeFailure(ctx, handshakeStageForState(state))
 			h.logger.Info("[#%d] handshake timeout from %s in state %s (active: %d)",
 				ctx.id, c.RemoteAddr(), state, atomic.LoadInt64(&h.activeConns))
 			c.Close()
@@ -419,10 +421,10 @@ func (h *ProxyHandler) handleProxyProto(c gnet.Conn, ctx *ConnContext) gnet.Acti
 			return gnet.None
 		case internalPrefaceRejected:
 			if !h.acquireInitialIPLimit(ctx, c.RemoteAddr(), atomic.LoadInt64(&h.activeConns)) {
-				return gnet.Close
+				return h.failHandshake(ctx, handshakeFailureAdmission)
 			}
 			h.logger.Debug("[#%d] rejected unauthenticated internal WEB preface", ctx.id)
-			return gnet.Close
+			return h.failHandshake(ctx, handshakeFailureProxyProtocol)
 		case internalPrefaceAccepted:
 			c.Discard(h.config.InternalProxyAuth.prefaceLen())
 			ctx.internalProxyCandidate = false
@@ -442,7 +444,7 @@ func (h *ProxyHandler) handleProxyProto(c gnet.Conn, ctx *ConnContext) gnet.Acti
 	frameStatus, err := inspectProxyProtocolFrame(data)
 	if err != nil {
 		h.logger.Debug("[#%d] PROXY protocol error: %v", ctx.id, err)
-		return gnet.Close
+		return h.failHandshake(ctx, handshakeFailureProxyProtocol)
 	}
 	if frameStatus == proxyProtoIncomplete {
 		return gnet.None
@@ -450,7 +452,7 @@ func (h *ProxyHandler) handleProxyProto(c gnet.Conn, ctx *ConnContext) gnet.Acti
 	if frameStatus == proxyProtoNotPresent {
 		if ctx.internalProxyAuthenticated {
 			h.logger.Debug("[#%d] authenticated internal WEB preface without PROXY header", ctx.id)
-			return gnet.Close
+			return h.failHandshake(ctx, handshakeFailureProxyProtocol)
 		}
 		return h.fallbackFromProxyProtocol(c, ctx)
 	}
@@ -458,7 +460,7 @@ func (h *ProxyHandler) handleProxyProto(c gnet.Conn, ctx *ConnContext) gnet.Acti
 	result, err := ParseProxyProtocol(data)
 	if err != nil {
 		h.logger.Debug("[#%d] PROXY protocol error: %v", ctx.id, err)
-		return gnet.Close
+		return h.failHandshake(ctx, handshakeFailureProxyProtocol)
 	}
 
 	if result == nil {
@@ -473,7 +475,7 @@ func (h *ProxyHandler) handleProxyProto(c gnet.Conn, ctx *ConnContext) gnet.Acti
 	// one so saturation cannot create an uncharged window.
 	if ctx.internalProxyAuthenticated {
 		if result.SrcAddr == nil || !h.transferInitialIPLimit(ctx, result.SrcAddr, atomic.LoadInt64(&h.activeConns)) {
-			return gnet.Close
+			return h.failHandshake(ctx, handshakeFailureAdmission)
 		}
 	}
 
@@ -487,7 +489,7 @@ func (h *ProxyHandler) handleProxyProto(c gnet.Conn, ctx *ConnContext) gnet.Acti
 		clientAddr = c.RemoteAddr()
 	}
 	if !h.acquireInitialIPLimit(ctx, clientAddr, atomic.LoadInt64(&h.activeConns)) {
-		return gnet.Close
+		return h.failHandshake(ctx, handshakeFailureAdmission)
 	}
 
 	// Proceed to protocol detection
@@ -497,7 +499,7 @@ func (h *ProxyHandler) handleProxyProto(c gnet.Conn, ctx *ConnContext) gnet.Acti
 
 func (h *ProxyHandler) fallbackFromProxyProtocol(c gnet.Conn, ctx *ConnContext) gnet.Action {
 	if !h.acquireInitialIPLimit(ctx, c.RemoteAddr(), atomic.LoadInt64(&h.activeConns)) {
-		return gnet.Close
+		return h.failHandshake(ctx, handshakeFailureAdmission)
 	}
 	ctx.SetState(StateDetectProtocol)
 	return h.handleDetectProtocol(c, ctx)

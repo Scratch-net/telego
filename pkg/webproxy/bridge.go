@@ -21,9 +21,19 @@ type BridgePage struct {
 	CSP   string
 }
 
-// RenderBridge constructs the serialized-HTTPS WEB bridge. The bootstrap token
-// is embedded only in this no-store response and is never placed in a URL.
+// RenderBridge constructs the backward-compatible serialized HTTPS bridge.
 func RenderBridge(hostname, bootstrapToken string, batchBytes int) (BridgePage, error) {
+	return RenderBridgeForCarrier(hostname, bootstrapToken, batchBytes, CarrierHTTPS)
+}
+
+// RenderBridgeForCarrier constructs one WEB bridge for the selected carrier.
+// The bootstrap token exists only in this no-store response, never in a URL.
+func RenderBridgeForCarrier(
+	hostname string,
+	bootstrapToken string,
+	batchBytes int,
+	carrier CarrierMode,
+) (BridgePage, error) {
 	if err := ValidateHostname(hostname); err != nil {
 		return BridgePage{}, err
 	}
@@ -33,6 +43,9 @@ func RenderBridge(hostname, bootstrapToken string, batchBytes int) (BridgePage, 
 	if batchBytes <= 0 || batchBytes > maxCarrierBatchBytes {
 		return BridgePage{}, errors.New("WEB bridge batch size is out of range")
 	}
+	if !carrier.valid() {
+		return BridgePage{}, errors.New("WEB bridge carrier mode is unsupported")
+	}
 
 	var rawNonce [18]byte
 	if _, err := rand.Read(rawNonce[:]); err != nil {
@@ -41,14 +54,17 @@ func RenderBridge(hostname, bootstrapToken string, batchBytes int) (BridgePage, 
 	nonce := base64.RawURLEncoding.EncodeToString(rawNonce[:])
 	originJSON, _ := json.Marshal("https://" + hostname)
 	tokenJSON, _ := json.Marshal(bootstrapToken)
+	carrierJSON, _ := json.Marshal(carrier)
 	body := strings.NewReplacer(
 		"__NONCE__", nonce,
 		"__ORIGIN__", string(originJSON),
 		"__BOOTSTRAP__", string(tokenJSON),
+		"__CARRIER__", string(carrierJSON),
 		"__BATCH_LIMIT__", strconv.Itoa(batchBytes),
 	).Replace(bridgeDocument)
 	if strings.Contains(body, "__NONCE__") || strings.Contains(body, "__ORIGIN__") ||
-		strings.Contains(body, "__BOOTSTRAP__") || strings.Contains(body, "__BATCH_LIMIT__") {
+		strings.Contains(body, "__BOOTSTRAP__") || strings.Contains(body, "__CARRIER__") ||
+		strings.Contains(body, "__BATCH_LIMIT__") {
 		return BridgePage{}, errors.New("WEB bridge template replacement failed")
 	}
 
@@ -76,9 +92,7 @@ func RenderBridge(hostname, bootstrapToken string, batchBytes int) (BridgePage, 
 	}, nil
 }
 
-// The bridge is deliberately small and carrier-specific. It has no external
-// resources and implements only the serialized HTTPS mode selected for the
-// first native Telego WEB release.
+// The bridge is self-contained and has no external resources.
 const bridgeDocument = `<!doctype html>
 <html lang="en">
 <head>
@@ -90,14 +104,15 @@ const bridgeDocument = `<!doctype html>
 <script nonce="__NONCE__">
 (()=>{
 'use strict';
-const relayOrigin=__ORIGIN__,bootstrap=__BOOTSTRAP__,batchLimit=__BATCH_LIMIT__;
+const relayOrigin=__ORIGIN__,bootstrap=__BOOTSTRAP__,carrier=__CARRIER__,batchLimit=__BATCH_LIMIT__;
 const match=/^#android=([A-Za-z0-9_-]{43})$/.exec(location.hash),androidNonce=match?match[1]:'';
 history.replaceState(null,'',location.pathname);
-const queueByteLimit=33554432,queueItemLimit=16384,maxFrames=4096,maxPayload=1048576;
+const queueByteLimit=33554432,queueItemLimit=16384,maxFrames=4096,maxPayload=1048576,closedLaneLimit=4096;
 let initialized=false,closed=false,port=null,sessionToken='',createStarted=false;
 let queuedBytes=0,queuedItems=0,upSequence=1,downCursor='0',upRunning=false,pollController=null;
 const lifecycleController=new AbortController();
 const beforeSession=[],upPending=[];
+const lanes=new Map(),closedLanes=new Set(),closedLaneOrder=[];
 const status=state=>{if(port&&!closed)port.postMessage({t:'status',state})};
 function ensureOpen(external){if(closed||lifecycleController.signal.aborted||(external&&external.aborted))throw new DOMException('carrier closed','AbortError')}
 function pause(milliseconds,external){
@@ -116,9 +131,9 @@ function splitFrames(value){
  const view=new DataView(value),result=[];let offset=0;
  while(offset<value.byteLength){
   if(value.byteLength-offset<8||result.length>=maxFrames)throw new Error('invalid frame batch');
-  const type=view.getUint8(offset),size=view.getUint32(offset+4),end=offset+8+size;
+  const type=view.getUint8(offset),id=view.getUint32(offset)&0x00ffffff,size=view.getUint32(offset+4),end=offset+8+size;
   if((type===2&&!size)||size>maxPayload||end>value.byteLength)throw new Error('invalid frame');
-  result.push(offset===0&&end===value.byteLength?value:value.slice(offset,end));offset=end;
+  result.push({type,id,data:offset===0&&end===value.byteLength?value:value.slice(offset,end)});offset=end;
  }
  if(!result.length)throw new Error('empty frame batch');
  return result;
@@ -182,13 +197,18 @@ async function createSession(first){
  try{
   status('connecting');
   const response=await request('/api/v1/session',()=>options('POST',bootstrap,first));
-  if(response.status!==200||response.headers.get('X-Carrier-Mode')!=='https')throw new Error('session creation rejected');
+  if(response.status!==200||response.headers.get('X-Carrier-Mode')!==carrier)throw new Error('session creation rejected');
   sessionToken=response.headers.get('X-Session-Token')||'';downCursor=response.headers.get('X-Down-Cursor')||'0';
   const welcome=await response.arrayBuffer();
   if(!sessionToken||welcome.byteLength!==8||new DataView(welcome).getUint8(0)!==17)throw new Error('invalid session creation');
   if(closed){deleteSession();return}port.postMessage(welcome,[welcome]);status('connected');
-  for(const data of beforeSession.splice(0)){release(data.byteLength,1);queueUp(data)}poll();
+  if(carrier==='https-lanes')ensureLane(0);
+  for(const data of beforeSession.splice(0)){release(data.byteLength,1);queueCarrier(data)}
+  if(carrier==='https')poll();else pollLane(lanes.get(0));
  }catch(error){fail()}
+}
+function queueCarrier(data){
+ try{if(carrier==='https')queueUp(data);else for(const frame of splitFrames(data))queueLane(frame)}catch(error){fail()}
 }
 function queueUp(data){
  try{splitFrames(data)}catch(error){fail();return}
@@ -218,9 +238,63 @@ async function poll(){
   }catch(error){if(!closed)fail();return}
  }
 }
+function ensureLane(id){
+ let lane=lanes.get(id);
+ if(!lane){lane={id,sequence:1,cursor:'0',pending:[],running:false,polling:false,controller:null};lanes.set(id,lane)}
+ return lane;
+}
+function rememberLaneClosed(id){
+ if(!id||closedLanes.has(id))return;
+ if(closedLaneOrder.length===closedLaneLimit)closedLanes.delete(closedLaneOrder.shift());
+ closedLanes.add(id);closedLaneOrder.push(id);
+}
+function finishLane(lane){
+ if(!lane||lanes.get(lane.id)!==lane)return;
+ for(const data of lane.pending)release(data.byteLength,1);
+ lane.pending.length=0;lanes.delete(lane.id);rememberLaneClosed(lane.id);
+}
+function queueLane(frame){
+ let lane=lanes.get(frame.id);
+ if(!lane&&(frame.type===2||frame.type===3||frame.type===4))return;
+ if(!lane&&closedLanes.has(frame.id))throw new Error('closed lane was reused');
+ if(!lane&&frame.type!==1)throw new Error('lane did not begin with OPEN');
+ lane=lane||ensureLane(frame.id);
+ if(!reserve(frame.data)){fail();return}
+ lane.pending.push(frame.data);runLaneUp(lane);
+}
+async function runLaneUp(lane){
+ if(lane.running)return;lane.running=true;
+ try{
+  while(!closed&&sessionToken&&lane.pending.length){
+   const batch=joinPending(lane.pending),sequence=String(lane.sequence),laneID=String(lane.id);
+   const response=await request('/api/v1/up',()=>options('POST',sessionToken,batch.body,{'X-Up-Seq':sequence,'X-Lane-ID':laneID}));
+   if(response.status!==204||response.headers.get('X-Up-Ack')!==sequence)throw new Error('lane uplink rejected');
+   release(batch.total,batch.count);port.postMessage({t:'traffic',up:batch.total,down:0});lane.sequence++;
+   if(!lane.polling)pollLane(lane);
+  }
+ }catch(error){fail()}finally{lane.running=false;if(!closed&&sessionToken&&lane.pending.length)runLaneUp(lane)}
+}
+async function pollLane(lane){
+ if(!lane||lane.polling)return;lane.polling=true;
+ try{
+  while(!closed&&sessionToken&&lanes.get(lane.id)===lane){
+   const controller=new AbortController(),laneID=String(lane.id);lane.controller=controller;
+   const response=await request('/api/v1/down',()=>options('POST',sessionToken,null,{'X-Down-Cursor':lane.cursor,'X-Lane-ID':laneID},controller.signal));
+   if(response.status===204){if(response.headers.get('X-Lane-Closed')==='1'){finishLane(lane);return}status('connected');continue}
+   if(response.status!==200)throw new Error('lane downlink rejected');
+   const next=response.headers.get('X-Down-Cursor')||'',data=await response.arrayBuffer(),frames=splitFrames(data);
+   if(!next||!frames.length)throw new Error('invalid lane downlink response');
+   for(const frame of frames)if(frame.id!==lane.id)throw new Error('cross-lane frame');
+   if(closed)return;port.postMessage({t:'traffic',up:0,down:data.byteLength});port.postMessage(data,[data]);lane.cursor=next;status('connected');
+  }
+ }catch(error){if(!closed)fail()}finally{lane.polling=false;lane.controller=null}
+}
 function deleteSession(){if(sessionToken)fetch(relayOrigin+'/api/v1/session',options('DELETE',sessionToken,null,null,undefined,true)).catch(()=>{})}
 function close(notifyServer){
- if(closed)return;closed=true;lifecycleController.abort();if(pollController)pollController.abort();if(notifyServer)deleteSession();if(port)port.close();
+ if(closed)return;closed=true;lifecycleController.abort();if(pollController)pollController.abort();
+ for(const lane of lanes.values())if(lane.controller)lane.controller.abort();
+ if(notifyServer)deleteSession();beforeSession.length=0;upPending.length=0;
+ for(const lane of lanes.values())lane.pending.length=0;lanes.clear();queuedBytes=0;queuedItems=0;if(port)port.close();
 }
 function activatePort(nextPort){
  initialized=true;port=nextPort;
@@ -228,7 +302,7 @@ function activatePort(nextPort){
   if(message.data instanceof ArrayBuffer){
    if(!createStarted){if(message.data.byteLength>64){fail();return}createStarted=true;createSession(message.data)}
    else if(!sessionToken){try{splitFrames(message.data)}catch(error){fail();return}if(!reserve(message.data)){fail();return}beforeSession.push(message.data)}
-   else queueUp(message.data);
+   else queueCarrier(message.data);
   }else if(message.data&&message.data.t==='close')close(true);
  };
  port.start();status('connecting');
@@ -244,7 +318,7 @@ addEventListener('message',event=>{
 const androidBridge=globalThis.TelegramWebProxy;
 if(!initialized&&androidNonce&&androidBridge&&typeof androidBridge.postMessage==='function'){
  const androidPort={onmessage:null,start(){},close(){androidBridge.onmessage=null},postMessage(value){
-  if(value instanceof ArrayBuffer){let frames;try{frames=splitFrames(value)}catch(error){fail();return}for(const frame of frames)androidBridge.postMessage(frame)}
+  if(value instanceof ArrayBuffer){let frames;try{frames=splitFrames(value)}catch(error){fail();return}for(const frame of frames)androidBridge.postMessage(frame.data)}
   else androidBridge.postMessage(JSON.stringify(value));
  }};
  androidBridge.onmessage=event=>{let data=event.data;if(typeof data==='string'){try{data=JSON.parse(data)}catch(error){return}}if(androidPort.onmessage)androidPort.onmessage({data})};

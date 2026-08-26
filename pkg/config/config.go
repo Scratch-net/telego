@@ -115,6 +115,7 @@ type WebProxyConfig struct {
 	BindTo            string   `toml:"bind-to"`
 	Hostname          string   `toml:"hostname"`
 	Backend           string   `toml:"backend"`
+	Carrier           string   `toml:"carrier"`
 	TrustedProxyCIDRs []string `toml:"trusted-proxy-cidrs"`
 	NumEventLoops     int      `toml:"num-event-loops"`
 }
@@ -126,6 +127,7 @@ type WebProxyRuntimeConfig struct {
 	BindAddr             string
 	Hostname             string
 	Backend              string
+	Carrier              webproxy.CarrierMode
 	TrustedProxyCIDRs    []string
 	NumEventLoops        int
 	Profiles             []webproxy.Profile
@@ -310,6 +312,10 @@ func (c *Config) ToWebProxyRuntimeConfig(mtProxyBind string) (WebProxyRuntimeCon
 	if c.WebProxy.NumEventLoops < 0 {
 		return WebProxyRuntimeConfig{}, errors.New("web-proxy.num-event-loops cannot be negative")
 	}
+	carrier, err := webproxy.ParseCarrierMode(c.WebProxy.Carrier)
+	if err != nil {
+		return WebProxyRuntimeConfig{}, fmt.Errorf("invalid web-proxy.carrier: %w", err)
+	}
 
 	bindAddr := c.WebProxy.BindTo
 	if bindAddr == "" {
@@ -353,6 +359,7 @@ func (c *Config) ToWebProxyRuntimeConfig(mtProxyBind string) (WebProxyRuntimeCon
 		BindAddr:             bindAddr,
 		Hostname:             hostname,
 		Backend:              backend,
+		Carrier:              carrier,
 		TrustedProxyCIDRs:    append([]string(nil), c.WebProxy.TrustedProxyCIDRs...),
 		NumEventLoops:        c.WebProxy.NumEventLoops,
 		Profiles:             profiles,
@@ -393,11 +400,12 @@ func (c *Config) webProxyFingerprint() string {
 	}
 	trusted := strings.Join(c.WebProxy.TrustedProxyCIDRs, ",")
 	return fmt.Sprintf(
-		"enabled=%t\x00bind=%s\x00hostname=%s\x00backend=%s\x00trusted=%s\x00loops=%d",
+		"enabled=%t\x00bind=%s\x00hostname=%s\x00backend=%s\x00carrier=%s\x00trusted=%s\x00loops=%d",
 		c.WebProxy.Enabled,
 		c.WebProxy.BindTo,
 		c.WebProxy.Hostname,
 		c.WebProxy.Backend,
+		c.WebProxy.Carrier,
 		trusted,
 		c.WebProxy.NumEventLoops,
 	)
