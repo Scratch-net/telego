@@ -1,0 +1,9 @@
+[Unit]
+Description=Renew the Telego TLS certificate and reload Nginx
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/telego/examples/web-proxy
+ExecStart=/opt/telego/examples/web-proxy/renew-certificate.sh

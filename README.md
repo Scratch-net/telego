@@ -43,7 +43,7 @@
 
 ### Networking
 - **Event-driven I/O** — Built on [gnet](https://github.com/panjf2000/gnet) with epoll/kqueue for maximum efficiency
-- **Native WEB Proxy** — Optional gnet HTTPS carrier for Telegram Desktop behind Nginx
+- **Native WEB Proxy** — Optional gnet HTTPS or WebSocket carrier for Telegram Desktop behind Nginx
 - **Zero-copy relaying** — Direct buffer manipulation without intermediate copies
 - **Buffer pooling** — Striped sync.Pool design eliminates allocations in hot paths
 - **Optimized TCP** — `TCP_NODELAY`, `TCP_QUICKACK`, 64KB buffers, `SO_REUSEPORT`
@@ -170,6 +170,19 @@ bind-to = "127.0.0.1:8080"
 trusted-proxy-cidrs = ["127.0.0.1/32"]
 ```
 
+The `carrier` value selects one of four transports:
+
+| Value | Transport | Requirements |
+|-------|-----------|--------------|
+| `https` | One serialized fetch and long-poll carrier | This value is the default when `carrier` is empty or absent. |
+| `https-lanes` | One fetch and long-poll lane for each Telegram stream | Enable HTTP/2 on the public Nginx server. This value is the conservative recommendation until comparative benchmarks exist. |
+| `websocket` | One multiplexed WebSocket for the WEB session | Forward HTTP/1.1 `Upgrade` and `Connection` headers to Telego. |
+| `websocket-lanes` | One WebSocket for each Telegram stream | Use this value for the official WebSocket lane option. Forward HTTP/1.1 upgrade headers to Telego. |
+
+The browser page is the active WEB carrier bridge. Keep its tab open while Telegram uses the proxy.
+
+In WebSocket modes, the page opens same-host `wss` connections through Nginx. In HTTPS modes, the page uses fetch requests and long polls.
+
 You must route every request from the Nginx TLS server to this listener. This rule prevents carrier headers from bypassing Telego.
 
 The setup uses two private fallback statuses.
@@ -185,6 +198,13 @@ Use `--web-host` to print WEB links when you generate a new secret:
 telego generate www.google.com --web-host proxy.example.com
 ```
 
+The same command works through Docker because the image runs Telego as its entry point:
+
+```bash
+docker run --rm scratchnet/telego:latest \
+  generate www.google.com --web-host proxy.example.com
+```
+
 The positional hostname is the FakeTLS mask hostname. The `--web-host` value is the public WEB proxy hostname.
 
 The `--web-host` value must match `[web-proxy].hostname` and the TLS certificate in Nginx.
@@ -192,10 +212,6 @@ The `--web-host` value must match `[web-proxy].hostname` and the TLS certificate
 Read the [native WEB proxy setup guide](docs/web-proxy.md) for the complete Nginx configuration, Docker setup, and rollback procedure.
 
 The WEB configuration is inactive by default. Configurations without `[web-proxy]` continue to use the existing MTProxy startup path.
-
-The recommended `https-lanes` carrier gives each Telegram stream an independent HTTP carrier. It requires HTTP/2 on the public Nginx server.
-
-Existing configurations that omit `carrier` continue to use serialized `https`. This default prevents an upgrade from changing the Nginx requirements.
 
 ---
 
@@ -259,7 +275,8 @@ mask-host = "www.google.com"  # Host to mimic (SNI validation, proxy links)
 # Native Telegram Desktop WEB proxy (optional; requires Nginx with real TLS)
 [web-proxy]
 enabled = false
-# carrier = "https-lanes"                  # Recommended. Requires public HTTP/2.
+# carrier = "https-lanes"                  # Conservative recommendation. Requires public HTTP/2.
+# Other values: https, websocket, websocket-lanes
 # hostname = "proxy.example.com"            # Required public certificate hostname
 # bind-to = "127.0.0.1:8080"               # Private HTTP/1.1 listener
 # backend = "127.0.0.1:443"                # Derived TCP or Unix MTProxy backend
@@ -557,6 +574,7 @@ bind-to = "127.0.0.1:9090"
 | `telego_traffic_in_bytes_total` | Counter | Bytes received from clients |
 | `telego_traffic_out_bytes_total` | Counter | Bytes sent to clients |
 | `telego_handshake_failures_total` | Counter | MTProxy handshake failures by `stage` |
+| `telego_web_websocket_connections_active` | Gauge | Active WEB WebSocket carrier connections. This metric has no labels. |
 | `telego_web_sessions_active` | Gauge | Active WEB sessions |
 | `telego_web_streams_active` | Gauge | Active WEB backend streams |
 | `telego_web_backend_dials_active` | Gauge | WEB backend dials in progress |
@@ -568,6 +586,8 @@ bind-to = "127.0.0.1:9090"
 | `telego_web_backpressure_total` | Counter | WEB backpressure events by `operation` |
 
 Connection, IP, block, and traffic metrics include a `user` label. Diagnostic metrics use the labels in the table.
+
+`telego_web_websocket_connections_active` has no labels. It counts accepted WebSocket carriers after the HTTP upgrade response leaves Telego.
 
 ---
 

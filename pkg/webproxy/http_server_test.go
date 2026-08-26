@@ -90,6 +90,66 @@ func TestHTTPServerRouteSessionEndToEnd(t *testing.T) {
 	}
 }
 
+func TestHTTPServerWebSocketBridgeUsesRequestHost(t *testing.T) {
+	application := newHTTPTestApplicationWithConfig(t, time.Second, func(config *ManagerConfig) {
+		config.Carrier = CarrierWebSocket
+	}, nil)
+	request, err := http.NewRequest(http.MethodGet,
+		"http://"+application.address+"/?bridge="+application.profiles[0].Capability().String(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Host = "proxy.example.com:443"
+	response, err := (&http.Client{Timeout: time.Second}).Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := readHTTPBody(t, response)
+	if response.StatusCode != http.StatusOK ||
+		!bytes.Contains(body, []byte(`webSocketTarget="wss://proxy.example.com:443/api/v1/ws"`)) ||
+		!strings.Contains(response.Header.Get("Content-Security-Policy"),
+			"connect-src 'self' wss://proxy.example.com:443") {
+		t.Fatalf("request-host bridge = %d, CSP %q", response.StatusCode,
+			response.Header.Get("Content-Security-Policy"))
+	}
+}
+
+func TestHTTPServerWebSocketBridgeUsesSessionStreamLimit(t *testing.T) {
+	application := newHTTPTestApplicationWithConfig(t, time.Second, func(config *ManagerConfig) {
+		config.Carrier = CarrierWebSocketLanes
+		config.Limits.MaxStreamsPerSession = 2
+	}, nil)
+	client := &http.Client{Timeout: time.Second}
+	response := application.do(t, client, http.MethodGet,
+		"/?bridge="+application.profiles[0].Capability().String(), nil, nil)
+	body := readHTTPBody(t, response)
+	if response.StatusCode != http.StatusOK || !bytes.Contains(body, []byte("maxWebSocketLanes=2")) {
+		t.Fatalf("WebSocket lanes bridge stream limit: status=%d", response.StatusCode)
+	}
+}
+
+func TestHTTPServerHTTPSBridgeKeepsConfiguredHost(t *testing.T) {
+	application := newHTTPTestApplication(t, time.Second)
+	request, err := http.NewRequest(http.MethodGet,
+		"http://"+application.address+"/?bridge="+application.profiles[0].Capability().String(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Host = "proxy.example.com:443"
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := readHTTPBody(t, response)
+	if response.StatusCode != http.StatusOK ||
+		!bytes.Contains(body, []byte(`relayOrigin="https://proxy.example.com"`)) ||
+		bytes.Contains(body, []byte("WebSocket(")) ||
+		strings.Contains(response.Header.Get("Content-Security-Policy"), "wss:") {
+		t.Fatalf("HTTPS bridge changed for an explicit default port: status %d, CSP %q",
+			response.StatusCode, response.Header.Get("Content-Security-Policy"))
+	}
+}
+
 func TestHTTPServerHTTPSLanesCarrierEndToEnd(t *testing.T) {
 	application := newHTTPTestApplicationWithConfig(t, 500*time.Millisecond, func(config *ManagerConfig) {
 		config.Carrier = CarrierHTTPSLanes

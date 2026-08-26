@@ -57,6 +57,28 @@ func TestParseCarrierRequestHeaderLimitsAndSmugglingRejection(t *testing.T) {
 	if err != nil || !upgrade.upgrade || upgrade.close {
 		t.Fatalf("ordinary upgrade = %#v, %v", upgrade, err)
 	}
+	tokenListUpgrade, _, err := parseCarrierRequestHeader([]byte("GET /socket HTTP/1.1\r\nHost: proxy.example.com\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\n\r\n"))
+	if err != nil || !tokenListUpgrade.upgrade || tokenListUpgrade.close {
+		t.Fatalf("token-list upgrade = %#v, %v", tokenListUpgrade, err)
+	}
+	for name, connection := range map[string]string{
+		"empty option":      "keep-alive,,upgrade",
+		"duplicate option":  "upgrade, Upgrade",
+		"close and upgrade": "close, upgrade",
+		"unknown option":    "keep-alive, x-hop",
+		"upgrade no header": "upgrade",
+	} {
+		t.Run("connection "+name, func(t *testing.T) {
+			raw := "GET /socket HTTP/1.1\r\nHost: proxy.example.com\r\nConnection: " + connection + "\r\n"
+			if name != "upgrade no header" {
+				raw += "Upgrade: websocket\r\n"
+			}
+			raw += "\r\n"
+			if _, _, parseErr := parseCarrierRequestHeader([]byte(raw)); !errors.Is(parseErr, errHTTPMalformed) {
+				t.Fatalf("error = %v, want malformed", parseErr)
+			}
+		})
+	}
 	for name, raw := range tests {
 		t.Run(name, func(t *testing.T) {
 			if _, _, err := parseCarrierRequestHeader([]byte(raw)); !errors.Is(err, errHTTPMalformed) {

@@ -272,7 +272,7 @@ func TestManagerRejectsInvalidConfigAndDuplicateCapabilities(t *testing.T) {
 		{"hostname backend", func(config *ManagerConfig) { config.Backend = "localhost:443" }},
 		{"relative Unix backend", func(config *ManagerConfig) { config.Backend = "unix://relative.sock" }},
 		{"root Unix backend", func(config *ManagerConfig) { config.Backend = "/" }},
-		{"unsupported carrier", func(config *ManagerConfig) { config.Carrier = "websocket" }},
+		{"unsupported carrier", func(config *ManagerConfig) { config.Carrier = "quic" }},
 		{"zero limit", func(config *ManagerConfig) { config.Limits.MaxSessions = 0 }},
 		{"oversized carrier", func(config *ManagerConfig) { config.Limits.CarrierBatchBytes = maxCarrierBatchBytes + 1 }},
 		{"small global streams", func(config *ManagerConfig) { config.Limits.MaxStreams = config.Limits.MaxStreamsPerSession - 1 }},

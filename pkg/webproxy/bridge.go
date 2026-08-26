@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"net/netip"
+	"net/url"
 	"strconv"
 	"strings"
 )
@@ -34,7 +36,24 @@ func RenderBridgeForCarrier(
 	batchBytes int,
 	carrier CarrierMode,
 ) (BridgePage, error) {
-	if err := ValidateHostname(hostname); err != nil {
+	return renderBridgeForCarrier(
+		hostname,
+		bootstrapToken,
+		batchBytes,
+		carrier,
+		DefaultLimits().MaxStreamsPerSession,
+	)
+}
+
+func renderBridgeForCarrier(
+	hostname string,
+	bootstrapToken string,
+	batchBytes int,
+	carrier CarrierMode,
+	maxStreamsPerSession int,
+) (BridgePage, error) {
+	relayOrigin, webSocketOrigin, err := bridgeOrigins(hostname)
+	if err != nil {
 		return BridgePage{}, err
 	}
 	if _, err := parseTokenHash(bootstrapToken); err != nil {
@@ -46,13 +65,24 @@ func RenderBridgeForCarrier(
 	if !carrier.valid() {
 		return BridgePage{}, errors.New("WEB bridge carrier mode is unsupported")
 	}
+	if maxStreamsPerSession <= 0 {
+		return BridgePage{}, errors.New("WEB bridge stream limit is out of range")
+	}
+	document := bridgeDocument
+	if carrier.usesWebSocket() {
+		document, err = bridgeDocumentWithWebSocket()
+		if err != nil {
+			return BridgePage{}, err
+		}
+	}
 
 	var rawNonce [18]byte
 	if _, err := rand.Read(rawNonce[:]); err != nil {
 		return BridgePage{}, err
 	}
 	nonce := base64.RawURLEncoding.EncodeToString(rawNonce[:])
-	originJSON, _ := json.Marshal("https://" + hostname)
+	originJSON, _ := json.Marshal(relayOrigin)
+	webSocketTargetJSON, _ := json.Marshal(webSocketOrigin + webSocketPath)
 	tokenJSON, _ := json.Marshal(bootstrapToken)
 	carrierJSON, _ := json.Marshal(carrier)
 	body := strings.NewReplacer(
@@ -61,11 +91,18 @@ func RenderBridgeForCarrier(
 		"__BOOTSTRAP__", string(tokenJSON),
 		"__CARRIER__", string(carrierJSON),
 		"__BATCH_LIMIT__", strconv.Itoa(batchBytes),
-	).Replace(bridgeDocument)
+		"__MAX_STREAMS__", strconv.Itoa(maxStreamsPerSession),
+		"__WEBSOCKET_TARGET__", string(webSocketTargetJSON),
+	).Replace(document)
 	if strings.Contains(body, "__NONCE__") || strings.Contains(body, "__ORIGIN__") ||
 		strings.Contains(body, "__BOOTSTRAP__") || strings.Contains(body, "__CARRIER__") ||
-		strings.Contains(body, "__BATCH_LIMIT__") {
+		strings.Contains(body, "__BATCH_LIMIT__") || strings.Contains(body, "__MAX_STREAMS__") ||
+		strings.Contains(body, "__WEBSOCKET_TARGET__") {
 		return BridgePage{}, errors.New("WEB bridge template replacement failed")
+	}
+	connectSource := "connect-src 'self'"
+	if carrier.usesWebSocket() {
+		connectSource += " " + webSocketOrigin
 	}
 
 	return BridgePage{
@@ -75,7 +112,7 @@ func RenderBridgeForCarrier(
 			"default-src 'none'",
 			"base-uri 'none'",
 			"child-src 'none'",
-			"connect-src 'self'",
+			connectSource,
 			"font-src 'none'",
 			"form-action 'none'",
 			"frame-ancestors http://127.0.0.1:*",
@@ -91,6 +128,213 @@ func RenderBridgeForCarrier(
 		}, "; "),
 	}, nil
 }
+
+func bridgeOrigins(authority string) (relayOrigin, webSocketOrigin string, err error) {
+	parsed, parseErr := url.Parse("https://" + authority)
+	if parseErr != nil || parsed.Host != authority || parsed.User != nil || parsed.Path != "" ||
+		parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", "", ErrInvalidHostname
+	}
+	hostname := parsed.Hostname()
+	if hostname == "" {
+		return "", "", ErrInvalidHostname
+	}
+	hostPart := hostname
+	if address, addressErr := netip.ParseAddr(hostname); addressErr == nil {
+		if address.Zone() != "" || address.String() != hostname {
+			return "", "", ErrInvalidHostname
+		}
+		if address.Is6() {
+			hostPart = "[" + hostname + "]"
+		}
+	} else if validateErr := ValidateHostname(hostname); validateErr != nil {
+		return "", "", validateErr
+	}
+	port := parsed.Port()
+	if port != "" {
+		parsedPort, portErr := strconv.ParseUint(port, 10, 16)
+		if portErr != nil || parsedPort == 0 || strconv.FormatUint(parsedPort, 10) != port {
+			return "", "", ErrInvalidHostname
+		}
+		hostPart += ":" + port
+	}
+	if hostPart != authority {
+		return "", "", ErrInvalidHostname
+	}
+	return "https://" + authority, "wss://" + authority, nil
+}
+
+func bridgeDocumentWithWebSocket() (string, error) {
+	document := bridgeDocument
+	replacements := [...][2]string{
+		{
+			"let queuedBytes=0,queuedItems=0,upSequence=1,downCursor='0',upRunning=false,pollController=null;",
+			"let queuedBytes=0,queuedItems=0,upSequence=1,downCursor='0',upRunning=false,pollController=null,webSocket=null,webSocketTimer=0,webSocketBufferedBytes=0,webSocketTrackedBytes=0,webSocketLaneReservations=0;",
+		},
+		{
+			"const queueByteLimit=33554432,queueItemLimit=16384,maxFrames=4096,maxPayload=1048576,closedLaneLimit=4096;",
+			"const queueByteLimit=33554432,queueItemLimit=16384,maxFrames=4096,maxPayload=1048576,closedLaneLimit=4096,laneQueueLimit=8388608,laneItemLimit=1024,maxWebSocketLanes=__MAX_STREAMS__;\nconst webSocketTarget=__WEBSOCKET_TARGET__;",
+		},
+		{
+			`function reserve(data){
+ if(!data.byteLength||data.byteLength>queueByteLimit-queuedBytes||queuedItems>=queueItemLimit)return false;
+ queuedBytes+=data.byteLength;queuedItems++;return true;
+}
+function release(bytes,items){queuedBytes-=bytes;queuedItems-=items}`,
+			`function refreshWebSocketBuffered(socket,lane){
+ const current=socket?socket.bufferedAmount:0,previous=lane?lane.buffered:webSocketTrackedBytes;
+ webSocketBufferedBytes+=current-previous;if(lane)lane.buffered=current;else webSocketTrackedBytes=current;
+}
+function bufferedBytes(lane){
+ if(carrier==='websocket')refreshWebSocketBuffered(webSocket,null);else if(lane)refreshWebSocketBuffered(lane.socket,lane);
+ return webSocketBufferedBytes;
+}
+function refreshAllWebSocketBuffered(){
+ if(carrier==='websocket')refreshWebSocketBuffered(webSocket,null);else for(const activeLane of lanes.values())refreshWebSocketBuffered(activeLane.socket,activeLane);
+ return webSocketBufferedBytes;
+}
+function hasWebSocketByteCapacity(data,lane){
+ if(queuedBytes+bufferedBytes(lane)<=queueByteLimit-data.byteLength)return true;
+ return queuedBytes+refreshAllWebSocketBuffered()<=queueByteLimit-data.byteLength;
+}
+function reserve(data,lane){
+ if(!data.byteLength||queuedItems>=queueItemLimit)return false;
+ if(lane&&(lane.bytes>laneQueueLimit-data.byteLength||lane.items>=laneItemLimit))return false;
+ if(!hasWebSocketByteCapacity(data,lane))return false;
+ queuedBytes+=data.byteLength;queuedItems++;if(lane){lane.bytes+=data.byteLength;lane.items++}return true;
+}
+function release(bytes,items,lane){queuedBytes-=bytes;queuedItems-=items;if(lane){lane.bytes-=bytes;lane.items-=items}}`,
+		},
+		{"function joinPending(values){", "function joinPending(values,lane){"},
+		{"values[0]=values[0].slice(bound.bytes);queuedItems++;", "values[0]=values[0].slice(bound.bytes);queuedItems++;if(lane)lane.items++;"},
+		{
+			"if(closed){deleteSession();return}port.postMessage(welcome,[welcome]);status('connected');",
+			"if(carrier==='websocket')await openWebSocket();\n  if(closed){deleteSession();return}port.postMessage(welcome,[welcome]);status('connected');",
+		},
+		{
+			"if(carrier==='https')poll();else pollLane(lanes.get(0));",
+			"if(carrier==='https')poll();else if(carrier==='https-lanes')pollLane(lanes.get(0));",
+		},
+		{
+			"try{if(carrier==='https')queueUp(data);else for(const frame of splitFrames(data))queueLane(frame)}catch(error){fail()}",
+			"try{\n  if(carrier==='https')queueUp(data);\n  else if(carrier==='https-lanes')for(const frame of splitFrames(data))queueLane(frame);\n  else if(carrier==='websocket')queueWebSocket(data);\n  else for(const frame of splitFrames(data))queueWebSocketLane(frame);\n }catch(error){fail()}",
+		},
+		{
+			"lane={id,sequence:1,cursor:'0',pending:[],running:false,polling:false,controller:null};",
+			"lane={id,sequence:1,cursor:'0',pending:[],running:false,polling:false,controller:null,bytes:0,items:0,buffered:0,socket:null,timer:0,opened:false,localClosed:false,remoteClosed:false,finished:false};",
+		},
+		{"function deleteSession(){", webSocketBridgeFunctions + "\nfunction deleteSession(){"},
+		{
+			`function close(notifyServer){
+ if(closed)return;closed=true;lifecycleController.abort();if(pollController)pollController.abort();
+ for(const lane of lanes.values())if(lane.controller)lane.controller.abort();
+ if(notifyServer)deleteSession();beforeSession.length=0;upPending.length=0;
+ for(const lane of lanes.values())lane.pending.length=0;lanes.clear();queuedBytes=0;queuedItems=0;if(port)port.close();
+}`,
+			`function close(notifyServer){
+ if(closed)return;closed=true;lifecycleController.abort();if(pollController)pollController.abort();
+ for(const lane of lanes.values()){
+  if(lane.controller)lane.controller.abort();if(lane.timer)clearTimeout(lane.timer);
+  if(lane.socket)try{lane.socket.close()}catch(error){}
+ }
+ if(webSocketTimer)clearTimeout(webSocketTimer);if(webSocket)try{webSocket.close()}catch(error){}
+ if(notifyServer)deleteSession();beforeSession.length=0;upPending.length=0;
+ for(const lane of lanes.values())lane.pending.length=0;lanes.clear();queuedBytes=0;queuedItems=0;if(port)port.close();
+}`,
+		},
+	}
+	for _, replacement := range replacements {
+		if strings.Count(document, replacement[0]) != 1 {
+			return "", errors.New("WEB WebSocket bridge template section is not unique")
+		}
+		document = strings.Replace(document, replacement[0], replacement[1], 1)
+	}
+	return document, nil
+}
+
+const webSocketBridgeFunctions = `function openWebSocket(){
+ return new Promise((resolve,reject)=>{
+  const socket=new WebSocket(webSocketTarget,'tproxy-v1.'+sessionToken);webSocket=socket;socket.binaryType='arraybuffer';
+  socket.onopen=()=>resolve();
+  socket.onmessage=event=>{
+   if(!(event.data instanceof ArrayBuffer)||!event.data.byteLength){fail();return}
+   port.postMessage({t:'traffic',up:0,down:event.data.byteLength});port.postMessage(event.data,[event.data]);status('connected');
+  };
+  socket.onerror=()=>reject(new Error('websocket failed'));socket.onclose=()=>{if(!closed)fail()};
+ });
+}
+function queueWebSocket(data){
+ if(!reserve(data)){fail();return}upPending.push(data);runWebSocketUp();
+}
+function scheduleWebSocketUp(){
+ if(!webSocketTimer)webSocketTimer=setTimeout(()=>{webSocketTimer=0;runWebSocketUp()},10);
+}
+function runWebSocketUp(){
+ if(closed||!webSocket||webSocket.readyState!==WebSocket.OPEN)return;
+ refreshWebSocketBuffered(webSocket,null);if(!upPending.length){if(webSocket.bufferedAmount)scheduleWebSocketUp();return}
+ if(webSocket.bufferedAmount+queuedBytes>queueByteLimit||webSocket.bufferedAmount>=batchLimit){
+  scheduleWebSocketUp();return;
+ }
+ try{
+  const batch=joinPending(upPending);webSocket.send(batch.body);refreshWebSocketBuffered(webSocket,null);release(batch.total,batch.count);
+  port.postMessage({t:'traffic',up:batch.total,down:0});if(upPending.length)queueMicrotask(runWebSocketUp);else if(webSocket.bufferedAmount)scheduleWebSocketUp();
+ }catch(error){fail()}
+}
+function closeFrame(id){
+ const data=new ArrayBuffer(8),view=new DataView(data);
+ view.setUint8(0,3);view.setUint8(1,id>>>16);view.setUint8(2,id>>>8);view.setUint8(3,id);view.setUint32(4,0);return data;
+}
+function finishWebSocketLane(lane,notify){
+ if(lane.finished||lanes.get(lane.id)!==lane)return;
+ lane.finished=true;if(lane.timer)clearTimeout(lane.timer);
+ webSocketBufferedBytes-=lane.buffered;lane.buffered=0;webSocketLaneReservations--;
+ if(lane.bytes||lane.items)release(lane.bytes,lane.items,lane);
+ lane.pending.length=0;lanes.delete(lane.id);rememberLaneClosed(lane.id);
+ if(lane.socket&&(lane.socket.readyState===WebSocket.OPEN||lane.socket.readyState===WebSocket.CONNECTING))try{lane.socket.close()}catch(error){}
+ if(notify&&port&&!closed){const frame=closeFrame(lane.id);port.postMessage(frame,[frame])}
+}
+function openWebSocketLane(lane){
+ const socket=new WebSocket(webSocketTarget,'tproxy-lane-v1.'+sessionToken+'.'+lane.id);
+ lane.socket=socket;socket.binaryType='arraybuffer';
+ socket.onopen=()=>{if(closed||lane.finished){socket.close();return}lane.opened=true;status('connected');runWebSocketLaneUp(lane)};
+ socket.onmessage=event=>{
+  if(!(event.data instanceof ArrayBuffer)||!event.data.byteLength){fail();return}
+  let frames;try{frames=splitFrames(event.data)}catch(error){fail();return}
+  if(frames.some(frame=>frame.id!==lane.id)){fail();return}if(frames.some(frame=>frame.type===3))lane.remoteClosed=true;
+  port.postMessage({t:'traffic',up:0,down:event.data.byteLength});port.postMessage(event.data,[event.data]);status('connected');
+ };
+ socket.onerror=()=>{};
+ socket.onclose=()=>{
+  if(closed||lane.finished)return;if(!lane.opened){fail();return}
+  finishWebSocketLane(lane,!lane.localClosed&&!lane.remoteClosed);
+ };
+}
+function queueWebSocketLane(frame){
+ let lane=lanes.get(frame.id);
+ if(!lane&&(frame.type===2||frame.type===3||frame.type===4))return;
+ if(!frame.id||(!lane&&closedLanes.has(frame.id)))throw new Error('closed lane was reused');
+ if(!lane&&frame.type!==1)throw new Error('lane did not begin with OPEN');
+ if(!lane&&webSocketLaneReservations>=maxWebSocketLanes){fail();return}
+ if(!lane){webSocketLaneReservations++;lane=ensureLane(frame.id)}if(!reserve(frame.data,lane)){fail();return}
+ lane.pending.push(frame.data);if(frame.type===3)lane.localClosed=true;
+ if(!lane.socket)openWebSocketLane(lane);else runWebSocketLaneUp(lane);
+}
+function scheduleWebSocketLaneUp(lane){
+ if(!lane.timer)lane.timer=setTimeout(()=>{lane.timer=0;runWebSocketLaneUp(lane)},10);
+}
+function runWebSocketLaneUp(lane){
+ const socket=lane.socket;
+ if(closed||lane.finished||!socket||socket.readyState!==WebSocket.OPEN)return;
+ refreshWebSocketBuffered(socket,lane);if(!lane.pending.length){if(socket.bufferedAmount)scheduleWebSocketLaneUp(lane);return}
+ if(socket.bufferedAmount>=batchLimit){
+  scheduleWebSocketLaneUp(lane);return;
+ }
+ try{
+  const batch=joinPending(lane.pending,lane);socket.send(batch.body);refreshWebSocketBuffered(socket,lane);release(batch.total,batch.count,lane);
+  port.postMessage({t:'traffic',up:batch.total,down:0});if(lane.pending.length)queueMicrotask(()=>runWebSocketLaneUp(lane));else if(socket.bufferedAmount)scheduleWebSocketLaneUp(lane);
+ }catch(error){fail()}
+}
+`
 
 // The bridge is self-contained and has no external resources.
 const bridgeDocument = `<!doctype html>

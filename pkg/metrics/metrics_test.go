@@ -37,11 +37,12 @@ type mockWebStatsProvider struct{}
 
 func (mockWebStatsProvider) RuntimeStats() webproxy.RuntimeStats {
 	return webproxy.RuntimeStats{
-		Capacity:        webproxy.Capacity{Sessions: 2, Streams: 4, BackendDials: 1, PendingBytes: 128, PendingItems: 3},
-		SessionsCreated: 5,
-		SessionsClosed:  []webproxy.RuntimeCounter{{Label: "client", Total: 2}},
-		CarrierRetries:  []webproxy.RuntimeCounter{{Label: "uplink", Total: 7}},
-		Backpressure:    []webproxy.RuntimeCounter{{Label: "uplink", Total: 1}},
+		Capacity:         webproxy.Capacity{Sessions: 2, Streams: 4, BackendDials: 1, PendingBytes: 128, PendingItems: 3},
+		WebSocketsActive: 2,
+		SessionsCreated:  5,
+		SessionsClosed:   []webproxy.RuntimeCounter{{Label: "client", Total: 2}},
+		CarrierRetries:   []webproxy.RuntimeCounter{{Label: "uplink", Total: 7}},
+		Backpressure:     []webproxy.RuntimeCounter{{Label: "uplink", Total: 1}},
 	}
 }
 
@@ -135,6 +136,7 @@ func TestMetricsIntegration(t *testing.T) {
 		"telego_traffic_in_bytes_total",
 		"telego_traffic_out_bytes_total",
 		"telego_handshake_failures_total",
+		"telego_web_websocket_connections_active",
 		"telego_web_sessions_active",
 		"telego_web_streams_active",
 		"telego_web_backend_dials_active",
@@ -150,6 +152,19 @@ func TestMetricsIntegration(t *testing.T) {
 		if !strings.Contains(content, metric) {
 			t.Errorf("metrics output should contain %s", metric)
 		}
+	}
+	webSocketGauge := "telego_web_websocket_connections_active"
+	foundWebSocketGauge := false
+	for line := range strings.SplitSeq(content, "\n") {
+		if !strings.HasPrefix(line, webSocketGauge+"{") {
+			continue
+		}
+		foundWebSocketGauge = strings.HasSuffix(line, "} 2") &&
+			!strings.Contains(line, "carrier=") && !strings.Contains(line, "mode=") &&
+			!strings.Contains(line, "lane=")
+	}
+	if !foundWebSocketGauge {
+		t.Errorf("WebSocket gauge is missing, has a transport label, or has the wrong value")
 	}
 
 	// Verify user labels appear

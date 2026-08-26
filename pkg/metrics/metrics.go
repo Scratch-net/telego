@@ -104,6 +104,13 @@ func registerProxyMetrics(meter metric.Meter, provider ProxyStatsProvider) {
 }
 
 func registerWebMetrics(meter metric.Meter, provider WebStatsProvider) {
+	meter.Int64ObservableGauge("telego_web_websocket_connections_active",
+		metric.WithDescription("Active WEB WebSocket carrier connections"),
+		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
+			observer.Observe(provider.RuntimeStats().WebSocketsActive)
+			return nil
+		}),
+	)
 	meter.Int64ObservableGauge("telego_web_sessions_active",
 		metric.WithDescription("Active WEB relay sessions"),
 		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {

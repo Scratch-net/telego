@@ -98,10 +98,11 @@ type Manager struct {
 	shutdownDone chan struct{}
 	shutdownOnce sync.Once
 
-	sessionsCreated atomic.Uint64
-	sessionsClosed  [sessionCloseReasonCount]atomic.Uint64
-	carrierRetries  [carrierOperationCount]atomic.Uint64
-	backpressure    [carrierOperationCount]atomic.Uint64
+	sessionsCreated  atomic.Uint64
+	sessionsClosed   [sessionCloseReasonCount]atomic.Uint64
+	carrierRetries   [carrierOperationCount]atomic.Uint64
+	backpressure     [carrierOperationCount]atomic.Uint64
+	webSocketsActive atomic.Int64
 }
 
 // NewManager validates and copies config before starting its expiry worker.

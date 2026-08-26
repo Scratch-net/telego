@@ -33,21 +33,23 @@ type RuntimeCounter struct {
 
 // RuntimeStats is a point-in-time view of WEB capacity and cumulative events.
 type RuntimeStats struct {
-	Capacity        Capacity
-	SessionsCreated uint64
-	SessionsClosed  []RuntimeCounter
-	CarrierRetries  []RuntimeCounter
-	Backpressure    []RuntimeCounter
+	Capacity         Capacity
+	WebSocketsActive int64
+	SessionsCreated  uint64
+	SessionsClosed   []RuntimeCounter
+	CarrierRetries   []RuntimeCounter
+	Backpressure     []RuntimeCounter
 }
 
 // RuntimeStats returns WEB diagnostics without bearer or client identifiers.
 func (m *Manager) RuntimeStats() RuntimeStats {
 	stats := RuntimeStats{
-		Capacity:        m.Capacity(),
-		SessionsCreated: m.sessionsCreated.Load(),
-		SessionsClosed:  make([]RuntimeCounter, 0, sessionCloseReasonCount),
-		CarrierRetries:  make([]RuntimeCounter, 0, carrierOperationCount),
-		Backpressure:    make([]RuntimeCounter, 0, carrierOperationCount),
+		Capacity:         m.Capacity(),
+		WebSocketsActive: m.webSocketsActive.Load(),
+		SessionsCreated:  m.sessionsCreated.Load(),
+		SessionsClosed:   make([]RuntimeCounter, 0, sessionCloseReasonCount),
+		CarrierRetries:   make([]RuntimeCounter, 0, carrierOperationCount),
+		Backpressure:     make([]RuntimeCounter, 0, carrierOperationCount),
 	}
 	for reason := range sessionCloseReasonCount {
 		stats.SessionsClosed = append(stats.SessionsClosed, RuntimeCounter{

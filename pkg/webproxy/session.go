@@ -70,20 +70,21 @@ type downBatch struct {
 }
 
 type carrierLane struct {
-	pendingFrames  []queuedFrame
-	pendingWindows map[uint32]int
-	unacked        []byte
-	unackedCost    int
-	unackedItems   int
-	unackedBase    uint64
-	downCursor     uint64
-	lastUpSequence uint64
-	lastUpDigest   [sha256.Size]byte
-	upActive       bool
-	downActive     bool
-	superseded     chan struct{}
-	downSlot       chan struct{}
-	notify         chan struct{}
+	pendingFrames   []queuedFrame
+	pendingWindows  map[uint32]int
+	unacked         []byte
+	unackedCost     int
+	unackedItems    int
+	unackedBase     uint64
+	downCursor      uint64
+	lastUpSequence  uint64
+	lastUpDigest    [sha256.Size]byte
+	upActive        bool
+	downActive      bool
+	websocketActive bool
+	superseded      chan struct{}
+	downSlot        chan struct{}
+	notify          chan struct{}
 }
 
 func newCarrierLane() *carrierLane {
@@ -109,21 +110,22 @@ type Session struct {
 	dialBackend BackendDialContextFunc
 	budget      func(int, int, pendingClass) bool
 
-	mu             sync.Mutex
-	streams        map[uint32]*streamState
-	usedStreams    streamIDHistory
-	tombstones     boundedSet[uint32]
-	carrierLanes   map[uint32]*carrierLane
-	pendingCost    int
-	pendingItems   int
-	closed         bool
-	closeReason    sessionCloseReason
-	lastActivity   time.Time
-	budgetNotify   chan struct{}
-	done           chan struct{}
-	finishNotified chan struct{}
-	finishOnce     sync.Once
-	backendWG      sync.WaitGroup
+	mu              sync.Mutex
+	streams         map[uint32]*streamState
+	usedStreams     streamIDHistory
+	tombstones      boundedSet[uint32]
+	carrierLanes    map[uint32]*carrierLane
+	websocketActive bool
+	pendingCost     int
+	pendingItems    int
+	closed          bool
+	closeReason     sessionCloseReason
+	lastActivity    time.Time
+	budgetNotify    chan struct{}
+	done            chan struct{}
+	finishNotified  chan struct{}
+	finishOnce      sync.Once
+	backendWG       sync.WaitGroup
 
 	onFinished            func(*Session, sessionCloseReason)
 	onCarrierRetry        func(carrierOperation)
@@ -133,10 +135,34 @@ type Session struct {
 	onStreamFinished      func()
 }
 
+// WebSocketLaneLease owns one WebSocket-lanes attachment. Its identity keeps
+// stale cleanup from affecting a later attachment that reuses the same ID.
+type WebSocketLaneLease struct {
+	session     *Session
+	laneID      uint32
+	lane        *carrierLane
+	releaseOnce sync.Once
+}
+
+// webSocketInputReservation charges one decoder-owned or worker-queued
+// WebSocket message against the same bounded session and manager budgets used
+// by carrier and backend queues.
+type webSocketInputReservation struct {
+	mu       sync.Mutex
+	session  *Session
+	cost     int
+	items    int
+	released bool
+}
+
 func newSession(options sessionOptions) *Session {
 	carrier := options.carrier
 	if carrier == "" {
 		carrier = CarrierHTTPS
+	}
+	carrierLanes := make(map[uint32]*carrierLane)
+	if carrier != CarrierWebSocketLanes {
+		carrierLanes[0] = newCarrierLane()
 	}
 	session := &Session{
 		profile:               options.profile,
@@ -150,7 +176,7 @@ func newSession(options sessionOptions) *Session {
 		budget:                options.budget,
 		streams:               make(map[uint32]*streamState),
 		tombstones:            newBoundedSet[uint32](options.limits.MaxClosedStreamIDs),
-		carrierLanes:          map[uint32]*carrierLane{0: newCarrierLane()},
+		carrierLanes:          carrierLanes,
 		lastActivity:          time.Now(),
 		budgetNotify:          make(chan struct{}),
 		done:                  make(chan struct{}),
@@ -171,13 +197,187 @@ func (s *Session) Profile() Profile { return s.profile }
 // CarrierMode returns the immutable transport selected for this session.
 func (s *Session) CarrierMode() CarrierMode { return s.carrier }
 
+func (s *Session) doneChannel() <-chan struct{} { return s.done }
+
+func (s *Session) reserveWebSocketInput(size int) (*webSocketInputReservation, bool) {
+	maxOwned := 2 * min(s.limits.MaxBodyBytes, maxWebSocketMessageBytes)
+	if size < 0 || size > maxOwned {
+		return nil, false
+	}
+	cost, ok := checkedAddInt(size, queueItemCost)
+	if !ok {
+		return nil, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || !s.reservePendingLocked(cost, 1, pendingUplink) {
+		return nil, false
+	}
+	return &webSocketInputReservation{session: s, cost: cost, items: 1}, true
+}
+
+func (r *webSocketInputReservation) resize(size int) bool {
+	if r == nil || r.session == nil {
+		return false
+	}
+	// A chunked message is coalesced by the uplink worker. The payload,
+	// linked fragment metadata, and contiguous body coexist only during that
+	// ownership transfer.
+	maxOwned := 3 * min(r.session.limits.MaxBodyBytes, maxWebSocketMessageBytes)
+	if size < 0 || size > maxOwned {
+		return false
+	}
+	newCost, ok := checkedAddInt(size, queueItemCost)
+	if !ok {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.released {
+		return false
+	}
+	r.session.mu.Lock()
+	defer r.session.mu.Unlock()
+	if r.session.closed {
+		return false
+	}
+	delta := newCost - r.cost
+	if delta > 0 && !r.session.reservePendingLocked(delta, 0, pendingUplink) {
+		return false
+	}
+	if delta < 0 {
+		r.session.releasePendingLocked(-delta, 0)
+	}
+	r.cost = newCost
+	return true
+}
+
+func (r *webSocketInputReservation) Release() {
+	if r == nil || r.session == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.released {
+		return
+	}
+	r.released = true
+	r.session.mu.Lock()
+	if !r.session.closed {
+		r.session.releasePendingLocked(r.cost, r.items)
+	}
+	r.session.mu.Unlock()
+	r.cost = 0
+	r.items = 0
+}
+
+// AcquireWebSocket reserves the single multiplexed WebSocket for this session.
+func (s *Session) AcquireWebSocket() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.carrier != CarrierWebSocket || s.websocketActive {
+		return false
+	}
+	s.websocketActive = true
+	return true
+}
+
+// AcquireWebSocketLane reserves one nonzero stream lane for a WebSocket.
+func (s *Session) AcquireWebSocketLane(laneID uint32) *WebSocketLaneLease {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.carrier != CarrierWebSocketLanes || laneID == 0 || laneID > MaxStreamID {
+		return nil
+	}
+	if s.usedStreams.Contains(laneID) {
+		return nil
+	}
+	lane := s.carrierLanes[laneID]
+	if lane == nil {
+		if len(s.carrierLanes) >= s.limits.MaxStreamsPerSession {
+			return nil
+		}
+		lane = newCarrierLane()
+		s.carrierLanes[laneID] = lane
+	}
+	if lane.websocketActive {
+		return nil
+	}
+	lane.websocketActive = true
+	s.lastActivity = time.Now()
+	return &WebSocketLaneLease{session: s, laneID: laneID, lane: lane}
+}
+
+// ProcessUp applies one uplink message through this acquired lane.
+func (l *WebSocketLaneLease) ProcessUp(sequence uint64, body []byte) (uint64, error) {
+	if l == nil || l.session == nil || l.lane == nil {
+		return 0, ErrClosed
+	}
+	return l.session.processUp(l.laneID, sequence, body, true, l.lane)
+}
+
+// Poll acknowledges and polls downlink through this acquired lane.
+func (l *WebSocketLaneLease) Poll(
+	ctx context.Context,
+	cursor uint64,
+) ([]byte, uint64, bool, error) {
+	body, next, closed, pollLease, err := l.PollCarrier(ctx, cursor)
+	pollLease.Release()
+	return body, next, closed, err
+}
+
+// PollCarrier retains the downlink claim until the caller releases it.
+func (l *WebSocketLaneLease) PollCarrier(
+	ctx context.Context,
+	cursor uint64,
+) ([]byte, uint64, bool, *PollLease, error) {
+	if l == nil || l.session == nil || l.lane == nil {
+		return nil, cursor, false, nil, ErrClosed
+	}
+	return l.session.pollCarrier(ctx, l.laneID, cursor, true, l.lane)
+}
+
+// Release idempotently detaches this lane and closes only its backend stream.
+func (l *WebSocketLaneLease) Release() {
+	if l == nil || l.session == nil || l.lane == nil {
+		return
+	}
+	l.releaseOnce.Do(func() {
+		l.session.mu.Lock()
+		backend := l.session.releaseWebSocketLaneLocked(l.laneID, l.lane)
+		l.session.mu.Unlock()
+		if backend != nil {
+			requestBackendCloses([]*backendStream{backend})
+		}
+	})
+}
+
+func (s *Session) releaseWebSocketLaneLocked(laneID uint32, expected *carrierLane) *backendStream {
+	if s.carrier != CarrierWebSocketLanes || expected == nil || s.carrierLanes[laneID] != expected {
+		return nil
+	}
+	lane := expected
+	lane.websocketActive = false
+	var backend *backendStream
+	if state := s.streams[laneID]; state != nil {
+		s.releaseStreamWritesLocked(state)
+		state.backend.cancelContext()
+		delete(s.streams, laneID)
+		s.rememberClosedLocked(laneID)
+		backend = state.backend
+	}
+	s.releaseCarrierLaneLocked(laneID)
+	s.lastActivity = time.Now()
+	return backend
+}
+
 // ProcessUp applies the next serialized uplink batch or acknowledges a
 // byte-identical retry of the last committed sequence.
 func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
-	if s.carrier != CarrierHTTPS {
+	if s.carrier.usesLanes() {
 		return 0, ErrProtocol
 	}
-	return s.processUp(0, sequence, body, false)
+	return s.processUp(0, sequence, body, false, nil)
 }
 
 // ProcessUpLane applies one uplink batch to an independent stream lane.
@@ -185,24 +385,34 @@ func (s *Session) ProcessUpLane(laneID uint32, sequence uint64, body []byte) (ui
 	if s.carrier != CarrierHTTPSLanes || laneID > MaxStreamID {
 		return 0, ErrProtocol
 	}
-	return s.processUp(laneID, sequence, body, true)
+	return s.processUp(laneID, sequence, body, true, nil)
 }
 
-func (s *Session) processUp(laneID uint32, sequence uint64, body []byte, lanes bool) (uint64, error) {
+func (s *Session) processUp(
+	laneID uint32,
+	sequence uint64,
+	body []byte,
+	lanes bool,
+	expected *carrierLane,
+) (uint64, error) {
 	digest := sha256.Sum256(body)
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
 		return 0, ErrClosed
 	}
+	lane := s.carrierLanes[laneID]
+	if expected != nil && lane != expected {
+		s.mu.Unlock()
+		return 0, ErrClosed
+	}
 	s.lastActivity = time.Now()
 	if sequence == 0 || len(body) > s.limits.MaxBodyBytes {
-		backends := s.closeLocked(sessionCloseProtocol)
+		backends := s.laneProtocolFailureLocked(laneID, expected)
 		s.mu.Unlock()
 		requestBackendCloses(backends)
 		return 0, ErrProtocol
 	}
-	lane := s.carrierLanes[laneID]
 	if lane == nil {
 		if !lanes || laneID == 0 || !batchStartsWithOpen(body, laneID) {
 			s.mu.Unlock()
@@ -211,7 +421,7 @@ func (s *Session) processUp(laneID uint32, sequence uint64, body []byte, lanes b
 				s.recordCarrierRetry(carrierOperationUplink)
 				return sequence, nil
 			}
-			s.protocolFailure()
+			s.laneProtocolFailure(laneID, expected)
 			return 0, ErrProtocol
 		}
 		lane = newCarrierLane()
@@ -221,14 +431,14 @@ func (s *Session) processUp(laneID uint32, sequence uint64, body []byte, lanes b
 		matches := bytes.Equal(digest[:], lane.lastUpDigest[:])
 		s.mu.Unlock()
 		if !matches {
-			s.protocolFailure()
+			s.laneProtocolFailure(laneID, expected)
 			return 0, ErrProtocol
 		}
 		s.recordCarrierRetry(carrierOperationUplink)
 		return sequence, nil
 	}
 	if sequence != lane.lastUpSequence+1 {
-		backends := s.closeLocked(sessionCloseProtocol)
+		backends := s.laneProtocolFailureLocked(laneID, expected)
 		s.mu.Unlock()
 		requestBackendCloses(backends)
 		return 0, ErrProtocol
@@ -254,7 +464,7 @@ func (s *Session) processUp(laneID uint32, sequence uint64, body []byte, lanes b
 		return 0, ErrClosed
 	}
 	if parseErr != nil || !s.validateBatchLocked(frames) {
-		backends := s.closeLocked(sessionCloseProtocol)
+		backends := s.laneProtocolFailureLocked(laneID, expected)
 		s.mu.Unlock()
 		requestBackendCloses(backends)
 		return 0, ErrProtocol
@@ -393,10 +603,10 @@ func (s *Session) PollLane(ctx context.Context, laneID uint32, cursor uint64) ([
 // PollCarrier retains the newest-poll claim until the returned lease is
 // released by the carrier after its HTTP response drains.
 func (s *Session) PollCarrier(ctx context.Context, cursor uint64) ([]byte, uint64, *PollLease, error) {
-	if s.carrier != CarrierHTTPS {
+	if s.carrier.usesLanes() {
 		return nil, cursor, nil, ErrProtocol
 	}
-	body, next, _, lease, err := s.pollCarrier(ctx, 0, cursor, false)
+	body, next, _, lease, err := s.pollCarrier(ctx, 0, cursor, false, nil)
 	return body, next, lease, err
 }
 
@@ -409,7 +619,7 @@ func (s *Session) PollCarrierLane(
 	if s.carrier != CarrierHTTPSLanes || laneID > MaxStreamID {
 		return nil, cursor, false, nil, ErrProtocol
 	}
-	return s.pollCarrier(ctx, laneID, cursor, true)
+	return s.pollCarrier(ctx, laneID, cursor, true, nil)
 }
 
 func (s *Session) pollCarrier(
@@ -417,6 +627,7 @@ func (s *Session) pollCarrier(
 	laneID uint32,
 	cursor uint64,
 	lanes bool,
+	expected *carrierLane,
 ) ([]byte, uint64, bool, *PollLease, error) {
 	s.mu.Lock()
 	if s.closed {
@@ -424,10 +635,14 @@ func (s *Session) pollCarrier(
 		return nil, cursor, false, nil, ErrClosed
 	}
 	lane := s.carrierLanes[laneID]
+	if expected != nil && lane != expected {
+		s.mu.Unlock()
+		return nil, cursor, false, nil, ErrClosed
+	}
 	if lane == nil {
 		closed := lanes && s.usedStreams.Contains(laneID)
 		if !closed {
-			backends := s.closeLocked(sessionCloseProtocol)
+			backends := s.laneProtocolFailureLocked(laneID, expected)
 			s.mu.Unlock()
 			requestBackendCloses(backends)
 			return nil, cursor, false, nil, ErrProtocol
@@ -493,7 +708,7 @@ func (s *Session) pollCarrier(
 			return body, next, false, lease, nil
 		}
 		if cursor != lane.downCursor {
-			backends := s.closeLocked(sessionCloseProtocol)
+			backends := s.laneProtocolFailureLocked(laneID, expected)
 			lease.releaseLocked()
 			s.mu.Unlock()
 			requestBackendCloses(backends)
@@ -504,7 +719,7 @@ func (s *Session) pollCarrier(
 		lane.unackedCost = 0
 		lane.unackedItems = 0
 	} else if cursor != lane.downCursor {
-		backends := s.closeLocked(sessionCloseProtocol)
+		backends := s.laneProtocolFailureLocked(laneID, expected)
 		lease.releaseLocked()
 		s.mu.Unlock()
 		requestBackendCloses(backends)
@@ -519,7 +734,7 @@ func (s *Session) pollCarrier(
 		}
 		if len(lane.pendingFrames) != 0 {
 			if lane.downCursor == math.MaxUint64 {
-				backends := s.closeLocked(sessionCloseProtocol)
+				backends := s.laneProtocolFailureLocked(laneID, expected)
 				lease.releaseLocked()
 				s.mu.Unlock()
 				requestBackendCloses(backends)
@@ -921,7 +1136,7 @@ func (s *Session) backendClosed(streamID uint32, backend *backendStream) {
 
 func (s *Session) queueFrameLocked(frameType FrameType, streamID uint32, payload []byte) bool {
 	laneID := uint32(0)
-	if s.carrier == CarrierHTTPSLanes {
+	if s.carrier.usesLanes() {
 		laneID = streamID
 	}
 	lane := s.carrierLanes[laneID]
@@ -1091,7 +1306,7 @@ func (s *Session) takeDownBatchLocked(lane *carrierLane) downBatch {
 
 func (s *Session) rememberClosedLocked(streamID uint32) {
 	evicted, ok := s.tombstones.Add(streamID)
-	if s.carrier == CarrierHTTPSLanes {
+	if s.carrier.usesLanes() {
 		if ok {
 			s.releaseCarrierLaneLocked(evicted)
 		}
@@ -1103,7 +1318,7 @@ func (s *Session) rememberClosedLocked(streamID uint32) {
 
 func (s *Session) dropPendingStreamFramesLocked(streamID uint32) {
 	laneID := uint32(0)
-	if s.carrier == CarrierHTTPSLanes {
+	if s.carrier.usesLanes() {
 		laneID = streamID
 	}
 	lane := s.carrierLanes[laneID]
@@ -1179,11 +1394,22 @@ func (s *Session) releaseStreamWritesLocked(state *streamState) {
 	state.writes = nil
 }
 
-func (s *Session) protocolFailure() {
+func (s *Session) laneProtocolFailure(laneID uint32, expected *carrierLane) {
 	s.mu.Lock()
-	backends := s.closeLocked(sessionCloseProtocol)
+	backends := s.laneProtocolFailureLocked(laneID, expected)
 	s.mu.Unlock()
 	requestBackendCloses(backends)
+}
+
+func (s *Session) laneProtocolFailureLocked(laneID uint32, expected *carrierLane) []*backendStream {
+	if s.carrier != CarrierWebSocketLanes {
+		return s.closeLocked(sessionCloseProtocol)
+	}
+	backend := s.releaseWebSocketLaneLocked(laneID, expected)
+	if backend == nil {
+		return nil
+	}
+	return []*backendStream{backend}
 }
 
 func (s *Session) closeLocked(reason sessionCloseReason) []*backendStream {

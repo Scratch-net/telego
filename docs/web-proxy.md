@@ -1,6 +1,6 @@
 # Native Telegram WEB proxy
 
-Telego includes an optional WEB proxy for Telegram Desktop. It supports the `https` and `https-lanes` carriers.
+Telego includes an optional WEB proxy for Telegram Desktop. It supports four carrier values.
 
 The WEB listener uses gnet and accepts private HTTP/1.1 traffic. Nginx keeps the real TLS certificate and the public website.
 
@@ -35,6 +35,7 @@ Do not publish the WEB listener to the Internet. Nginx is the only permitted cli
 - Configure Nginx as the TLS splice target.
 - Use Nginx request buffering for all requests to the WEB listener.
 - Use HTTP/2 on the public Nginx TLS server with `https-lanes`.
+- Forward HTTP/1.1 upgrade headers to Telego for both WebSocket modes.
 - Use HTTP/1.1 between Nginx and the WEB listener.
 
 The WEB carrier does not terminate TLS. It does not replace Nginx or certificate renewal.
@@ -68,9 +69,28 @@ trusted-proxy-cidrs = ["127.0.0.1/32"]
 
 Replace the hostname and secret. The `hostname` value must match the public TLS certificate.
 
-`https-lanes` is the recommended carrier. It gives each Telegram stream an independent sequence, cursor, queue, and long poll.
+The `carrier` value selects one of these transports:
+
+| Value | Transport | Compatibility and use |
+|-------|-----------|-----------------------|
+| `https` | One serialized fetch and long-poll carrier | This value has the least Nginx requirements. It is the default when `carrier` is empty or absent. |
+| `https-lanes` | One fetch and long-poll lane for each Telegram stream | Enable public HTTP/2. This value is the conservative recommendation until comparative benchmarks exist. |
+| `websocket` | One multiplexed WebSocket for the WEB session | Forward HTTP/1.1 `Upgrade` and `Connection` headers to Telego. |
+| `websocket-lanes` | One WebSocket for each Telegram stream | Use this value for the official WebSocket lane option. Forward HTTP/1.1 upgrade headers to Telego. |
 
 If `carrier` is absent, Telego uses serialized `https`. Existing configurations keep their current behavior after an upgrade.
+
+### Browser page
+
+The browser page is the active WEB carrier bridge. Telegram Desktop exchanges WEB frames with this page through its local browser channel.
+
+Keep the tab open while Telegram uses the proxy. Closing the page closes the carrier and the WEB session.
+
+In `websocket` mode, the page opens one same-host `wss` connection. In `websocket-lanes` mode, it opens one connection for each active lane.
+
+The WebSocket target is `wss://<WEB host>/api/v1/ws`. The bridge sends the bearer credential in `Sec-WebSocket-Protocol`.
+
+In `https` mode, the page uses serialized fetch requests and long polls. In `https-lanes` mode, it uses independent fetch and long-poll lanes.
 
 Telego derives `127.0.0.1:443` from the wildcard MTProxy bind. A Unix MTProxy bind produces the same Unix socket as the backend.
 
@@ -109,6 +129,11 @@ This example uses four private upstreams or listeners:
 Define the upstreams in the Nginx `http` block:
 
 ```nginx
+map $http_upgrade $telego_connection_upgrade {
+    default upgrade;
+    ''      '';
+}
+
 upstream telego_web {
     server 127.0.0.1:8080;
     keepalive 64;
@@ -138,9 +163,15 @@ error_page 419 = @telego_sanitized;
 proxy_set_header Host $http_host;
 proxy_set_header X-Forwarded-For $remote_addr;
 proxy_set_header Forwarded "";
-proxy_set_header Connection "";
-proxy_set_header Upgrade "";
+proxy_set_header Upgrade $http_upgrade;
+proxy_set_header Connection $telego_connection_upgrade;
 ```
+
+These directives keep the private upstream on HTTP/1.1 and forward WebSocket upgrades to Telego.
+
+The 40-second read timeout is longer than the 25-second WebSocket ping cycle. Telego closes an inactive WebSocket after two missed cycles.
+
+CAUTION: Never add `$http_sec_websocket_protocol` to an Nginx access log. `Sec-WebSocket-Protocol` contains the WEB bearer credential.
 
 The WEB listener checks the actual client `Host` value. Never replace `$http_host` with a trusted constant.
 
@@ -200,6 +231,10 @@ server {
         proxy_set_header X-Carrier-Mode "";
         proxy_set_header X-Up-Ack "";
         proxy_set_header X-Lane-ID "";
+        proxy_set_header Sec-WebSocket-Key "";
+        proxy_set_header Sec-WebSocket-Protocol "";
+        proxy_set_header Sec-WebSocket-Version "";
+        proxy_set_header Sec-WebSocket-Extensions "";
         proxy_set_header X-Forwarded-For "";
         proxy_set_header Forwarded "";
         proxy_set_header Connection "";
@@ -260,6 +295,7 @@ Telego uses status 419 for a carrier-shaped request that did not authenticate. T
 - It removes `Cookie` and `Authorization`.
 - It removes `Forwarded` and `X-Forwarded-For`.
 - It removes `Connection` and `Upgrade`.
+- It removes all `Sec-WebSocket-*` handshake headers.
 
 The WEB listener adds `X-Telego-Fallback` to each sentinel response. Nginx consumes both sentinel statuses and never sends them to the public client.
 
@@ -328,6 +364,15 @@ Complete these actions before the first start:
 5. Make sure that no service uses public port 80.
 6. Make sure that the public DNS record points to this host.
 7. Make sure that the internet can reach port 80 on this host.
+
+Generate a new secret and all link types through the Telego image:
+
+```bash
+docker run --rm scratchnet/telego:latest \
+  generate proxy.example.com --web-host proxy.example.com
+```
+
+Put the reported base secret in `telego.toml`. Telego derives both WEB credentials from this base secret.
 
 Create the certificate directories:
 
@@ -418,7 +463,7 @@ An existing MTProxy installation needs no secret migration. Complete these actio
 
 1. Add the `[web-proxy]` section with `carrier = "https-lanes"`.
 2. Enable HTTP/2 on the public Nginx TLS server.
-3. Add the Nginx WEB ingress and fallback locations.
+3. Add the Nginx map, WEB ingress, and fallback locations.
 4. Restart Telego.
 5. Reload Nginx.
 6. Add one of the printed WEB links to Telegram Desktop.
@@ -440,4 +485,8 @@ If you migrate from `tproxy-server`, keep its old Nginx upstream during the firs
 
 ## Current scope
 
-The native implementation supports `https` and `https-lanes`. It does not support `websocket` or `websocket-lanes`.
+The native implementation supports `https`, `https-lanes`, `websocket`, and `websocket-lanes`.
+
+The default remains `https`. `https-lanes` remains the conservative recommendation until comparative benchmarks exist.
+
+`websocket-lanes` is the official WebSocket lane option. This documentation makes no speed claim for either WebSocket mode.

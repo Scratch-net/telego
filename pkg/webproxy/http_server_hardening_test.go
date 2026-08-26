@@ -69,7 +69,7 @@ func TestHTTPServerFallbackClassesAndBridgeCookie(t *testing.T) {
 	if bridge.StatusCode != 200 || bridge.Header.Get(FallbackClassificationHeader) != "" {
 		t.Fatalf("cookie bridge = %d, headers %#v", bridge.StatusCode, bridge.Header)
 	}
-	for _, value := range []string{"GET $uri", "no request body", "Host from $http_host", "Authorization", "Cookie", "X-Up-Seq", "X-Down-Cursor", "X-Session-Token", "Forwarded", "Connection", "Upgrade"} {
+	for _, value := range []string{"GET $uri", "no request body", "Host from $http_host", "Authorization", "Cookie", "X-Up-Seq", "X-Down-Cursor", "X-Session-Token", "Sec-WebSocket-Key", "Sec-WebSocket-Protocol", "Sec-WebSocket-Version", "Sec-WebSocket-Extensions", "Forwarded", "Connection", "Upgrade"} {
 		if !strings.Contains(NginxSanitizedFallback, value) {
 			t.Errorf("sanitized fallback contract omitted %q", value)
 		}
@@ -160,7 +160,12 @@ func TestHTTPServerMatchedCarrierPressureNeverFallsThrough(t *testing.T) {
 
 func TestHTTPServerUpgradeFallbackClassification(t *testing.T) {
 	application := newHTTPTestApplication(t, 100*time.Millisecond)
+	token, _, err := newToken()
+	if err != nil {
+		t.Fatal(err)
+	}
 	for name, test := range map[string]struct {
+		method         string
 		target         string
 		extra          string
 		status         int
@@ -182,6 +187,42 @@ func TestHTTPServerUpgradeFallbackClassification(t *testing.T) {
 			target: "/socket", extra: "Authorization: Bearer AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n",
 			status: defaultPassthroughStatus, classification: FallbackOrdinarySite,
 		},
+		"ordinary WebSocket protocol list on wrong path": {
+			target: "/socket", extra: "Sec-WebSocket-Protocol: site-v1, chat-v2\r\n",
+			status: defaultPassthroughStatus, classification: FallbackOrdinarySite,
+		},
+		"Telego first WebSocket protocol on wrong path": {
+			target: "/socket", extra: "Sec-WebSocket-Protocol: " + webSocketProtocolPrefix + token + ", site-v1\r\n",
+			status: defaultSanitizedFallbackStatus, classification: FallbackSanitizedPublic,
+		},
+		"Telego middle WebSocket protocol with wrong method": {
+			method: "POST", target: "/socket", extra: "Sec-WebSocket-Protocol: site-v1, " + webSocketProtocolPrefix + token + ", chat-v2\r\n",
+			status: defaultSanitizedFallbackStatus, classification: FallbackSanitizedPublic,
+		},
+		"Telego lane last WebSocket protocol with query": {
+			target: "/socket?site=1", extra: "Sec-WebSocket-Protocol: site-v1, " + webSocketLaneProtocolPrefix + token + ".1\r\n",
+			status: defaultSanitizedFallbackStatus, classification: FallbackSanitizedPublic,
+		},
+		"malformed Telego WebSocket protocol in list": {
+			target: "/socket", extra: "Sec-WebSocket-Protocol: site-v1, " + webSocketProtocolPrefix + "invalid, chat-v2\r\n",
+			status: defaultSanitizedFallbackStatus, classification: FallbackSanitizedPublic,
+		},
+		"ordinary WebSocket protocol with wrong method": {
+			method: "POST", target: "/socket", extra: "Sec-WebSocket-Protocol: site-v1\r\n",
+			status: defaultPassthroughStatus, classification: FallbackOrdinarySite,
+		},
+		"Telego WebSocket protocol with wrong method": {
+			method: "POST", target: "/socket", extra: "Sec-WebSocket-Protocol: " + webSocketProtocolPrefix + token + "\r\n",
+			status: defaultSanitizedFallbackStatus, classification: FallbackSanitizedPublic,
+		},
+		"ordinary WebSocket protocol with query": {
+			target: "/socket?site=1", extra: "Sec-WebSocket-Protocol: site-v1\r\n",
+			status: defaultPassthroughStatus, classification: FallbackOrdinarySite,
+		},
+		"Telego WebSocket protocol with query": {
+			target: "/socket?site=1", extra: "Sec-WebSocket-Protocol: " + webSocketProtocolPrefix + token + "\r\n",
+			status: defaultSanitizedFallbackStatus, classification: FallbackSanitizedPublic,
+		},
 		"corroborated WEB bearer": {
 			target: "/socket", extra: "Authorization: Bearer AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\nX-Down-Cursor: 0\r\n",
 			status: defaultSanitizedFallbackStatus, classification: FallbackSanitizedPublic,
@@ -192,22 +233,38 @@ func TestHTTPServerUpgradeFallbackClassification(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
+			method := test.method
+			if method == "" {
+				method = "GET"
+			}
 			connection := dialHTTPTest(t, application.address)
 			defer connection.Close()
-			raw := "GET " + test.target + " HTTP/1.1\r\nHost: proxy.example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n" + test.extra + "\r\n"
+			raw := method + " " + test.target + " HTTP/1.1\r\nHost: proxy.example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n" + test.extra + "\r\n"
 			if _, err := io.WriteString(connection, raw); err != nil {
 				t.Fatal(err)
 			}
 			if err := connection.SetDeadline(time.Now().Add(time.Second)); err != nil {
 				t.Fatal(err)
 			}
-			response, err := http.ReadResponse(bufio.NewReader(connection), &http.Request{Method: "GET"})
+			response, err := http.ReadResponse(bufio.NewReader(connection), &http.Request{Method: method})
 			if err != nil {
 				t.Fatal(err)
 			}
-			_ = readHTTPBody(t, response)
+			body := readHTTPBody(t, response)
 			if response.StatusCode != test.status || response.Header.Get(FallbackClassificationHeader) != test.classification {
 				t.Fatalf("upgrade fallback = %d, headers %#v", response.StatusCode, response.Header)
+			}
+			if test.classification == FallbackSanitizedPublic {
+				if bytes.Contains(body, []byte(token)) {
+					t.Fatal("sanitized fallback body disclosed the WebSocket credential")
+				}
+				for name, values := range response.Header {
+					for _, value := range values {
+						if strings.Contains(value, token) {
+							t.Fatalf("sanitized fallback header %q disclosed the WebSocket credential", name)
+						}
+					}
+				}
 			}
 		})
 	}
@@ -226,7 +283,7 @@ func TestHTTPServerMatchedBridgeRenderErrorNeverFallsThrough(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server.renderBridge = func(string, string, int, CarrierMode) (BridgePage, error) {
+	server.renderBridge = func(string, string, int, CarrierMode, int) (BridgePage, error) {
 		return BridgePage{}, errors.New("injected render failure")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

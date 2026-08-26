@@ -799,6 +799,31 @@ func TestWebProxyConfigDefaults(t *testing.T) {
 	}
 }
 
+func TestWebProxyConfigAcceptsWebSocketCarriers(t *testing.T) {
+	for _, carrier := range []webproxy.CarrierMode{
+		webproxy.CarrierWebSocket,
+		webproxy.CarrierWebSocketLanes,
+	} {
+		t.Run(string(carrier), func(t *testing.T) {
+			cfg := Config{
+				Secrets: map[string]string{"alice": "0123456789abcdef0123456789abcdef"},
+				WebProxy: WebProxyConfig{
+					Enabled:  true,
+					Hostname: "proxy.example.com",
+					Carrier:  string(carrier),
+				},
+			}
+			runtime, err := cfg.ToWebProxyRuntimeConfig("0.0.0.0:443")
+			if err != nil {
+				t.Fatalf("ToWebProxyRuntimeConfig: %v", err)
+			}
+			if runtime.Carrier != carrier {
+				t.Fatalf("carrier = %q, want %q", runtime.Carrier, carrier)
+			}
+		})
+	}
+}
+
 func TestWebProxyConfigDerivesUnixMTProxyBackend(t *testing.T) {
 	cfg := Config{
 		Secrets:  map[string]string{"alice": "0123456789abcdef0123456789abcdef"},
@@ -963,6 +988,10 @@ func TestDockerWebProxyOperationalContracts(t *testing.T) {
 		"proxy_set_header Cookie \"\";",
 		"proxy_set_header X-Down-Cursor \"\";",
 		"proxy_set_header X-Session-Token \"\";",
+		"proxy_set_header Sec-WebSocket-Key \"\";",
+		"proxy_set_header Sec-WebSocket-Protocol \"\";",
+		"proxy_set_header Sec-WebSocket-Version \"\";",
+		"proxy_set_header Sec-WebSocket-Extensions \"\";",
 	} {
 		if !strings.Contains(nginxText, required) {
 			t.Fatalf("example lacks required arbitrary-path fallback directive %q", required)
@@ -1024,7 +1053,7 @@ func TestWebProxyConfigRequiresExplicitValuesWhenNotDerivable(t *testing.T) {
 		{name: "hostname", bind: "0.0.0.0:443", wantErr: "web-proxy.hostname is required"},
 		{name: "canonical hostname", bind: "0.0.0.0:443", mutate: func(c *Config) { c.WebProxy.Hostname = "Proxy.Example.com" }, wantErr: "invalid web-proxy.hostname"},
 		{name: "event loops", bind: "0.0.0.0:443", mutate: func(c *Config) { c.WebProxy.Hostname = "proxy.example.com"; c.WebProxy.NumEventLoops = -1 }, wantErr: "cannot be negative"},
-		{name: "carrier", bind: "0.0.0.0:443", mutate: func(c *Config) { c.WebProxy.Hostname = "proxy.example.com"; c.WebProxy.Carrier = "websocket" }, wantErr: "unsupported WEB carrier mode"},
+		{name: "carrier", bind: "0.0.0.0:443", mutate: func(c *Config) { c.WebProxy.Hostname = "proxy.example.com"; c.WebProxy.Carrier = "quic" }, wantErr: "unsupported WEB carrier mode"},
 		{name: "interface backend", bind: "192.0.2.1:443", mutate: func(c *Config) { c.WebProxy.Hostname = "proxy.example.com" }, wantErr: "not wildcard or loopback"},
 		{name: "unix HTTP bind", bind: "0.0.0.0:443", mutate: func(c *Config) {
 			c.WebProxy.Hostname = "proxy.example.com"

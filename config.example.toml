@@ -102,8 +102,13 @@ mask-host = "www.google.com"
 [web-proxy]
 enabled = false
 
-# Carrier for new WEB sessions. Use https-lanes with public HTTP/2 to remove
-# carrier head-of-line blocking. Omit this value to keep serialized https.
+# Carrier for new WEB sessions:
+# - https: one serialized fetch and long-poll carrier. This is the default.
+# - https-lanes: one fetch and long-poll lane for each Telegram stream.
+# - websocket: one multiplexed WebSocket for the WEB session.
+# - websocket-lanes: one WebSocket for each Telegram stream.
+# Use https-lanes as the conservative recommendation until benchmarks exist.
+# It requires public HTTP/2. WebSocket modes require HTTP/1.1 upgrade forwarding.
 carrier = "https-lanes"
 
 # Public DNS hostname on the real TLS certificate. Do not include a scheme,

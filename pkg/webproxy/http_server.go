@@ -39,7 +39,7 @@ const (
 	// traffic that did not authenticate. The named location must force GET; use
 	// $uri (never $request_uri) so args are empty; disable the request body; and
 	// clear every listed carrier credential/header before proxying.
-	NginxSanitizedFallback = "intercept only SanitizedFallbackStatus with X-Telego-Fallback: sanitized-public-v1; GET $uri; no args; no request body; preserve Host from $http_host; clear Content-Length, Content-Type, Transfer-Encoding, Authorization, Cookie, X-Up-Seq, X-Down-Cursor, X-Session-Token, X-Carrier-Mode, X-Up-Ack, X-Lane-ID, Forwarded, X-Forwarded-For, Connection, Upgrade"
+	NginxSanitizedFallback = "intercept only SanitizedFallbackStatus with X-Telego-Fallback: sanitized-public-v1; GET $uri; no args; no request body; preserve Host from $http_host; clear Content-Length, Content-Type, Transfer-Encoding, Authorization, Cookie, X-Up-Seq, X-Down-Cursor, X-Session-Token, X-Carrier-Mode, X-Up-Ack, X-Lane-ID, Sec-WebSocket-Key, Sec-WebSocket-Protocol, Sec-WebSocket-Version, Sec-WebSocket-Extensions, Forwarded, X-Forwarded-For, Connection, Upgrade"
 )
 
 var (
@@ -51,21 +51,23 @@ var (
 // deployment's TLS-terminating Nginx. It does not alter the public MTProxy
 // gnet engine or own Manager shutdown.
 type HTTPServerConfig struct {
-	Bind                    string
-	Hostname                string
-	Manager                 *Manager
-	PassthroughStatus       int
-	SanitizedFallbackStatus int
-	Multicore               bool
-	ReusePort               bool
-	LockOSThread            bool
-	NumEventLoop            int
-	SocketSendBuffer        int
-	HeaderTimeout           time.Duration
-	BodyTimeout             time.Duration
-	IdleTimeout             time.Duration
-	WriteTimeout            time.Duration
-	TrustedProxyCIDRs       []string
+	Bind                         string
+	Hostname                     string
+	Manager                      *Manager
+	PassthroughStatus            int
+	SanitizedFallbackStatus      int
+	Multicore                    bool
+	ReusePort                    bool
+	LockOSThread                 bool
+	NumEventLoop                 int
+	SocketSendBuffer             int
+	HeaderTimeout                time.Duration
+	BodyTimeout                  time.Duration
+	IdleTimeout                  time.Duration
+	WriteTimeout                 time.Duration
+	TrustedProxyCIDRs            []string
+	webSocketBackpressureTimeout time.Duration
+	webSocketBackpressureRetry   time.Duration
 }
 
 // HTTPServer is an independent gnet engine for HTTPS WEB carriers.
@@ -73,7 +75,7 @@ type HTTPServerConfig struct {
 type HTTPServer struct {
 	config       HTTPServerConfig
 	handler      *httpEventHandler
-	renderBridge func(string, string, int, CarrierMode) (BridgePage, error)
+	renderBridge func(string, string, int, CarrierMode, int) (BridgePage, error)
 
 	lifecycleMu    sync.Mutex
 	started        bool
@@ -137,6 +139,15 @@ func NewHTTPServer(config HTTPServerConfig) (*HTTPServer, error) {
 			*value = fallback
 		}
 	}
+	if config.webSocketBackpressureTimeout < 0 || config.webSocketBackpressureRetry < 0 {
+		return nil, fmt.Errorf("%w: WebSocket backpressure durations cannot be negative", ErrInvalidHTTPServerConfig)
+	}
+	if config.webSocketBackpressureTimeout == 0 {
+		config.webSocketBackpressureTimeout = webSocketBackpressureTimeout
+	}
+	if config.webSocketBackpressureRetry == 0 {
+		config.webSocketBackpressureRetry = webSocketBackpressureRetry
+	}
 	trustedProxies := make([]netip.Prefix, 0, len(config.TrustedProxyCIDRs))
 	for _, value := range config.TrustedProxyCIDRs {
 		prefix, err := netip.ParsePrefix(value)
@@ -148,7 +159,7 @@ func NewHTTPServer(config HTTPServerConfig) (*HTTPServer, error) {
 
 	server := &HTTPServer{
 		config:         config,
-		renderBridge:   RenderBridgeForCarrier,
+		renderBridge:   renderBridgeForCarrier,
 		ready:          make(chan struct{}),
 		done:           make(chan struct{}),
 		errors:         make(chan error, 1),
@@ -307,6 +318,9 @@ func (h *httpEventHandler) OnTraffic(connection gnet.Conn) gnet.Action {
 	if !ok {
 		return gnet.Close
 	}
+	if transport := state.webSocketTransport(); transport != nil {
+		return h.onWebSocketTraffic(connection, state, transport)
+	}
 	if state.isDraining() {
 		if connection.InboundBuffered() > maxPipelineBytes {
 			state.requestClose()
@@ -370,7 +384,7 @@ func (h *httpEventHandler) OnTraffic(connection gnet.Conn) gnet.Action {
 		if parseErr != nil {
 			return h.writeImmediate(connection, state, rejectResponse(400))
 		}
-		prepared, disposition := h.prepare(request, state.peerIP)
+		prepared, disposition := h.prepare(request, state.peerIP, connection.InboundBuffered())
 		switch disposition {
 		case requestPassthrough:
 			return h.writeImmediate(connection, state, h.passthroughFallback())
@@ -381,9 +395,13 @@ func (h *httpEventHandler) OnTraffic(connection gnet.Conn) gnet.Action {
 			return h.writeImmediate(connection, state, rejectResponse(500))
 		}
 		if consumed != len(state.input) {
+			prepared.releaseWebSocket()
 			return h.writeImmediate(connection, state, rejectResponse(400))
 		}
 		state.input = nil
+		if prepared.kind == requestWebSocket {
+			return h.upgradeWebSocket(connection, state, prepared)
+		}
 		state.pending = prepared
 		state.armDeadline(connection, h.server.config.BodyTimeout)
 	}
@@ -402,6 +420,7 @@ type httpConnectionState struct {
 	peerIP     string
 	pending    *preparedRequest
 	input      []byte
+	websocket  *webSocketConnection
 }
 
 func (s *httpConnectionState) readHeader(connection gnet.Conn) bool {
@@ -613,8 +632,10 @@ func (s *httpConnectionState) close() {
 	s.mu.Lock()
 	cancel := s.cancel
 	lease := s.lease
+	transport := s.websocket
 	s.cancel = nil
 	s.lease = nil
+	s.websocket = nil
 	s.invalidateDeadlineLocked()
 	if s.drainWake != nil {
 		s.drainWake.Stop()
@@ -624,6 +645,35 @@ func (s *httpConnectionState) close() {
 		cancel()
 	}
 	lease.Release()
+	if transport != nil {
+		transport.close()
+	}
+}
+
+func (s *httpConnectionState) beginWebSocket(
+	connection gnet.Conn,
+	transport *webSocketConnection,
+	writeTimeout time.Duration,
+) {
+	s.mu.Lock()
+	s.active = false
+	s.draining = false
+	s.cancel = nil
+	s.websocket = transport
+	s.armDeadlineLocked(connection, writeTimeout)
+	s.mu.Unlock()
+}
+
+func (s *httpConnectionState) webSocketTransport() *webSocketConnection {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.websocket
+}
+
+func (s *httpConnectionState) invalidateDeadline() {
+	s.mu.Lock()
+	s.invalidateDeadlineLocked()
+	s.mu.Unlock()
 }
 
 type requestKind uint8
@@ -634,6 +684,7 @@ const (
 	requestUp
 	requestDown
 	requestDelete
+	requestWebSocket
 )
 
 type requestDisposition uint8
@@ -645,23 +696,30 @@ const (
 )
 
 type preparedRequest struct {
-	request       carrierRequest
-	kind          requestKind
-	capability    Capability
-	bootstrapAuth *BootstrapAuthorization
-	session       *Session
-	token         string
-	sequence      uint64
-	cursor        uint64
-	laneID        uint32
-	clientIP      string
+	request            carrierRequest
+	kind               requestKind
+	capability         Capability
+	bootstrapAuth      *BootstrapAuthorization
+	session            *Session
+	token              string
+	sequence           uint64
+	cursor             uint64
+	laneID             uint32
+	clientIP           string
+	webSocket          webSocketUpgrade
+	webSocketLane      *WebSocketLaneLease
+	webSocketMultiplex bool
 }
 
-func (h *httpEventHandler) prepare(request carrierRequest, peerIP string) (*preparedRequest, requestDisposition) {
+func (h *httpEventHandler) prepare(
+	request carrierRequest,
+	peerIP string,
+	trailingBytes int,
+) (*preparedRequest, requestDisposition) {
 	if !reservedCarrierRequest(request) {
 		return nil, requestPassthrough
 	}
-	if request.upgrade || headerPresent(request, "upgrade") {
+	if request.path != webSocketPath && (request.upgrade || headerPresent(request, "upgrade")) {
 		return nil, requestSanitizedFallback
 	}
 	config := h.server.config
@@ -679,6 +737,36 @@ func (h *httpEventHandler) prepare(request carrierRequest, peerIP string) (*prep
 			return prepared, requestCarrier
 		}
 		return nil, requestSanitizedFallback
+	}
+	if request.path == webSocketPath {
+		upgrade, err := validateWebSocketUpgrade(request)
+		if err != nil || trailingBytes != 0 {
+			return nil, requestSanitizedFallback
+		}
+		session, err := config.Manager.Get(upgrade.token)
+		if err != nil || upgrade.lanes && session.CarrierMode() != CarrierWebSocketLanes ||
+			!upgrade.lanes && session.CarrierMode() != CarrierWebSocket {
+			return nil, requestSanitizedFallback
+		}
+		prepared := &preparedRequest{
+			request:   request,
+			kind:      requestWebSocket,
+			session:   session,
+			clientIP:  clientIP,
+			webSocket: upgrade,
+		}
+		if upgrade.lanes {
+			prepared.webSocketLane = session.AcquireWebSocketLane(upgrade.laneID)
+			if prepared.webSocketLane == nil {
+				return nil, requestSanitizedFallback
+			}
+		} else {
+			prepared.webSocketMultiplex = session.AcquireWebSocket()
+			if !prepared.webSocketMultiplex {
+				return nil, requestSanitizedFallback
+			}
+		}
+		return prepared, requestCarrier
 	}
 	if cookie, present := request.headers["cookie"]; present && cookie != "" {
 		return nil, requestSanitizedFallback
@@ -773,16 +861,38 @@ func requestCarrierLane(request carrierRequest, carrier CarrierMode) (uint32, bo
 }
 
 func reservedCarrierRequest(request carrierRequest) bool {
-	if request.path == "/api/v1/session" || request.path == "/api/v1/up" || request.path == "/api/v1/down" {
+	if request.path == "/api/v1/session" || request.path == "/api/v1/up" ||
+		request.path == "/api/v1/down" || request.path == webSocketPath {
 		return true
 	}
 	if request.path == "/" && bridgeQueryPresent(request.query) {
 		return true
 	}
+	for value := range strings.SplitSeq(request.headers["sec-websocket-protocol"], ",") {
+		protocol := strings.Trim(value, " \t")
+		if strings.HasPrefix(protocol, webSocketProtocolPrefix) ||
+			strings.HasPrefix(protocol, webSocketLaneProtocolPrefix) {
+			return true
+		}
+	}
 	if _, ok := bearerToken(request.headers["authorization"]); !ok {
 		return false
 	}
 	return anyHeaderPresent(request, "x-up-seq", "x-down-cursor", "x-lane-id", "x-session-token", "x-carrier-mode", "x-up-ack")
+}
+
+func (r *preparedRequest) releaseWebSocket() {
+	if r == nil {
+		return
+	}
+	if r.webSocketLane != nil {
+		r.webSocketLane.Release()
+		r.webSocketLane = nil
+	}
+	if r.webSocketMultiplex && r.session != nil {
+		r.session.Close()
+		r.webSocketMultiplex = false
+	}
 }
 
 func bridgeQueryPresent(query string) bool {
@@ -937,11 +1047,16 @@ func (h *httpEventHandler) serve(
 			}
 			return rejectResponse(500)
 		}
+		bridgeAuthority := h.server.config.Hostname
+		if manager.CarrierMode().usesWebSocket() {
+			bridgeAuthority = request.request.headers["host"]
+		}
 		page, err := h.server.renderBridge(
-			h.server.config.Hostname,
+			bridgeAuthority,
 			bootstrap,
 			manager.limits.CarrierBatchBytes,
 			manager.CarrierMode(),
+			manager.limits.MaxStreamsPerSession,
 		)
 		if err != nil {
 			return rejectResponse(500)

@@ -119,16 +119,56 @@ func parseCarrierRequestHeader(data []byte) (carrierRequest, int, error) {
 		request.contentLength = length
 		request.hasContentLength = true
 	}
-	switch connectionValue := request.headers["connection"]; {
-	case connectionValue == "", strings.EqualFold(connectionValue, "keep-alive"):
-	case strings.EqualFold(connectionValue, "close"):
-		request.close = true
-	case strings.EqualFold(connectionValue, "upgrade") && request.headers["upgrade"] != "":
-		request.upgrade = true
-	default:
+	closeConnection, upgradeConnection, validConnection := parseConnectionHeader(
+		request.headers["connection"],
+		request.headers["upgrade"],
+	)
+	if !validConnection {
 		return carrierRequest{}, 0, fmt.Errorf("%w: unsupported Connection value", errHTTPMalformed)
 	}
+	request.close = closeConnection
+	request.upgrade = upgradeConnection
 	return request, headerBytes, nil
+}
+
+func parseConnectionHeader(value, upgrade string) (closeConnection, upgradeConnection, valid bool) {
+	if value == "" {
+		return false, false, true
+	}
+
+	var keepAlive, closeSeen, upgradeSeen bool
+	for field := range strings.SplitSeq(value, ",") {
+		token := strings.Trim(field, " \t")
+		if token == "" || !validHeaderName([]byte(token)) {
+			return false, false, false
+		}
+		switch {
+		case strings.EqualFold(token, "keep-alive"):
+			if keepAlive {
+				return false, false, false
+			}
+			keepAlive = true
+		case strings.EqualFold(token, "close"):
+			if closeSeen {
+				return false, false, false
+			}
+			closeSeen = true
+		case strings.EqualFold(token, "upgrade"):
+			if upgradeSeen {
+				return false, false, false
+			}
+			upgradeSeen = true
+		default:
+			return false, false, false
+		}
+	}
+	if closeSeen {
+		return true, false, !keepAlive && !upgradeSeen
+	}
+	if upgradeSeen {
+		return false, true, upgrade != ""
+	}
+	return false, false, keepAlive
 }
 
 func parseRequestTarget(request *carrierRequest, target []byte) error {

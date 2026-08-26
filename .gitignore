@@ -1,6 +1,8 @@
 # Binaries for programs and plugins
 /telego
 telego-*
+!/examples/web-proxy/systemd/telego-cert-renew.service
+!/examples/web-proxy/systemd/telego-cert-renew.timer
 getProxySecret
 *.exe
 *.exe~

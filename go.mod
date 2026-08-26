@@ -5,6 +5,7 @@ go 1.27
 require (
 	github.com/alecthomas/kong v1.16.1
 	github.com/fsnotify/fsnotify v1.10.1
+	github.com/gobwas/ws v1.4.0
 	github.com/gotd/td v0.161.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/panjf2000/gnet/v2 v2.10.0
@@ -36,6 +37,8 @@ require (
 	github.com/go-faster/yaml v0.4.6 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
+	github.com/gobwas/httphead v0.1.0 // indirect
+	github.com/gobwas/pool v0.2.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gotd/ige v0.3.0 // indirect
 	github.com/gotd/log v0.1.0 // indirect
