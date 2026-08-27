@@ -1512,14 +1512,17 @@ func TestHTTPServerWebSocketSlowReaderRemainsFullDuplexUntilPollLeaseDrain(t *te
 		!bytes.Equal(frames[1].Payload, bytes.Repeat([]byte{0x72}, payloadSize)) {
 		t.Fatal("full-duplex input corrupted the leased downlink payload")
 	}
-	frames = readWebSocketUntilData(t, client, 3, 5*time.Second)
-	foundUplink := false
-	for _, frame := range frames {
-		if frame.Type == FrameData && frame.StreamID == 3 && bytes.Equal(frame.Payload, uplinkPayload) {
-			foundUplink = true
+	uplinkDeadline := time.Now().Add(5 * time.Second)
+	receivedUplink := make([]byte, 0, len(uplinkPayload))
+	for len(receivedUplink) < len(uplinkPayload) {
+		frames = readWebSocketBatch(t, client, time.Until(uplinkDeadline))
+		for _, frame := range frames {
+			if frame.Type == FrameData && frame.StreamID == 3 {
+				receivedUplink = append(receivedUplink, frame.Payload...)
+			}
 		}
 	}
-	if !foundUplink {
+	if !bytes.Equal(receivedUplink, uplinkPayload) {
 		t.Fatal("uplink did not remain active while the downlink PollLease drained")
 	}
 	eventually(t, time.Second, func() bool {
