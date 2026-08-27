@@ -443,6 +443,62 @@ func TestHTTPServerReportsBindFailure(t *testing.T) {
 	}
 }
 
+func TestHTTPServerCanRestartAfterClosingConnection(t *testing.T) {
+	manager := testManager(t, testProfiles(t), nil, nil)
+	address := unusedTCPAddress(t)
+	newServer := func() *HTTPServer {
+		server, err := NewHTTPServer(HTTPServerConfig{
+			Bind:         address,
+			Hostname:     "proxy.example.com",
+			Manager:      manager,
+			Multicore:    false,
+			NumEventLoop: 1,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return server
+	}
+	start := func(server *HTTPServer) {
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancel()
+		if err := server.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stop := func(server *HTTPServer) {
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancel()
+		if err := server.Stop(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	first := newServer()
+	start(first)
+	connection, err := net.Dial("tcp", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(connection, "GET / HTTP/1.1\r\nHost: proxy.example.com\r\nConnection: close\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(connection), &http.Request{Method: "GET"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = readHTTPBody(t, response)
+	expectConnectionClosed(t, connection, time.Second)
+	if err := connection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stop(first)
+
+	second := newServer()
+	start(second)
+	stop(second)
+}
+
 type httpTestApplication struct {
 	server   *HTTPServer
 	manager  *Manager

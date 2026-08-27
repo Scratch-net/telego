@@ -202,6 +202,7 @@ func (s *HTTPServer) Start(ctx context.Context) error {
 	}
 	options := []gnet.Option{
 		gnet.WithMulticore(s.config.Multicore),
+		gnet.WithReuseAddr(true),
 		gnet.WithReusePort(s.config.ReusePort),
 		gnet.WithLockOSThread(s.config.LockOSThread),
 		gnet.WithReadBufferCap(64 * 1024),
