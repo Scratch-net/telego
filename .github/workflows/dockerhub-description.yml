@@ -1,0 +1,28 @@
+name: Update Docker Hub description
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - docs/docker-hub.md
+      - .github/workflows/dockerhub-description.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  update:
+    name: Update description
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Publish Docker Hub description
+        uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: scratchnet/telego
+          short-description: High-performance Telegram MTProxy in Go with TLS fronting and WEB protocol support
+          readme-filepath: ./docs/docker-hub.md
