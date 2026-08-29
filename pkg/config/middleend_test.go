@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"testing"
@@ -26,6 +27,7 @@ func TestMiddleEndDisabledIgnoresDormantSettings(t *testing.T) {
 	config := &Config{MiddleEnd: MiddleEndConfig{
 		ProxyTag:       "invalid",
 		SOCKS5:         "invalid",
+		NATIP:          "invalid",
 		MaxConnections: -1,
 		QueueBudgetMB:  -1,
 	}}
@@ -48,7 +50,7 @@ func TestMiddleEndRuntimeDefaultsAreDerivedAndValid(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(runtimeConfig.CloseIdleConnections)
-	if !runtimeConfig.Enabled || runtimeConfig.MaxConnections != middleEndDefaultMaxConnections || runtimeConfig.ProxyTag != nil {
+	if !runtimeConfig.Enabled || runtimeConfig.MaxConnections != middleEndDefaultMaxConnections || runtimeConfig.ProxyTag != nil || runtimeConfig.Service.NATResolver == nil {
 		t.Fatalf("runtime identity = enabled %v max %d tag %v", runtimeConfig.Enabled, runtimeConfig.MaxConnections, runtimeConfig.ProxyTag)
 	}
 	service := runtimeConfig.Service
@@ -88,6 +90,7 @@ func TestMiddleEndRuntimeParsesTagAndProxyWithoutDisclosure(t *testing.T) {
 			SOCKS5:         "127.0.0.1:10808",
 			SOCKS5Username: username,
 			SOCKS5Password: password,
+			NATIP:          "8.8.8.8",
 		},
 	}
 	runtimeConfig, err := config.ToMiddleEndRuntimeConfig()
@@ -98,6 +101,10 @@ func TestMiddleEndRuntimeParsesTagAndProxyWithoutDisclosure(t *testing.T) {
 	wantTag := middleend.ProxyTag{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef}
 	if runtimeConfig.ProxyTag == nil || !bytes.Equal(runtimeConfig.ProxyTag[:], wantTag[:]) {
 		t.Fatal("proxy tag was not parsed exactly")
+	}
+	natIP, err := runtimeConfig.Service.NATResolver.Resolve(t.Context(), middleend.AddressFamilyIPv4)
+	if err != nil || natIP != netip.MustParseAddr(config.MiddleEnd.NATIP) {
+		t.Fatalf("static NAT IP = %s, %v", natIP, err)
 	}
 	request := &http.Request{URL: newURLForTest(t, "https://core.telegram.org/getProxySecret")}
 	proxyURL, err := runtimeConfig.artifactTransport.Proxy(request)
@@ -148,6 +155,8 @@ func TestMiddleEndRuntimeRejectsUnsafeExpertOverrides(t *testing.T) {
 		},
 		"invalid tag":         func(config *Config) { config.MiddleEnd.ProxyTag = "abcd" },
 		"artifact proxy path": func(config *Config) { config.MiddleEnd.ArtifactProxy = "http://127.0.0.1:10808/path" },
+		"malformed NAT IP":    func(config *Config) { config.MiddleEnd.NATIP = "public.example" },
+		"private NAT IP":      func(config *Config) { config.MiddleEnd.NATIP = "172.18.0.2" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			config := &Config{
@@ -196,7 +205,7 @@ func TestMiddleEndFrontendPolicyAndFingerprint(t *testing.T) {
 		t.Fatalf("fingerprint = %q", fingerprint)
 	}
 	copyConfig := *config
-	copyConfig.MiddleEnd.QueueBudgetMB++
+	copyConfig.MiddleEnd.NATIP = "8.8.8.8"
 	if copyConfig.middleEndFingerprint() == fingerprint {
 		t.Fatal("restart-only Middle-End change did not alter fingerprint")
 	}

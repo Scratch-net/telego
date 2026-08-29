@@ -29,6 +29,10 @@ type middleEndMonitorCounters struct {
 	repairing               bool
 	refreshFailures         uint64
 	generationFailures      uint64
+	natIPv4Successes        uint64
+	natIPv4Failures         uint64
+	natIPv6Successes        uint64
+	natIPv6Failures         uint64
 	slotRepairSuccesses     uint64
 	slotRepairFailures      uint64
 	responseBackpressure    uint64
@@ -99,6 +103,10 @@ func (m *middleEndMonitor) observe() {
 		repairing:               snapshot.Supervisor.Repairing,
 		refreshFailures:         snapshot.Coordinator.RefreshFailures,
 		generationFailures:      snapshot.Coordinator.GenerationFailures,
+		natIPv4Successes:        snapshot.NAT.IPv4.Successes,
+		natIPv4Failures:         snapshot.NAT.IPv4.Failures,
+		natIPv6Successes:        snapshot.NAT.IPv6.Successes,
+		natIPv6Failures:         snapshot.NAT.IPv6.Failures,
 		slotRepairSuccesses:     snapshot.Supervisor.SlotRepairSuccesses,
 		slotRepairFailures:      snapshot.Supervisor.SlotRepairFailures,
 		responseBackpressure:    responseBackpressure,
@@ -109,6 +117,22 @@ func (m *middleEndMonitor) observe() {
 		directFallbacksActive:   frontend.DirectFallbacksActive,
 	}
 	previous := m.previous
+	if !previous.initialized && snapshot.NAT.Static {
+		logMiddleEndStaticNAT("ipv4", snapshot.NAT.IPv4)
+		logMiddleEndStaticNAT("ipv6", snapshot.NAT.IPv6)
+	}
+	logMiddleEndNATProbeChanges(
+		"ipv4",
+		snapshot.NAT.IPv4,
+		previous.natIPv4Successes,
+		previous.natIPv4Failures,
+	)
+	logMiddleEndNATProbeChanges(
+		"ipv6",
+		snapshot.NAT.IPv6,
+		previous.natIPv6Successes,
+		previous.natIPv6Failures,
+	)
 	if !previous.initialized || current.admitting != previous.admitting {
 		if current.admitting {
 			livePayloadCapacity, rotationPayloadCapacity := middleEndPayloadCapacity(snapshot, frontend)
@@ -196,6 +220,43 @@ func (m *middleEndMonitor) observe() {
 	m.observeLinkPressure("active", snapshot.Supervisor.Active, snapshot.Capacity)
 	m.observeLinkPressure("retiring", snapshot.Supervisor.Retiring, snapshot.Capacity)
 	m.previous = current
+}
+
+func logMiddleEndStaticNAT(family string, snapshot middleend.NATResolverFamilySnapshot) {
+	if !snapshot.Ready || !snapshot.PublicIP.IsValid() {
+		return
+	}
+	log.Info().
+		Str("family", family).
+		Str("public_ip", snapshot.PublicIP.String()).
+		Msg("Middle-End uses the configured NAT public IP for private direct sockets")
+}
+
+func logMiddleEndNATProbeChanges(
+	family string,
+	snapshot middleend.NATResolverFamilySnapshot,
+	previousSuccesses uint64,
+	previousFailures uint64,
+) {
+	if snapshot.Successes > previousSuccesses {
+		log.Info().
+			Str("family", family).
+			Str("public_ip", snapshot.PublicIP.String()).
+			Int("responding_servers", snapshot.RespondingServers).
+			Int("agreeing_servers", snapshot.AgreeingServers).
+			Uint64("successes_total", snapshot.Successes).
+			Time("cache_expires_at", snapshot.ExpiresAt).
+			Msg("Middle-End resolved the NAT public IP for private direct sockets")
+	}
+	if snapshot.Failures > previousFailures {
+		log.Warn().
+			Str("family", family).
+			Uint64("new_failures", snapshot.Failures-previousFailures).
+			Uint64("failures_total", snapshot.Failures).
+			Time("retry_at", snapshot.RetryAt).
+			Err(snapshot.LastFailure).
+			Msg("Middle-End NAT public-IP discovery failed; direct fallback remains active")
+	}
 }
 
 // middleEndPayloadCapacity returns conservative logical payload-retention

@@ -30,6 +30,7 @@ type ServiceConfig struct {
 	Supervisor             GenerationSupervisorConfig
 	CoordinatorRetry       time.Duration
 	SOCKS5                 *SOCKS5Dialer
+	NATResolver            *NATResolver
 	EndpointDialTimeout    time.Duration
 	DialConcurrency        int
 	LinksPerDC             int
@@ -80,6 +81,7 @@ func (c ServiceConfig) Validate() error {
 type ServiceSnapshot struct {
 	Coordinator GenerationCoordinatorSnapshot
 	Supervisor  GenerationSupervisorSnapshot
+	NAT         NATResolverSnapshot
 	Capacity    ServiceCapacitySnapshot
 }
 
@@ -115,6 +117,7 @@ type serviceState struct {
 	runtime     *GnetClientRuntime
 	supervisor  *FixedBindingGenerationSupervisor
 	coordinator *GenerationCoordinator
+	nat         *NATResolver
 	capacity    ServiceCapacitySnapshot
 
 	closeOnce sync.Once
@@ -152,6 +155,7 @@ func NewService(config ServiceConfig) (*Service, error) {
 			Runtime:             runtime,
 			Snapshot:            snapshot,
 			SOCKS5:              config.SOCKS5,
+			NATResolver:         config.NATResolver,
 			EndpointDialTimeout: config.EndpointDialTimeout,
 			DialConcurrency:     config.DialConcurrency,
 			LinksPerDC:          config.LinksPerDC,
@@ -180,6 +184,7 @@ func NewService(config ServiceConfig) (*Service, error) {
 		runtime:     runtime,
 		supervisor:  supervisor,
 		coordinator: coordinator,
+		nat:         config.NATResolver,
 		capacity: ServiceCapacitySnapshot{
 			EventLoops:           config.Runtime.EventLoops,
 			LinksPerDC:           config.LinksPerDC,
@@ -242,6 +247,7 @@ func (s *Service) Snapshot() ServiceSnapshot {
 	return ServiceSnapshot{
 		Coordinator: s.state.coordinator.Snapshot(),
 		Supervisor:  s.state.supervisor.Snapshot(),
+		NAT:         s.state.nat.Snapshot(),
 		Capacity:    s.state.capacity,
 	}
 }

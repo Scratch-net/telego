@@ -27,7 +27,10 @@ type generationFactoryTestDialer struct {
 func (d *generationFactoryTestDialer) Dial(
 	ctx context.Context,
 	endpoint netip.AddrPort,
+	connectTimeout time.Duration,
 ) (*net.TCPConn, netip.AddrPort, netip.AddrPort, error) {
+	dialContext, cancelDial := context.WithTimeout(ctx, connectTimeout)
+	defer cancelDial()
 	d.mu.Lock()
 	d.attempts = append(d.attempts, endpoint)
 	failure := d.failures[endpoint]
@@ -47,8 +50,8 @@ func (d *generationFactoryTestDialer) Dial(
 	if d.release != nil {
 		select {
 		case <-d.release:
-		case <-ctx.Done():
-			return nil, netip.AddrPort{}, netip.AddrPort{}, context.Cause(ctx)
+		case <-dialContext.Done():
+			return nil, netip.AddrPort{}, netip.AddrPort{}, context.Cause(dialContext)
 		}
 	}
 	if failure != nil {

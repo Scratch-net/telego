@@ -29,6 +29,7 @@ type GnetGenerationFactoryConfig struct {
 	Runtime             *GnetClientRuntime
 	Snapshot            ArtifactSnapshot
 	SOCKS5              *SOCKS5Dialer
+	NATResolver         *NATResolver
 	EndpointDialTimeout time.Duration
 	DialConcurrency     int
 	LinksPerDC          int
@@ -95,7 +96,7 @@ type generationSlotJob struct {
 }
 
 type generationEndpointDialer interface {
-	Dial(context.Context, netip.AddrPort) (*net.TCPConn, netip.AddrPort, netip.AddrPort, error)
+	Dial(context.Context, netip.AddrPort, time.Duration) (*net.TCPConn, netip.AddrPort, netip.AddrPort, error)
 }
 
 type generationLinkBuilder interface {
@@ -104,6 +105,7 @@ type generationLinkBuilder interface {
 
 type productionGenerationDialer struct {
 	socks5 *SOCKS5Dialer
+	nat    *NATResolver
 }
 
 // NewGnetGenerationFactory validates and retains one immutable artifact
@@ -114,7 +116,7 @@ func NewGnetGenerationFactory(config GnetGenerationFactoryConfig) (*GnetGenerati
 	}
 	return newGnetGenerationFactory(
 		config,
-		productionGenerationDialer{socks5: config.SOCKS5},
+		productionGenerationDialer{socks5: config.SOCKS5, nat: config.NATResolver},
 		config.Runtime,
 		os.Getpid(),
 		time.Now(),
@@ -341,9 +343,7 @@ func (s *gnetGenerationFactoryState) buildSlot(ctx context.Context, dcID DCID, c
 	candidates := generationEndpointOrder(s.snapshot.Endpoints(dcID), cursor)
 	var lastErr error
 	for _, candidate := range candidates {
-		dialContext, cancel := context.WithTimeout(ctx, s.endpointDialTimeout)
-		conn, serverAddr, clientAddr, err := s.dialer.Dial(dialContext, candidate.endpoint)
-		cancel()
+		conn, serverAddr, clientAddr, err := s.dialer.Dial(ctx, candidate.endpoint, s.endpointDialTimeout)
 		if err != nil {
 			lastErr = err
 			continue
@@ -451,9 +451,12 @@ func closeGenerationSlots(results []generationSlotResult) {
 func (d productionGenerationDialer) Dial(
 	ctx context.Context,
 	endpoint netip.AddrPort,
+	connectTimeout time.Duration,
 ) (*net.TCPConn, netip.AddrPort, netip.AddrPort, error) {
+	dialContext, cancelDial := context.WithTimeout(ctx, connectTimeout)
+	defer cancelDial()
 	if d.socks5 != nil {
-		conn, bound, err := d.socks5.DialContext(ctx, endpoint.String())
+		conn, bound, err := d.socks5.DialContext(dialContext, endpoint.String())
 		if err != nil {
 			return nil, netip.AddrPort{}, netip.AddrPort{}, fmt.Errorf("SOCKS5 CONNECT: %w", err)
 		}
@@ -469,7 +472,7 @@ func (d productionGenerationDialer) Dial(
 	if endpoint.Addr().Unmap().Is4() {
 		network = "tcp4"
 	}
-	connection, err := (&net.Dialer{}).DialContext(ctx, network, endpoint.String())
+	connection, err := (&net.Dialer{}).DialContext(dialContext, network, endpoint.String())
 	if err != nil {
 		return nil, netip.AddrPort{}, netip.AddrPort{}, fmt.Errorf("direct CONNECT: %w", err)
 	}
@@ -478,7 +481,22 @@ func (d productionGenerationDialer) Dial(
 		_ = connection.Close()
 		return nil, netip.AddrPort{}, netip.AddrPort{}, fmt.Errorf("direct CONNECT returned %T, want *net.TCPConn", connection)
 	}
-	serverAddr, clientAddr, err := DirectAddressTuple(conn, endpoint)
+	cancelDial()
+	serverAddr, clientAddr, tupleErr := DirectAddressTuple(conn, endpoint)
+	if tupleErr == nil {
+		return conn, serverAddr, clientAddr, nil
+	}
+	rawServer, rawClient, rawErr := directSocketAddressTuple(conn, endpoint)
+	if rawErr != nil || validatePublicEndpoint("server", rawServer) != nil || validatePublicEndpoint("client", rawClient) == nil || d.nat == nil {
+		_ = conn.Close()
+		return nil, netip.AddrPort{}, netip.AddrPort{}, tupleErr
+	}
+	publicIP, err := d.nat.Resolve(ctx, addressFamily(rawClient.Addr()))
+	if err != nil {
+		_ = conn.Close()
+		return nil, netip.AddrPort{}, netip.AddrPort{}, fmt.Errorf("direct NAT tuple: %w", err)
+	}
+	serverAddr, clientAddr, err = DirectNATAddressTuple(conn, endpoint, publicIP)
 	if err != nil {
 		_ = conn.Close()
 		return nil, netip.AddrPort{}, netip.AddrPort{}, err

@@ -8,11 +8,81 @@ import (
 	"time"
 )
 
-var sharedIPv4Prefix = netip.MustParsePrefix("100.64.0.0/10")
+var nonPublicAddressPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("100::/64"),
+	netip.MustParsePrefix("2001:db8::/32"),
+	netip.MustParsePrefix("2002::/16"),
+}
 
 // DirectAddressTuple validates that an established direct TCP connection has
 // a public, exact endpoint tuple suitable for Telegram's address-bound KDF.
 func DirectAddressTuple(conn *net.TCPConn, selectedServer netip.AddrPort) (netip.AddrPort, netip.AddrPort, error) {
+	return directAddressTuple(conn, selectedServer, netip.Addr{})
+}
+
+// DirectNATAddressTuple validates a direct TCP connection and replaces only a
+// non-public client IP with publicIP. It always retains the exact kernel TCP
+// source port. A public socket endpoint is never changed.
+func DirectNATAddressTuple(
+	conn *net.TCPConn,
+	selectedServer netip.AddrPort,
+	publicIP netip.Addr,
+) (netip.AddrPort, netip.AddrPort, error) {
+	return directAddressTuple(conn, selectedServer, publicIP)
+}
+
+func directAddressTuple(
+	conn *net.TCPConn,
+	selectedServer netip.AddrPort,
+	publicIP netip.Addr,
+) (netip.AddrPort, netip.AddrPort, error) {
+	serverAddr, clientAddr, err := directSocketAddressTuple(conn, selectedServer)
+	if err != nil {
+		return netip.AddrPort{}, netip.AddrPort{}, err
+	}
+	if err := validatePublicEndpoint("server", serverAddr); err != nil {
+		return netip.AddrPort{}, netip.AddrPort{}, fmt.Errorf("direct TCP tuple: %w", err)
+	}
+	translated, err := translateNATClientAddress(clientAddr, publicIP)
+	if err != nil {
+		return netip.AddrPort{}, netip.AddrPort{}, fmt.Errorf("direct TCP tuple: %w", err)
+	}
+	if err := validatePublicTuple(serverAddr, translated); err != nil {
+		return netip.AddrPort{}, netip.AddrPort{}, fmt.Errorf("direct NAT TCP tuple: %w", err)
+	}
+	return serverAddr, translated, nil
+}
+
+func translateNATClientAddress(clientAddr netip.AddrPort, publicIP netip.Addr) (netip.AddrPort, error) {
+	clientErr := validatePublicEndpoint("client", clientAddr)
+	if clientErr == nil {
+		return clientAddr, nil
+	}
+	if !publicIP.IsValid() {
+		return netip.AddrPort{}, clientErr
+	}
+	translated := netip.AddrPortFrom(publicIP.Unmap(), clientAddr.Port())
+	if err := validatePublicEndpoint("translated client", translated); err != nil {
+		return netip.AddrPort{}, err
+	}
+	if clientAddr.Addr().Unmap().Is4() != translated.Addr().Is4() {
+		return netip.AddrPort{}, fmt.Errorf("%w: translated client address family differs from the TCP socket", ErrTupleNotAuthoritative)
+	}
+	return translated, nil
+}
+
+func directSocketAddressTuple(
+	conn *net.TCPConn,
+	selectedServer netip.AddrPort,
+) (netip.AddrPort, netip.AddrPort, error) {
 	if conn == nil {
 		return netip.AddrPort{}, netip.AddrPort{}, fmt.Errorf("%w: nil direct TCP connection", ErrTupleNotAuthoritative)
 	}
@@ -31,8 +101,8 @@ func DirectAddressTuple(conn *net.TCPConn, selectedServer netip.AddrPort) (netip
 	if serverAddr != selectedServer {
 		return netip.AddrPort{}, netip.AddrPort{}, fmt.Errorf("%w: direct remote endpoint differs from the selected artifact endpoint", ErrTupleNotAuthoritative)
 	}
-	if err := validatePublicTuple(serverAddr, clientAddr); err != nil {
-		return netip.AddrPort{}, netip.AddrPort{}, fmt.Errorf("direct TCP tuple: %w", err)
+	if err := validateAddressTuple(serverAddr, clientAddr); err != nil {
+		return netip.AddrPort{}, netip.AddrPort{}, fmt.Errorf("%w: direct TCP tuple: %v", ErrTupleNotAuthoritative, err)
 	}
 	return serverAddr, clientAddr, nil
 }
@@ -101,8 +171,10 @@ func validatePublicEndpoint(label string, endpoint netip.AddrPort) error {
 	if !address.IsGlobalUnicast() || address.IsPrivate() || address.IsLoopback() || address.IsLinkLocalUnicast() {
 		return fmt.Errorf("%w: %s endpoint is not public global-unicast", ErrTupleNotAuthoritative, label)
 	}
-	if address.Is4() && sharedIPv4Prefix.Contains(address) {
-		return fmt.Errorf("%w: %s endpoint uses shared address space", ErrTupleNotAuthoritative, label)
+	for _, prefix := range nonPublicAddressPrefixes {
+		if prefix.Contains(address) {
+			return fmt.Errorf("%w: %s endpoint uses non-public address space", ErrTupleNotAuthoritative, label)
+		}
 	}
 	return nil
 }

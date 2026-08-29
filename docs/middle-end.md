@@ -23,6 +23,9 @@ enabled = true
 # Override the proxy for artifact requests only.
 # artifact-proxy = "http://127.0.0.1:3128"
 
+# Usually, leave this value empty. See "Direct links and NAT."
+# nat-ip = "YOUR_PUBLIC_IP"
+
 # These expert values can only reduce the derived defaults.
 # max-connections = 0
 # queue-budget-mb = 0
@@ -31,6 +34,26 @@ enabled = true
 Restart Telego after a change to this section. The hot reload does not change the ME runtime.
 
 Do not publish the proxy tag or the SOCKS5 credentials in an issue or log.
+
+## Direct links and NAT
+
+Direct ME links use the address and port that the Telegram ME server sees. These values are inputs to the ME key derivation.
+
+If the TCP socket has a public IP, Telego uses the exact socket tuple. Telego does not run a NAT probe.
+
+If the TCP socket has a private IP, Telego gets the public IP from a fixed STUN pool. This behavior supports Docker bridge networks.
+
+Telego keeps the kernel-assigned TCP source port. It does not use the UDP port from the STUN response.
+
+Telego caches a successful STUN result for 10 minutes. Concurrent ME links share one probe, and failed probes use a bounded backoff.
+
+The ME handshake validates the complete tuple. If NAT changes the TCP source port, the handshake fails and direct fallback stays available.
+
+Set `nat-ip` only when automatic discovery returns the wrong public IP. The value must be a public IPv4 or IPv6 address.
+
+The `nat-ip` value replaces only a private socket IP from the same address family. It cannot replace the TCP source port.
+
+SOCKS5 links do not use `nat-ip` or STUN. They use the exact public `BND.ADDR:BND.PORT` from the SOCKS5 CONNECT response.
 
 ## Connection routing
 
@@ -85,6 +108,8 @@ Telego derives the operational limits below. Most installations do not need an o
 | Frontend output budget | 32MiB plus 16KiB | Uses the same derived value |
 | Response items for each binding | 768 | Fixed from the telemt route limit |
 | Endpoint dial timeout | 3s | Fixed from the official implementation |
+| NAT probe timeout | 5s | One shared STUN batch for private direct sockets |
+| NAT result cache | 10 minutes | Matches the public telemt cache period |
 | Generation preparation timeout | 100s | Covers construction, startup, and the first all-DC probe |
 | Retiring generation drain | 90s | Closes remaining bindings after the deadline |
 
@@ -112,9 +137,17 @@ The queue metrics report current use, capacity, and lifetime high-water values. 
 
 Telego also logs route fallback, artifact failure, generation failure, physical-link repair, and binding eviction events.
 
+Telego logs NAT discovery results, the selected public IP, responder agreement, and the retry time.
+
 ## Troubleshooting
 
 If direct fallback stays active, read the latest artifact or generation error. Then make sure that the artifact URLs and ME endpoints are reachable.
+
+If the error reports NAT discovery, make sure that the container can send UDP to the STUN pool.
+
+If STUN reports the wrong IP, set `nat-ip` to the public IP that carries the ME TCP connections.
+
+If the ME handshake still fails, inspect the host NAT rules. The rules must keep the TCP source port for each ME connection.
 
 If you add a SOCKS5 proxy, make sure that it accepts remote DNS and the configured credentials. Restart Telego after the change.
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"runtime"
 	"strings"
@@ -47,10 +48,30 @@ var (
 	middleEndRepairBackoffInitial   = 500 * time.Millisecond
 	middleEndRepairBackoffMaximum   = 30 * time.Second
 	middleEndEndpointDialTimeout    = 3 * time.Second
+	middleEndNATProbeTimeout        = 5 * time.Second
+	middleEndNATCacheTTL            = 10 * time.Minute
+	middleEndNATBackoffInitial      = time.Minute
+	middleEndNATBackoffMaximum      = time.Hour
 	middleEndOutputRetryInitial     = 25 * time.Millisecond
 	middleEndOutputRetryMaximum     = 120 * time.Millisecond
 	middleEndOutputStallTimeout     = 100 * time.Second
 )
+
+var middleEndNATSTUNServers = []string{
+	"stun.l.google.com:5349",
+	"stun1.l.google.com:3478",
+	"stun.gmx.net:3478",
+	"stun.l.google.com:19302",
+	"stun.1und1.de:3478",
+	"stun1.l.google.com:19302",
+	"stun2.l.google.com:19302",
+	"stun3.l.google.com:19302",
+	"stun4.l.google.com:19302",
+	"stun.services.mozilla.com:3478",
+	"stun.stunprotocol.org:3478",
+	"stun.nextcloud.com:3478",
+	"stun.voip.eutelia.it:3478",
+}
 
 // MiddleEndRuntimeConfig owns the non-network resources needed to construct a
 // complete ME service and frontend. It never exposes proxy credentials or the
@@ -131,6 +152,10 @@ func (c *Config) ToMiddleEndRuntimeConfig() (MiddleEndRuntimeConfig, error) {
 	if err != nil {
 		return MiddleEndRuntimeConfig{}, err
 	}
+	natResolver, err := newMiddleEndNATResolver(c.MiddleEnd.NATIP)
+	if err != nil {
+		return MiddleEndRuntimeConfig{}, err
+	}
 	artifactProxy, err := parseMiddleEndArtifactProxy(c.MiddleEnd.ArtifactProxy, socksProxyURL)
 	if err != nil {
 		return MiddleEndRuntimeConfig{}, err
@@ -163,6 +188,7 @@ func (c *Config) ToMiddleEndRuntimeConfig() (MiddleEndRuntimeConfig, error) {
 		},
 		CoordinatorRetry:    middleEndCoordinatorRetry,
 		SOCKS5:              socks5,
+		NATResolver:         natResolver,
 		EndpointDialTimeout: middleEndEndpointDialTimeout,
 		DialConcurrency:     middleEndDialConcurrency,
 		LinksPerDC:          middleEndLinksPerDC,
@@ -204,6 +230,31 @@ func (c *Config) ToMiddleEndRuntimeConfig() (MiddleEndRuntimeConfig, error) {
 		MaxConnections:    maxConnections,
 		artifactTransport: transport,
 	}, nil
+}
+
+func newMiddleEndNATResolver(value string) (*middleend.NATResolver, error) {
+	var publicIP netip.Addr
+	value = strings.TrimSpace(value)
+	if value != "" {
+		parsed, err := netip.ParseAddr(value)
+		if err != nil {
+			return nil, errors.New("middle-end.nat-ip must be a public IPv4 or IPv6 address")
+		}
+		publicIP = parsed
+	}
+	resolver, err := middleend.NewNATResolver(middleend.NATResolverConfig{
+		PublicIP:              publicIP,
+		STUNServers:           middleEndNATSTUNServers,
+		ProbeTimeout:          middleEndNATProbeTimeout,
+		ProbeConcurrency:      len(middleEndNATSTUNServers),
+		CacheTTL:              middleEndNATCacheTTL,
+		FailureBackoffInitial: middleEndNATBackoffInitial,
+		FailureBackoffMaximum: middleEndNATBackoffMaximum,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("invalid middle-end.nat-ip or NAT discovery policy: %w", err)
+	}
+	return resolver, nil
 }
 
 func middleEndMaxConnections(configured int) int {
@@ -301,13 +352,14 @@ func (c *Config) middleEndFingerprint() string {
 	digest := sha256.New()
 	_, _ = fmt.Fprintf(
 		digest,
-		"enabled=%t\x00tag=%s\x00socks=%s\x00user=%s\x00password=%s\x00artifact=%s\x00max=%d\x00budget=%d\x00loops=%d\x00upstream=%s",
+		"enabled=%t\x00tag=%s\x00socks=%s\x00user=%s\x00password=%s\x00artifact=%s\x00nat=%s\x00max=%d\x00budget=%d\x00loops=%d\x00upstream=%s",
 		c.MiddleEnd.Enabled,
 		c.MiddleEnd.ProxyTag,
 		c.MiddleEnd.SOCKS5,
 		c.MiddleEnd.SOCKS5Username,
 		c.MiddleEnd.SOCKS5Password,
 		c.MiddleEnd.ArtifactProxy,
+		c.MiddleEnd.NATIP,
 		c.MiddleEnd.MaxConnections,
 		c.MiddleEnd.QueueBudgetMB,
 		c.Performance.NumEventLoops,

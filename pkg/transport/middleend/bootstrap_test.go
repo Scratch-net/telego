@@ -16,8 +16,8 @@ import (
 )
 
 var (
-	bootstrapTestServer = netip.MustParseAddrPort("192.0.2.10:443")
-	bootstrapTestClient = netip.MustParseAddrPort("198.51.100.10:32000")
+	bootstrapTestServer = netip.MustParseAddrPort("149.154.167.50:443")
+	bootstrapTestClient = netip.MustParseAddrPort("1.1.1.1:32000")
 	bootstrapTestSecret = bytes.Repeat([]byte{0x31}, MinimumSecretSize)
 )
 

@@ -131,6 +131,7 @@ type MiddleEndConfig struct {
 	SOCKS5Username string `toml:"socks5-username"`
 	SOCKS5Password string `toml:"socks5-password"`
 	ArtifactProxy  string `toml:"artifact-proxy"`
+	NATIP          string `toml:"nat-ip"`
 	MaxConnections int    `toml:"max-connections"`
 	QueueBudgetMB  int    `toml:"queue-budget-mb"`
 }

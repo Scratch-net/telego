@@ -1,12 +1,261 @@
 package middleend
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/pion/stun/v3"
 )
+
+func natResolverTestConfig() NATResolverConfig {
+	return NATResolverConfig{
+		STUNServers:           []string{"stun-a.invalid:3478", "stun-b.invalid:3478"},
+		ProbeTimeout:          time.Second,
+		ProbeConcurrency:      2,
+		CacheTTL:              10 * time.Minute,
+		FailureBackoffInitial: time.Minute,
+		FailureBackoffMaximum: time.Hour,
+	}
+}
+
+func TestNATResolverStaticValidationAndRedaction(t *testing.T) {
+	config := natResolverTestConfig()
+	config.PublicIP = netip.MustParseAddr("8.8.8.8")
+	resolver, err := NewNATResolver(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	address, err := resolver.Resolve(t.Context(), AddressFamilyIPv4)
+	if err != nil || address != config.PublicIP {
+		t.Fatalf("static Resolve = %s, %v", address, err)
+	}
+	if _, err := resolver.Resolve(t.Context(), AddressFamilyIPv6); !errors.Is(err, ErrNATPublicIPDiscovery) {
+		t.Fatalf("wrong-family static error = %v", err)
+	}
+	staticSnapshot := resolver.Snapshot()
+	if !staticSnapshot.Configured || !staticSnapshot.Static || !staticSnapshot.IPv4.Ready || staticSnapshot.IPv4.PublicIP != config.PublicIP {
+		t.Fatalf("static snapshot = %+v", staticSnapshot)
+	}
+	formatted := fmt.Sprintf("%v %#v %v %#v", config, config, resolver, resolver)
+	if strings.Contains(formatted, config.PublicIP.String()) || strings.Contains(formatted, config.STUNServers[0]) {
+		t.Fatalf("NAT formatting exposed addresses: %s", formatted)
+	}
+
+	for name, configure := range map[string]func(*NATResolverConfig){
+		"private static":       func(c *NATResolverConfig) { c.PublicIP = netip.MustParseAddr("172.18.0.2") },
+		"documentation static": func(c *NATResolverConfig) { c.PublicIP = netip.MustParseAddr("192.0.2.1") },
+		"no servers":           func(c *NATResolverConfig) { c.STUNServers = nil },
+		"zero timeout":         func(c *NATResolverConfig) { c.ProbeTimeout = 0 },
+		"zero concurrency":     func(c *NATResolverConfig) { c.ProbeConcurrency = 0 },
+		"invalid server":       func(c *NATResolverConfig) { c.STUNServers[0] = "missing-port" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := natResolverTestConfig()
+			configure(&candidate)
+			if _, err := NewNATResolver(candidate); !errors.Is(err, ErrInvalidNATResolver) {
+				t.Fatalf("error = %v, want ErrInvalidNATResolver", err)
+			}
+		})
+	}
+}
+
+func TestNATResolverSingleflightCacheAndExpiry(t *testing.T) {
+	var clock atomic.Int64
+	clock.Store(time.Unix(1_700_000_000, 0).UnixNano())
+	var calls atomic.Int32
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enterOnce sync.Once
+	probe := func(ctx context.Context, family AddressFamily, _ []string, _ int) (natProbeResult, error) {
+		calls.Add(1)
+		enterOnce.Do(func() { close(entered) })
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return natProbeResult{}, context.Cause(ctx)
+		}
+		if family != AddressFamilyIPv4 {
+			return natProbeResult{}, errors.New("unexpected family")
+		}
+		return natProbeResult{address: netip.MustParseAddr("8.8.8.8"), respondingServers: 2, agreeingServers: 2}, nil
+	}
+	resolver, err := newNATResolver(
+		natResolverTestConfig(),
+		func() time.Time { return time.Unix(0, clock.Load()) },
+		probe,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	results := make(chan error, 8)
+	var workers sync.WaitGroup
+	for range 8 {
+		workers.Go(func() {
+			address, err := resolver.Resolve(t.Context(), AddressFamilyIPv4)
+			if err == nil && address != netip.MustParseAddr("8.8.8.8") {
+				err = fmt.Errorf("address = %s", address)
+			}
+			results <- err
+		})
+	}
+	<-entered
+	close(release)
+	workers.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("singleflight probe calls = %d, want 1", calls.Load())
+	}
+	snapshot := resolver.Snapshot().IPv4
+	if !snapshot.Ready || snapshot.Attempts != 1 || snapshot.Successes != 1 || snapshot.Failures != 0 ||
+		snapshot.RespondingServers != 2 || snapshot.AgreeingServers != 2 {
+		t.Fatalf("successful snapshot = %+v", snapshot)
+	}
+	if _, err := resolver.Resolve(t.Context(), AddressFamilyIPv4); err != nil || calls.Load() != 1 {
+		t.Fatalf("cached Resolve error/calls = %v/%d", err, calls.Load())
+	}
+	clock.Add((10*time.Minute + time.Nanosecond).Nanoseconds())
+	if _, err := resolver.Resolve(t.Context(), AddressFamilyIPv4); err != nil || calls.Load() != 2 {
+		t.Fatalf("expired Resolve error/calls = %v/%d", err, calls.Load())
+	}
+}
+
+func TestNATResolverFailureBackoff(t *testing.T) {
+	var clock atomic.Int64
+	clock.Store(time.Unix(1_700_000_000, 0).UnixNano())
+	var calls atomic.Int32
+	probeErr := errors.New("STUN unavailable")
+	resolver, err := newNATResolver(
+		natResolverTestConfig(),
+		func() time.Time { return time.Unix(0, clock.Load()) },
+		func(context.Context, AddressFamily, []string, int) (natProbeResult, error) {
+			calls.Add(1)
+			return natProbeResult{}, probeErr
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolver.Resolve(t.Context(), AddressFamilyIPv4); !errors.Is(err, ErrNATPublicIPDiscovery) || !errors.Is(err, probeErr) {
+		t.Fatalf("first failure = %v", err)
+	}
+	if _, err := resolver.Resolve(t.Context(), AddressFamilyIPv4); !errors.Is(err, ErrNATPublicIPBackoff) || calls.Load() != 1 {
+		t.Fatalf("backoff failure/calls = %v/%d", err, calls.Load())
+	}
+	failedSnapshot := resolver.Snapshot().IPv4
+	if failedSnapshot.Ready || failedSnapshot.Attempts != 1 || failedSnapshot.Failures != 1 || !errors.Is(failedSnapshot.LastFailure, probeErr) {
+		t.Fatalf("failed snapshot = %+v", failedSnapshot)
+	}
+	clock.Add((time.Minute + time.Nanosecond).Nanoseconds())
+	if _, err := resolver.Resolve(t.Context(), AddressFamilyIPv4); !errors.Is(err, probeErr) || calls.Load() != 2 {
+		t.Fatalf("post-backoff failure/calls = %v/%d", err, calls.Load())
+	}
+}
+
+func TestSelectNATProbeResultUsesDeterministicPlurality(t *testing.T) {
+	first := netip.MustParseAddr("8.8.8.8")
+	second := netip.MustParseAddr("1.1.1.1")
+	result, err := selectNATProbeResult([]indexedNATProbeResult{
+		{address: first},
+		{address: second},
+		{address: second},
+		{err: errors.New("unavailable")},
+	})
+	if err != nil || result.address != second || result.respondingServers != 3 || result.agreeingServers != 2 {
+		t.Fatalf("plurality result = %+v, %v", result, err)
+	}
+	tied, err := selectNATProbeResult([]indexedNATProbeResult{{address: first}, {address: second}})
+	if err != nil || tied.address != first {
+		t.Fatalf("tie result = %+v, %v", tied, err)
+	}
+}
+
+func TestProbeOneSTUNServerReadsXORMappedAddress(t *testing.T) {
+	server, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	served := make(chan error, 1)
+	go func() {
+		packet := make([]byte, 2048)
+		count, peer, err := server.ReadFromUDP(packet)
+		if err != nil {
+			served <- err
+			return
+		}
+		request := &stun.Message{Raw: packet[:count]}
+		if err := request.Decode(); err != nil {
+			served <- err
+			return
+		}
+		response, err := stun.Build(
+			stun.NewTransactionIDSetter(request.TransactionID),
+			stun.BindingSuccess,
+			&stun.XORMappedAddress{IP: net.ParseIP("8.8.8.8"), Port: 54321},
+		)
+		if err == nil {
+			_, err = server.WriteToUDP(response.Raw, peer)
+		}
+		served <- err
+	}()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	address, err := probeOneSTUNServer(ctx, AddressFamilyIPv4, server.LocalAddr().String())
+	if err != nil || address != netip.MustParseAddr("8.8.8.8") {
+		t.Fatalf("STUN result = %s, %v", address, err)
+	}
+	if err := <-served; err != nil {
+		t.Fatalf("serve STUN: %v", err)
+	}
+}
+
+func TestProbeOneSTUNServerHonorsContextDeadline(t *testing.T) {
+	server, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	if _, err := probeOneSTUNServer(ctx, AddressFamilyIPv4, server.LocalAddr().String()); err == nil {
+		t.Fatal("silent STUN server returned no error")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("STUN deadline took %v", elapsed)
+	}
+}
+
+func TestTranslateNATClientAddressRetainsKernelPort(t *testing.T) {
+	private := netip.MustParseAddrPort("172.18.0.2:43123")
+	publicIP := netip.MustParseAddr("8.8.8.8")
+	translated, err := translateNATClientAddress(private, publicIP)
+	if err != nil || translated != netip.MustParseAddrPort("8.8.8.8:43123") {
+		t.Fatalf("translated endpoint = %s, %v", translated, err)
+	}
+	alreadyPublic := netip.MustParseAddrPort("1.1.1.1:43123")
+	unchanged, err := translateNATClientAddress(alreadyPublic, publicIP)
+	if err != nil || unchanged != alreadyPublic {
+		t.Fatalf("public endpoint = %s, %v", unchanged, err)
+	}
+	if _, err := translateNATClientAddress(private, netip.MustParseAddr("2001:4860:4860::8888")); !errors.Is(err, ErrTupleNotAuthoritative) {
+		t.Fatalf("mixed-family error = %v", err)
+	}
+}
 
 func TestSOCKS5AddressTupleAuthority(t *testing.T) {
 	server := netip.MustParseAddrPort("149.154.167.50:443")
@@ -35,6 +284,10 @@ func TestSOCKS5AddressTupleAuthority(t *testing.T) {
 		{
 			name:  "shared",
 			bound: SOCKS5Address{Type: SOCKS5AddressIPv4, IP: netip.MustParseAddr("100.64.1.2"), Port: 32000},
+		},
+		{
+			name:  "documentation",
+			bound: SOCKS5Address{Type: SOCKS5AddressIPv4, IP: netip.MustParseAddr("198.51.100.10"), Port: 32000},
 		},
 		{
 			name:  "domain",

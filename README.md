@@ -163,6 +163,7 @@ Add this section to enable ME:
 enabled = true
 # proxy-tag = "0123456789abcdef0123456789abcdef"
 # socks5 = "127.0.0.1:1080"
+# nat-ip = "YOUR_PUBLIC_IP" # Usually empty. Automatic STUN supports Docker bridge networks.
 ```
 
 Telego keeps four physical links for each signed DC. It replaces failed links without moving healthy bindings or replacing the complete generation.
@@ -311,6 +312,7 @@ enabled = false
 # socks5-username = "proxy-user"
 # socks5-password = "proxy-password"
 # artifact-proxy = "http://127.0.0.1:3128" # Overrides the artifact proxy only
+# nat-ip = "YOUR_PUBLIC_IP"                # Usually empty. Overrides automatic STUN.
 # max-connections = 0                       # 0 = 10,000. An override can only reduce it.
 # queue-budget-mb = 0                       # 0 = 32 MiB plus 16 KiB
 
