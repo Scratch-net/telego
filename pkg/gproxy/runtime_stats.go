@@ -45,6 +45,15 @@ func (h *ProxyHandler) HandshakeFailureStats() []HandshakeFailureStat {
 	return result
 }
 
+// MiddleEndFrontendStats returns aggregate public-side ME buffer pressure. A
+// direct-only handler returns a zero snapshot.
+func (h *ProxyHandler) MiddleEndFrontendStats() MiddleEndFrontendStats {
+	if h == nil || h.middleEnd == nil {
+		return MiddleEndFrontendStats{}
+	}
+	return h.middleEnd.stats()
+}
+
 func (h *ProxyHandler) failHandshake(ctx *ConnContext, stage handshakeFailureStage) gnet.Action {
 	h.recordHandshakeFailure(ctx, stage)
 	return gnet.Close

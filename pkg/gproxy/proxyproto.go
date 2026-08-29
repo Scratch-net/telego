@@ -149,6 +149,18 @@ func parseProxyProtoV1(data []byte) (*ProxyProtoResult, error) {
 	if srcIP == nil || dstIP == nil {
 		return nil, fmt.Errorf("proxy protocol v1: invalid IP address")
 	}
+	if proto == "TCP4" {
+		if srcIP.To4() == nil || dstIP.To4() == nil {
+			return nil, fmt.Errorf("proxy protocol v1: TCP4 address family mismatch")
+		}
+	} else {
+		if srcIP.To4() != nil || dstIP.To4() != nil {
+			return nil, fmt.Errorf("proxy protocol v1: TCP6 address family mismatch")
+		}
+		if srcIP.To16() == nil || dstIP.To16() == nil {
+			return nil, fmt.Errorf("proxy protocol v1: invalid TCP6 address")
+		}
+	}
 
 	srcPort, err := strconv.Atoi(string(parts[4]))
 	if err != nil || srcPort < 0 || srcPort > 65535 {
@@ -207,8 +219,16 @@ func parseProxyProtoV2(data []byte) (*ProxyProtoResult, error) {
 		return nil, fmt.Errorf("proxy protocol v2: unsupported command %d", command)
 	}
 
-	// Parse addresses based on family
+	// A PROXY command is authoritative for a TCP connection only when the
+	// transport nibble is STREAM. Do not materialize DGRAM metadata as TCP
+	// addresses, especially on the authenticated internal ingress.
 	family := (famProto >> 4) & 0x0F
+	protocol := famProto & 0x0F
+	if protocol != 1 {
+		return nil, fmt.Errorf("proxy protocol v2: unsupported transport protocol %d", protocol)
+	}
+
+	// Parse addresses based on family.
 	addrData := data[16:totalLen]
 
 	switch family {
@@ -241,9 +261,6 @@ func parseProxyProtoV2(data []byte) (*ProxyProtoResult, error) {
 
 		result.SrcAddr = &net.TCPAddr{IP: srcIP, Port: int(srcPort)}
 		result.DstAddr = &net.TCPAddr{IP: dstIP, Port: int(dstPort)}
-
-	case 0: // AF_UNSPEC - no addresses
-		// Valid but no addresses to parse
 
 	default:
 		return nil, fmt.Errorf("proxy protocol v2: unsupported address family %d", family)

@@ -1,6 +1,7 @@
 package gproxy
 
 import (
+	"bytes"
 	"encoding/binary"
 	"net"
 	"testing"
@@ -121,6 +122,19 @@ func TestParseProxyProtocol_V1_InvalidIP(t *testing.T) {
 	}
 }
 
+func TestParseProxyProtocolV1RejectsAddressFamilyMismatch(t *testing.T) {
+	for _, header := range []string{
+		"PROXY TCP4 2001:db8::1 192.0.2.2 12345 443\r\n",
+		"PROXY TCP4 192.0.2.1 2001:db8::2 12345 443\r\n",
+		"PROXY TCP6 192.0.2.1 2001:db8::2 12345 443\r\n",
+		"PROXY TCP6 2001:db8::1 192.0.2.2 12345 443\r\n",
+	} {
+		if _, err := ParseProxyProtocol([]byte(header)); err == nil {
+			t.Fatalf("address-family mismatch accepted: %q", header)
+		}
+	}
+}
+
 func TestParseProxyProtocol_V2_IPv4(t *testing.T) {
 	// Build v2 header manually
 	data := make([]byte, 28) // 16 header + 12 addresses
@@ -173,6 +187,44 @@ func TestParseProxyProtocol_V2_IPv4(t *testing.T) {
 	}
 	if srcAddr.Port != 54321 {
 		t.Errorf("SrcAddr Port: got %d, want 54321", srcAddr.Port)
+	}
+}
+
+func TestParseProxyProtocolV2ProxyRequiresIPStream(t *testing.T) {
+	base := make([]byte, 28)
+	copy(base[:12], proxyProtoV2Sig)
+	base[12] = 0x21
+	binary.BigEndian.PutUint16(base[14:16], 12)
+	copy(base[16:20], net.ParseIP("192.0.2.1").To4())
+	copy(base[20:24], net.ParseIP("198.51.100.1").To4())
+	binary.BigEndian.PutUint16(base[24:26], 12345)
+	binary.BigEndian.PutUint16(base[26:28], 443)
+
+	for _, test := range []struct {
+		name     string
+		famProto byte
+	}{
+		{name: "IPv4 DGRAM", famProto: 0x12},
+		{name: "IPv4 unspecified transport", famProto: 0x10},
+		{name: "unspecified family STREAM", famProto: 0x01},
+		{name: "UNIX STREAM with IPv4 address block", famProto: 0x31},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			wire := bytes.Clone(base)
+			wire[13] = test.famProto
+			if _, err := ParseProxyProtocol(wire); err == nil {
+				t.Fatal("invalid PROXY family/transport was accepted")
+			}
+		})
+	}
+
+	local := make([]byte, 16)
+	copy(local[:12], proxyProtoV2Sig)
+	local[12] = 0x20
+	local[13] = 0x12
+	result, err := ParseProxyProtocol(local)
+	if err != nil || result == nil || !result.IsLocal {
+		t.Fatalf("LOCAL DGRAM compatibility = %+v, %v", result, err)
 	}
 }
 

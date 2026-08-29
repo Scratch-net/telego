@@ -1,0 +1,90 @@
+package main
+
+import (
+	"testing"
+
+	"github.com/scratch-net/telego/pkg/gproxy"
+	"github.com/scratch-net/telego/pkg/transport/middleend"
+)
+
+func TestMiddleEndPayloadCapacityCountsIndependentBudgetsOnce(t *testing.T) {
+	snapshot := middleend.ServiceSnapshot{
+		Capacity: middleend.ServiceCapacitySnapshot{
+			LinkSubmissionBytes:  11,
+			LinkEventBytes:       13,
+			ManagerRequestBytes:  17,
+			ManagerControlBytes:  19,
+			ManagerResponseBytes: 23,
+			BindingResponseBytes: 1_000,
+		},
+		Supervisor: middleend.GenerationSupervisorSnapshot{
+			Active:   &middleend.FixedBindingManagerSnapshot{Slots: make([]middleend.FixedBindingSlotSnapshot, 2)},
+			Retiring: &middleend.FixedBindingManagerSnapshot{Slots: make([]middleend.FixedBindingSlotSnapshot, 1)},
+		},
+	}
+	frontend := gproxy.MiddleEndFrontendStats{InputBytesLimit: 29, OutputBytesLimit: 31}
+
+	live, rotation := middleEndPayloadCapacity(snapshot, frontend)
+	const managerCapacity = 17 + 19 + 23
+	const perLinkCapacity = 11 + 13
+	wantLive := int64(29 + 31 + 2*managerCapacity + 3*perLinkCapacity)
+	wantRotation := int64(29 + 31 + 2*(managerCapacity+2*perLinkCapacity))
+	if live != wantLive || rotation != wantRotation {
+		t.Fatalf("payload capacities = live %d rotation %d, want live %d rotation %d", live, rotation, wantLive, wantRotation)
+	}
+}
+
+func TestMiddleEndPayloadCapacityHandlesMissingGenerations(t *testing.T) {
+	live, rotation := middleEndPayloadCapacity(middleend.ServiceSnapshot{}, gproxy.MiddleEndFrontendStats{
+		InputBytesLimit:  29,
+		OutputBytesLimit: 31,
+	})
+	if live != 60 || rotation != 60 {
+		t.Fatalf("payload capacities = live %d rotation %d, want 60 and 60", live, rotation)
+	}
+}
+
+func TestMiddleEndMonitorAggregatesCurrentGenerationBackpressure(t *testing.T) {
+	snapshot := middleend.GenerationSupervisorSnapshot{
+		Active:   &middleend.FixedBindingManagerSnapshot{ResponseBackpressureEvents: 2, ControlBackpressureEvents: 3},
+		Retiring: &middleend.FixedBindingManagerSnapshot{ResponseBackpressureEvents: 11, ControlBackpressureEvents: 13},
+	}
+	response, control := middleEndBackpressureTotals(snapshot)
+	if response != 13 || control != 16 {
+		t.Fatalf("backpressure totals = response %d control %d", response, control)
+	}
+}
+
+func TestMiddleEndMonitorAggregatesRepairingSlots(t *testing.T) {
+	snapshot := middleend.GenerationSupervisorSnapshot{
+		Active:   &middleend.FixedBindingManagerSnapshot{RepairingSlots: 1},
+		Retiring: &middleend.FixedBindingManagerSnapshot{RepairingSlots: 3},
+	}
+	if total := middleEndRepairingSlots(snapshot); total != 4 {
+		t.Fatalf("repairing slots = %d, want 4", total)
+	}
+}
+
+func TestMiddleEndMonitorPressureThresholdsResetWithGeneration(t *testing.T) {
+	monitor := &middleEndMonitor{pressure: make(map[string]middleEndPressureState)}
+	monitor.observePressure("active", "response", "bytes", 79, 100)
+	if state := monitor.pressure["active/response/bytes"]; state.stage != 0 || state.value != 79 {
+		t.Fatalf("below threshold state = %+v", state)
+	}
+	monitor.observePressure("active", "response", "bytes", 80, 100)
+	if state := monitor.pressure["active/response/bytes"]; state.stage != 1 {
+		t.Fatalf("80%% state = %+v", state)
+	}
+	monitor.observePressure("active", "response", "bytes", 96, 100)
+	if state := monitor.pressure["active/response/bytes"]; state.stage != 2 {
+		t.Fatalf("95%% state = %+v", state)
+	}
+	monitor.observePressure("active", "response", "bytes", 100, 100)
+	if state := monitor.pressure["active/response/bytes"]; state.stage != 3 {
+		t.Fatalf("100%% state = %+v", state)
+	}
+	monitor.observePressure("active", "response", "bytes", 1, 100)
+	if state := monitor.pressure["active/response/bytes"]; state.stage != 0 || state.value != 1 {
+		t.Fatalf("replacement generation state = %+v", state)
+	}
+}

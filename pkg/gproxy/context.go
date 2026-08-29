@@ -29,6 +29,7 @@ const (
 	StateRelaying                        // Bidirectional relay active
 	StateSplicing                        // Forward to mask host (invalid client)
 	StateClosed                          // Connection is closing
+	StateMiddleEnd                       // Authenticated client routed through Middle-End
 )
 
 // ProtocolMode indicates the MTProxy protocol variant.
@@ -62,6 +63,8 @@ func (s ConnState) String() string {
 		return "Splicing"
 	case StateClosed:
 		return "Closed"
+	case StateMiddleEnd:
+		return "MiddleEnd"
 	default:
 		return "Unknown"
 	}
@@ -154,6 +157,12 @@ type ConnContext struct {
 	// matching process-local preface changes it to an authenticated internal hop.
 	internalProxyCandidate     bool
 	internalProxyAuthenticated bool
+	trustedProxySource         net.Addr
+	trustedProxyDestination    net.Addr
+
+	// middleEnd is installed only after an exact signed-DC Bind succeeds. All
+	// fields behind it except the readiness handoff are client-event-loop owned.
+	middleEnd *middleEndClient
 
 	// Connection limit tracking (protected by mu)
 	ipLimitTracked   bool   // Whether this connection is tracked in per-IP limiter (set in OnOpen)
@@ -280,6 +289,22 @@ func (c *ConnContext) SetRealClientAddr(addr net.Addr) {
 	c.realClientAddr = addr
 }
 
+// setTrustedProxyTuple records the source and destination from the
+// process-authenticated internal PROXY hop. Public PROXY headers never call
+// this method and are not authoritative for Middle-End forwarding.
+func (c *ConnContext) setTrustedProxyTuple(source, destination net.Addr) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.trustedProxySource = source
+	c.trustedProxyDestination = destination
+}
+
+func (c *ConnContext) trustedProxyTuple() (net.Addr, net.Addr, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.trustedProxySource, c.trustedProxyDestination, c.internalProxyAuthenticated
+}
+
 // SetSpliceOverride records a one-shot splice target ("host:port") for an
 // unauthenticated probe whose SNI is on the mask safelist.
 func (c *ConnContext) SetSpliceOverride(addr string) {
@@ -337,6 +362,9 @@ func (c *ConnContext) Cleanup() {
 	c.decryptor = nil
 	c.o2ConnectionType = 0
 	c.secret = nil
+	c.trustedProxySource = nil
+	c.trustedProxyDestination = nil
+	c.middleEnd = nil
 }
 
 // SetTrafficCounters sets the traffic counter pointers for this connection.

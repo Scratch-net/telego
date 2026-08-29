@@ -18,8 +18,11 @@ import (
 	"github.com/scratch-net/telego/pkg/gproxy"
 	"github.com/scratch-net/telego/pkg/log"
 	"github.com/scratch-net/telego/pkg/metrics"
+	"github.com/scratch-net/telego/pkg/transport/middleend"
 	"github.com/scratch-net/telego/pkg/webproxy"
 )
+
+const middleEndLifecycleTimeout = 100 * time.Second
 
 // Build-time variables injected via ldflags.
 var (
@@ -53,6 +56,11 @@ func (c *RunCmd) Run() error {
 	cfg, err := fileCfg.ToGProxyConfig()
 	if err != nil {
 		log.Error().Err(err).Msg("invalid config")
+		return err
+	}
+	middleEndRuntimeConfig, err := fileCfg.ToMiddleEndRuntimeConfig()
+	if err != nil {
+		log.Error().Err(err).Msg("invalid Middle-End config")
 		return err
 	}
 
@@ -118,7 +126,53 @@ func (c *RunCmd) Run() error {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	logger := &zerologAdapter{}
-	shutdown, handler, errCh := gproxy.RunWithHandler(&cfg, logger)
+	var (
+		middleEndService       *middleend.Service
+		middleEndStatusMonitor *middleEndMonitor
+	)
+	if middleEndRuntimeConfig.Enabled {
+		logMiddleEndFileDescriptorCapacity(middleEndRuntimeConfig.MaxConnections)
+		middleEndService, err = middleend.NewService(middleEndRuntimeConfig.Service)
+		if err != nil {
+			middleEndRuntimeConfig.CloseIdleConnections()
+			log.Warn().Err(err).Msg("Middle-End runtime unavailable; starting with direct fallback")
+		} else if err := middleEndService.Start(); err != nil {
+			closeMiddleEndService(middleEndService, middleEndRuntimeConfig)
+			middleEndService = nil
+			log.Warn().Err(err).Msg("Middle-End startup unavailable; starting with direct fallback")
+		} else {
+			log.Info().
+				Int("max_connections", middleEndRuntimeConfig.MaxConnections).
+				Int("links_per_dc", middleEndRuntimeConfig.Service.LinksPerDC).
+				Int("event_loops", middleEndRuntimeConfig.Service.Runtime.EventLoops).
+				Int("generation_queue_budget_bytes", middleEndRuntimeConfig.Service.BindingLimits.MaxPendingRequestBytes).
+				Int("per_link_queue_budget_bytes", middleEndRuntimeConfig.Service.LinkLimits.MaxPendingSubmissionBytes).
+				Msg("Middle-End service started; direct fallback remains active until an active generation is ready")
+		}
+	}
+
+	var (
+		shutdown func()
+		handler  *gproxy.ProxyHandler
+		errCh    <-chan error
+	)
+	if middleEndService != nil {
+		shutdown, handler, errCh, err = gproxy.RunWithMiddleEnd(
+			&cfg,
+			logger,
+			middleEndRuntimeConfig.Frontend(middleEndService.Source()),
+		)
+		if err != nil {
+			middleEndStatusMonitor.Stop()
+			closeMiddleEndService(middleEndService, middleEndRuntimeConfig)
+			return fmt.Errorf("start public proxy with Middle-End: %w", err)
+		}
+	} else {
+		shutdown, handler, errCh = gproxy.RunWithHandler(&cfg, logger)
+	}
+	if middleEndService != nil {
+		middleEndStatusMonitor = startMiddleEndMonitor(middleEndService, handler)
+	}
 	if webRuntime != nil {
 		startCtx, cancel := context.WithTimeout(context.Background(), webProxyLifecycleTimeout)
 		err := webRuntime.Start(startCtx)
@@ -148,6 +202,9 @@ func (c *RunCmd) Run() error {
 		}
 		if webRuntime != nil {
 			metricsConfig.WebStats = webRuntime.manager
+		}
+		if middleEndService != nil {
+			metricsConfig.MiddleEnd = middleEndService
 		}
 		metricsServer, err = metrics.NewServer(metricsConfig, handler.UserLimiter())
 		if err != nil {
@@ -184,6 +241,11 @@ func (c *RunCmd) Run() error {
 					return nil, "", err
 				}
 			}
+			middleEndConfig, err := fileCfg.ToMiddleEndRuntimeConfig()
+			if err != nil {
+				return nil, "", err
+			}
+			middleEndConfig.CloseIdleConnections()
 			logLevel := fileCfg.General.LogLevel
 			if logLevel == "" {
 				logLevel = fileCfg.LogLevel
@@ -197,6 +259,7 @@ func (c *RunCmd) Run() error {
 	hotReloader.Start()
 
 	cleanup := func() {
+		hotReloader.Stop()
 		if webRuntime != nil {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), webProxyLifecycleTimeout)
 			if err := webRuntime.Shutdown(shutdownCtx); err != nil {
@@ -204,13 +267,16 @@ func (c *RunCmd) Run() error {
 			}
 			cancel()
 		}
+		shutdown()
+		if middleEndService != nil {
+			middleEndStatusMonitor.Stop()
+			closeMiddleEndService(middleEndService, middleEndRuntimeConfig)
+		}
 		if metricsServer != nil {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			_ = metricsServer.Shutdown(shutdownCtx)
 			cancel()
 		}
-		hotReloader.Stop()
-		shutdown()
 	}
 
 	select {
@@ -228,6 +294,25 @@ func (c *RunCmd) Run() error {
 		}
 		return fmt.Errorf("WEB HTTP server failed: %w", err)
 	}
+}
+
+func closeMiddleEndService(service *middleend.Service, runtimeConfig config.MiddleEndRuntimeConfig) {
+	if service == nil {
+		runtimeConfig.CloseIdleConnections()
+		return
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), middleEndLifecycleTimeout)
+	err := service.Close(shutdownCtx)
+	cancel()
+	if err == nil {
+		runtimeConfig.CloseIdleConnections()
+		return
+	}
+	log.Warn().Err(err).Msg("Middle-End shutdown continues in the background")
+	go func() {
+		<-service.Done()
+		runtimeConfig.CloseIdleConnections()
+	}()
 }
 
 // printTelegramLinks detects public IP via STUN and prints Telegram proxy links for all secrets.

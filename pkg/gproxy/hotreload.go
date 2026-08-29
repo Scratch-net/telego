@@ -219,6 +219,16 @@ func (r *HotReloader) warnNonHotChanges(old, new *Config) bool {
 		r.logger.Warn("WEB proxy settings changed but require restart")
 		restartRequired = true
 	}
+	if old.MiddleEndFingerprint != new.MiddleEndFingerprint {
+		r.logger.Warn("Middle-End settings changed but require restart")
+		restartRequired = true
+	}
+
+	if old.MaxConnections != new.MaxConnections {
+		r.logger.Warn("max-connections changed (%d -> %d) but requires restart",
+			old.MaxConnections, new.MaxConnections)
+		restartRequired = true
+	}
 
 	if old.MaxIPsPerUser != new.MaxIPsPerUser {
 		r.logger.Warn("max-ips-per-user changed (%d -> %d) but requires restart",

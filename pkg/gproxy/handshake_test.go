@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/panjf2000/gnet/v2"
+
 	"github.com/scratch-net/telego/pkg/transport/faketls"
 	"github.com/scratch-net/telego/pkg/transport/obfuscated2"
 )
@@ -48,6 +50,21 @@ type capturedOutboundHandshake struct {
 	connectionType obfuscated2.ConnectionType
 	wire           []byte
 	err            error
+}
+
+type blockingDirectDialLogger struct {
+	*testLogger
+	blockFormat string
+	entered     chan struct{}
+	release     chan struct{}
+}
+
+func (l *blockingDirectDialLogger) Debug(format string, args ...any) {
+	if format == l.blockFormat {
+		close(l.entered)
+		<-l.release
+	}
+	l.testLogger.Debug(format, args...)
 }
 
 func captureOutboundHandshake(handler *ProxyHandler) <-chan capturedOutboundHandshake {
@@ -191,6 +208,124 @@ func TestFakeTLSHandlerChain_PreservesO2FramingToDC(t *testing.T) {
 			}
 			assertOutboundFraming(t, ctx, waitForOutboundHandshake(t, captured), tc.connectionType, 3)
 		})
+	}
+}
+
+func TestEEDirectRouteLeavesHandshakeStateBeforeBlockingDialLog(t *testing.T) {
+	secret := []byte("0123456789abcdef")
+	logger := &blockingDirectDialLogger{
+		testLogger:  &testLogger{},
+		blockFormat: "[#%d:%s] dialing DC %d",
+		entered:     make(chan struct{}),
+		release:     make(chan struct{}),
+	}
+	const handshakeTimeout = 100 * time.Millisecond
+	handler := NewProxyHandler(&Config{
+		Secrets:           []Secret{{Name: "test", Key: secret, Host: "example.com"}},
+		TimeSkewTolerance: time.Minute,
+		HandshakeTimeout:  handshakeTimeout,
+	}, logger)
+	handler.directDCDial = func(int, obfuscated2.ConnectionType) (*directDCConn, error) {
+		return nil, net.ErrClosed
+	}
+	clientHello := buildTLSRecord(
+		faketls.RecordTypeHandshake,
+		buildValidClientHello(secret, "example.com", bytes.Repeat([]byte{0x5a}, 32)),
+	)
+	o2Frame := buildTLSRecord(
+		faketls.RecordTypeApplicationData,
+		buildDeterministicO2ClientFrame(t, secret, 2, obfuscated2.ConnectionTypeIntermediate),
+	)
+	connection := newTestMockGnetConn()
+	if _, action := handler.OnOpen(connection); action != gnet.None {
+		t.Fatalf("OnOpen action = %v", action)
+	}
+	context := connection.Context().(*ConnContext)
+	connection.SetReadData(append(clientHello, o2Frame...))
+	actionResult := make(chan gnet.Action, 1)
+	go func() {
+		actionResult <- handler.OnTraffic(connection)
+	}()
+	select {
+	case <-logger.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("EE direct route did not reach blocking dial log")
+	}
+	if context.State() != StateDialingDC {
+		t.Fatalf("state during blocking dial log = %v, want DialingDC", context.State())
+	}
+	time.Sleep(2 * handshakeTimeout)
+	if connection.IsClosed() {
+		t.Fatal("handshake timer closed authenticated direct EE route while logger blocked")
+	}
+	if got := handler.handshakeFailures[handshakeFailureTLSMTProto].Load(); got != 0 {
+		t.Fatalf("TLS MTProto timeout failures = %d, want 0", got)
+	}
+	close(logger.release)
+	select {
+	case action := <-actionResult:
+		if action != gnet.None {
+			t.Fatalf("OnTraffic action = %v", action)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("EE direct route did not resume after logger release")
+	}
+}
+
+func TestDDDirectRouteLeavesHandshakeStateBeforeBlockingAuthenticatedLog(t *testing.T) {
+	secret := []byte("0123456789abcdef")
+	logger := &blockingDirectDialLogger{
+		testLogger:  &testLogger{},
+		blockFormat: "[#%d] dd mode: matched secret %q, DC %d",
+		entered:     make(chan struct{}),
+		release:     make(chan struct{}),
+	}
+	const handshakeTimeout = 100 * time.Millisecond
+	handler := NewProxyHandler(&Config{
+		Secrets:          []Secret{{Name: "test", Key: secret}},
+		HandshakeTimeout: handshakeTimeout,
+	}, logger)
+	handler.directDCDial = func(int, obfuscated2.ConnectionType) (*directDCConn, error) {
+		return nil, net.ErrClosed
+	}
+	connection := newTestMockGnetConn()
+	if _, action := handler.OnOpen(connection); action != gnet.None {
+		t.Fatalf("OnOpen action = %v", action)
+	}
+	context := connection.Context().(*ConnContext)
+	connection.SetReadData(buildDeterministicO2ClientFrame(
+		t,
+		secret,
+		2,
+		obfuscated2.ConnectionTypeIntermediate,
+	))
+	actionResult := make(chan gnet.Action, 1)
+	go func() {
+		actionResult <- handler.OnTraffic(connection)
+	}()
+	select {
+	case <-logger.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("DD direct route did not reach blocking authenticated log")
+	}
+	if context.State() != StateDialingDC {
+		t.Fatalf("state during blocking authenticated log = %v, want DialingDC", context.State())
+	}
+	time.Sleep(2 * handshakeTimeout)
+	if connection.IsClosed() {
+		t.Fatal("handshake timer closed authenticated direct DD route while logger blocked")
+	}
+	if got := handler.handshakeFailures[handshakeFailureDirectMTProto].Load(); got != 0 {
+		t.Fatalf("direct MTProto timeout failures = %d, want 0", got)
+	}
+	close(logger.release)
+	select {
+	case action := <-actionResult:
+		if action != gnet.None {
+			t.Fatalf("OnTraffic action = %v", action)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("DD direct route did not resume after logger release")
 	}
 }
 

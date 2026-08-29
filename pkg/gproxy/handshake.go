@@ -136,6 +136,12 @@ func (h *ProxyHandler) handleDDFrame(c gnet.Conn, ctx *ConnContext) gnet.Action 
 		ctx.SetTrafficCounters(bytesIn, bytesOut)
 	}
 
+	// The authenticated direct-only client must leave the handshake states
+	// before a potentially blocking logger runs. Middle-End remains precommit
+	// until exact Bind succeeds below.
+	if h.middleEnd == nil {
+		ctx.SetState(StateDialingDC)
+	}
 	h.logger.Debug("[#%d] dd mode: matched secret %q, DC %d", ctx.id, matchedSecret.Name, dcID)
 
 	// Store ciphers and DC ID
@@ -145,18 +151,7 @@ func (h *ProxyHandler) handleDDFrame(c gnet.Conn, ctx *ConnContext) gnet.Action 
 	ctx.encryptor = encryptor
 	ctx.decryptor = decryptor
 	ctx.mu.Unlock()
-	ctx.SetState(StateDialingDC)
-
-	// Clear handshake deadline, set idle timeout
-	c.SetReadDeadline(time.Time{})
-	if idleTimeout := h.IdleTimeout(); idleTimeout > 0 {
-		c.SetReadDeadline(time.Now().Add(idleTimeout))
-	}
-
-	// Dial DC asynchronously
-	go h.dialDC(c, ctx)
-
-	return gnet.None
+	return h.commitAuthenticatedRoute(c, ctx)
 }
 
 // handleTLSHeader reads and validates the TLS record header (5 bytes).
@@ -468,20 +463,15 @@ func (h *ProxyHandler) handleO2Frame(c gnet.Conn, ctx *ConnContext) gnet.Action 
 			ctx.decryptor = decryptor
 			ctx.pendingData = pendingData
 			ctx.mu.Unlock()
-			ctx.SetState(StateDialingDC)
 
-			h.logger.Debug("[#%d:%s] dialing DC %d", ctx.id, secret.Name, dcID)
-
-			// Clear handshake deadline, set idle timeout
-			c.SetReadDeadline(time.Time{})
-			if idleTimeout := h.IdleTimeout(); idleTimeout > 0 {
-				c.SetReadDeadline(time.Now().Add(idleTimeout))
+			// Preserve the direct-only ordering: the authenticated connection is
+			// no longer in a handshake state before a potentially blocking logger
+			// runs. The Middle-End branch remains precommit until exact Bind wins.
+			if h.middleEnd == nil {
+				ctx.SetState(StateDialingDC)
 			}
-
-			// Dial DC asynchronously
-			go h.dialDC(c, ctx)
-
-			return gnet.None
+			h.logger.Debug("[#%d:%s] dialing DC %d", ctx.id, secret.Name, dcID)
+			return h.commitAuthenticatedRoute(c, ctx)
 		}
 
 		// Unknown record type - close connection

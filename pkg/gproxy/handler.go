@@ -77,6 +77,11 @@ type ProxyHandler struct {
 	// contacting Telegram.
 	directDCDial func(int, obfuscated2.ConnectionType) (*directDCConn, error)
 
+	// middleEnd is nil for the existing direct-only construction path. A
+	// non-nil frontend is injected explicitly and owns no source/runtime
+	// lifecycle.
+	middleEnd *middleEndFrontend
+
 	// Mask SNI safelist: lowercased domain -> resolved "host:port" splice target.
 	// Empty when the feature is unconfigured.
 	maskSafelist map[string]string
@@ -193,6 +198,9 @@ func (h *ProxyHandler) UserLimiter() *UserIPLimiter {
 
 // OnBoot is called when the gnet engine starts.
 func (h *ProxyHandler) OnBoot(eng gnet.Engine) gnet.Action {
+	if h.middleEnd != nil {
+		h.middleEnd.start()
+	}
 	h.logger.Info("gnet proxy started on %s", h.config.BindAddr)
 	return gnet.None
 }
@@ -238,6 +246,9 @@ func silenceWedged(lastClientMs, lastServerMs, nowMs, thresholdMs int64) bool {
 // OnShutdown is called when the gnet engine shuts down.
 func (h *ProxyHandler) OnShutdown(eng gnet.Engine) {
 	h.logger.Info("gnet proxy shutting down")
+	if h.middleEnd != nil {
+		h.middleEnd.stop()
+	}
 	if h.dcClient != nil {
 		h.dcClient.Stop()
 	}
@@ -264,6 +275,10 @@ func (h *ProxyHandler) OnOpen(c gnet.Conn) ([]byte, gnet.Action) {
 
 	conns := atomic.AddInt64(&h.activeConns, 1)
 	h.logger.Info("[#%d] new connection from %s (active: %d)", ctx.id, c.RemoteAddr(), conns)
+	if h.config.MaxConnections > 0 && conns > int64(h.config.MaxConnections) {
+		h.logger.Info("[#%d] global connection limit reached: %d > %d", ctx.id, conns, h.config.MaxConnections)
+		return nil, h.failHandshake(ctx, handshakeFailureAdmission)
+	}
 
 	// Every peer consumes admission immediately. Unix WEB candidates use a
 	// synthetic loopback address because Unix peer addresses contain no IP.
@@ -289,7 +304,7 @@ func (h *ProxyHandler) OnOpen(c gnet.Conn) ([]byte, gnet.Action) {
 	// (no data sent) never trigger a read, so the deadline is never checked.
 	time.AfterFunc(handshakeTimeout, func() {
 		state := ctx.State()
-		if state != StateClosed && state != StateRelaying && state != StateSplicing && state != StateDialingDC {
+		if state != StateClosed && state != StateRelaying && state != StateSplicing && state != StateDialingDC && state != StateMiddleEnd {
 			h.recordHandshakeFailure(ctx, handshakeStageForState(state))
 			h.logger.Info("[#%d] handshake timeout from %s in state %s (active: %d)",
 				ctx.id, c.RemoteAddr(), state, atomic.LoadInt64(&h.activeConns))
@@ -313,6 +328,13 @@ func (h *ProxyHandler) OnClose(c gnet.Conn, err error) gnet.Action {
 	// Mark as closed FIRST - goroutines check this before proceeding
 	ctx.SetState(StateClosed)
 	ctx.cancelSpliceDrain()
+	if h.middleEnd != nil {
+		if ctx.middleEnd != nil {
+			h.closeMiddleEnd(ctx.middleEnd)
+		} else {
+			h.middleEnd.closeDirectFallback(ctx.id)
+		}
+	}
 
 	// Drop from the silence-sweep registry if it was tracked.
 	if h.clientSilenceCloseMs > 0 {
@@ -401,6 +423,8 @@ func (h *ProxyHandler) OnTraffic(c gnet.Conn) gnet.Action {
 		return h.handleRelay(c, ctx)
 	case StateSplicing:
 		return h.handleSplice(c, ctx)
+	case StateMiddleEnd:
+		return h.handleMiddleEnd(c, ctx)
 	case StateClosed:
 		return gnet.Close
 	}
@@ -477,6 +501,7 @@ func (h *ProxyHandler) handleProxyProto(c gnet.Conn, ctx *ConnContext) gnet.Acti
 		if result.SrcAddr == nil || !h.transferInitialIPLimit(ctx, result.SrcAddr, atomic.LoadInt64(&h.activeConns)) {
 			return h.failHandshake(ctx, handshakeFailureAdmission)
 		}
+		ctx.setTrustedProxyTuple(result.SrcAddr, result.DstAddr)
 	}
 
 	// Store real client address if provided.

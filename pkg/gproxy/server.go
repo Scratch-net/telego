@@ -15,6 +15,12 @@ import (
 	"github.com/scratch-net/telego/pkg/transport/faketls"
 )
 
+const (
+	proxyShutdownTimeout = 90 * time.Second
+	publicReadBufferCap  = 64 * 1024
+	publicWriteBufferCap = 64 * 1024
+)
+
 // Secret represents a named proxy secret.
 type Secret struct {
 	Name   string // User-friendly name for logging
@@ -87,6 +93,7 @@ type Config struct {
 	InternalProxyProtocol bool
 	InternalProxyAuth     *InternalProxyAuth
 	HandshakeTimeout      time.Duration // Max time for handshake before closing (default 30s)
+	MaxConnections        int           // Max concurrent accepted connections, 0 = unlimited
 	MaxConnectionsPerIP   int           // Max concurrent connections per IP+secret, 0 = unlimited
 	MaxIPsPerUser         int           // Max unique IPs per user, 0 = unlimited
 	IPBlockTimeout        time.Duration // How long blocked IPs stay blocked (default 5m)
@@ -113,6 +120,9 @@ type Config struct {
 	// WebProxyFingerprint changes when restart-only [web-proxy] settings change.
 	// It contains no secret values and exists only for hot-reload diagnostics.
 	WebProxyFingerprint string
+	// MiddleEndFingerprint changes when restart-only [middle-end] settings
+	// change. It is a digest and never contains proxy credentials or tags.
+	MiddleEndFingerprint string
 }
 
 // DefaultConfig returns sensible defaults.
@@ -164,12 +174,40 @@ func Run(cfg *Config, logger Logger) (shutdown func(), errCh <-chan error) {
 // RunWithHandler starts the proxy and returns the handler for hot-reload.
 // Returns a shutdown function, the handler (for hot-reload), and error channel.
 func RunWithHandler(cfg *Config, logger Logger) (shutdown func(), handler *ProxyHandler, errCh <-chan error) {
-	ch := make(chan error, 1)
-	handlerCh := make(chan *ProxyHandler, 1)
-
 	if logger == nil {
 		logger = defaultLogger{}
 	}
+	handler = NewProxyHandler(cfg, logger)
+	shutdown, errCh = runWithPreparedHandler(cfg, logger, handler)
+	return shutdown, handler, errCh
+}
+
+// RunWithMiddleEnd starts the proxy with an externally owned, already-started
+// Middle-End binding source. It validates and constructs the handler before any
+// network runtime starts. The caller must keep the source alive until shutdown
+// returns and every public connection has received OnClose.
+func RunWithMiddleEnd(
+	cfg *Config,
+	logger Logger,
+	frontend MiddleEndFrontendConfig,
+) (shutdown func(), handler *ProxyHandler, errCh <-chan error, err error) {
+	if logger == nil {
+		logger = defaultLogger{}
+	}
+	handler, err = NewProxyHandlerWithMiddleEnd(cfg, logger, frontend)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	shutdown, errCh = runWithPreparedHandler(cfg, logger, handler)
+	return shutdown, handler, errCh, nil
+}
+
+func runWithPreparedHandler(
+	cfg *Config,
+	logger Logger,
+	handler *ProxyHandler,
+) (shutdown func(), errCh <-chan error) {
+	ch := make(chan error, 1)
 
 	// Probe DC addresses at startup and sort by RTT
 	dc.SetProbeLogger(logger.Info)
@@ -188,11 +226,8 @@ func RunWithHandler(cfg *Config, logger Logger) (shutdown func(), handler *Proxy
 	ready := make(chan struct{})
 
 	go func() {
-		h := NewProxyHandler(cfg, logger)
-		handlerCh <- h // Send handler for hot-reload access
-
 		// Initialize DC client for outgoing connections
-		dcHandler := &dcEventHandler{proxy: h}
+		dcHandler := &dcEventHandler{proxy: handler}
 		dcClient, err := gnet.NewClient(
 			dcHandler,
 			gnet.WithMulticore(cfg.Multicore),
@@ -208,7 +243,7 @@ func RunWithHandler(cfg *Config, logger Logger) (shutdown func(), handler *Proxy
 			ch <- fmt.Errorf("failed to start DC client: %w", err)
 			return
 		}
-		h.dcClient = dcClient
+		handler.dcClient = dcClient
 		if cfg.Socks5Addr != "" {
 			logger.Debug("DC client started with SOCKS5 proxy: %s", cfg.Socks5Addr)
 		} else {
@@ -227,11 +262,11 @@ func RunWithHandler(cfg *Config, logger Logger) (shutdown func(), handler *Proxy
 
 		// Initialize TLS fronting if configured
 		if cfg.MaskHost != "" && cfg.FetchRealCert {
-			h.certFetcher = tlsfront.NewCertFetcher(cfg.CertRefreshHours, cfg.MaskHost)
+			handler.certFetcher = tlsfront.NewCertFetcher(cfg.CertRefreshHours, cfg.MaskHost)
 
 			// Fetch certificate synchronously at startup
 			logger.Debug("Fetching TLS certificate from %s:%d (SNI: %s)...", cfg.CertHost, cfg.CertPort, cfg.MaskHost)
-			cert, err := h.certFetcher.FetchCert(cfg.CertHost, cfg.CertPort)
+			cert, err := handler.certFetcher.FetchCert(cfg.CertHost, cfg.CertPort)
 			if err != nil {
 				logger.Warn("Failed to fetch certificate: %v (will retry in background)", err)
 			} else {
@@ -239,42 +274,28 @@ func RunWithHandler(cfg *Config, logger Logger) (shutdown func(), handler *Proxy
 			}
 
 			// Start background refresh
-			h.certFetcher.StartBackgroundRefresh(cfg.CertHost, cfg.CertPort)
+			handler.certFetcher.StartBackgroundRefresh(cfg.CertHost, cfg.CertPort)
 
 			// Initialize ServerHello fetcher for hybrid mode (real TLS fingerprint)
-			h.serverHelloFetcher = tlsfront.NewServerHelloFetcher(cfg.CertHost, cfg.CertPort)
+			handler.serverHelloFetcher = tlsfront.NewServerHelloFetcher(cfg.CertHost, cfg.CertPort)
 			logger.Debug("Fetching real ServerHello from %s:%d for hybrid TLS mode...", cfg.CertHost, cfg.CertPort)
-			_, _, err = h.serverHelloFetcher.GetServerHelloTemplate()
+			_, _, err = handler.serverHelloFetcher.GetServerHelloTemplate()
 			if err != nil {
 				logger.Warn("Failed to fetch ServerHello template: %v (will retry)", err)
 			} else {
 				logger.Info("Hybrid TLS mode enabled: using real ServerHello from %s", cfg.CertHost)
 			}
-			h.serverHelloFetcher.StartBackgroundRefresh()
+			handler.serverHelloFetcher.StartBackgroundRefresh()
 		}
 
 		// Custom handler to capture engine
 		wrapper := &engineCaptureHandler{
-			ProxyHandler: h,
+			ProxyHandler: handler,
 			engPtr:       &engPtr,
 			ready:        ready,
 		}
 
-		opts := []gnet.Option{
-			gnet.WithMulticore(cfg.Multicore),
-			gnet.WithReusePort(cfg.ReusePort),
-			gnet.WithLockOSThread(cfg.LockOSThread),
-		}
-
-		if cfg.NumEventLoop > 0 {
-			opts = append(opts, gnet.WithNumEventLoop(cfg.NumEventLoop))
-		}
-
-		// Enable the engine ticker only when the client-silence wedge breaker is
-		// active; OnTick sweeps relaying connections for the iOS bad_salt wedge.
-		if cfg.ClientSilenceClose > 0 {
-			opts = append(opts, gnet.WithTicker(true))
-		}
+		opts := publicGnetOptions(cfg)
 
 		addr, isUnix := parseBindAddress(cfg.BindAddr)
 
@@ -293,12 +314,9 @@ func RunWithHandler(cfg *Config, logger Logger) (shutdown func(), handler *Proxy
 		ch <- gnet.Run(wrapper, addr, opts...)
 	}()
 
-	// Wait for handler to be created (very fast, inside goroutine)
-	h := <-handlerCh
-
 	shutdownFn := func() {
 		// Wait for engine to be ready with a timeout
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), proxyShutdownTimeout)
 		defer cancel()
 
 		select {
@@ -311,7 +329,28 @@ func RunWithHandler(cfg *Config, logger Logger) (shutdown func(), handler *Proxy
 		}
 	}
 
-	return shutdownFn, h, ch
+	return shutdownFn, ch
+}
+
+func publicGnetOptions(cfg *Config) []gnet.Option {
+	opts := []gnet.Option{
+		gnet.WithMulticore(cfg.Multicore),
+		gnet.WithReusePort(cfg.ReusePort),
+		gnet.WithLockOSThread(cfg.LockOSThread),
+		// Pin the audited gnet defaults so dependency changes cannot silently
+		// alter per-readable-event work or static outbound-buffer capacity.
+		gnet.WithReadBufferCap(publicReadBufferCap),
+		gnet.WithWriteBufferCap(publicWriteBufferCap),
+	}
+	if cfg.NumEventLoop > 0 {
+		opts = append(opts, gnet.WithNumEventLoop(cfg.NumEventLoop))
+	}
+	// Enable the engine ticker only when the client-silence wedge breaker is
+	// active; OnTick sweeps relaying connections for the iOS bad_salt wedge.
+	if cfg.ClientSilenceClose > 0 {
+		opts = append(opts, gnet.WithTicker(true))
+	}
+	return opts
 }
 
 // engineCaptureHandler wraps ProxyHandler to capture the engine on boot.

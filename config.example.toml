@@ -133,6 +133,47 @@ carrier = "https-lanes"
 # gnet event loops for the private WEB HTTP listener (0 = automatic).
 # num-event-loops = 0
 
+# Telegram Middle-End transport. This section has no effect while `enabled` is false.
+# Changes to this section require a restart.
+[middle-end]
+enabled = false
+
+# Registered Telegram proxy tag. The value contains exactly 32 hexadecimal characters.
+# Leave this value empty if Telegram did not issue a proxy tag.
+# proxy-tag = "0123456789abcdef0123456789abcdef"
+
+# SOCKS5 proxy for Middle-End links. The default is `[upstream].socks5`.
+# The artifact fetch also uses this proxy through remote DNS resolution.
+# socks5 = "127.0.0.1:1080"
+
+# Optional SOCKS5 credentials. Set both values or leave both values empty.
+# socks5-username = "proxy-user"
+# socks5-password = "proxy-password"
+
+# Optional proxy for the Telegram artifact fetch. This value replaces the SOCKS5 default.
+# The schemes `http`, `https`, `socks5`, and `socks5h` are valid.
+# Do not add a path, a query, or a fragment.
+# artifact-proxy = "http://127.0.0.1:3128"
+
+# Maximum public connections while Middle-End is enabled.
+# A value of 0 uses 10,000 connections. An override can only reduce this limit.
+# The valid override range is 1 through 10,000.
+# max-connections = 0
+
+# Global byte limit for each request, response, frontend input, and frontend output queue.
+# A value of 0 uses 32 MiB plus one 16 KiB permit.
+# The valid override range is 2 through 32 MiB. An override can only reduce this limit.
+# queue-budget-mb = 0
+
+# Telego derives the other limits. Each signed DC gets four gnet links in the active generation.
+# Liveness probes run every 5s. A link fails after 100s without a valid probe response.
+# Artifact rotation prepares one candidate, then drains the old generation for up to 90s.
+# New clients use direct DC links until an active generation is ready.
+# Use the `telego_middleend_*` metrics to compare queue use with configured capacity.
+# Telego also logs admission, repair, refresh, queue pressure, and binding eviction events.
+# Telego logs the process descriptor limit and the direct-fallback minimum at startup.
+# The active-ready log reports live and two-generation payload-capacity ceilings.
+
 # Performance tuning (all optional)
 [performance]
 # IP preference for DC connections: prefer-ipv4, prefer-ipv6, only-ipv4, only-ipv6

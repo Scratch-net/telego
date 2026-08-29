@@ -35,6 +35,7 @@ type Config struct {
 	Upstream    UpstreamConfig    `toml:"upstream"`
 	Metrics     MetricsConfig     `toml:"metrics"`
 	WebProxy    WebProxyConfig    `toml:"web-proxy"`
+	MiddleEnd   MiddleEndConfig   `toml:"middle-end"`
 }
 
 // GeneralConfig contains general server settings.
@@ -118,6 +119,20 @@ type WebProxyConfig struct {
 	Carrier           string   `toml:"carrier"`
 	TrustedProxyCIDRs []string `toml:"trusted-proxy-cidrs"`
 	NumEventLoops     int      `toml:"num-event-loops"`
+}
+
+// MiddleEndConfig enables Telegram's official Middle-End transport. Queue,
+// topology, and timeout details are derived by ToMiddleEndRuntimeConfig. The
+// two expert bounds can only reduce the production defaults.
+type MiddleEndConfig struct {
+	Enabled        bool   `toml:"enabled"`
+	ProxyTag       string `toml:"proxy-tag"`
+	SOCKS5         string `toml:"socks5"`
+	SOCKS5Username string `toml:"socks5-username"`
+	SOCKS5Password string `toml:"socks5-password"`
+	ArtifactProxy  string `toml:"artifact-proxy"`
+	MaxConnections int    `toml:"max-connections"`
+	QueueBudgetMB  int    `toml:"queue-budget-mb"`
 }
 
 // WebProxyRuntimeConfig is the validated, immutable input used to construct
@@ -289,6 +304,10 @@ func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
 	// Public PROXY behavior remains controlled by [general].proxy-protocol.
 	cfg.InternalProxyProtocol = c.WebProxy.Enabled
 	cfg.WebProxyFingerprint = c.webProxyFingerprint()
+	cfg.MiddleEndFingerprint = c.middleEndFingerprint()
+	if c.MiddleEnd.Enabled {
+		cfg.MaxConnections = middleEndMaxConnections(c.MiddleEnd.MaxConnections)
+	}
 
 	return cfg, nil
 }

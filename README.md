@@ -152,6 +152,27 @@ Both modes use the same 16-byte secret key. The `ee` or `dd` prefix in the clien
 
 ---
 
+## Telegram Middle-End
+
+Telego can route authenticated MTProxy sessions through Telegram Middle-End servers. Both the public listener and the ME client runtime use gnet.
+
+Add this section to enable ME:
+
+```toml
+[middle-end]
+enabled = true
+# proxy-tag = "0123456789abcdef0123456789abcdef"
+# socks5 = "127.0.0.1:1080"
+```
+
+Telego keeps four physical links for each signed DC. It replaces failed links without moving healthy bindings or replacing the complete generation.
+
+The direct DC path stays available before ME is ready. Each public TCP connection keeps its first selected route until that connection closes.
+
+Read the [Middle-End operator guide](docs/middle-end.md) for topology, failure behavior, limits, metrics, and proxy configuration.
+
+---
+
 ## Native Telegram WEB Proxy
 
 Telego includes an optional WEB proxy for Telegram Desktop. It uses a separate private gnet HTTP/1.1 listener behind Nginx.
@@ -281,6 +302,17 @@ enabled = false
 # backend = "127.0.0.1:443"                # Derived TCP or Unix MTProxy backend
 # trusted-proxy-cidrs = ["127.0.0.1/32"]   # Nginx peers allowed to send X-Forwarded-For
 # num-event-loops = 0                       # 0 = automatic
+
+# Telegram Middle-End transport (optional; requires a restart)
+[middle-end]
+enabled = false
+# proxy-tag = "0123456789abcdef0123456789abcdef"
+# socks5 = "127.0.0.1:1080"                # Defaults to [upstream].socks5
+# socks5-username = "proxy-user"
+# socks5-password = "proxy-password"
+# artifact-proxy = "http://127.0.0.1:3128" # Overrides the artifact proxy only
+# max-connections = 0                       # 0 = 10,000. An override can only reduce it.
+# queue-budget-mb = 0                       # 0 = 32 MiB plus 16 KiB
 
 # Performance tuning (all optional)
 [performance]
@@ -583,6 +615,11 @@ bind-to = "127.0.0.1:9090"
 | `telego_web_sessions_closed_total` | Counter | WEB sessions closed by `reason` |
 | `telego_web_carrier_retries_total` | Counter | WEB retries and replays by `operation` |
 | `telego_web_backpressure_total` | Counter | WEB backpressure events by `operation` |
+| `telego_middleend_admitting` | Gauge | Whether an active ME generation accepts new bindings |
+| `telego_middleend_links` | Gauge | ME links by generation role, signed DC, and state |
+| `telego_middleend_slot_repair_total` | Counter | Physical-link replacement results |
+| `telego_middleend_frontend_routes_active` | Gauge | Active ME and direct-fallback routes |
+| `telego_middleend_frontend_route_commits_total` | Counter | Lifetime ME and direct-fallback route selections |
 
 Connection, IP, block, and traffic metrics include a `user` label. Diagnostic metrics use the labels in the table.
 
@@ -616,8 +653,6 @@ PRs are welcome! Please ensure:
 
 1. Tests pass: `go test -race ./...`
 2. Benchmarks don't regress: `go test -bench=. ./...`
-
-**Note:** Middle-End (ME) protocol and ad-tags will not be supported.
 
 ---
 

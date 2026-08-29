@@ -4,6 +4,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/panjf2000/gnet/v2"
+
 	"github.com/scratch-net/telego/pkg/dc"
 )
 
@@ -97,6 +99,35 @@ func TestIsUnixSocket(t *testing.T) {
 		if result != tc.isUnix {
 			t.Errorf("IsUnixSocket(%q): got %v, want %v", tc.addr, result, tc.isUnix)
 		}
+	}
+}
+
+func TestPublicGnetOptionsPinAuditedBufferCaps(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.NumEventLoop = 3
+	cfg.ClientSilenceClose = time.Second
+	var options gnet.Options
+	for _, option := range publicGnetOptions(&cfg) {
+		option(&options)
+	}
+	if options.ReadBufferCap != publicReadBufferCap || options.WriteBufferCap != publicWriteBufferCap {
+		t.Fatalf("public buffer caps = read %d write %d, want %d and %d", options.ReadBufferCap, options.WriteBufferCap, publicReadBufferCap, publicWriteBufferCap)
+	}
+	if options.Multicore != cfg.Multicore || options.ReusePort != cfg.ReusePort || options.LockOSThread != cfg.LockOSThread || options.NumEventLoop != cfg.NumEventLoop || !options.Ticker {
+		t.Fatalf("public gnet options = %+v", options)
+	}
+}
+
+func TestPublicGnetOptionsLeaveOptionalOverridesDisabled(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.NumEventLoop = 0
+	cfg.ClientSilenceClose = 0
+	var options gnet.Options
+	for _, option := range publicGnetOptions(&cfg) {
+		option(&options)
+	}
+	if options.NumEventLoop != 0 || options.Ticker {
+		t.Fatalf("optional public gnet options = event loops %d ticker %v", options.NumEventLoop, options.Ticker)
 	}
 }
 

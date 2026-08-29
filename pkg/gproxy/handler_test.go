@@ -331,6 +331,29 @@ func TestNewProxyHandler(t *testing.T) {
 	}
 }
 
+func TestProxyHandlerGlobalConnectionLimit(t *testing.T) {
+	handler := NewProxyHandler(&Config{MaxConnections: 1}, &testLogger{})
+	first := newTestMockGnetConn()
+	if _, action := handler.OnOpen(first); action != gnet.None {
+		t.Fatalf("first OnOpen action = %v", action)
+	}
+	second := newTestMockGnetConn()
+	if _, action := handler.OnOpen(second); action != gnet.Close {
+		t.Fatalf("saturated OnOpen action = %v, want close", action)
+	}
+	if got := atomic.LoadInt64(&handler.activeConns); got != 2 {
+		t.Fatalf("active before rejected OnClose = %d", got)
+	}
+	handler.OnClose(second, nil)
+	if got := atomic.LoadInt64(&handler.activeConns); got != 1 {
+		t.Fatalf("active after rejected OnClose = %d", got)
+	}
+	handler.OnClose(first, nil)
+	if got := atomic.LoadInt64(&handler.activeConns); got != 0 {
+		t.Fatalf("active after all closes = %d", got)
+	}
+}
+
 func TestNewProxyHandler_NoLimits(t *testing.T) {
 	cfg := &Config{
 		IdleTimeout: 5 * time.Minute,
