@@ -63,6 +63,9 @@ func (c ServiceConfig) Validate() error {
 	if c.CoordinatorRetry <= 0 {
 		return fmt.Errorf("%w: coordinator retry interval must be positive", ErrInvalidServiceConfig)
 	}
+	if c.NATResolver == nil {
+		return fmt.Errorf("%w: nil NAT resolver", ErrInvalidServiceConfig)
+	}
 	factoryConfig := GnetGenerationFactoryConfig{
 		EndpointDialTimeout: c.EndpointDialTimeout,
 		DialConcurrency:     c.DialConcurrency,
@@ -118,6 +121,7 @@ type serviceState struct {
 	supervisor  *FixedBindingGenerationSupervisor
 	coordinator *GenerationCoordinator
 	nat         *NATResolver
+	primeNAT    bool
 	capacity    ServiceCapacitySnapshot
 
 	closeOnce sync.Once
@@ -185,6 +189,7 @@ func NewService(config ServiceConfig) (*Service, error) {
 		supervisor:  supervisor,
 		coordinator: coordinator,
 		nat:         config.NATResolver,
+		primeNAT:    config.SOCKS5 != nil,
 		capacity: ServiceCapacitySnapshot{
 			EventLoops:           config.Runtime.EventLoops,
 			LinksPerDC:           config.LinksPerDC,
@@ -226,6 +231,9 @@ func (s *Service) Start() error {
 	defer state.mu.Unlock()
 	if state.closing {
 		return ErrServiceClosed
+	}
+	if state.primeNAT {
+		state.nat.Prime(AddressFamilyIPv4)
 	}
 	return state.coordinator.Start()
 }

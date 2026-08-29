@@ -4,13 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-func serviceTestConfig(source ArtifactSource) ServiceConfig {
+func serviceTestConfig(t *testing.T, source ArtifactSource) ServiceConfig {
+	t.Helper()
+	natResolver, err := NewNATResolver(NATResolverConfig{PublicIP: netip.MustParseAddr("8.8.8.8")})
+	if err != nil {
+		t.Fatal(err)
+	}
 	return ServiceConfig{
 		ArtifactSource:         source,
 		ArtifactRefreshTimeout: time.Second,
@@ -24,6 +30,7 @@ func serviceTestConfig(source ArtifactSource) ServiceConfig {
 			RepairBackoffMaximum: 5 * time.Millisecond,
 		},
 		CoordinatorRetry:    5 * time.Millisecond,
+		NATResolver:         natResolver,
 		EndpointDialTimeout: 30 * time.Millisecond,
 		DialConcurrency:     2,
 		LinksPerDC:          1,
@@ -38,7 +45,7 @@ func serviceTestConfig(source ArtifactSource) ServiceConfig {
 }
 
 func TestServiceConfigValidationAndRedaction(t *testing.T) {
-	valid := serviceTestConfig(artifactSourceFunc(func(context.Context) (RawArtifacts, error) {
+	valid := serviceTestConfig(t, artifactSourceFunc(func(context.Context) (RawArtifacts, error) {
 		return RawArtifacts{}, errors.New("unused")
 	}))
 	if err := valid.Validate(); err != nil {
@@ -59,6 +66,11 @@ func TestServiceConfigValidationAndRedaction(t *testing.T) {
 		func() ServiceConfig {
 			config := valid
 			config.CoordinatorRetry = 0
+			return config
+		}(),
+		func() ServiceConfig {
+			config := valid
+			config.NATResolver = nil
 			return config
 		}(),
 		func() ServiceConfig {
@@ -104,7 +116,7 @@ func TestServiceArtifactOutageKeepsDirectFallbackAndRetries(t *testing.T) {
 		calls.Add(1)
 		return RawArtifacts{}, outage
 	})
-	service, err := NewService(serviceTestConfig(source))
+	service, err := NewService(serviceTestConfig(t, source))
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
@@ -120,7 +132,7 @@ func TestServiceArtifactOutageKeepsDirectFallbackAndRetries(t *testing.T) {
 	}
 	capacity := service.Snapshot().Capacity
 	if capacity.EventLoops != 1 || capacity.LinksPerDC != 1 ||
-		capacity.MaxResidentBindings != validServiceResidentLimit(t, serviceTestConfig(source)) {
+		capacity.MaxResidentBindings != validServiceResidentLimit(t, serviceTestConfig(t, source)) {
 		t.Fatalf("capacity snapshot = %+v", capacity)
 	}
 	if err := service.Start(); err != nil {
@@ -140,6 +152,59 @@ func TestServiceArtifactOutageKeepsDirectFallbackAndRetries(t *testing.T) {
 	}
 }
 
+func TestServiceSOCKS5PrimesFrontendNAT(t *testing.T) {
+	probeStarted := make(chan struct{}, 1)
+	resolver, err := newNATResolver(
+		natResolverTestConfig(),
+		time.Now,
+		func(context.Context, AddressFamily, []string, int) (natProbeResult, error) {
+			select {
+			case probeStarted <- struct{}{}:
+			default:
+			}
+			return natProbeResult{
+				address:           netip.MustParseAddr("8.8.8.8"),
+				respondingServers: 2,
+				agreeingServers:   2,
+			}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialer, err := NewSOCKS5Dialer("127.0.0.1:1080", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := serviceTestConfig(t, artifactSourceFunc(func(context.Context) (RawArtifacts, error) {
+		return RawArtifacts{}, errors.New("artifact outage")
+	}))
+	config.SOCKS5 = dialer
+	config.NATResolver = resolver
+	service, err := NewService(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		closeContext, cancelClose := context.WithTimeout(context.Background(), time.Second)
+		defer cancelClose()
+		if err := service.Close(closeContext); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+	if err := service.Start(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-probeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("SOCKS5 service did not prime frontend IPv4 NAT discovery")
+	}
+	waitServiceCondition(t, service, time.Second, func(snapshot ServiceSnapshot) bool {
+		return snapshot.NAT.IPv4.Ready && snapshot.NAT.IPv4.Successes == 1
+	})
+}
+
 func validServiceResidentLimit(t *testing.T, config ServiceConfig) int {
 	t.Helper()
 	if err := config.Validate(); err != nil {
@@ -157,7 +222,7 @@ func TestServiceCloseCancelsAndJoinsArtifactRefresh(t *testing.T) {
 		close(stopped)
 		return RawArtifacts{}, context.Cause(ctx)
 	})
-	service, err := NewService(serviceTestConfig(source))
+	service, err := NewService(serviceTestConfig(t, source))
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
@@ -191,7 +256,7 @@ func TestServiceCloseTimeoutContinuesAndLaterJoins(t *testing.T) {
 		<-release
 		return RawArtifacts{}, errors.New("released artifact source")
 	})
-	service, err := NewService(serviceTestConfig(source))
+	service, err := NewService(serviceTestConfig(t, source))
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}

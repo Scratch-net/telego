@@ -81,6 +81,7 @@ type natResolverFamilyState struct {
 	failures            uint64
 	respondingServers   int
 	agreeingServers     int
+	priming             bool
 }
 
 type natProbeResult struct {
@@ -220,6 +221,81 @@ func (s *natResolverState) familySnapshot(family AddressFamily) NATResolverFamil
 		AgreeingServers:   state.agreeingServers,
 		LastFailure:       state.lastFailure,
 	}
+}
+
+// TranslateCachedEndpoint replaces only a non-public or wildcard endpoint IP
+// with the cached public IP for the same address family. It retains the
+// endpoint port and never waits for network I/O. A cache miss starts one
+// bounded background probe, so callers can choose direct fallback while
+// discovery runs.
+func (r *NATResolver) TranslateCachedEndpoint(endpoint netip.AddrPort) (netip.AddrPort, error) {
+	if !endpoint.IsValid() || endpoint.Port() == 0 {
+		return netip.AddrPort{}, fmt.Errorf("%w: invalid proxy endpoint", ErrNATPublicIPDiscovery)
+	}
+	address := endpoint.Addr().Unmap()
+	if address.Zone() != "" {
+		return netip.AddrPort{}, fmt.Errorf("%w: proxy endpoint is zoned", ErrNATPublicIPDiscovery)
+	}
+	endpoint = netip.AddrPortFrom(address, endpoint.Port())
+	if validatePublicEndpoint("proxy", endpoint) == nil {
+		return endpoint, nil
+	}
+
+	snapshot := r.Snapshot()
+	var (
+		family AddressFamily
+		cached NATResolverFamilySnapshot
+	)
+	switch addressFamily(address) {
+	case AddressFamilyIPv4:
+		family = AddressFamilyIPv4
+		cached = snapshot.IPv4
+	case AddressFamilyIPv6:
+		family = AddressFamilyIPv6
+		cached = snapshot.IPv6
+	default:
+		return netip.AddrPort{}, fmt.Errorf("%w: invalid proxy address family", ErrNATPublicIPDiscovery)
+	}
+	if !cached.Ready || !cached.PublicIP.IsValid() {
+		r.Prime(family)
+		return netip.AddrPort{}, fmt.Errorf("%w: no cached public IP for the proxy address family", ErrNATPublicIPDiscovery)
+	}
+	translated, err := translateNATClientAddress(endpoint, cached.PublicIP)
+	if err != nil {
+		return netip.AddrPort{}, fmt.Errorf("%w: translate proxy endpoint: %w", ErrNATPublicIPDiscovery, err)
+	}
+	return translated, nil
+}
+
+// Prime starts one bounded background discovery for family when no cached
+// result, active probe, or failure backoff exists. It never waits for network
+// I/O and returns whether it started a goroutine.
+func (r *NATResolver) Prime(family AddressFamily) bool {
+	if r == nil || r.state == nil || (family != AddressFamilyIPv4 && family != AddressFamilyIPv6) {
+		return false
+	}
+	state := r.state
+	if state.static.IsValid() {
+		return false
+	}
+	state.mu.Lock()
+	now := state.now()
+	cached := &state.families[family]
+	if cached.priming || cached.inFlight != nil || now.Before(cached.retryAt) ||
+		(cached.address.IsValid() && now.Before(cached.expiresAt)) {
+		state.mu.Unlock()
+		return false
+	}
+	cached.priming = true
+	state.mu.Unlock()
+
+	go func() {
+		_, _ = r.Resolve(context.Background(), family)
+		state.mu.Lock()
+		state.families[family].priming = false
+		state.mu.Unlock()
+	}()
+	return true
 }
 
 // Resolve returns a public address in family. Concurrent cache misses share

@@ -39,9 +39,14 @@ Do not publish the proxy tag or the SOCKS5 credentials in an issue or log.
 
 Direct ME links use the address and port that the Telegram ME server sees. These values are inputs to the ME key derivation.
 
+Each client request also carries the public proxy address. Telegram rejects requests that contain a private Docker or host address.
+
 If the TCP socket has a public IP, Telego uses the exact socket tuple. Telego does not run a NAT probe.
 
-If the TCP socket has a private IP, Telego gets the public IP from a fixed STUN pool. This behavior supports Docker bridge networks.
+If an ME or frontend socket has a private IP, Telego gets the public IP from a fixed STUN pool.
+This behavior supports Docker bridge networks.
+
+On Unix, gnet reports the listener address for each accepted client. Telego also translates an IPv4 or IPv6 wildcard listener through the same NAT state.
 
 Telego keeps the kernel-assigned TCP source port. It does not use the UDP port from the STUN response.
 
@@ -51,9 +56,13 @@ The ME handshake validates the complete tuple. If NAT changes the TCP source por
 
 Set `nat-ip` only when automatic discovery returns the wrong public IP. The value must be a public IPv4 or IPv6 address.
 
-The `nat-ip` value replaces only a private socket IP from the same address family. It cannot replace the TCP source port.
+The `nat-ip` value replaces only a private socket IP from the same address family. It cannot replace a port.
 
-SOCKS5 links do not use `nat-ip` or STUN. They use the exact public `BND.ADDR:BND.PORT` from the SOCKS5 CONNECT response.
+SOCKS5 links use the exact public `BND.ADDR:BND.PORT` for their ME key derivation. They do not replace this tuple with STUN data.
+
+The frontend still uses `nat-ip` or STUN when its client-facing socket has a private IP. SOCKS5 mode starts IPv4 discovery in the background.
+
+If discovery is not ready, that client uses direct fallback. A later connection can use ME after discovery succeeds.
 
 ## Connection routing
 
@@ -138,6 +147,8 @@ The queue metrics report current use, capacity, and lifetime high-water values. 
 Telego also logs route fallback, artifact failure, generation failure, physical-link repair, and binding eviction events.
 
 Telego logs NAT discovery results, the selected public IP, responder agreement, and the retry time.
+
+Telego also logs aggregated ME session commits and the current number of active ME bindings.
 
 ## Troubleshooting
 

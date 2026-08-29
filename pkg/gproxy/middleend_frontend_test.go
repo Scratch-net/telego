@@ -286,9 +286,22 @@ func newUnstartedMiddleEndTestManager(
 	return manager
 }
 
-func middleEndTestFrontendConfig(manager *middleend.FixedBindingManager) MiddleEndFrontendConfig {
+func middleEndTestNATResolver(t *testing.T) *middleend.NATResolver {
+	t.Helper()
+	natResolver, err := middleend.NewNATResolver(middleend.NATResolverConfig{
+		PublicIP: netip.MustParseAddr("8.8.8.8"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return natResolver
+}
+
+func middleEndTestFrontendConfig(t *testing.T, manager *middleend.FixedBindingManager) MiddleEndFrontendConfig {
+	t.Helper()
 	return MiddleEndFrontendConfig{
 		Source:                     manager,
+		NATResolver:                middleEndTestNATResolver(t),
 		PrecommitFailure:           MiddleEndPrecommitClose,
 		MaxPendingClientBytes:      2 << 20,
 		MaxPendingClientBytesTotal: 8 << 20,
@@ -309,7 +322,7 @@ func newMiddleEndTestHandler(
 	secret := []byte("0123456789abcdef")
 	link := newMiddleEndTestLink()
 	manager := newMiddleEndTestManager(t, dcID, link)
-	config := middleEndTestFrontendConfig(manager)
+	config := middleEndTestFrontendConfig(t, manager)
 	if frontendConfig != nil {
 		frontendConfig(&config)
 	}
@@ -578,7 +591,7 @@ func driveMiddleEndCommit(
 func TestMiddleEndFrontendConfigValidationAndRedaction(t *testing.T) {
 	link := newMiddleEndTestLink()
 	manager := newMiddleEndTestManager(t, 2, link)
-	valid := middleEndTestFrontendConfig(manager)
+	valid := middleEndTestFrontendConfig(t, manager)
 	var typedNilSource *middleend.FixedBindingManager
 	tests := []MiddleEndFrontendConfig{
 		{},
@@ -630,6 +643,17 @@ func stringsContainsAny(value string, markers ...string) bool {
 	return false
 }
 
+func TestMiddleEndAddrPortAllowsOnlyProxyWildcard(t *testing.T) {
+	wildcard := &net.TCPAddr{IP: net.IPv4zero, Port: 443}
+	if _, err := middleEndAddrPort("remote", wildcard, false); !errors.Is(err, middleend.ErrInvalidProxyAddress) {
+		t.Fatalf("remote wildcard error = %v", err)
+	}
+	got, err := middleEndAddrPort("proxy", wildcard, true)
+	if err != nil || got != netip.MustParseAddrPort("0.0.0.0:443") {
+		t.Fatalf("proxy wildcard = %s, %v", got, err)
+	}
+}
+
 func TestMiddleEndDDCommitPreservesInputAndRoutesExactSignedDC(t *testing.T) {
 	for _, dcID := range []middleend.DCID{-2, 0, 2} {
 		t.Run(fmt.Sprintf("dc_%d", dcID), func(t *testing.T) {
@@ -640,6 +664,9 @@ func TestMiddleEndDDCommitPreservesInputAndRoutesExactSignedDC(t *testing.T) {
 				obfuscated2.ConnectionTypeIntermediate,
 				func(config *MiddleEndFrontendConfig) { config.ProxyTag = &tag },
 			)
+			// gnet returns the listener address, not getsockname(2), for accepted
+			// sockets. A wildcard listener must retain its port and use NAT state.
+			conn.localAddr = &net.TCPAddr{IP: net.IPv4zero, Port: 8888}
 			originalTag := tag
 			tag[0] = 99
 			_, _, _, clientEncryptor, err := obfuscated2.ParseClientFrameWithType(
@@ -671,7 +698,7 @@ func TestMiddleEndDDCommitPreservesInputAndRoutesExactSignedDC(t *testing.T) {
 				t.Fatalf("route = DC %d connection %d", ctx.middleEnd.binding.DCID(), submission.ConnectionID)
 			}
 			if request.RemoteAddr != netip.MustParseAddrPort("192.168.1.1:12345") ||
-				request.ProxyAddr != netip.MustParseAddrPort("127.0.0.1:8888") {
+				request.ProxyAddr != netip.MustParseAddrPort("8.8.8.8:8888") {
 				t.Fatalf("socket tuple = %s -> %s", request.RemoteAddr, request.ProxyAddr)
 			}
 			if request.Tag == nil || *request.Tag != originalTag {
@@ -799,7 +826,7 @@ func TestMiddleEndPublicProxyTupleIgnoredAuthenticatedTupleRequired(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if request2.RemoteAddr.String() != "198.51.100.20:45678" || request2.ProxyAddr.String() != "203.0.113.10:443" {
+	if request2.RemoteAddr.String() != "198.51.100.20:45678" || request2.ProxyAddr.String() != "8.8.8.8:443" {
 		t.Fatalf("authenticated tuple = %s -> %s", request2.RemoteAddr, request2.ProxyAddr)
 	}
 	closeMiddleEndTestClient(handler2, conn2, ctx2)
@@ -1378,7 +1405,7 @@ func TestMiddleEndReservationWithoutRetainedRequestFailsClosed(t *testing.T) {
 	handler, err := NewProxyHandlerWithMiddleEnd(
 		&Config{Secrets: []Secret{{Name: "test", Key: []byte("0123456789abcdef")}}},
 		&testLogger{},
-		middleEndTestFrontendConfig(manager),
+		middleEndTestFrontendConfig(t, manager),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1493,7 +1520,7 @@ func TestMiddleEndWaitingReservationAcceptsThenProcessesNextPacket(t *testing.T)
 	handler, err := NewProxyHandlerWithMiddleEnd(
 		&Config{Secrets: []Secret{{Name: "test", Key: []byte("0123456789abcdef")}}},
 		&testLogger{},
-		middleEndTestFrontendConfig(manager),
+		middleEndTestFrontendConfig(t, manager),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1684,6 +1711,7 @@ func TestMiddleEndSupervisorWakesClientWhenRetiringGenerationIsForcedClosed(t *t
 		TimeSkewTolerance: time.Minute,
 	}, &testLogger{}, MiddleEndFrontendConfig{
 		Source:                     supervisor,
+		NATResolver:                middleEndTestNATResolver(t),
 		PrecommitFailure:           MiddleEndPrecommitClose,
 		MaxPendingClientBytes:      2 << 20,
 		MaxPendingClientBytesTotal: 8 << 20,
@@ -1772,7 +1800,7 @@ func TestMiddleEndActualShutdownOrderLeavesManagerExternal(t *testing.T) {
 	handler, err := NewProxyHandlerWithMiddleEnd(
 		&Config{Secrets: []Secret{{Name: "test", Key: []byte("0123456789abcdef")}}},
 		&testLogger{},
-		middleEndTestFrontendConfig(manager),
+		middleEndTestFrontendConfig(t, manager),
 	)
 	if err != nil {
 		t.Fatal(err)

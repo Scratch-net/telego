@@ -257,6 +257,89 @@ func TestTranslateNATClientAddressRetainsKernelPort(t *testing.T) {
 	}
 }
 
+func TestNATResolverTranslateCachedEndpoint(t *testing.T) {
+	config := natResolverTestConfig()
+	config.PublicIP = netip.MustParseAddr("8.8.8.8")
+	resolver, err := NewNATResolver(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	private := netip.MustParseAddrPort("172.18.0.2:443")
+	translated, err := resolver.TranslateCachedEndpoint(private)
+	if err != nil || translated != netip.MustParseAddrPort("8.8.8.8:443") {
+		t.Fatalf("translated endpoint = %s, %v", translated, err)
+	}
+	wildcard := netip.MustParseAddrPort("0.0.0.0:443")
+	translated, err = resolver.TranslateCachedEndpoint(wildcard)
+	if err != nil || translated != netip.MustParseAddrPort("8.8.8.8:443") {
+		t.Fatalf("wildcard endpoint = %s, %v", translated, err)
+	}
+	ipv6Config := natResolverTestConfig()
+	ipv6Config.PublicIP = netip.MustParseAddr("2001:4860:4860::8888")
+	ipv6Resolver, err := NewNATResolver(ipv6Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	translated, err = ipv6Resolver.TranslateCachedEndpoint(netip.MustParseAddrPort("[::]:443"))
+	if err != nil || translated != netip.MustParseAddrPort("[2001:4860:4860::8888]:443") {
+		t.Fatalf("IPv6 wildcard endpoint = %s, %v", translated, err)
+	}
+	public := netip.MustParseAddrPort("1.1.1.1:443")
+	unchanged, err := resolver.TranslateCachedEndpoint(public)
+	if err != nil || unchanged != public {
+		t.Fatalf("public endpoint = %s, %v", unchanged, err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	automatic, err := newNATResolver(
+		natResolverTestConfig(),
+		time.Now,
+		func(ctx context.Context, _ AddressFamily, _ []string, _ int) (natProbeResult, error) {
+			if calls.Add(1) == 1 {
+				close(entered)
+			}
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return natProbeResult{}, context.Cause(ctx)
+			}
+			return natProbeResult{
+				address:           netip.MustParseAddr("8.8.4.4"),
+				respondingServers: 2,
+				agreeingServers:   2,
+			}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := automatic.TranslateCachedEndpoint(private); !errors.Is(err, ErrNATPublicIPDiscovery) {
+		t.Fatalf("uncached translation error = %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("uncached translation did not start background discovery")
+	}
+	if _, err := automatic.TranslateCachedEndpoint(private); !errors.Is(err, ErrNATPublicIPDiscovery) {
+		t.Fatalf("in-flight translation error = %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("background discovery calls = %d, want 1", calls.Load())
+	}
+	close(release)
+	if _, err := automatic.Resolve(t.Context(), AddressFamilyIPv4); err != nil {
+		t.Fatal(err)
+	}
+	translated, err = automatic.TranslateCachedEndpoint(private)
+	if err != nil || translated != netip.MustParseAddrPort("8.8.4.4:443") {
+		t.Fatalf("cached translated endpoint = %s, %v", translated, err)
+	}
+}
+
 func TestSOCKS5AddressTupleAuthority(t *testing.T) {
 	server := netip.MustParseAddrPort("149.154.167.50:443")
 	tests := []struct {

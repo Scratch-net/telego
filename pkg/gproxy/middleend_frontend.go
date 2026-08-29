@@ -82,6 +82,7 @@ var (
 // connection OnClose callback and the serving engine has returned.
 type MiddleEndFrontendConfig struct {
 	Source                     MiddleEndBindingSource
+	NATResolver                *middleend.NATResolver
 	PrecommitFailure           MiddleEndPrecommitAction
 	ProxyTag                   *middleend.ProxyTag
 	MaxPendingClientBytes      int
@@ -129,6 +130,9 @@ func NewProxyHandlerWithMiddleEnd(
 func (c MiddleEndFrontendConfig) validate() error {
 	if nilMiddleEndBindingSource(c.Source) {
 		return fmt.Errorf("%w: nil binding source", ErrInvalidMiddleEndFrontend)
+	}
+	if c.NATResolver == nil {
+		return fmt.Errorf("%w: nil NAT resolver", ErrInvalidMiddleEndFrontend)
 	}
 	switch c.PrecommitFailure {
 	case MiddleEndPrecommitDirectFallback, MiddleEndPrecommitClose:
@@ -184,6 +188,7 @@ func nilMiddleEndBindingSource(source MiddleEndBindingSource) bool {
 
 type middleEndFrontend struct {
 	source           MiddleEndBindingSource
+	nat              *middleend.NATResolver
 	precommitFailure MiddleEndPrecommitAction
 	tag              middleend.ProxyTag
 	hasTag           bool
@@ -210,6 +215,7 @@ type middleEndFrontend struct {
 func newMiddleEndFrontend(config MiddleEndFrontendConfig) *middleEndFrontend {
 	frontend := &middleEndFrontend{
 		source:           config.Source,
+		nat:              config.NATResolver,
 		precommitFailure: config.PrecommitFailure,
 		maxPendingClient: config.MaxPendingClientBytes,
 		retryInitial:     config.OutputRetryInitial,
@@ -433,7 +439,7 @@ func (f *middleEndFrontend) commit(
 		)
 	}
 
-	remoteAddr, proxyAddr, err := middleEndClientTuple(c, ctx)
+	remoteAddr, proxyAddr, err := middleEndClientTuple(c, ctx, f.nat)
 	if err != nil {
 		return false, err
 	}
@@ -532,25 +538,36 @@ func (f *middleEndFrontend) closeDirectFallback(connectionID uint64) {
 	f.mu.Unlock()
 }
 
-func middleEndClientTuple(c gnet.Conn, ctx *ConnContext) (netip.AddrPort, netip.AddrPort, error) {
+func middleEndClientTuple(
+	c gnet.Conn,
+	ctx *ConnContext,
+	natResolver *middleend.NATResolver,
+) (netip.AddrPort, netip.AddrPort, error) {
 	remote := c.RemoteAddr()
 	local := c.LocalAddr()
 	if source, destination, authenticated := ctx.trustedProxyTuple(); authenticated {
 		remote = source
 		local = destination
 	}
-	remoteAddr, err := middleEndAddrPort("remote", remote)
+	remoteAddr, err := middleEndAddrPort("remote", remote, false)
 	if err != nil {
 		return netip.AddrPort{}, netip.AddrPort{}, err
 	}
-	proxyAddr, err := middleEndAddrPort("proxy", local)
+	// On Unix, gnet exposes the listener address for an accepted socket. Keep
+	// an IPv4 or IPv6 wildcard here so the NAT resolver can supply its public
+	// address while retaining the authoritative listener port.
+	proxyAddr, err := middleEndAddrPort("proxy", local, true)
 	if err != nil {
 		return netip.AddrPort{}, netip.AddrPort{}, err
+	}
+	proxyAddr, err = natResolver.TranslateCachedEndpoint(proxyAddr)
+	if err != nil {
+		return netip.AddrPort{}, netip.AddrPort{}, fmt.Errorf("translate Middle-End proxy address: %w", err)
 	}
 	return remoteAddr, proxyAddr, nil
 }
 
-func middleEndAddrPort(label string, address net.Addr) (netip.AddrPort, error) {
+func middleEndAddrPort(label string, address net.Addr, allowUnspecified bool) (netip.AddrPort, error) {
 	tcpAddress, ok := address.(*net.TCPAddr)
 	if !ok || tcpAddress == nil {
 		return netip.AddrPort{}, fmt.Errorf("%w: %s address has type %T", middleend.ErrInvalidProxyAddress, label, address)
@@ -559,11 +576,11 @@ func middleEndAddrPort(label string, address net.Addr) (netip.AddrPort, error) {
 	if !addrPort.IsValid() || addrPort.Port() == 0 {
 		return netip.AddrPort{}, fmt.Errorf("%w: %s endpoint must have a valid address and nonzero port", middleend.ErrInvalidProxyAddress, label)
 	}
-	addr := addrPort.Addr()
-	if addr.IsUnspecified() || addr.Zone() != "" {
+	addr := addrPort.Addr().Unmap()
+	if addr.Zone() != "" || (addr.IsUnspecified() && !allowUnspecified) {
 		return netip.AddrPort{}, fmt.Errorf("%w: %s endpoint is unspecified or zoned", middleend.ErrInvalidProxyAddress, label)
 	}
-	return netip.AddrPortFrom(addr.Unmap(), addrPort.Port()), nil
+	return netip.AddrPortFrom(addr, addrPort.Port()), nil
 }
 
 func (h *ProxyHandler) handleMiddleEnd(c gnet.Conn, ctx *ConnContext) gnet.Action {

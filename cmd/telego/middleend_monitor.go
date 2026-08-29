@@ -40,6 +40,7 @@ type middleEndMonitorCounters struct {
 	frontendInputPressure   uint64
 	frontendOutputPressure  uint64
 	frontendOutputEvictions uint64
+	middleEndBindingsTotal  uint64
 	directFallbacksActive   int64
 }
 
@@ -114,6 +115,7 @@ func (m *middleEndMonitor) observe() {
 		frontendInputPressure:   frontend.InputBackpressureEvents,
 		frontendOutputPressure:  frontend.OutputBackpressureEvents,
 		frontendOutputEvictions: frontend.OutputEvictions,
+		middleEndBindingsTotal:  frontend.MiddleEndBindingsTotal,
 		directFallbacksActive:   frontend.DirectFallbacksActive,
 	}
 	previous := m.previous
@@ -154,6 +156,13 @@ func (m *middleEndMonitor) observe() {
 			Msg("Middle-End direct fallback sessions active; they remain direct until clients reconnect")
 	} else if current.directFallbacksActive == 0 && previous.directFallbacksActive > 0 {
 		log.Info().Msg("Middle-End direct fallback sessions cleared")
+	}
+	if current.middleEndBindingsTotal > previous.middleEndBindingsTotal {
+		log.Info().
+			Uint64("new_middleend_sessions", current.middleEndBindingsTotal-previous.middleEndBindingsTotal).
+			Uint64("middleend_sessions_total", current.middleEndBindingsTotal).
+			Int64("active_middleend_bindings", frontend.MiddleEndBindingsActive).
+			Msg("Middle-End client sessions committed to gnet ME links")
 	}
 	if !previous.initialized || current.repairing != previous.repairing {
 		if current.repairing {
