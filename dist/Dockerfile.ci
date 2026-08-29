@@ -1,3 +1,5 @@
+FROM alpine:latest AS certificates
+
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS builder
 
 ARG TARGETOS
@@ -19,6 +21,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     -o /telego ./cmd/telego
 
 FROM scratch
+COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=builder /telego /telego
 ENTRYPOINT ["/telego"]
 CMD ["run", "-c", "/config.toml"]

@@ -2,6 +2,8 @@
 # Usage: docker build -f Dockerfile.build -t telego .
 # With version: docker build -f Dockerfile.build --build-arg VERSION=v1.0.0 -t telego .
 
+FROM alpine:latest AS certificates
+
 FROM golang:1.27-alpine AS builder
 
 ARG BUILD_TAGS="poll_opt,gc_opt"
@@ -20,6 +22,7 @@ RUN CGO_ENABLED=0 go build -trimpath -tags="${BUILD_TAGS}" \
 
 FROM scratch
 
+COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=builder /src/telego /telego
 
 ENTRYPOINT ["/telego"]
