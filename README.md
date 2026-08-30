@@ -5,7 +5,7 @@
 <h1 align="center">telEgo</h1> <!-- Название проекта читается "ТелЕго", см https://ru.wikipedia.org/wiki/%D0%96%D0%B0%D1%80%D0%B3%D0%BE%D0%BD_%D0%BF%D0%B0%D0%B4%D0%BE%D0%BD%D0%BA%D0%BE%D0%B2 -->
 
 <p align="center">
-  <strong>High-performance Telegram MTProxy in Go with TLS fronting and WEB protocol support</strong>
+  <strong>High-performance Telegram MTProxy in Go with TLS fronting, Telegram Middle-End, and native WEB protocol support</strong>
 </p>
 
 <p align="center">
@@ -22,6 +22,7 @@
   <a href="#installation">Installation</a> •
   <a href="#quick-start">Quick Start</a> •
   <a href="#configuration">Configuration</a> •
+  <a href="#telegram-middle-end">Middle-End</a> •
   <a href="#native-telegram-web-proxy">WEB Proxy</a> •
   <a href="#docker">Docker</a> •
   <a href="#nginx--lets-encrypt-real-certificate-tls">Nginx + LE</a> •
@@ -42,6 +43,7 @@
 
 ### Networking
 - **Event-driven I/O** — Built on [gnet](https://github.com/panjf2000/gnet) with epoll/kqueue for maximum efficiency
+- **Telegram Middle-End** — Routes authenticated MTProxy and native WEB streams through persistent gnet link pools
 - **Native WEB Proxy** — Optional gnet HTTPS or WebSocket carrier for Telegram Desktop behind Nginx
 - **Zero-copy relaying** — Direct buffer manipulation without intermediate copies
 - **Buffer pooling** — Striped sync.Pool design eliminates allocations in hot paths
@@ -62,6 +64,7 @@
 
 ### Operations
 - **Multi-user Support** — Named secrets with per-user tracking and logging
+- **ME Link Repair** — Replaces failed physical links without moving healthy bindings or rebuilding every DC pool
 - **Connection Tracking** — Unique connection IDs for easy log correlation
 - **Connection Limits** — Per-IP connection limits and per-user IP limits with smart blocking (only blocks IPs with active connections when evicted, allowing legitimate reconnections)
 - **Prometheus Metrics** — Per-user connection counts, traffic, and blocked IP statistics
@@ -75,7 +78,7 @@
 ### Deployment
 - **Unix Socket Support** — Bind to Unix sockets for reverse proxy setups
 - **PROXY Protocol** — Accept v1/v2 headers from HAProxy/nginx to preserve client IPs
-- **SOCKS5 Upstream** — Route DC connections through SOCKS5 proxy (Hysteria2, VLESS, etc.)
+- **SOCKS5 Upstream** — Route direct DC traffic, ME links, and artifact requests through a SOCKS5 proxy
 
 ---
 
@@ -154,21 +157,29 @@ Both modes use the same 16-byte secret key. The `ee` or `dd` prefix in the clien
 
 ## Telegram Middle-End
 
-Telego can route authenticated MTProxy sessions through Telegram Middle-End servers. Both the public listener and the ME client runtime use gnet.
+Telegram Middle-End (ME) is Telegram's upstream transport for MTProxy servers. Telego routes authenticated MTProxy and native WEB streams through ME.
+
+Both the public listener and the ME link engine use gnet. Telego keeps four physical links for each signed Telegram DC.
+
+A registered proxy can include its Telegram-issued proxy tag in each ME request. ME also works without a proxy tag.
 
 Add this section to enable ME:
 
 ```toml
 [middle-end]
 enabled = true
-# proxy-tag = "0123456789abcdef0123456789abcdef"
+# proxy-tag = "0123456789abcdef0123456789abcdef" # Tag issued by Telegram
 # socks5 = "127.0.0.1:1080"
 # nat-ip = "YOUR_PUBLIC_IP" # Usually empty. Automatic STUN supports Docker bridge networks.
 ```
 
-Telego keeps four physical links for each signed DC. It replaces failed links without moving healthy bindings or replacing the complete generation.
+Restart Telego after a change to this section. If the section is absent or `enabled` is `false`, ME stays disabled.
 
-The direct DC path stays available before ME is ready. Each public TCP connection keeps its first selected route until that connection closes.
+Telego replaces a failed link in place. Healthy bindings and healthy DC pools stay on their existing physical links.
+
+Before ME is ready, the direct DC path stays available. If ME cannot accept a binding, the direct DC path also stays available.
+
+Each connection keeps its selected route until it closes.
 
 Read the [Middle-End operator guide](docs/middle-end.md) for topology, failure behavior, limits, metrics, and proxy configuration.
 
@@ -535,7 +546,7 @@ kill -HUP $(pidof telego)
 - `idle-timeout` — Applies to new connections
 
 **Require restart:**
-- `bind-to`, `secrets`, `tls-fronting.*`, `proxy-protocol`, `web-proxy.*`, `max-connections-per-ip`, `max-ips-per-user`, `handshake-timeout`
+- `bind-to`, `secrets`, `tls-fronting.*`, `proxy-protocol`, `web-proxy.*`, `middle-end.*`, `max-connections-per-ip`, `max-ips-per-user`, `handshake-timeout`
 
 ---
 
@@ -632,19 +643,24 @@ Connection, IP, block, and traffic metrics include a `user` label. Diagnostic me
 ## Architecture
 
 ```
-┌─────────────┐     ┌──────────────────────────────────────┐     ┌──────────┐
-│   Client    │────▶│              telEgo                  │────▶│ Telegram │
-│ (Telegram)  │◀────│      Auto-detect ee/dd protocol      │◀────│    DC    │
-└─────────────┘     │                                      │     └──────────┘
-                    │  ee: FakeTLS ─▶ Obfuscated2 ─▶ Relay │
-                    │  dd: Obfuscated2 ─▶ Relay            │
-                    └──────────────────────────────────────┘
-                                     │
-                                     ▼ (unrecognized ee)
-                               ┌──────────┐
-                               │   Mask   │
-                               │   Host   │
-                               └──────────┘
+┌─────────────┐     ┌───────────────────────────────┐
+│  Telegram   │────▶│            telEgo             │
+│   client    │◀────│  ee, dd, and native WEB input │
+└─────────────┘     └───────────────┬───────────────┘
+                                    │ authenticated session
+                         ┌──────────┴──────────┐
+                         ▼                     ▼
+                 ┌───────────────┐     ┌───────────────┐
+                 │ Telegram ME   │     │Direct fallback│
+                 │ gnet link pool│     │   connection   │
+                 └───────┬───────┘     └───────┬───────┘
+                         └──────────┬───────────┘
+                                    ▼
+                             ┌─────────────┐
+                             │ Telegram DC │
+                             └─────────────┘
+
+Unauthenticated FakeTLS probes ─────────────▶ mask host
 ```
 
 ---

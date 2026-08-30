@@ -5,7 +5,7 @@
 <h1 align="center">TeleGO</h1>
 
 <p align="center">
-  <strong>Высокопроизводительный Telegram MTProxy на Go с TLS-маскировкой</strong>
+  <strong>Высокопроизводительный Telegram MTProxy на Go с TLS-маскировкой, Telegram Middle-End и нативным WEB-протоколом</strong>
 </p>
 
 <p align="center">
@@ -13,6 +13,8 @@
   <a href="#возможности">Возможности</a> •
   <a href="#быстрый-старт">Быстрый старт</a> •
   <a href="#конфигурация">Конфигурация</a> •
+  <a href="#telegram-middle-end">Middle-End</a> •
+  <a href="#нативный-web-прокси-telegram">WEB-прокси</a> •
   <a href="#docker">Docker</a>
 </p>
 
@@ -33,6 +35,8 @@
 | Умная блокировка IP | Да | Нет | Нет |
 | Защита от OOM | Да | Нет | Нет |
 | Горячая перезагрузка | Да | Да | Нет |
+| Telegram Middle-End | Да | Нет | Да |
+| Нативный WEB-протокол | Да | Нет | Нет |
 | Поддерживается (2026) | Да | Частично | Нет |
 
 ---
@@ -41,6 +45,8 @@
 
 ### Сеть
 - **Event-driven I/O** — на базе [gnet](https://github.com/panjf2000/gnet) с epoll/kqueue
+- **Telegram Middle-End** — маршрутизация MTProxy- и WEB-потоков через постоянные пулы gnet-соединений с ME
+- **Нативный WEB-прокси** — HTTPS- или WebSocket-транспорт для Telegram Desktop за Nginx
 - **Zero-copy** — прямая работа с буферами без копирования
 - **Пул буферов** — отсутствие аллокаций в горячих путях
 - **Оптимизированный TCP** — `TCP_NODELAY`, `TCP_QUICKACK`, буферы 64KB
@@ -55,6 +61,7 @@
 
 ### Эксплуатация
 - **Мульти-пользователь** — именованные секреты с отслеживанием по пользователям
+- **Восстановление ME-соединений** — замена отказавшего физического соединения без переноса исправных привязок
 - **Лимиты подключений** — ограничение IP на пользователя с умной блокировкой
 - **Prometheus-метрики** — статистика подключений и трафика по пользователям
 - **Горячая перезагрузка** — SIGHUP и отслеживание изменений файла конфигурации
@@ -95,6 +102,55 @@ telego run -c config.toml -l
 
 ---
 
+## Telegram Middle-End
+
+Telegram Middle-End (ME) — официальный транспорт Telegram для MTProxy-серверов. Telego направляет через ME авторизованные MTProxy- и нативные WEB-потоки.
+
+Публичный сервер и клиент ME работают на gnet. Telego поддерживает по четыре физических соединения с каждым DC из подписанных артефактов Telegram.
+
+Зарегистрированный прокси может передавать выданный Telegram тег в каждом запросе ME. Без тега транспорт ME тоже работает.
+
+Добавьте раздел:
+
+```toml
+[middle-end]
+enabled = true
+# proxy-tag = "0123456789abcdef0123456789abcdef" # Тег, выданный Telegram
+# socks5 = "127.0.0.1:1080"
+# nat-ip = "YOUR_PUBLIC_IP" # Обычно не требуется: STUN поддерживает Docker bridge.
+```
+
+После изменения этого раздела перезапустите Telego. Если раздел отсутствует или `enabled = false`, ME отключён.
+
+Telego заменяет отказавшее физическое соединение отдельно. Исправные привязки и пулы других DC продолжают работать.
+
+Пока ME не готов, новые подключения используют прямой маршрут к DC. Выбранный маршрут не меняется до закрытия клиентского подключения.
+
+Подробности: [руководство по Middle-End](docs/middle-end.md).
+
+---
+
+## Нативный WEB-прокси Telegram
+
+Telego поддерживает нативный WEB-протокол Telegram Desktop. Приватный HTTP/1.1-сервер на gnet работает за Nginx с настоящим TLS-сертификатом.
+
+Добавьте раздел:
+
+```toml
+[web-proxy]
+enabled = true
+hostname = "proxy.example.com"
+carrier = "https-lanes"
+bind-to = "127.0.0.1:8080"
+trusted-proxy-cidrs = ["127.0.0.1/32"]
+```
+
+WEB-потоки используют ME, если активное поколение ME принимает новые привязки. При недоступности ME сохраняется прямой маршрут к DC.
+
+Полная конфигурация Nginx и доступные транспорты описаны в [руководстве по WEB-прокси](docs/web-proxy.md).
+
+---
+
 ## Конфигурация
 
 ```toml
@@ -122,12 +178,27 @@ mask-host = "www.google.com"
 # enable-drs = true        # Сначала маленькие записи, потом полный размер (1369 -> 16384 байт после 8 записей или 128 КБ)
 # enable-split-tls = true  # Первая запись ApplicationData размером 1 байт
 
+[web-proxy]
+enabled = false
+# hostname = "proxy.example.com"
+# carrier = "https-lanes"
+# bind-to = "127.0.0.1:8080"
+# trusted-proxy-cidrs = ["127.0.0.1/32"]
+
+[middle-end]
+enabled = false
+# proxy-tag = "0123456789abcdef0123456789abcdef"
+# socks5 = "127.0.0.1:1080"
+# nat-ip = "YOUR_PUBLIC_IP"
+# max-connections = 0
+# queue-budget-mb = 0
+
 [performance]
 prefer-ip = "prefer-ipv4"
 idle-timeout = "5m"
 
 [upstream]
-# socks5 = "127.0.0.1:1080"   # Upstream через SOCKS5
+# socks5 = "127.0.0.1:1080"   # Прямой DC- или ME-трафик через SOCKS5
 
 [metrics]
 bind-to = "127.0.0.1:9090"
@@ -194,8 +265,13 @@ go install github.com/scratch-net/telego/cmd/telego@latest
 | `telego_blocked_total` | Counter | Всего блокировок |
 | `telego_traffic_in_bytes_total` | Counter | Входящий трафик |
 | `telego_traffic_out_bytes_total` | Counter | Исходящий трафик |
+| `telego_middleend_admitting` | Gauge | Готовность ME принимать новые привязки |
+| `telego_middleend_links` | Gauge | Физические ME-соединения по DC и состоянию |
+| `telego_middleend_slot_repair_total` | Counter | Результаты замены физических ME-соединений |
+| `telego_middleend_frontend_routes_active` | Gauge | Активные маршруты ME и прямого резервного подключения |
+| `telego_middleend_frontend_route_commits_total` | Counter | Выбор маршрута ME или прямого резервного подключения |
 
-Все метрики имеют лейбл `user` для разбивки по пользователям.
+Метрики подключений, IP, блокировок и трафика имеют лейбл `user`. Диагностические метрики ME используют лейблы из таблицы метрик.
 
 ---
 
