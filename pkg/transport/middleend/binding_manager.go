@@ -1476,10 +1476,10 @@ func proxyRequestEncodedSize(request ProxyRequest) (int, error) {
 	if err := validateProxyPacket(request.Packet, request.Flags); err != nil {
 		return 0, err
 	}
-	if err := validateProxyAddress(request.RemoteAddr); err != nil {
+	if err := validateProxyAddress(request.RemoteAddr, true); err != nil {
 		return 0, fmt.Errorf("encode remote address: %w", err)
 	}
-	if err := validateProxyAddress(request.ProxyAddr); err != nil {
+	if err := validateProxyAddress(request.ProxyAddr, false); err != nil {
 		return 0, fmt.Errorf("encode proxy address: %w", err)
 	}
 	headerSize := ProxyRequestBaseSize
@@ -1496,10 +1496,10 @@ func proxyRequestIdentity(request ProxyRequest) (int, [sha256.Size]byte, error) 
 	}
 	var canonical [4 + 20 + 20 + 1 + len(ProxyTag{}) + sha256.Size]byte
 	binary.LittleEndian.PutUint32(canonical[0:4], uint32(request.Flags))
-	if err := putProxyAddress(canonical[4:24], request.RemoteAddr); err != nil {
+	if err := putProxyAddress(canonical[4:24], request.RemoteAddr, true); err != nil {
 		return 0, [sha256.Size]byte{}, fmt.Errorf("encode remote address: %w", err)
 	}
-	if err := putProxyAddress(canonical[24:44], request.ProxyAddr); err != nil {
+	if err := putProxyAddress(canonical[24:44], request.ProxyAddr, false); err != nil {
 		return 0, [sha256.Size]byte{}, fmt.Errorf("encode proxy address: %w", err)
 	}
 	if request.Tag != nil {

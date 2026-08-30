@@ -80,10 +80,10 @@ func (r ProxyRequest) MarshalBinary() ([]byte, error) {
 	binary.LittleEndian.PutUint32(wire[0:4], OperationProxyRequest)
 	binary.LittleEndian.PutUint32(wire[4:8], uint32(r.Flags))
 	binary.LittleEndian.PutUint64(wire[8:16], uint64(r.ConnectionID))
-	if err := putProxyAddress(wire[16:36], r.RemoteAddr); err != nil {
+	if err := putProxyAddress(wire[16:36], r.RemoteAddr, true); err != nil {
 		return nil, fmt.Errorf("encode remote address: %w", err)
 	}
-	if err := putProxyAddress(wire[36:56], r.ProxyAddr); err != nil {
+	if err := putProxyAddress(wire[36:56], r.ProxyAddr, false); err != nil {
 		return nil, fmt.Errorf("encode proxy address: %w", err)
 	}
 
@@ -120,11 +120,11 @@ func parseProxyRequest(wire []byte, clonePacket bool) (ProxyRequest, error) {
 	request.ConnectionID = int64(binary.LittleEndian.Uint64(wire[8:16]))
 
 	var err error
-	request.RemoteAddr, err = parseProxyAddress(wire[16:36])
+	request.RemoteAddr, err = parseProxyAddress(wire[16:36], true)
 	if err != nil {
 		return ProxyRequest{}, fmt.Errorf("decode remote address: %w", err)
 	}
-	request.ProxyAddr, err = parseProxyAddress(wire[36:56])
+	request.ProxyAddr, err = parseProxyAddress(wire[36:56], false)
 	if err != nil {
 		return ProxyRequest{}, fmt.Errorf("decode proxy address: %w", err)
 	}
@@ -454,11 +454,11 @@ func validateMTProtoEnvelope(packet []byte) (bool, error) {
 	}
 }
 
-func putProxyAddress(dst []byte, addrPort netip.AddrPort) error {
+func putProxyAddress(dst []byte, addrPort netip.AddrPort, allowZeroPort bool) error {
 	if len(dst) != 20 {
 		return fmt.Errorf("%w: address destination length %d", ErrInvalidProxyAddress, len(dst))
 	}
-	if err := validateProxyAddress(addrPort); err != nil {
+	if err := validateProxyAddress(addrPort, allowZeroPort); err != nil {
 		return err
 	}
 
@@ -476,7 +476,7 @@ func putProxyAddress(dst []byte, addrPort netip.AddrPort) error {
 	return nil
 }
 
-func parseProxyAddress(wire []byte) (netip.AddrPort, error) {
+func parseProxyAddress(wire []byte, allowZeroPort bool) (netip.AddrPort, error) {
 	if len(wire) != 20 {
 		return netip.AddrPort{}, fmt.Errorf("%w: address length %d", ErrInvalidProxyAddress, len(wire))
 	}
@@ -485,19 +485,19 @@ func parseProxyAddress(wire []byte) (netip.AddrPort, error) {
 		return netip.AddrPort{}, fmt.Errorf("%w: malformed IP", ErrInvalidProxyAddress)
 	}
 	port := binary.LittleEndian.Uint32(wire[16:20])
-	if port == 0 || port > 65535 {
+	if port > 65535 || (port == 0 && !allowZeroPort) {
 		return netip.AddrPort{}, fmt.Errorf("%w: port %d", ErrInvalidProxyAddress, port)
 	}
 	addrPort := netip.AddrPortFrom(addr.Unmap(), uint16(port))
-	if err := validateProxyAddress(addrPort); err != nil {
+	if err := validateProxyAddress(addrPort, allowZeroPort); err != nil {
 		return netip.AddrPort{}, err
 	}
 	return addrPort, nil
 }
 
-func validateProxyAddress(addrPort netip.AddrPort) error {
-	if !addrPort.IsValid() || addrPort.Port() == 0 {
-		return fmt.Errorf("%w: endpoint must have a valid address and nonzero port", ErrInvalidProxyAddress)
+func validateProxyAddress(addrPort netip.AddrPort, allowZeroPort bool) error {
+	if !addrPort.IsValid() || (addrPort.Port() == 0 && !allowZeroPort) {
+		return fmt.Errorf("%w: endpoint must have a valid address and permitted port", ErrInvalidProxyAddress)
 	}
 	addr := addrPort.Addr()
 	if addr.IsUnspecified() || addr.Zone() != "" {

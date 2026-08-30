@@ -645,13 +645,51 @@ func stringsContainsAny(value string, markers ...string) bool {
 
 func TestMiddleEndAddrPortAllowsOnlyProxyWildcard(t *testing.T) {
 	wildcard := &net.TCPAddr{IP: net.IPv4zero, Port: 443}
-	if _, err := middleEndAddrPort("remote", wildcard, false); !errors.Is(err, middleend.ErrInvalidProxyAddress) {
+	if _, err := middleEndAddrPort("remote", wildcard, false, false); !errors.Is(err, middleend.ErrInvalidProxyAddress) {
 		t.Fatalf("remote wildcard error = %v", err)
 	}
-	got, err := middleEndAddrPort("proxy", wildcard, true)
+	got, err := middleEndAddrPort("proxy", wildcard, true, false)
 	if err != nil || got != netip.MustParseAddrPort("0.0.0.0:443") {
 		t.Fatalf("proxy wildcard = %s, %v", got, err)
 	}
+	unknownPort := &net.TCPAddr{IP: net.ParseIP("198.51.100.7"), Port: 0}
+	if _, err := middleEndAddrPort("remote", unknownPort, false, false); !errors.Is(err, middleend.ErrInvalidProxyAddress) {
+		t.Fatalf("unauthenticated zero remote port error = %v", err)
+	}
+	got, err = middleEndAddrPort("remote", unknownPort, false, true)
+	if err != nil || got != netip.MustParseAddrPort("198.51.100.7:0") {
+		t.Fatalf("authenticated zero remote port = %s, %v", got, err)
+	}
+}
+
+func TestMiddleEndAuthenticatedWEBTupleAllowsUnknownClientPort(t *testing.T) {
+	handler, link, conn, ctx, frame, _ := newMiddleEndTestHandler(t, 2, obfuscated2.ConnectionTypeIntermediate, nil)
+	conn.localAddr = &net.TCPAddr{IP: net.IPv4zero, Port: 8888}
+	ctx.internalProxyAuthenticated = true
+	ctx.setTrustedProxyTuple(
+		&net.TCPAddr{IP: net.ParseIP("198.51.100.7"), Port: 0},
+		&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0},
+	)
+	_, _, _, clientEncryptor, err := obfuscated2.ParseClientFrameWithType(handler.config.Secrets[0].Key, frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet := validMiddleEndPacket()
+	encrypted := encodeMiddleEndClientPacket(t, obfuscated2.ConnectionTypeIntermediate, packet, clientEncryptor)
+	conn.SetReadData(append(bytes.Clone(frame), encrypted...))
+	if action := driveMiddleEndCommit(t, handler, conn, ctx); action != gnet.None {
+		t.Fatalf("commit action = %v", action)
+	}
+	runMiddleEndOwner(conn, func() gnet.Action { return handler.OnTraffic(conn) })
+	request, err := middleend.ParseProxyRequest(waitMiddleEndSubmission(t, link).Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.RemoteAddr != netip.MustParseAddrPort("198.51.100.7:0") ||
+		request.ProxyAddr != netip.MustParseAddrPort("8.8.8.8:8888") {
+		t.Fatalf("WEB tuple = %s -> %s", request.RemoteAddr, request.ProxyAddr)
+	}
+	closeMiddleEndTestClient(handler, conn, ctx)
 }
 
 func TestMiddleEndDDCommitPreservesInputAndRoutesExactSignedDC(t *testing.T) {

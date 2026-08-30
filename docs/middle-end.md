@@ -68,6 +68,10 @@ If discovery is not ready, that client uses direct fallback. A later connection 
 
 Each public TCP connection selects one route after authentication. This selection does not change during that TCP connection.
 
+An authenticated native WEB stream does not have a client TCP source port. Telego follows official MTProxy behavior and sends remote port zero to ME.
+
+The proxy address still contains the public listener port. Unauthenticated public connections cannot supply a zero remote port.
+
 - Telego selects ME when the active generation can bind the exact signed DC.
 - Telego selects a direct DC connection when ME setup fails before the bind.
 - Telego does not move a direct connection to ME after the active generation becomes ready.

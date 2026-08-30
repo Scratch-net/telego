@@ -545,18 +545,22 @@ func middleEndClientTuple(
 ) (netip.AddrPort, netip.AddrPort, error) {
 	remote := c.RemoteAddr()
 	local := c.LocalAddr()
-	if source, destination, authenticated := ctx.trustedProxyTuple(); authenticated {
+	authenticated := false
+	if source, destination, trusted := ctx.trustedProxyTuple(); trusted {
+		authenticated = true
 		remote = source
-		local = destination
+		if tcpDestination, ok := destination.(*net.TCPAddr); ok && tcpDestination != nil && tcpDestination.Port != 0 {
+			local = destination
+		}
 	}
-	remoteAddr, err := middleEndAddrPort("remote", remote, false)
+	remoteAddr, err := middleEndAddrPort("remote", remote, false, authenticated)
 	if err != nil {
 		return netip.AddrPort{}, netip.AddrPort{}, err
 	}
 	// On Unix, gnet exposes the listener address for an accepted socket. Keep
 	// an IPv4 or IPv6 wildcard here so the NAT resolver can supply its public
 	// address while retaining the authoritative listener port.
-	proxyAddr, err := middleEndAddrPort("proxy", local, true)
+	proxyAddr, err := middleEndAddrPort("proxy", local, true, false)
 	if err != nil {
 		return netip.AddrPort{}, netip.AddrPort{}, err
 	}
@@ -567,14 +571,19 @@ func middleEndClientTuple(
 	return remoteAddr, proxyAddr, nil
 }
 
-func middleEndAddrPort(label string, address net.Addr, allowUnspecified bool) (netip.AddrPort, error) {
+func middleEndAddrPort(
+	label string,
+	address net.Addr,
+	allowUnspecified bool,
+	allowZeroPort bool,
+) (netip.AddrPort, error) {
 	tcpAddress, ok := address.(*net.TCPAddr)
 	if !ok || tcpAddress == nil {
 		return netip.AddrPort{}, fmt.Errorf("%w: %s address has type %T", middleend.ErrInvalidProxyAddress, label, address)
 	}
 	addrPort := tcpAddress.AddrPort()
-	if !addrPort.IsValid() || addrPort.Port() == 0 {
-		return netip.AddrPort{}, fmt.Errorf("%w: %s endpoint must have a valid address and nonzero port", middleend.ErrInvalidProxyAddress, label)
+	if !addrPort.IsValid() || (addrPort.Port() == 0 && !allowZeroPort) {
+		return netip.AddrPort{}, fmt.Errorf("%w: %s endpoint must have a valid address and permitted port", middleend.ErrInvalidProxyAddress, label)
 	}
 	addr := addrPort.Addr().Unmap()
 	if addr.Zone() != "" || (addr.IsUnspecified() && !allowUnspecified) {

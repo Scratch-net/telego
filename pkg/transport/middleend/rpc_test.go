@@ -120,6 +120,27 @@ func TestProxyRequestIPv6GoldenRoundTrip(t *testing.T) {
 	}
 }
 
+func TestProxyRequestOfficialWEBUnknownRemotePortRoundTrip(t *testing.T) {
+	request := ProxyRequest{
+		Flags:        ProxyRequestFlagMagic | ProxyRequestFlagExternalMode2 | ProxyRequestFlagAbridged,
+		ConnectionID: 9,
+		RemoteAddr:   netip.MustParseAddrPort("198.51.100.7:0"),
+		ProxyAddr:    netip.MustParseAddrPort("192.0.2.1:443"),
+		Packet:       validEncryptedPacket(EncryptedMessageHeaderSize),
+	}
+	wire, err := request.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary: %v", err)
+	}
+	parsed, err := ParseProxyRequest(wire)
+	if err != nil {
+		t.Fatalf("ParseProxyRequest: %v", err)
+	}
+	if parsed.RemoteAddr != request.RemoteAddr || parsed.ProxyAddr != request.ProxyAddr {
+		t.Fatalf("parsed addresses = %s -> %s", parsed.RemoteAddr, parsed.ProxyAddr)
+	}
+}
+
 func TestProxyRequestFlagsForClient(t *testing.T) {
 	encrypted := validEncryptedPacket(EncryptedMessageHeaderSize)
 	unencrypted := validUnencryptedPacket(MTProtoReqPQMultiConstructor)
@@ -281,9 +302,9 @@ func TestProxyRequestRejectsMalformedPayloads(t *testing.T) {
 			want: ErrInvalidTLString,
 		},
 		{
-			name: "zero remote port",
+			name: "zero proxy port",
 			mutate: func(wire []byte) []byte {
-				clear(wire[32:36])
+				clear(wire[52:56])
 				return wire
 			},
 			want: ErrInvalidProxyAddress,
