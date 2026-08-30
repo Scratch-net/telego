@@ -39,14 +39,11 @@ Do not publish the proxy tag or the SOCKS5 credentials in an issue or log.
 
 Direct ME links use the address and port that the Telegram ME server sees. These values are inputs to the ME key derivation.
 
-Each client request also carries the public proxy address. Telegram rejects requests that contain a private Docker or host address.
+Each client request also carries the public proxy endpoint. The endpoint combines the selected ME link IP with the client-facing listener port.
 
 If the TCP socket has a public IP, Telego uses the exact socket tuple. Telego does not run a NAT probe.
 
-If an ME or frontend socket has a private IP, Telego gets the public IP from a fixed STUN pool.
-This behavior supports Docker bridge networks.
-
-On Unix, gnet reports the listener address for each accepted client. Telego also translates an IPv4 or IPv6 wildcard listener through the same NAT state.
+If a direct ME socket has a private IP, Telego gets its public IP from a fixed STUN pool. This behavior supports Docker bridge networks.
 
 Telego keeps the kernel-assigned TCP source port. It does not use the UDP port from the STUN response.
 
@@ -66,11 +63,11 @@ Set `nat-ip` only when automatic discovery returns the wrong public IP. The valu
 
 The `nat-ip` value replaces only a private socket IP from the same address family. It cannot replace a port.
 
-SOCKS5 links use the exact public `BND.ADDR:BND.PORT` for their ME key derivation. They do not replace this tuple with STUN data.
+SOCKS5 links use the exact public `BND.ADDR:BND.PORT` for their ME key derivation. They do not use STUN data.
 
-The frontend still uses `nat-ip` or STUN when its client-facing socket has a private IP. SOCKS5 mode starts IPv4 discovery in the background.
+Each request on a SOCKS5 link uses `BND.ADDR` as its proxy IP. It retains the client-facing listener port as its proxy port.
 
-If discovery is not ready, that client uses direct fallback. A later connection can use ME after discovery succeeds.
+Different links can use different source IPs. This behavior supports SOCKS5 egress and hosts with more than one public IP.
 
 ## Connection routing
 
@@ -149,6 +146,8 @@ Enable the Prometheus listener to inspect ME state. Start with these metrics:
 | `telego_middleend_frontend_routes_active` | Current `middleend` and `direct_fallback` public routes |
 | `telego_middleend_frontend_route_commits_total` | Lifetime route selections |
 | `telego_middleend_links` | Physical links by generation role, signed DC, and state |
+| `telego_middleend_slot_failure_total` | Physical-link failures during the service lifetime |
+| `telego_middleend_slot_failure_affected_bindings_total` | Bindings that physical-link failures terminated |
 | `telego_middleend_slot_repairs_active` | Physical slots that Telego currently replaces |
 | `telego_middleend_slot_repair_total` | Successful and failed physical-slot replacements |
 | `telego_middleend_artifact_state` | Applied and pending artifact state |
@@ -158,6 +157,8 @@ Enable the Prometheus listener to inspect ME state. Start with these metrics:
 The queue metrics report current use, capacity, and lifetime high-water values. Telego logs thresholds at 80%, 95%, and 100%.
 
 Telego also logs route fallback, artifact failure, generation failure, physical-link repair, and binding eviction events.
+
+Each physical-link failure log includes the signed DC, operation, exact error, and affected binding count.
 
 Each direct-fallback commit log reports the new, active, and total session counts.
 

@@ -94,9 +94,11 @@ func (mockMiddleEndStatsProvider) Snapshot() middleend.ServiceSnapshot {
 			GenerationFailures:  3,
 		},
 		Supervisor: middleend.GenerationSupervisorSnapshot{
-			Admitting:           true,
-			SlotRepairSuccesses: 13,
-			SlotRepairFailures:  2,
+			Admitting:                   true,
+			SlotFailures:                17,
+			SlotFailureAffectedBindings: 6,
+			SlotRepairSuccesses:         13,
+			SlotRepairFailures:          2,
 			Active: &middleend.FixedBindingManagerSnapshot{
 				Ready:                      true,
 				Accepting:                  true,
@@ -246,6 +248,8 @@ func TestMetricsIntegration(t *testing.T) {
 		"telego_middleend_repairing",
 		"telego_middleend_slot_repairs_active",
 		"telego_middleend_slot_repair_total",
+		"telego_middleend_slot_failure_total",
+		"telego_middleend_slot_failure_affected_bindings_total",
 		"telego_middleend_artifact_state",
 		"telego_middleend_artifact_refresh_total",
 		"telego_middleend_generation_apply_total",
@@ -298,6 +302,12 @@ func TestMetricsIntegration(t *testing.T) {
 		t.Errorf("Middle-End slot-repair metrics are missing or have the wrong values:\n%s\n%s",
 			metricLines(content, "telego_middleend_slot_repairs_active"),
 			metricLines(content, "telego_middleend_slot_repair_total"))
+	}
+	if !metricSampleMatches(content, "telego_middleend_slot_failure_total", nil, " 17") ||
+		!metricSampleMatches(content, "telego_middleend_slot_failure_affected_bindings_total", nil, " 6") {
+		t.Errorf("Middle-End slot-failure metrics are missing or have the wrong values:\n%s\n%s",
+			metricLines(content, "telego_middleend_slot_failure_total"),
+			metricLines(content, "telego_middleend_slot_failure_affected_bindings_total"))
 	}
 	if !metricSampleMatches(content, "telego_middleend_link_queue_high_water_bytes", []string{`dc="-2"`, `queue="submission"`, `role="active"`}, " 1024") {
 		t.Errorf("Middle-End submission byte high-water gauge is missing or has the wrong value:\n%s", metricLines(content, "telego_middleend_link_queue_high_water_bytes"))

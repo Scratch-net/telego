@@ -70,15 +70,18 @@ type FixedBindingGenerationFactory func(context.Context) (*FixedBindingManager, 
 // slices are defensive sorted copies. Admitting is true only for a healthy
 // active generation.
 type GenerationSupervisorSnapshot struct {
-	Admitting           bool
-	ActiveDCIDs         []DCID
-	RetiringDCIDs       []DCID
-	Active              *FixedBindingManagerSnapshot
-	Retiring            *FixedBindingManagerSnapshot
-	Repairing           bool
-	SlotRepairSuccesses uint64
-	SlotRepairFailures  uint64
-	LastError           error
+	Admitting                   bool
+	ActiveDCIDs                 []DCID
+	RetiringDCIDs               []DCID
+	Active                      *FixedBindingManagerSnapshot
+	Retiring                    *FixedBindingManagerSnapshot
+	Repairing                   bool
+	SlotFailures                uint64
+	SlotFailureAffectedBindings uint64
+	LastSlotFailure             FixedBindingSlotFailureSnapshot
+	SlotRepairSuccesses         uint64
+	SlotRepairFailures          uint64
+	LastError                   error
 }
 
 // FixedBindingGenerationSupervisor owns one active and at most one retiring
@@ -97,15 +100,18 @@ type generationSupervisorState struct {
 	rootContext context.Context
 	cancelRoot  context.CancelFunc
 
-	mu          sync.Mutex
-	active      *supervisedGeneration
-	retiring    *supervisedGeneration
-	sources     []*supervisedGeneration
-	lastFactory FixedBindingGenerationFactory
-	lastErr     error
-	repairing   bool
-	closing     bool
-	closeResult error
+	mu                          sync.Mutex
+	active                      *supervisedGeneration
+	retiring                    *supervisedGeneration
+	sources                     []*supervisedGeneration
+	lastFactory                 FixedBindingGenerationFactory
+	lastErr                     error
+	lastSlotFailure             FixedBindingSlotFailureSnapshot
+	slotFailures                uint64
+	slotFailureAffectedBindings uint64
+	repairing                   bool
+	closing                     bool
+	closeResult                 error
 
 	ready               chan struct{}
 	done                chan struct{}
@@ -310,6 +316,14 @@ func (s *generationSupervisorState) prepareGeneration(parent context.Context, fa
 		factory:  factory,
 		liveStop: make(chan struct{}),
 	}
+	manager.state.mu.Lock()
+	if manager.state.state != fixedBindingManagerCreated {
+		manager.state.mu.Unlock()
+		s.closeGeneration(generation)
+		return nil, fmt.Errorf("%w: factory returned a manager that was already started", ErrInvalidGenerationSupervisor)
+	}
+	manager.state.slotFailureObserver = s.recordSlotFailure
+	manager.state.mu.Unlock()
 	if err := manager.Start(prepareContext); err != nil {
 		s.closeGeneration(generation)
 		return nil, fmt.Errorf("prepare Middle-End generation: start: %w", err)
@@ -324,6 +338,15 @@ func (s *generationSupervisorState) prepareGeneration(parent context.Context, fa
 		return nil, err
 	}
 	return generation, nil
+}
+
+func (s *generationSupervisorState) recordSlotFailure(failure FixedBindingSlotFailureSnapshot) {
+	s.mu.Lock()
+	s.slotFailures++
+	s.slotFailureAffectedBindings += uint64(failure.AffectedBindings)
+	failure.Sequence = s.slotFailures
+	s.lastSlotFailure = failure
+	s.mu.Unlock()
 }
 
 func (s *generationSupervisorState) ownsManager(manager *FixedBindingManager) bool {
@@ -777,11 +800,14 @@ func (s *FixedBindingGenerationSupervisor) Snapshot() GenerationSupervisorSnapsh
 	state := s.state
 	state.mu.Lock()
 	result := GenerationSupervisorSnapshot{
-		Admitting:           healthyGeneration(state.active),
-		Repairing:           state.repairing,
-		SlotRepairSuccesses: state.slotRepairSuccesses.Load(),
-		SlotRepairFailures:  state.slotRepairFailures.Load(),
-		LastError:           state.lastErr,
+		Admitting:                   healthyGeneration(state.active),
+		Repairing:                   state.repairing,
+		SlotFailures:                state.slotFailures,
+		SlotFailureAffectedBindings: state.slotFailureAffectedBindings,
+		LastSlotFailure:             state.lastSlotFailure,
+		SlotRepairSuccesses:         state.slotRepairSuccesses.Load(),
+		SlotRepairFailures:          state.slotRepairFailures.Load(),
+		LastError:                   state.lastErr,
 	}
 	var activeManager, retiringManager *FixedBindingManager
 	if state.active != nil {

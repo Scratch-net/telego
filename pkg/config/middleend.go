@@ -100,7 +100,6 @@ func (c MiddleEndRuntimeConfig) Frontend(source gproxy.MiddleEndBindingSource) g
 	}
 	return gproxy.MiddleEndFrontendConfig{
 		Source:                     source,
-		NATResolver:                c.Service.NATResolver,
 		PrecommitFailure:           gproxy.MiddleEndPrecommitDirectFallback,
 		ProxyTag:                   tag,
 		MaxPendingClientBytes:      middleend.MaxMEFrameSize,

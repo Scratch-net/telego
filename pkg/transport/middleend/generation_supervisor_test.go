@@ -3,6 +3,7 @@ package middleend
 import (
 	"context"
 	"errors"
+	"net/netip"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -136,7 +137,7 @@ type generationSlotRepairTestFactory struct {
 	enteredOnce sync.Once
 }
 
-func (f *generationSlotRepairTestFactory) build(ctx context.Context, _ DCID) (ClientLink, error) {
+func (f *generationSlotRepairTestFactory) build(ctx context.Context, dcID DCID) (FixedBindingSlot, error) {
 	if f.entered != nil {
 		f.enteredOnce.Do(func() { close(f.entered) })
 	}
@@ -144,7 +145,7 @@ func (f *generationSlotRepairTestFactory) build(ctx context.Context, _ DCID) (Cl
 		select {
 		case <-f.gate:
 		case <-ctx.Done():
-			return nil, context.Cause(ctx)
+			return FixedBindingSlot{}, context.Cause(ctx)
 		}
 	}
 	link := newFixedBindingFakeLink()
@@ -164,7 +165,11 @@ func (f *generationSlotRepairTestFactory) build(ctx context.Context, _ DCID) (Cl
 	f.mu.Lock()
 	f.links = append(f.links, link)
 	f.mu.Unlock()
-	return link, nil
+	return FixedBindingSlot{
+		DCID:     dcID,
+		SourceIP: netip.MustParseAddr("8.8.8.8"),
+		Link:     link,
+	}, nil
 }
 
 func (f *generationSlotRepairTestFactory) snapshotLinks() []*fixedBindingFakeLink {
@@ -504,6 +509,13 @@ func TestGenerationSupervisorRepairsFailedSlotWithoutRetiringGeneration(t *testi
 		}
 		return true
 	})
+	failureSnapshot := supervisor.Snapshot()
+	if failureSnapshot.SlotFailures != 1 || failureSnapshot.SlotFailureAffectedBindings != 1 ||
+		failureSnapshot.LastSlotFailure.Sequence != 1 || failureSnapshot.LastSlotFailure.DCID != dcID ||
+		failureSnapshot.LastSlotFailure.Reason != FixedBindingSlotFailureProbeTimeout ||
+		failureSnapshot.LastSlotFailure.AffectedBindings != 1 || failureSnapshot.LastSlotFailure.Error == nil {
+		t.Fatalf("supervisor slot failure telemetry = %+v", failureSnapshot)
+	}
 	if calls := factory.callCount(); calls != 1 {
 		t.Fatalf("whole-generation factory calls = %d, want 1", calls)
 	}

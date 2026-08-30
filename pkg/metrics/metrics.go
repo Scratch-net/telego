@@ -165,6 +165,20 @@ func registerMiddleEndMetrics(meter metric.Meter, provider MiddleEndStatsProvide
 			return nil
 		}),
 	)
+	meter.Int64ObservableCounter("telego_middleend_slot_failure_total",
+		metric.WithDescription("ME physical-link failures for the service lifetime"),
+		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
+			observer.Observe(metricValue(provider.Snapshot().Supervisor.SlotFailures))
+			return nil
+		}),
+	)
+	meter.Int64ObservableCounter("telego_middleend_slot_failure_affected_bindings_total",
+		metric.WithDescription("ME bindings terminated by physical-link failures for the service lifetime"),
+		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
+			observer.Observe(metricValue(provider.Snapshot().Supervisor.SlotFailureAffectedBindings))
+			return nil
+		}),
+	)
 	meter.Int64ObservableGauge("telego_middleend_artifact_state",
 		metric.WithDescription("Current Telegram ME artifact application state"),
 		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {

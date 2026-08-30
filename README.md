@@ -161,6 +161,8 @@ Telegram Middle-End (ME) is Telegram's upstream transport for MTProxy servers. T
 
 Both the public listener and the ME link engine use gnet. Telego keeps four physical links for each signed Telegram DC.
 
+Each ME request uses the public source IP of its selected link. This behavior supports SOCKS5 egress and hosts with multiple public IPs.
+
 A registered proxy can include its Telegram-issued proxy tag in each ME request. ME also works without a proxy tag.
 
 Add this section to enable ME:
@@ -630,6 +632,8 @@ bind-to = "127.0.0.1:9090"
 | `telego_web_backpressure_total` | Counter | WEB backpressure events by `operation` |
 | `telego_middleend_admitting` | Gauge | Whether an active ME generation accepts new bindings |
 | `telego_middleend_links` | Gauge | ME links by generation role, signed DC, and state |
+| `telego_middleend_slot_failure_total` | Counter | Physical-link failures |
+| `telego_middleend_slot_failure_affected_bindings_total` | Counter | Bindings terminated by physical-link failures |
 | `telego_middleend_slot_repair_total` | Counter | Physical-link replacement results |
 | `telego_middleend_frontend_routes_active` | Gauge | Active ME and direct-fallback routes |
 | `telego_middleend_frontend_route_commits_total` | Counter | Lifetime ME and direct-fallback route selections |

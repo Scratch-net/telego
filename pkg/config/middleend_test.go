@@ -54,10 +54,6 @@ func TestMiddleEndRuntimeDefaultsAreDerivedAndValid(t *testing.T) {
 		t.Fatalf("runtime identity = enabled %v max %d tag %v", runtimeConfig.Enabled, runtimeConfig.MaxConnections, runtimeConfig.ProxyTag)
 	}
 	service := runtimeConfig.Service
-	frontend := runtimeConfig.Frontend(nil)
-	if frontend.NATResolver != service.NATResolver {
-		t.Fatal("frontend and ME links do not share the NAT resolver")
-	}
 	if service.Runtime.EventLoops != 2 || service.LinksPerDC != 4 || service.DialConcurrency != 8 {
 		t.Fatalf("runtime topology = loops %d links %d dialers %d", service.Runtime.EventLoops, service.LinksPerDC, service.DialConcurrency)
 	}

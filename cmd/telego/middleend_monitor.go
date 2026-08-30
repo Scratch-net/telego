@@ -24,25 +24,27 @@ type middleEndMonitor struct {
 }
 
 type middleEndMonitorCounters struct {
-	initialized             bool
-	admitting               bool
-	repairing               bool
-	refreshFailures         uint64
-	generationFailures      uint64
-	natIPv4Successes        uint64
-	natIPv4Failures         uint64
-	natIPv6Successes        uint64
-	natIPv6Failures         uint64
-	slotRepairSuccesses     uint64
-	slotRepairFailures      uint64
-	responseBackpressure    uint64
-	controlBackpressure     uint64
-	frontendInputPressure   uint64
-	frontendOutputPressure  uint64
-	frontendOutputEvictions uint64
-	middleEndBindingsTotal  uint64
-	directFallbacksActive   int64
-	directFallbacksTotal    uint64
+	initialized                 bool
+	admitting                   bool
+	repairing                   bool
+	refreshFailures             uint64
+	generationFailures          uint64
+	natIPv4Successes            uint64
+	natIPv4Failures             uint64
+	natIPv6Successes            uint64
+	natIPv6Failures             uint64
+	slotFailures                uint64
+	slotFailureAffectedBindings uint64
+	slotRepairSuccesses         uint64
+	slotRepairFailures          uint64
+	responseBackpressure        uint64
+	controlBackpressure         uint64
+	frontendInputPressure       uint64
+	frontendOutputPressure      uint64
+	frontendOutputEvictions     uint64
+	middleEndBindingsTotal      uint64
+	directFallbacksActive       int64
+	directFallbacksTotal        uint64
 }
 
 type middleEndPressureState struct {
@@ -100,25 +102,27 @@ func (m *middleEndMonitor) observe() {
 	}
 	responseBackpressure, controlBackpressure := middleEndBackpressureTotals(snapshot.Supervisor)
 	current := middleEndMonitorCounters{
-		initialized:             true,
-		admitting:               snapshot.Supervisor.Admitting,
-		repairing:               snapshot.Supervisor.Repairing,
-		refreshFailures:         snapshot.Coordinator.RefreshFailures,
-		generationFailures:      snapshot.Coordinator.GenerationFailures,
-		natIPv4Successes:        snapshot.NAT.IPv4.Successes,
-		natIPv4Failures:         snapshot.NAT.IPv4.Failures,
-		natIPv6Successes:        snapshot.NAT.IPv6.Successes,
-		natIPv6Failures:         snapshot.NAT.IPv6.Failures,
-		slotRepairSuccesses:     snapshot.Supervisor.SlotRepairSuccesses,
-		slotRepairFailures:      snapshot.Supervisor.SlotRepairFailures,
-		responseBackpressure:    responseBackpressure,
-		controlBackpressure:     controlBackpressure,
-		frontendInputPressure:   frontend.InputBackpressureEvents,
-		frontendOutputPressure:  frontend.OutputBackpressureEvents,
-		frontendOutputEvictions: frontend.OutputEvictions,
-		middleEndBindingsTotal:  frontend.MiddleEndBindingsTotal,
-		directFallbacksActive:   frontend.DirectFallbacksActive,
-		directFallbacksTotal:    frontend.DirectFallbacksTotal,
+		initialized:                 true,
+		admitting:                   snapshot.Supervisor.Admitting,
+		repairing:                   snapshot.Supervisor.Repairing,
+		refreshFailures:             snapshot.Coordinator.RefreshFailures,
+		generationFailures:          snapshot.Coordinator.GenerationFailures,
+		natIPv4Successes:            snapshot.NAT.IPv4.Successes,
+		natIPv4Failures:             snapshot.NAT.IPv4.Failures,
+		natIPv6Successes:            snapshot.NAT.IPv6.Successes,
+		natIPv6Failures:             snapshot.NAT.IPv6.Failures,
+		slotFailures:                snapshot.Supervisor.SlotFailures,
+		slotFailureAffectedBindings: snapshot.Supervisor.SlotFailureAffectedBindings,
+		slotRepairSuccesses:         snapshot.Supervisor.SlotRepairSuccesses,
+		slotRepairFailures:          snapshot.Supervisor.SlotRepairFailures,
+		responseBackpressure:        responseBackpressure,
+		controlBackpressure:         controlBackpressure,
+		frontendInputPressure:       frontend.InputBackpressureEvents,
+		frontendOutputPressure:      frontend.OutputBackpressureEvents,
+		frontendOutputEvictions:     frontend.OutputEvictions,
+		middleEndBindingsTotal:      frontend.MiddleEndBindingsTotal,
+		directFallbacksActive:       frontend.DirectFallbacksActive,
+		directFallbacksTotal:        frontend.DirectFallbacksTotal,
 	}
 	previous := m.previous
 	if !previous.initialized && snapshot.NAT.Static {
@@ -202,6 +206,21 @@ func (m *middleEndMonitor) observe() {
 			Int("repairing_slots", middleEndRepairingSlots(snapshot.Supervisor)).
 			Err(snapshot.Supervisor.LastError).
 			Msg("Middle-End physical-link replacement failed; recovery will retry while unaffected DC pools remain available")
+	}
+	if current.slotFailures > previous.slotFailures {
+		failure := snapshot.Supervisor.LastSlotFailure
+		log.Warn().
+			Uint64("new_failures", current.slotFailures-previous.slotFailures).
+			Uint64("failures_total", current.slotFailures).
+			Uint64("affected_bindings", middleEndCounterIncrease(
+				current.slotFailureAffectedBindings,
+				previous.slotFailureAffectedBindings,
+			)).
+			Uint64("affected_bindings_total", current.slotFailureAffectedBindings).
+			Int("last_dc", int(failure.DCID)).
+			Str("last_reason", string(failure.Reason)).
+			Err(failure.Error).
+			Msg("Middle-End physical links failed; bindings on each failed slot closed before replacement")
 	}
 	if current.slotRepairSuccesses > previous.slotRepairSuccesses {
 		log.Info().

@@ -108,6 +108,8 @@ Telegram Middle-End (ME) — официальный транспорт Telegram 
 
 Публичный сервер и клиент ME работают на gnet. Telego поддерживает по четыре физических соединения с каждым DC из подписанных артефактов Telegram.
 
+Каждый запрос ME использует публичный исходящий IP выбранного соединения. Это поддерживает SOCKS5 и серверы с несколькими публичными IP.
+
 Зарегистрированный прокси может передавать выданный Telegram тег в каждом запросе ME. Без тега транспорт ME тоже работает.
 
 Добавьте раздел:
@@ -267,6 +269,8 @@ go install github.com/scratch-net/telego/cmd/telego@latest
 | `telego_traffic_out_bytes_total` | Counter | Исходящий трафик |
 | `telego_middleend_admitting` | Gauge | Готовность ME принимать новые привязки |
 | `telego_middleend_links` | Gauge | Физические ME-соединения по DC и состоянию |
+| `telego_middleend_slot_failure_total` | Counter | Отказы физических ME-соединений |
+| `telego_middleend_slot_failure_affected_bindings_total` | Counter | Привязки, закрытые из-за отказов ME-соединений |
 | `telego_middleend_slot_repair_total` | Counter | Результаты замены физических ME-соединений |
 | `telego_middleend_frontend_routes_active` | Gauge | Активные маршруты ME и прямого резервного подключения |
 | `telego_middleend_frontend_route_commits_total` | Counter | Выбор маршрута ME или прямого резервного подключения |

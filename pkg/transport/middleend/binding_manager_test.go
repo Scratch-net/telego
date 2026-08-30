@@ -558,6 +558,7 @@ func TestNewFixedBindingManagerRejectsInvalidConstruction(t *testing.T) {
 		{name: "nil link", slots: []FixedBindingSlot{{DCID: 1}}, limits: validLimits},
 		{name: "typed nil", slots: []FixedBindingSlot{{DCID: 1, Link: typedNil}}, limits: validLimits},
 		{name: "typed nil slice", slots: []FixedBindingSlot{{DCID: 1, Link: typedNilSlice}}, limits: validLimits},
+		{name: "private source IP", slots: []FixedBindingSlot{{DCID: 1, SourceIP: netip.MustParseAddr("127.0.0.1"), Link: validLink}}, limits: validLimits},
 		{name: "nil Events", slots: []FixedBindingSlot{{DCID: 1, Link: nilEvents}}, limits: validLimits},
 		{name: "duplicate link", slots: []FixedBindingSlot{{DCID: -2, Link: validLink}, {DCID: 2, Link: validLink}}, limits: validLimits},
 		{name: "zero limits", slots: []FixedBindingSlot{{DCID: 1, Link: validLink}}},
@@ -3486,6 +3487,14 @@ func TestFixedBindingManagerSameDCLinkFailureIsolatesBindingsAndAdmission(t *tes
 		defer manager.state.mu.Unlock()
 		return manager.state.slotGroups[2][0].failed
 	})
+	failureSnapshot := manager.Snapshot()
+	if failureSnapshot.SlotFailures != 1 || failureSnapshot.SlotFailureAffectedBindings != 1 ||
+		failureSnapshot.LastSlotFailure.Sequence != 1 || failureSnapshot.LastSlotFailure.DCID != 2 ||
+		failureSnapshot.LastSlotFailure.Reason != FixedBindingSlotFailureLinkTerminal ||
+		failureSnapshot.LastSlotFailure.AffectedBindings != 1 ||
+		!errors.Is(failureSnapshot.LastSlotFailure.Error, failure) {
+		t.Fatalf("slot failure telemetry = %+v", failureSnapshot)
+	}
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
 	if _, err := firstBinding.NextEvent(ctx); !errors.Is(err, ErrFixedBindingSlotFailed) || !errors.Is(err, failure) {
@@ -3520,7 +3529,9 @@ func TestFixedBindingManagerRepairsFailedSlotWithoutMovingHealthyBindings(t *tes
 	manager, err := newFixedBindingManager(
 		[]FixedBindingSlot{{DCID: 2, Link: failedLink}, {DCID: 2, Link: healthyLink}},
 		fixedBindingTestLimits(),
-		func(context.Context, DCID) (ClientLink, error) { return replacement, nil },
+		func(_ context.Context, dcID DCID) (FixedBindingSlot, error) {
+			return FixedBindingSlot{DCID: dcID, SourceIP: netip.MustParseAddr("8.8.8.8"), Link: replacement}, nil
+		},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -3612,12 +3623,12 @@ func TestFixedBindingManagerRetriesAfterReplacementStartFailure(t *testing.T) {
 	manager, err := newFixedBindingManager(
 		[]FixedBindingSlot{{DCID: 2, Link: failedLink}, {DCID: 2, Link: healthyLink}},
 		fixedBindingTestLimits(),
-		func(context.Context, DCID) (ClientLink, error) {
+		func(_ context.Context, dcID DCID) (FixedBindingSlot, error) {
 			attempt++
 			if attempt == 1 {
-				return badReplacement, nil
+				return FixedBindingSlot{DCID: dcID, SourceIP: netip.MustParseAddr("8.8.8.8"), Link: badReplacement}, nil
 			}
-			return goodReplacement, nil
+			return FixedBindingSlot{DCID: dcID, SourceIP: netip.MustParseAddr("9.9.9.9"), Link: goodReplacement}, nil
 		},
 	)
 	if err != nil {
@@ -3695,7 +3706,9 @@ func TestFixedBindingManagerCloseCancelsBlockedSlotRepair(t *testing.T) {
 	manager, err := newFixedBindingManager(
 		[]FixedBindingSlot{{DCID: 2, Link: failedLink}},
 		fixedBindingTestLimits(),
-		func(context.Context, DCID) (ClientLink, error) { return replacement, nil },
+		func(_ context.Context, dcID DCID) (FixedBindingSlot, error) {
+			return FixedBindingSlot{DCID: dcID, SourceIP: netip.MustParseAddr("8.8.8.8"), Link: replacement}, nil
+		},
 	)
 	if err != nil {
 		t.Fatal(err)

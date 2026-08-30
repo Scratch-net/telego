@@ -155,8 +155,8 @@ enabled = false
 # Do not add a path, a query, or a fragment.
 # artifact-proxy = "http://127.0.0.1:3128"
 
-# Public IP for Middle-End operation behind NAT. Usually, leave this value empty.
-# Telego uses STUN when an ME or frontend socket has a private IP or wildcard listener.
+# Public IP for direct Middle-End links behind NAT. Usually, leave this value empty.
+# Telego uses STUN when a direct ME socket has a private IP.
 # The override changes only the IP. Telego always keeps the TCP source port.
 # nat-ip = "YOUR_PUBLIC_IP"
 

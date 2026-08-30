@@ -290,19 +290,19 @@ func (f *GnetGenerationFactory) Build(ctx context.Context) (*FixedBindingManager
 	return manager, nil
 }
 
-func (s *gnetGenerationFactoryState) buildReplacementLink(ctx context.Context, dcID DCID) (ClientLink, error) {
+func (s *gnetGenerationFactoryState) buildReplacementLink(ctx context.Context, dcID DCID) (FixedBindingSlot, error) {
 	select {
 	case s.repairs <- struct{}{}:
 		defer func() { <-s.repairs }()
 	case <-ctx.Done():
-		return nil, fmt.Errorf("%w: reserve replacement dial: %w", ErrGnetGenerationDial, context.Cause(ctx))
+		return FixedBindingSlot{}, fmt.Errorf("%w: reserve replacement dial: %w", ErrGnetGenerationDial, context.Cause(ctx))
 	}
 
 	s.buildMu.Lock()
 	endpoints := s.snapshot.Endpoints(dcID)
 	if len(endpoints) == 0 {
 		s.buildMu.Unlock()
-		return nil, fmt.Errorf("%w: signed DC %d has no endpoint", ErrGnetGenerationDial, dcID)
+		return FixedBindingSlot{}, fmt.Errorf("%w: signed DC %d has no endpoint", ErrGnetGenerationDial, dcID)
 	}
 	cursor := s.next[dcID]
 	s.next[dcID] = nextGenerationRepairCursor(cursor, endpoints)
@@ -310,9 +310,9 @@ func (s *gnetGenerationFactoryState) buildReplacementLink(ctx context.Context, d
 
 	result := s.buildSlot(ctx, dcID, cursor)
 	if result.err != nil {
-		return nil, fmt.Errorf("%w: signed DC %d replacement: %w", ErrGnetGenerationDial, dcID, result.err)
+		return FixedBindingSlot{}, fmt.Errorf("%w: signed DC %d replacement: %w", ErrGnetGenerationDial, dcID, result.err)
 	}
-	return result.slot.Link, nil
+	return result.slot, nil
 }
 
 func nextGenerationRepairCursor(cursor generationEndpointCursor, endpoints []netip.AddrPort) generationEndpointCursor {
@@ -382,7 +382,7 @@ func (s *gnetGenerationFactoryState) buildSlot(ctx context.Context, dcID DCID, c
 			return generationSlotResult{err: fmt.Errorf("construct gnet link: %w", err)}
 		}
 		return generationSlotResult{
-			slot:     FixedBindingSlot{DCID: dcID, Link: link},
+			slot:     FixedBindingSlot{DCID: dcID, SourceIP: clientAddr.Addr().Unmap(), Link: link},
 			selected: candidate,
 		}
 	}

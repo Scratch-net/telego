@@ -61,7 +61,8 @@ const (
 // MiddleEndBindingSource is the exclusive binding and readiness source for one
 // frontend. A source may route through one fixed manager or supervise multiple
 // whole generations. BindReady must select once, fix the ready-token consumer,
-// and never migrate a returned binding. Ready and Done must return stable
+// and never migrate a returned binding. Each binding must expose the public
+// source IP of its selected physical link. Ready and Done must return stable
 // channels, and TryNextReady has one consumer.
 type MiddleEndBindingSource interface {
 	BindReady(middleend.DCID) (*middleend.ClientBinding, error)
@@ -82,7 +83,6 @@ var (
 // connection OnClose callback and the serving engine has returned.
 type MiddleEndFrontendConfig struct {
 	Source                     MiddleEndBindingSource
-	NATResolver                *middleend.NATResolver
 	PrecommitFailure           MiddleEndPrecommitAction
 	ProxyTag                   *middleend.ProxyTag
 	MaxPendingClientBytes      int
@@ -130,9 +130,6 @@ func NewProxyHandlerWithMiddleEnd(
 func (c MiddleEndFrontendConfig) validate() error {
 	if nilMiddleEndBindingSource(c.Source) {
 		return fmt.Errorf("%w: nil binding source", ErrInvalidMiddleEndFrontend)
-	}
-	if c.NATResolver == nil {
-		return fmt.Errorf("%w: nil NAT resolver", ErrInvalidMiddleEndFrontend)
 	}
 	switch c.PrecommitFailure {
 	case MiddleEndPrecommitDirectFallback, MiddleEndPrecommitClose:
@@ -188,7 +185,6 @@ func nilMiddleEndBindingSource(source MiddleEndBindingSource) bool {
 
 type middleEndFrontend struct {
 	source           MiddleEndBindingSource
-	nat              *middleend.NATResolver
 	precommitFailure MiddleEndPrecommitAction
 	tag              middleend.ProxyTag
 	hasTag           bool
@@ -215,7 +211,6 @@ type middleEndFrontend struct {
 func newMiddleEndFrontend(config MiddleEndFrontendConfig) *middleEndFrontend {
 	frontend := &middleEndFrontend{
 		source:           config.Source,
-		nat:              config.NATResolver,
 		precommitFailure: config.PrecommitFailure,
 		maxPendingClient: config.MaxPendingClientBytes,
 		retryInitial:     config.OutputRetryInitial,
@@ -439,7 +434,7 @@ func (f *middleEndFrontend) commit(
 		)
 	}
 
-	remoteAddr, proxyAddr, err := middleEndClientTuple(c, ctx, f.nat)
+	remoteAddr, listenerAddr, err := middleEndClientTuple(c, ctx)
 	if err != nil {
 		return false, err
 	}
@@ -458,7 +453,6 @@ func (f *middleEndFrontend) commit(
 		mode:                  ctx.ProtocolMode(),
 		connectionType:        connectionType,
 		remoteAddr:            remoteAddr,
-		proxyAddr:             proxyAddr,
 		decryptor:             decryptor,
 		encryptor:             encryptor,
 		decoder:               decoder,
@@ -489,7 +483,16 @@ func (f *middleEndFrontend) commit(
 		_ = client.decoder.Close()
 		return false, fmt.Errorf("bind exact signed DC %d: %w", dcID, err)
 	}
+	proxyAddr, err := middleEndProxyAddr(listenerAddr, binding.SourceIP())
+	if err != nil {
+		f.mu.Unlock()
+		_ = binding.BeginClose()
+		client.releaseBudgets()
+		_ = client.decoder.Close()
+		return true, err
+	}
 	client.binding = binding
+	client.proxyAddr = proxyAddr
 	if _, exists := f.routes[binding.ConnectionID()]; exists {
 		// Process-lifetime connection IDs make this unreachable unless the
 		// dependency violates its allocator contract. BindReady has committed.
@@ -541,7 +544,6 @@ func (f *middleEndFrontend) closeDirectFallback(connectionID uint64) {
 func middleEndClientTuple(
 	c gnet.Conn,
 	ctx *ConnContext,
-	natResolver *middleend.NATResolver,
 ) (netip.AddrPort, netip.AddrPort, error) {
 	remote := c.RemoteAddr()
 	local := c.LocalAddr()
@@ -558,17 +560,23 @@ func middleEndClientTuple(
 		return netip.AddrPort{}, netip.AddrPort{}, err
 	}
 	// On Unix, gnet exposes the listener address for an accepted socket. Keep
-	// an IPv4 or IPv6 wildcard here so the NAT resolver can supply its public
-	// address while retaining the authoritative listener port.
+	// its authoritative port. The selected ME link supplies the public IP.
 	proxyAddr, err := middleEndAddrPort("proxy", local, true, false)
 	if err != nil {
 		return netip.AddrPort{}, netip.AddrPort{}, err
 	}
-	proxyAddr, err = natResolver.TranslateCachedEndpoint(proxyAddr)
-	if err != nil {
-		return netip.AddrPort{}, netip.AddrPort{}, fmt.Errorf("translate Middle-End proxy address: %w", err)
-	}
 	return remoteAddr, proxyAddr, nil
+}
+
+func middleEndProxyAddr(listenerAddr netip.AddrPort, sourceIP netip.Addr) (netip.AddrPort, error) {
+	sourceIP = sourceIP.Unmap()
+	if !sourceIP.IsValid() || sourceIP.IsUnspecified() || sourceIP.Zone() != "" {
+		return netip.AddrPort{}, fmt.Errorf(
+			"%w: selected Middle-End link has no authoritative source IP",
+			middleend.ErrInvalidProxyAddress,
+		)
+	}
+	return netip.AddrPortFrom(sourceIP, listenerAddr.Port()), nil
 }
 
 func middleEndAddrPort(

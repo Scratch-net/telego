@@ -18,6 +18,7 @@ type generationFactoryTestDialer struct {
 	mu       sync.Mutex
 	attempts []netip.AddrPort
 	failures map[netip.AddrPort]error
+	clients  map[netip.AddrPort]netip.AddrPort
 	entered  chan netip.AddrPort
 	release  <-chan struct{}
 	active   atomic.Int32
@@ -57,7 +58,10 @@ func (d *generationFactoryTestDialer) Dial(
 	if failure != nil {
 		return nil, netip.AddrPort{}, netip.AddrPort{}, failure
 	}
-	client := netip.MustParseAddrPort("198.51.100.10:40000")
+	client := d.clients[endpoint]
+	if !client.IsValid() {
+		client = netip.MustParseAddrPort("8.8.8.8:40000")
+	}
 	return new(net.TCPConn), endpoint, client, nil
 }
 
@@ -264,8 +268,13 @@ func TestGnetGenerationFactoryFallsBackAndRoundRobinsSuccessfulEndpoints(t *test
 func TestGnetGenerationFactoryRepairsOneSlotWithNextEndpoint(t *testing.T) {
 	v4a := netip.MustParseAddrPort("192.0.2.1:8888")
 	v4b := netip.MustParseAddrPort("192.0.2.2:8888")
+	clientA := netip.MustParseAddrPort("8.8.8.8:40000")
+	clientB := netip.MustParseAddrPort("9.9.9.9:50000")
 	snapshot := generationFactoryTestSnapshot(map[DCID][]netip.AddrPort{2: {v4a, v4b}})
-	dialer := &generationFactoryTestDialer{}
+	dialer := &generationFactoryTestDialer{clients: map[netip.AddrPort]netip.AddrPort{
+		v4a: clientA,
+		v4b: clientB,
+	}}
 	builder := &generationFactoryTestLinkBuilder{}
 	factory := newGenerationFactoryForTest(t, snapshot, dialer, builder, nil)
 
@@ -281,6 +290,13 @@ func TestGnetGenerationFactoryRepairsOneSlotWithNextEndpoint(t *testing.T) {
 			t.Errorf("Close: %v", err)
 		}
 	})
+	initialBinding, err := manager.Bind(2)
+	if err != nil {
+		t.Fatalf("Bind initial slot: %v", err)
+	}
+	if got := initialBinding.SourceIP(); got != clientA.Addr() {
+		t.Fatalf("initial binding source IP = %s, want %s", got, clientA.Addr())
+	}
 	links := builder.snapshotLinks()
 	links[0].peerClose(errors.New("replace first endpoint"))
 	waitFixedBindingCondition(t, func() bool { return manager.Snapshot().Slots[0].Failed })
@@ -299,6 +315,16 @@ func TestGnetGenerationFactoryRepairsOneSlotWithNextEndpoint(t *testing.T) {
 	if starts != 1 || manager.Snapshot().SlotRepairSuccesses != 1 {
 		t.Fatalf("replacement starts/snapshot = %d/%+v", starts, manager.Snapshot())
 	}
+	repairedBinding, err := manager.Bind(2)
+	if err != nil {
+		t.Fatalf("Bind repaired slot: %v", err)
+	}
+	if got := repairedBinding.SourceIP(); got != clientB.Addr() {
+		t.Fatalf("repaired binding source IP = %s, want %s", got, clientB.Addr())
+	}
+	if err := repairedBinding.Close(); err != nil {
+		t.Fatalf("Close repaired binding: %v", err)
+	}
 }
 
 func TestGnetGenerationFactoryBuildsEndpointDiversePerDCPool(t *testing.T) {
@@ -306,7 +332,11 @@ func TestGnetGenerationFactoryBuildsEndpointDiversePerDCPool(t *testing.T) {
 	v4b := netip.MustParseAddrPort("192.0.2.2:8888")
 	v4c := netip.MustParseAddrPort("192.0.2.3:8888")
 	snapshot := generationFactoryTestSnapshot(map[DCID][]netip.AddrPort{2: {v4a, v4b, v4c}})
-	dialer := &generationFactoryTestDialer{}
+	dialer := &generationFactoryTestDialer{clients: map[netip.AddrPort]netip.AddrPort{
+		v4a: netip.MustParseAddrPort("8.8.8.8:40000"),
+		v4b: netip.MustParseAddrPort("9.9.9.9:40001"),
+		v4c: netip.MustParseAddrPort("1.1.1.1:40002"),
+	}}
 	builder := &generationFactoryTestLinkBuilder{}
 	factory := newGenerationFactoryForTest(t, snapshot, dialer, builder, func(config *GnetGenerationFactoryConfig) {
 		config.LinksPerDC = 2
@@ -319,6 +349,26 @@ func TestGnetGenerationFactoryBuildsEndpointDiversePerDCPool(t *testing.T) {
 	}
 	if got := len(first.state.slotGroups[2]); got != 2 {
 		t.Fatalf("first pool links = %d, want 2", got)
+	}
+	if err := first.Start(t.Context()); err != nil {
+		t.Fatalf("first Start: %v", err)
+	}
+	firstBinding, err := first.Bind(2)
+	if err != nil {
+		t.Fatalf("first Bind: %v", err)
+	}
+	secondBinding, err := first.Bind(2)
+	if err != nil {
+		t.Fatalf("second Bind: %v", err)
+	}
+	if firstBinding.SourceIP() != dialer.clients[v4a].Addr() || secondBinding.SourceIP() != dialer.clients[v4b].Addr() {
+		t.Fatalf("pooled source IPs = %s/%s", firstBinding.SourceIP(), secondBinding.SourceIP())
+	}
+	if err := firstBinding.Close(); err != nil {
+		t.Fatalf("Close first binding: %v", err)
+	}
+	if err := secondBinding.Close(); err != nil {
+		t.Fatalf("Close second binding: %v", err)
 	}
 	if err := first.Close(); err != nil {
 		t.Fatalf("first Close: %v", err)

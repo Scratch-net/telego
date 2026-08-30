@@ -170,7 +170,7 @@ func TestServiceArtifactOutageKeepsDirectFallbackAndRetries(t *testing.T) {
 	}
 }
 
-func TestServiceSOCKS5PrimesFrontendNAT(t *testing.T) {
+func TestServiceSOCKS5DoesNotPrimeNAT(t *testing.T) {
 	probeStarted := make(chan struct{}, 1)
 	resolver, err := newNATResolver(
 		natResolverTestConfig(),
@@ -213,14 +213,17 @@ func TestServiceSOCKS5PrimesFrontendNAT(t *testing.T) {
 	if err := service.Start(); err != nil {
 		t.Fatal(err)
 	}
+	waitServiceCondition(t, service, time.Second, func(snapshot ServiceSnapshot) bool {
+		return snapshot.Coordinator.RefreshFailures >= 1
+	})
 	select {
 	case <-probeStarted:
-	case <-time.After(time.Second):
-		t.Fatal("SOCKS5 service did not prime frontend IPv4 NAT discovery")
+		t.Fatal("SOCKS5 service started unused IPv4 NAT discovery")
+	default:
 	}
-	waitServiceCondition(t, service, time.Second, func(snapshot ServiceSnapshot) bool {
-		return snapshot.NAT.IPv4.Ready && snapshot.NAT.IPv4.Successes == 1
-	})
+	if snapshot := service.Snapshot().NAT.IPv4; snapshot.Attempts != 0 || snapshot.Ready {
+		t.Fatalf("unused SOCKS5 NAT state = %+v", snapshot)
+	}
 }
 
 func validServiceResidentLimit(t *testing.T, config ServiceConfig) int {
