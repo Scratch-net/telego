@@ -2759,11 +2759,6 @@ func (m *fixedBindingManager) routeEvent(slot *fixedBindingSlot, event LinkEvent
 	default:
 		return fmt.Errorf("%w: DC %d emitted event kind %d", ErrFixedBindingProtocol, slot.dcID, event.Kind)
 	}
-	if event.ConnectionID <= 0 {
-		clearLinkEventPacket(&event)
-		return fmt.Errorf("%w: DC %d emitted nonpositive connection ID %d", ErrFixedBindingProtocol, slot.dcID, event.ConnectionID)
-	}
-
 	m.mu.Lock()
 	if m.state == fixedBindingManagerClosing || m.state == fixedBindingManagerClosed || slot.failed {
 		m.mu.Unlock()

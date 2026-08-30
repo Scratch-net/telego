@@ -3016,55 +3016,80 @@ func TestFixedBindingManagerResponseSaturationFailsOnlyOffendingBinding(t *testi
 	}
 }
 
-func TestFixedBindingManagerRejectsZeroAndCrossSlotIDs(t *testing.T) {
-	for _, test := range []struct {
-		name         string
-		connectionID int64
-	}{
-		{name: "zero"},
-		{name: "negative one", connectionID: -1},
-		{name: "minimum int64", connectionID: math.MinInt64},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			link := newFixedBindingFakeLink()
-			manager := newStartedFixedBindingManager(t, FixedBindingSlot{DCID: 1, Link: link})
-			packet := []byte{5, 4, 3, 2}
-			link.emit(LinkEvent{Kind: LinkEventProxyAnswer, ConnectionID: test.connectionID, Packet: packet})
-			waitFixedBindingCondition(t, func() bool {
-				manager.state.mu.Lock()
-				defer manager.state.mu.Unlock()
-				return manager.state.slots[1].failed
+func TestFixedBindingManagerTreatsNonpositiveIDsAsStale(t *testing.T) {
+	for _, connectionID := range []int64{0, -1, math.MinInt64} {
+		for _, kind := range []LinkEventKind{LinkEventProxyAnswer, LinkEventSimpleAck, LinkEventCloseExternal} {
+			t.Run(fmt.Sprintf("id_%d_kind_%d", connectionID, kind), func(t *testing.T) {
+				link := newFixedBindingFakeLink()
+				manager := newStartedFixedBindingManager(t, FixedBindingSlot{DCID: 1, Link: link})
+				binding, err := manager.Bind(1)
+				if err != nil {
+					t.Fatal(err)
+				}
+				packet := []byte(nil)
+				if kind == LinkEventProxyAnswer {
+					packet = []byte{5, 4, 3, 2}
+				}
+				link.emit(LinkEvent{
+					Kind:         kind,
+					ConnectionID: connectionID,
+					Packet:       packet,
+				})
+				if kind != LinkEventCloseExternal {
+					waitFixedBindingCondition(t, func() bool {
+						_, _, _, submissions, _ := link.stats()
+						return len(submissions) == 1
+					})
+					_, _, _, submissions, _ := link.stats()
+					closed, err := ParseCloseConnection(submissions[0].Payload)
+					if err != nil || closed.ConnectionID != connectionID {
+						t.Fatalf("stale close = %+v, %v", submissions[0], err)
+					}
+				}
+				link.emit(LinkEvent{
+					Kind:         LinkEventSimpleAck,
+					ConnectionID: binding.ConnectionID(),
+					ConfirmKey:   29,
+				})
+				event := nextFixedBindingEvent(t, binding)
+				if event.Kind != LinkEventSimpleAck || event.ConfirmKey != 29 {
+					t.Fatalf("healthy event = %+v", event)
+				}
+				if packet != nil && !allZero(packet) {
+					t.Fatalf("stale packet not cleared: %x", packet)
+				}
+				if kind == LinkEventCloseExternal {
+					_, _, _, submissions, _ := link.stats()
+					if len(submissions) != 0 {
+						t.Fatalf("stale external close submissions = %d, want 0", len(submissions))
+					}
+				}
+				snapshot := manager.Snapshot()
+				if snapshot.Slots[0].Failed {
+					t.Fatalf("stale event failed slot: %+v", snapshot.Slots[0])
+				}
 			})
-			if !allZero(packet) {
-				t.Fatalf("rejected packet not cleared: %x", packet)
-			}
-			manager.state.mu.Lock()
-			err := manager.state.slots[1].err
-			manager.state.mu.Unlock()
-			if !errors.Is(err, ErrFixedBindingProtocol) {
-				t.Fatalf("slot error = %v", err)
-			}
-		})
+		}
 	}
+}
 
-	t.Run("cross slot", func(t *testing.T) {
-		first := newFixedBindingFakeLink()
-		second := newFixedBindingFakeLink()
-		manager := newStartedFixedBindingManager(t, FixedBindingSlot{DCID: -2, Link: first}, FixedBindingSlot{DCID: 2, Link: second})
-		binding, err := manager.Bind(2)
-		if err != nil {
-			t.Fatal(err)
-		}
-		first.emit(LinkEvent{Kind: LinkEventSimpleAck, ConnectionID: binding.ConnectionID()})
-		waitFixedBindingCondition(t, func() bool {
-			manager.state.mu.Lock()
-			defer manager.state.mu.Unlock()
-			return manager.state.slots[-2].failed
-		})
-		if _, err := binding.PrepareProxyRequest(fixedBindingProxyRequest()); err != nil {
-			t.Fatalf("correct slot binding failed: %v", err)
-		}
+func TestFixedBindingManagerRejectsCrossSlotID(t *testing.T) {
+	first := newFixedBindingFakeLink()
+	second := newFixedBindingFakeLink()
+	manager := newStartedFixedBindingManager(t, FixedBindingSlot{DCID: -2, Link: first}, FixedBindingSlot{DCID: 2, Link: second})
+	binding, err := manager.Bind(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.emit(LinkEvent{Kind: LinkEventSimpleAck, ConnectionID: binding.ConnectionID()})
+	waitFixedBindingCondition(t, func() bool {
+		manager.state.mu.Lock()
+		defer manager.state.mu.Unlock()
+		return manager.state.slots[-2].failed
 	})
+	if _, err := binding.PrepareProxyRequest(fixedBindingProxyRequest()); err != nil {
+		t.Fatalf("correct slot binding failed: %v", err)
+	}
 }
 
 func TestFixedBindingManagerStaleIDBestEffortClose(t *testing.T) {
