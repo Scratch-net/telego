@@ -84,6 +84,47 @@ func TestMiddleEndMonitorCounterIncrease(t *testing.T) {
 	}
 }
 
+func TestMiddleEndGenerationFailureRecovered(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		coordinator middleend.GenerationCoordinatorSnapshot
+		admitting   bool
+		want        bool
+	}{
+		{
+			name:        "initial generation repaired by supervisor",
+			coordinator: middleend.GenerationCoordinatorSnapshot{Pending: true},
+			admitting:   true,
+			want:        true,
+		},
+		{
+			name:        "coordinator retry applied generation",
+			coordinator: middleend.GenerationCoordinatorSnapshot{Applied: true},
+			admitting:   true,
+			want:        true,
+		},
+		{
+			name:        "initial generation remains unavailable",
+			coordinator: middleend.GenerationCoordinatorSnapshot{Pending: true},
+		},
+		{
+			name:        "rotation remains pending",
+			coordinator: middleend.GenerationCoordinatorSnapshot{Applied: true, Pending: true},
+			admitting:   true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := middleend.ServiceSnapshot{
+				Coordinator: test.coordinator,
+				Supervisor:  middleend.GenerationSupervisorSnapshot{Admitting: test.admitting},
+			}
+			if got := middleEndGenerationFailureRecovered(snapshot); got != test.want {
+				t.Fatalf("generation failure recovered = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestMiddleEndMonitorPressureThresholdsResetWithGeneration(t *testing.T) {
 	monitor := &middleEndMonitor{pressure: make(map[string]middleEndPressureState)}
 	monitor.observePressure("active", "response", "bytes", 79, 100)

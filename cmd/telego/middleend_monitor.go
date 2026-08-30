@@ -182,10 +182,18 @@ func (m *middleEndMonitor) observe() {
 			Msg("Middle-End artifact refresh failed; last-known-good or direct fallback remains active")
 	}
 	if current.generationFailures > previous.generationFailures {
-		log.Warn().
-			Uint64("new_failures", current.generationFailures-previous.generationFailures).
-			Err(snapshot.Coordinator.LastError).
-			Msg("Middle-End generation build or apply failed; repair will retry")
+		newFailures := current.generationFailures - previous.generationFailures
+		if middleEndGenerationFailureRecovered(snapshot) {
+			log.Info().
+				Uint64("new_failures", newFailures).
+				Err(snapshot.Coordinator.LastError).
+				Msg("Middle-End recovered from transient generation build or apply failure")
+		} else {
+			log.Warn().
+				Uint64("new_failures", newFailures).
+				Err(snapshot.Coordinator.LastError).
+				Msg("Middle-End generation build or apply failed; repair will retry")
+		}
 	}
 	if current.slotRepairFailures > previous.slotRepairFailures {
 		log.Warn().
@@ -240,6 +248,14 @@ func middleEndCounterIncrease(current, previous uint64) uint64 {
 		return 0
 	}
 	return current - previous
+}
+
+func middleEndGenerationFailureRecovered(snapshot middleend.ServiceSnapshot) bool {
+	if !snapshot.Supervisor.Admitting {
+		return false
+	}
+	coordinator := snapshot.Coordinator
+	return (!coordinator.Applied && coordinator.Pending) || (coordinator.Applied && !coordinator.Pending)
 }
 
 func logMiddleEndStaticNAT(family string, snapshot middleend.NATResolverFamilySnapshot) {
