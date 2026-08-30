@@ -133,6 +133,249 @@ func TestNATResolverSingleflightCacheAndExpiry(t *testing.T) {
 	}
 }
 
+func TestNATResolverRefreshesWithoutTranslationGap(t *testing.T) {
+	var clock atomic.Int64
+	clock.Store(time.Unix(1_700_000_000, 0).UnixNano())
+	var calls atomic.Int32
+	refreshStarted := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseRefresh) }) })
+
+	resolver, err := newNATResolver(
+		natResolverTestConfig(),
+		func() time.Time { return time.Unix(0, clock.Load()) },
+		func(ctx context.Context, _ AddressFamily, _ []string, _ int) (natProbeResult, error) {
+			switch calls.Add(1) {
+			case 1:
+				return natProbeResult{
+					address:           netip.MustParseAddr("8.8.8.8"),
+					respondingServers: 2,
+					agreeingServers:   2,
+				}, nil
+			case 2:
+				close(refreshStarted)
+				select {
+				case <-releaseRefresh:
+				case <-ctx.Done():
+					return natProbeResult{}, context.Cause(ctx)
+				}
+				return natProbeResult{
+					address:           netip.MustParseAddr("1.1.1.1"),
+					respondingServers: 2,
+					agreeingServers:   2,
+				}, nil
+			default:
+				return natProbeResult{}, errors.New("unexpected extra NAT probe")
+			}
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolver.Resolve(t.Context(), AddressFamilyIPv4); err != nil {
+		t.Fatal(err)
+	}
+
+	config := natResolverTestConfig()
+	clock.Add((config.CacheTTL - config.ProbeTimeout/2).Nanoseconds())
+	private := netip.MustParseAddrPort("172.18.0.2:443")
+	translated, err := resolver.TranslateCachedEndpoint(private)
+	if err != nil || translated != netip.MustParseAddrPort("8.8.8.8:443") {
+		t.Fatalf("translation during early refresh = %s, %v", translated, err)
+	}
+	select {
+	case <-refreshStarted:
+	case <-time.After(time.Second):
+		t.Fatal("near-expiry translation did not start refresh")
+	}
+
+	clock.Add(config.ProbeTimeout.Nanoseconds())
+	translated, err = resolver.TranslateCachedEndpoint(private)
+	if err != nil || translated != netip.MustParseAddrPort("8.8.8.8:443") {
+		t.Fatalf("stale translation during refresh = %s, %v", translated, err)
+	}
+
+	releaseOnce.Do(func() { close(releaseRefresh) })
+	address, err := resolver.Resolve(t.Context(), AddressFamilyIPv4)
+	if err != nil || address != netip.MustParseAddr("1.1.1.1") {
+		t.Fatalf("refreshed address = %s, %v", address, err)
+	}
+	translated, err = resolver.TranslateCachedEndpoint(private)
+	if err != nil || translated != netip.MustParseAddrPort("1.1.1.1:443") {
+		t.Fatalf("translation after refresh = %s, %v", translated, err)
+	}
+}
+
+func TestNATResolverExpiredCacheRefreshesWithoutFallback(t *testing.T) {
+	var clock atomic.Int64
+	clock.Store(time.Unix(1_700_000_000, 0).UnixNano())
+	refreshStarted := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	var calls atomic.Int32
+	resolver, err := newNATResolver(
+		natResolverTestConfig(),
+		func() time.Time { return time.Unix(0, clock.Load()) },
+		func(ctx context.Context, _ AddressFamily, _ []string, _ int) (natProbeResult, error) {
+			if calls.Add(1) == 1 {
+				return natProbeResult{
+					address:           netip.MustParseAddr("8.8.8.8"),
+					respondingServers: 2,
+					agreeingServers:   2,
+				}, nil
+			}
+			close(refreshStarted)
+			select {
+			case <-releaseRefresh:
+				return natProbeResult{
+					address:           netip.MustParseAddr("8.8.8.8"),
+					respondingServers: 2,
+					agreeingServers:   2,
+				}, nil
+			case <-ctx.Done():
+				return natProbeResult{}, context.Cause(ctx)
+			}
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolver.Resolve(t.Context(), AddressFamilyIPv4); err != nil {
+		t.Fatal(err)
+	}
+	defer close(releaseRefresh)
+
+	config := natResolverTestConfig()
+	clock.Add((config.CacheTTL + time.Nanosecond).Nanoseconds())
+	private := netip.MustParseAddrPort("172.18.0.2:443")
+	translated, err := resolver.TranslateCachedEndpoint(private)
+	if err != nil || translated != netip.MustParseAddrPort("8.8.8.8:443") {
+		t.Fatalf("translation just after expiry = %s, %v", translated, err)
+	}
+	select {
+	case <-refreshStarted:
+	case <-time.After(time.Second):
+		t.Fatal("expired translation did not start refresh")
+	}
+}
+
+func TestNATResolverStaleGraceIsBounded(t *testing.T) {
+	var clock atomic.Int64
+	clock.Store(time.Unix(1_700_000_000, 0).UnixNano())
+	refreshStarted := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	var calls atomic.Int32
+	resolver, err := newNATResolver(
+		natResolverTestConfig(),
+		func() time.Time { return time.Unix(0, clock.Load()) },
+		func(ctx context.Context, _ AddressFamily, _ []string, _ int) (natProbeResult, error) {
+			if calls.Add(1) == 1 {
+				return natProbeResult{
+					address:           netip.MustParseAddr("8.8.8.8"),
+					respondingServers: 2,
+					agreeingServers:   2,
+				}, nil
+			}
+			close(refreshStarted)
+			select {
+			case <-releaseRefresh:
+				return natProbeResult{}, errors.New("STUN unavailable")
+			case <-ctx.Done():
+				return natProbeResult{}, context.Cause(ctx)
+			}
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolver.Resolve(t.Context(), AddressFamilyIPv4); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { close(releaseRefresh) })
+
+	config := natResolverTestConfig()
+	clock.Add((config.CacheTTL + config.ProbeTimeout + time.Nanosecond).Nanoseconds())
+	private := netip.MustParseAddrPort("172.18.0.2:443")
+	if _, err := resolver.TranslateCachedEndpoint(private); !errors.Is(err, ErrNATPublicIPDiscovery) {
+		t.Fatalf("translation beyond stale grace error = %v", err)
+	}
+	select {
+	case <-refreshStarted:
+	case <-time.After(time.Second):
+		t.Fatal("expired translation did not start refresh")
+	}
+}
+
+func TestNATResolverFailedRefreshKeepsOnlyBoundedStaleAddress(t *testing.T) {
+	var clock atomic.Int64
+	clock.Store(time.Unix(1_700_000_000, 0).UnixNano())
+	refreshStarted := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	var calls atomic.Int32
+	probeErr := errors.New("STUN unavailable")
+	resolver, err := newNATResolver(
+		natResolverTestConfig(),
+		func() time.Time { return time.Unix(0, clock.Load()) },
+		func(ctx context.Context, _ AddressFamily, _ []string, _ int) (natProbeResult, error) {
+			if calls.Add(1) == 1 {
+				return natProbeResult{
+					address:           netip.MustParseAddr("8.8.8.8"),
+					respondingServers: 2,
+					agreeingServers:   2,
+				}, nil
+			}
+			close(refreshStarted)
+			select {
+			case <-releaseRefresh:
+				return natProbeResult{}, probeErr
+			case <-ctx.Done():
+				return natProbeResult{}, context.Cause(ctx)
+			}
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolver.Resolve(t.Context(), AddressFamilyIPv4); err != nil {
+		t.Fatal(err)
+	}
+
+	config := natResolverTestConfig()
+	clock.Add((config.CacheTTL - config.ProbeTimeout/2).Nanoseconds())
+	private := netip.MustParseAddrPort("172.18.0.2:443")
+	translated, err := resolver.TranslateCachedEndpoint(private)
+	if err != nil || translated != netip.MustParseAddrPort("8.8.8.8:443") {
+		t.Fatalf("translation before failed refresh = %s, %v", translated, err)
+	}
+	select {
+	case <-refreshStarted:
+	case <-time.After(time.Second):
+		t.Fatal("near-expiry translation did not start failed refresh")
+	}
+	close(releaseRefresh)
+
+	deadline := time.After(time.Second)
+	for resolver.Snapshot().IPv4.Failures != 1 {
+		select {
+		case <-deadline:
+			t.Fatal("failed refresh was not recorded")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	translated, err = resolver.TranslateCachedEndpoint(private)
+	if err != nil || translated != netip.MustParseAddrPort("8.8.8.8:443") {
+		t.Fatalf("translation after early refresh failure = %s, %v", translated, err)
+	}
+
+	clock.Add((config.ProbeTimeout + config.ProbeTimeout/2 + time.Nanosecond).Nanoseconds())
+	if _, err := resolver.TranslateCachedEndpoint(private); !errors.Is(err, ErrNATPublicIPDiscovery) {
+		t.Fatalf("translation after failed-refresh grace error = %v", err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("failed refresh calls = %d, want 2 during backoff", calls.Load())
+	}
+}
+
 func TestNATResolverFailureBackoff(t *testing.T) {
 	var clock atomic.Int64
 	clock.Store(time.Unix(1_700_000_000, 0).UnixNano())

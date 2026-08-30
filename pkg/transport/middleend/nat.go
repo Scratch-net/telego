@@ -59,6 +59,7 @@ type natResolverState struct {
 	probeTimeout          time.Duration
 	probeConcurrency      int
 	cacheTTL              time.Duration
+	refreshWindow         time.Duration
 	failureBackoffInitial time.Duration
 	failureBackoffMaximum time.Duration
 	now                   func() time.Time
@@ -168,6 +169,7 @@ func newNATResolver(config NATResolverConfig, now func() time.Time, probe natPro
 		probeTimeout:          config.ProbeTimeout,
 		probeConcurrency:      config.ProbeConcurrency,
 		cacheTTL:              config.CacheTTL,
+		refreshWindow:         min(config.CacheTTL/2, config.ProbeTimeout),
 		failureBackoffInitial: config.FailureBackoffInitial,
 		failureBackoffMaximum: config.FailureBackoffMaximum,
 		now:                   now,
@@ -225,9 +227,9 @@ func (s *natResolverState) familySnapshot(family AddressFamily) NATResolverFamil
 
 // TranslateCachedEndpoint replaces only a non-public or wildcard endpoint IP
 // with the cached public IP for the same address family. It retains the
-// endpoint port and never waits for network I/O. A cache miss starts one
-// bounded background probe, so callers can choose direct fallback while
-// discovery runs.
+// endpoint port and never waits for network I/O. A near-expiry cache starts
+// one bounded background refresh. The last verified address stays available
+// for the same bounded window after expiry while that refresh completes.
 func (r *NATResolver) TranslateCachedEndpoint(endpoint netip.AddrPort) (netip.AddrPort, error) {
 	if !endpoint.IsValid() || endpoint.Port() == 0 {
 		return netip.AddrPort{}, fmt.Errorf("%w: invalid proxy endpoint", ErrNATPublicIPDiscovery)
@@ -256,9 +258,13 @@ func (r *NATResolver) TranslateCachedEndpoint(endpoint netip.AddrPort) (netip.Ad
 	default:
 		return netip.AddrPort{}, fmt.Errorf("%w: invalid proxy address family", ErrNATPublicIPDiscovery)
 	}
-	if !cached.Ready || !cached.PublicIP.IsValid() {
+	if !cached.PublicIP.IsValid() {
 		r.Prime(family)
 		return netip.AddrPort{}, fmt.Errorf("%w: no cached public IP for the proxy address family", ErrNATPublicIPDiscovery)
+	}
+	r.Prime(family)
+	if !cached.Ready && (cached.ExpiresAt.IsZero() || !r.state.now().Before(cached.ExpiresAt.Add(r.state.refreshWindow))) {
+		return netip.AddrPort{}, fmt.Errorf("%w: cached public IP expired for the proxy address family", ErrNATPublicIPDiscovery)
 	}
 	translated, err := translateNATClientAddress(endpoint, cached.PublicIP)
 	if err != nil {
@@ -267,8 +273,8 @@ func (r *NATResolver) TranslateCachedEndpoint(endpoint netip.AddrPort) (netip.Ad
 	return translated, nil
 }
 
-// Prime starts one bounded background discovery for family when no cached
-// result, active probe, or failure backoff exists. It never waits for network
+// Prime starts one bounded background discovery or near-expiry refresh for
+// family when no probe or failure backoff exists. It never waits for network
 // I/O and returns whether it started a goroutine.
 func (r *NATResolver) Prime(family AddressFamily) bool {
 	if r == nil || r.state == nil || (family != AddressFamilyIPv4 && family != AddressFamilyIPv6) {
@@ -281,8 +287,9 @@ func (r *NATResolver) Prime(family AddressFamily) bool {
 	state.mu.Lock()
 	now := state.now()
 	cached := &state.families[family]
+	refresh := cached.address.IsValid() && !now.Before(cached.expiresAt.Add(-state.refreshWindow))
 	if cached.priming || cached.inFlight != nil || now.Before(cached.retryAt) ||
-		(cached.address.IsValid() && now.Before(cached.expiresAt)) {
+		(cached.address.IsValid() && !refresh) {
 		state.mu.Unlock()
 		return false
 	}
@@ -290,7 +297,7 @@ func (r *NATResolver) Prime(family AddressFamily) bool {
 	state.mu.Unlock()
 
 	go func() {
-		_, _ = r.Resolve(context.Background(), family)
+		_, _ = r.resolve(context.Background(), family, refresh)
 		state.mu.Lock()
 		state.families[family].priming = false
 		state.mu.Unlock()
@@ -301,6 +308,10 @@ func (r *NATResolver) Prime(family AddressFamily) bool {
 // Resolve returns a public address in family. Concurrent cache misses share
 // one STUN batch. A failed batch is cached with bounded exponential backoff.
 func (r *NATResolver) Resolve(ctx context.Context, family AddressFamily) (netip.Addr, error) {
+	return r.resolve(ctx, family, false)
+}
+
+func (r *NATResolver) resolve(ctx context.Context, family AddressFamily, forceProbe bool) (netip.Addr, error) {
 	if ctx == nil {
 		return netip.Addr{}, fmt.Errorf("%w: nil context", ErrNATPublicIPDiscovery)
 	}
@@ -322,7 +333,7 @@ func (r *NATResolver) Resolve(ctx context.Context, family AddressFamily) (netip.
 		state.mu.Lock()
 		now := state.now()
 		cached := &state.families[family]
-		if cached.address.IsValid() && now.Before(cached.expiresAt) {
+		if cached.address.IsValid() && now.Before(cached.expiresAt) && !forceProbe {
 			address := cached.address
 			state.mu.Unlock()
 			return address, nil
@@ -337,6 +348,7 @@ func (r *NATResolver) Resolve(ctx context.Context, family AddressFamily) (netip.
 			state.mu.Unlock()
 			select {
 			case <-inFlight:
+				forceProbe = false
 				continue
 			case <-ctx.Done():
 				return netip.Addr{}, fmt.Errorf("%w: wait for shared probe: %w", ErrNATPublicIPDiscovery, context.Cause(ctx))
@@ -366,8 +378,6 @@ func (r *NATResolver) Resolve(ctx context.Context, family AddressFamily) (netip.
 			cached.respondingServers = result.respondingServers
 			cached.agreeingServers = result.agreeingServers
 		} else {
-			cached.address = netip.Addr{}
-			cached.expiresAt = time.Time{}
 			cached.consecutiveFailures++
 			cached.lastErr = err
 			cached.lastFailure = err

@@ -50,7 +50,13 @@ On Unix, gnet reports the listener address for each accepted client. Telego also
 
 Telego keeps the kernel-assigned TCP source port. It does not use the UDP port from the STUN response.
 
-Telego caches a successful STUN result for 10 minutes. Concurrent ME links share one probe, and failed probes use a bounded backoff.
+Telego caches a successful STUN result for 10 minutes. A new private endpoint starts a background refresh during the final 5 seconds.
+
+The endpoint continues to use the last verified IP during the refresh. Concurrent ME links share one probe.
+
+If the cache expires first, the last verified IP remains available for 5 seconds. This grace period gives the refresh time to finish.
+
+If the refresh fails, Telego stops using the old IP after the grace period. New connections use direct fallback during the bounded retry backoff.
 
 The ME handshake validates the complete tuple. If NAT changes the TCP source port, the handshake fails and direct fallback stays available.
 
