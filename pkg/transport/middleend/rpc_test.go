@@ -144,6 +144,7 @@ func TestProxyRequestOfficialWEBUnknownRemotePortRoundTrip(t *testing.T) {
 func TestProxyRequestFlagsForClient(t *testing.T) {
 	encrypted := validEncryptedPacket(EncryptedMessageHeaderSize)
 	unencrypted := validUnencryptedPacket(MTProtoReqPQMultiConstructor)
+	unencryptedAck := validUnencryptedPacket(MTProtoMsgsAckConstructor)
 
 	tests := []struct {
 		name           string
@@ -177,6 +178,15 @@ func TestProxyRequestFlagsForClient(t *testing.T) {
 			connectionType: obfuscated2.ConnectionTypePaddedIntermediate,
 			packet:         encrypted,
 			want:           ProxyRequestFlagMagic | ProxyRequestFlagExternalMode2 | ProxyRequestFlagIntermediate,
+		},
+		{
+			name:           "intermediate unencrypted handshake ack",
+			connectionType: obfuscated2.ConnectionTypeIntermediate,
+			packet:         unencryptedAck,
+			want: ProxyRequestFlagMagic |
+				ProxyRequestFlagExternalMode2 |
+				ProxyRequestFlagIntermediate |
+				ProxyRequestFlagNotEncrypted,
 		},
 	}
 
@@ -444,6 +454,7 @@ func TestMTProtoEnvelopeValidation(t *testing.T) {
 		MTProtoReqPQMultiConstructor,
 		MTProtoReqDHParamsConstructor,
 		MTProtoSetClientDHParamsConstructor,
+		MTProtoMsgsAckConstructor,
 	}
 	for _, constructor := range constructors {
 		packet := validUnencryptedPacket(constructor)

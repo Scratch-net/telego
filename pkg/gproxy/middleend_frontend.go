@@ -872,6 +872,7 @@ func (h *ProxyHandler) prepareMiddleEndRequest(
 		client.frontend.hasTag,
 	)
 	if err != nil {
+		h.logger.Debug("[%s] build Middle-End request flags: %v", ctx.LogPrefix(), err)
 		clear(packet.Payload)
 		return gnet.Close
 	}

@@ -406,10 +406,10 @@ func validateProxyPacket(packet []byte, flags ProxyRequestFlags) error {
 	return nil
 }
 
-// validateMTProtoEnvelope mirrors forward_mtproto_packet and
+// validateMTProtoEnvelope follows forward_mtproto_packet and
 // forward_mtproto_enc_packet in mtproto/mtproto-proxy.c at MTProxy commit
-// f36d8af769ffaeac36978d38c2c0f6d1104c2137. It validates only the envelope
-// fields that the official proxy validates before constructing RPC_PROXY_REQ.
+// f36d8af769ffaeac36978d38c2c0f6d1104c2137. It also admits the unencrypted
+// msgs_ack emitted between handshake steps by current Telegram clients.
 func validateMTProtoEnvelope(packet []byte) (bool, error) {
 	if len(packet)%4 != 0 {
 		return false, fmt.Errorf("%w: packet length %d is not word-aligned", ErrInvalidMTProtoEnvelope, len(packet))
@@ -447,7 +447,8 @@ func validateMTProtoEnvelope(packet []byte) (bool, error) {
 	case MTProtoReqPQConstructor,
 		MTProtoReqPQMultiConstructor,
 		MTProtoReqDHParamsConstructor,
-		MTProtoSetClientDHParamsConstructor:
+		MTProtoSetClientDHParamsConstructor,
+		MTProtoMsgsAckConstructor:
 		return true, nil
 	default:
 		return true, fmt.Errorf("%w: unsupported unencrypted constructor %08x", ErrInvalidMTProtoEnvelope, constructor)

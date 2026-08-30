@@ -78,13 +78,15 @@ const (
 	UnencryptedMessageHeaderSize = 20
 	MinimumUnencryptedBodySize   = 20
 
-	// The external proxy accepts only these four unencrypted MTProto
-	// constructors. They are CODE_* values from mtproto/mtproto-common.h at the
-	// pinned MTProxy commit.
+	// The first four constructors are the unencrypted MTProto handshake
+	// messages accepted by the pinned official external proxy. Some Telegram
+	// clients also acknowledge a handshake response before sending the next
+	// step, so the Middle-End frontend must admit msgs_ack as well.
 	MTProtoReqPQConstructor             uint32 = 0x60469778
 	MTProtoReqPQMultiConstructor        uint32 = 0xbe7e8ef1
 	MTProtoReqDHParamsConstructor       uint32 = 0xd712e4be
 	MTProtoSetClientDHParamsConstructor uint32 = 0xf5045f1f
+	MTProtoMsgsAckConstructor           uint32 = 0x62d6b459
 
 	MinimumSecretSize = 32
 	MaximumSecretSize = 256
