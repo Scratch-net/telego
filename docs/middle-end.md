@@ -50,13 +50,15 @@ On Unix, gnet reports the listener address for each accepted client. Telego also
 
 Telego keeps the kernel-assigned TCP source port. It does not use the UDP port from the STUN response.
 
-Telego caches a successful STUN result for 10 minutes. A new private endpoint starts a background refresh during the final 5 seconds.
+Telego caches a successful STUN result for 10 minutes. Telego starts a background refresh after 5 minutes.
 
-The endpoint continues to use the last verified IP during the refresh. Concurrent ME links share one probe.
+The refresh does not depend on a new client connection. Concurrent ME links share one probe.
 
-If the cache expires first, the last verified IP remains available for 5 seconds. This grace period gives the refresh time to finish.
+A failed refresh retries with bounded exponential backoff. The verified IP stays valid until its original 10-minute expiry.
 
-If the refresh fails, Telego stops using the old IP after the grace period. New connections use direct fallback during the bounded retry backoff.
+The verified IP remains available for 5 seconds after expiry while a probe completes.
+
+If no verified IP is available after that grace period, new connections use direct fallback during the retry backoff.
 
 The ME handshake validates the complete tuple. If NAT changes the TCP source port, the handshake fails and direct fallback stays available.
 
@@ -129,6 +131,7 @@ Telego derives the operational limits below. Most installations do not need an o
 | Endpoint dial timeout | 3s | Fixed from the official implementation |
 | NAT probe timeout | 5s | One shared STUN batch for private direct sockets |
 | NAT result cache | 10 minutes | Matches the public telemt cache period |
+| NAT proactive refresh | 5 minutes after success | Does not depend on client traffic |
 | Generation preparation timeout | 100s | Covers construction, startup, and the first all-DC probe |
 | Retiring generation drain | 90s | Closes remaining bindings after the deadline |
 
@@ -155,6 +158,8 @@ Enable the Prometheus listener to inspect ME state. Start with these metrics:
 The queue metrics report current use, capacity, and lifetime high-water values. Telego logs thresholds at 80%, 95%, and 100%.
 
 Telego also logs route fallback, artifact failure, generation failure, physical-link repair, and binding eviction events.
+
+Each direct-fallback commit log reports the new, active, and total session counts.
 
 Telego logs NAT discovery results, the selected public IP, responder agreement, and the retry time.
 

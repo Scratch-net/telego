@@ -65,6 +65,25 @@ func TestMiddleEndMonitorAggregatesRepairingSlots(t *testing.T) {
 	}
 }
 
+func TestMiddleEndMonitorCounterIncrease(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		current  uint64
+		previous uint64
+		want     uint64
+	}{
+		{name: "increase", current: 17, previous: 12, want: 5},
+		{name: "unchanged", current: 12, previous: 12},
+		{name: "counter reset", current: 3, previous: 12},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := middleEndCounterIncrease(test.current, test.previous); got != test.want {
+				t.Fatalf("counter increase = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
 func TestMiddleEndMonitorPressureThresholdsResetWithGeneration(t *testing.T) {
 	monitor := &middleEndMonitor{pressure: make(map[string]middleEndPressureState)}
 	monitor.observePressure("active", "response", "bytes", 79, 100)

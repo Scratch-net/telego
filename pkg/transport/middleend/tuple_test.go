@@ -26,6 +26,11 @@ func natResolverTestConfig() NATResolverConfig {
 	}
 }
 
+func cleanupNATResolver(t testing.TB, resolver *NATResolver) {
+	t.Helper()
+	t.Cleanup(resolver.Close)
+}
+
 func TestNATResolverStaticValidationAndRedaction(t *testing.T) {
 	config := natResolverTestConfig()
 	config.PublicIP = netip.MustParseAddr("8.8.8.8")
@@ -33,6 +38,7 @@ func TestNATResolverStaticValidationAndRedaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cleanupNATResolver(t, resolver)
 	address, err := resolver.Resolve(t.Context(), AddressFamilyIPv4)
 	if err != nil || address != config.PublicIP {
 		t.Fatalf("static Resolve = %s, %v", address, err)
@@ -95,6 +101,7 @@ func TestNATResolverSingleflightCacheAndExpiry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cleanupNATResolver(t, resolver)
 
 	results := make(chan error, 8)
 	var workers sync.WaitGroup
@@ -173,6 +180,7 @@ func TestNATResolverRefreshesWithoutTranslationGap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cleanupNATResolver(t, resolver)
 	if _, err := resolver.Resolve(t.Context(), AddressFamilyIPv4); err != nil {
 		t.Fatal(err)
 	}
@@ -204,6 +212,174 @@ func TestNATResolverRefreshesWithoutTranslationGap(t *testing.T) {
 	translated, err = resolver.TranslateCachedEndpoint(private)
 	if err != nil || translated != netip.MustParseAddrPort("1.1.1.1:443") {
 		t.Fatalf("translation after refresh = %s, %v", translated, err)
+	}
+}
+
+func TestNATResolverRefreshesProactivelyWithoutClientTraffic(t *testing.T) {
+	config := natResolverTestConfig()
+	config.CacheTTL = 100 * time.Millisecond
+	config.ProbeTimeout = 20 * time.Millisecond
+	var calls atomic.Int32
+	refreshed := make(chan struct{}, 1)
+	resolver, err := newNATResolver(
+		config,
+		time.Now,
+		func(context.Context, AddressFamily, []string, int) (natProbeResult, error) {
+			if calls.Add(1) == 2 {
+				refreshed <- struct{}{}
+			}
+			return natProbeResult{
+				address:           netip.MustParseAddr("8.8.8.8"),
+				respondingServers: 2,
+				agreeingServers:   2,
+			}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupNATResolver(t, resolver)
+	if _, err := resolver.Resolve(t.Context(), AddressFamilyIPv4); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-refreshed:
+	case <-time.After(time.Second):
+		t.Fatal("cached NAT address did not refresh without client traffic")
+	}
+}
+
+func TestNATResolverProactiveRefreshRetriesAfterBackoff(t *testing.T) {
+	type waitRequest struct {
+		delay   time.Duration
+		release chan struct{}
+	}
+	waits := make(chan waitRequest, 4)
+	nextWait := func() waitRequest {
+		select {
+		case request := <-waits:
+			return request
+		case <-time.After(time.Second):
+			t.Fatal("NAT refresh task was not scheduled")
+			return waitRequest{}
+		}
+	}
+	wait := func(ctx context.Context, delay time.Duration) bool {
+		request := waitRequest{delay: delay, release: make(chan struct{})}
+		waits <- request
+		select {
+		case <-request.release:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+
+	var clock atomic.Int64
+	clock.Store(time.Unix(1_700_000_000, 0).UnixNano())
+	var calls atomic.Int32
+	probeErr := errors.New("STUN unavailable")
+	resolver, err := newNATResolverWithWait(
+		natResolverTestConfig(),
+		func() time.Time { return time.Unix(0, clock.Load()) },
+		func(context.Context, AddressFamily, []string, int) (natProbeResult, error) {
+			switch calls.Add(1) {
+			case 1:
+				return natProbeResult{
+					address:           netip.MustParseAddr("8.8.8.8"),
+					respondingServers: 2,
+					agreeingServers:   2,
+				}, nil
+			case 2:
+				return natProbeResult{}, probeErr
+			case 3:
+				return natProbeResult{
+					address:           netip.MustParseAddr("1.1.1.1"),
+					respondingServers: 2,
+					agreeingServers:   2,
+				}, nil
+			default:
+				return natProbeResult{}, errors.New("unexpected extra NAT probe")
+			}
+		},
+		wait,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupNATResolver(t, resolver)
+	if _, err := resolver.Resolve(t.Context(), AddressFamilyIPv4); err != nil {
+		t.Fatal(err)
+	}
+
+	config := natResolverTestConfig()
+	refresh := nextWait()
+	if refresh.delay != config.CacheTTL/2 {
+		t.Fatalf("proactive refresh delay = %v, want %v", refresh.delay, config.CacheTTL/2)
+	}
+	clock.Add(refresh.delay.Nanoseconds())
+	close(refresh.release)
+
+	retry := nextWait()
+	if retry.delay != config.FailureBackoffInitial {
+		t.Fatalf("proactive retry delay = %v, want %v", retry.delay, config.FailureBackoffInitial)
+	}
+	clock.Add(retry.delay.Nanoseconds())
+	close(retry.release)
+
+	deadline := time.After(time.Second)
+	for resolver.Snapshot().IPv4.Successes != 2 {
+		select {
+		case <-deadline:
+			t.Fatal("proactive retry did not restore the NAT cache")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("proactive probe calls = %d, want 3", calls.Load())
+	}
+}
+
+func TestNATResolverCloseStopsScheduledRefresh(t *testing.T) {
+	waitStarted := make(chan context.Context, 1)
+	resolver, err := newNATResolverWithWait(
+		natResolverTestConfig(),
+		time.Now,
+		func(context.Context, AddressFamily, []string, int) (natProbeResult, error) {
+			return natProbeResult{
+				address:           netip.MustParseAddr("8.8.8.8"),
+				respondingServers: 2,
+				agreeingServers:   2,
+			}, nil
+		},
+		func(ctx context.Context, _ time.Duration) bool {
+			waitStarted <- ctx
+			<-ctx.Done()
+			return false
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolver.Resolve(t.Context(), AddressFamilyIPv4); err != nil {
+		t.Fatal(err)
+	}
+	var lifecycle context.Context
+	select {
+	case lifecycle = <-waitStarted:
+	case <-time.After(time.Second):
+		t.Fatal("proactive refresh wait did not start")
+	}
+	resolver.Close()
+	if !errors.Is(context.Cause(lifecycle), ErrNATResolverClosed) {
+		t.Fatalf("refresh lifecycle cause = %v", context.Cause(lifecycle))
+	}
+	if resolver.Prime(AddressFamilyIPv4) {
+		t.Fatal("closed resolver started a probe")
+	}
+	if _, err := resolver.Resolve(t.Context(), AddressFamilyIPv4); !errors.Is(err, ErrNATResolverClosed) {
+		t.Fatalf("Resolve after Close error = %v", err)
 	}
 }
 
@@ -240,6 +416,7 @@ func TestNATResolverExpiredCacheRefreshesWithoutFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cleanupNATResolver(t, resolver)
 	if _, err := resolver.Resolve(t.Context(), AddressFamilyIPv4); err != nil {
 		t.Fatal(err)
 	}
@@ -288,6 +465,7 @@ func TestNATResolverStaleGraceIsBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cleanupNATResolver(t, resolver)
 	if _, err := resolver.Resolve(t.Context(), AddressFamilyIPv4); err != nil {
 		t.Fatal(err)
 	}
@@ -336,6 +514,7 @@ func TestNATResolverFailedRefreshKeepsOnlyBoundedStaleAddress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cleanupNATResolver(t, resolver)
 	if _, err := resolver.Resolve(t.Context(), AddressFamilyIPv4); err != nil {
 		t.Fatal(err)
 	}
@@ -392,6 +571,7 @@ func TestNATResolverFailureBackoff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cleanupNATResolver(t, resolver)
 	if _, err := resolver.Resolve(t.Context(), AddressFamilyIPv4); !errors.Is(err, ErrNATPublicIPDiscovery) || !errors.Is(err, probeErr) {
 		t.Fatalf("first failure = %v", err)
 	}
@@ -507,6 +687,7 @@ func TestNATResolverTranslateCachedEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cleanupNATResolver(t, resolver)
 
 	private := netip.MustParseAddrPort("172.18.0.2:443")
 	translated, err := resolver.TranslateCachedEndpoint(private)
@@ -524,6 +705,7 @@ func TestNATResolverTranslateCachedEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cleanupNATResolver(t, ipv6Resolver)
 	translated, err = ipv6Resolver.TranslateCachedEndpoint(netip.MustParseAddrPort("[::]:443"))
 	if err != nil || translated != netip.MustParseAddrPort("[2001:4860:4860::8888]:443") {
 		t.Fatalf("IPv6 wildcard endpoint = %s, %v", translated, err)
@@ -559,6 +741,7 @@ func TestNATResolverTranslateCachedEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cleanupNATResolver(t, automatic)
 	if _, err := automatic.TranslateCachedEndpoint(private); !errors.Is(err, ErrNATPublicIPDiscovery) {
 		t.Fatalf("uncached translation error = %v", err)
 	}

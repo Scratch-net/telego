@@ -22,9 +22,12 @@ var (
 	// ErrNATPublicIPDiscovery reports that no authoritative public IP is
 	// available for a private direct TCP endpoint.
 	ErrNATPublicIPDiscovery = errors.New("discover Middle-End NAT public IP")
-	// ErrNATPublicIPBackoff reports a cached discovery failure. The coordinator
-	// will retry after the bounded backoff expires.
+	// ErrNATPublicIPBackoff reports a cached discovery failure. The resolver
+	// retries after the bounded backoff expires.
 	ErrNATPublicIPBackoff = errors.New("Middle-End NAT public IP discovery is in backoff")
+	// ErrNATResolverClosed reports use after the resolver owner stopped its
+	// proactive refresh and retry tasks.
+	ErrNATResolverClosed = errors.New("Middle-End NAT resolver is closed")
 )
 
 // NATResolverConfig contains the fixed operational policy for public-IP
@@ -47,8 +50,9 @@ func (NATResolverConfig) String() string { return "middleend.NATResolverConfig{r
 func (c NATResolverConfig) GoString() string { return c.String() }
 
 // NATResolver returns one public address for a private direct TCP endpoint.
-// Automatic results are singleflight, cached, and failure-backed-off for each
-// address family. The TCP source port is never part of this resolver.
+// Automatic results are singleflight, cached, proactively refreshed, and
+// failure-backed-off for each address family. The TCP source port is never
+// part of this resolver.
 type NATResolver struct {
 	state *natResolverState
 }
@@ -59,13 +63,19 @@ type natResolverState struct {
 	probeTimeout          time.Duration
 	probeConcurrency      int
 	cacheTTL              time.Duration
-	refreshWindow         time.Duration
+	refreshLead           time.Duration
+	staleGrace            time.Duration
 	failureBackoffInitial time.Duration
 	failureBackoffMaximum time.Duration
 	now                   func() time.Time
 	probe                 natProbeFunc
+	lifecycle             context.Context
+	cancelLifecycle       context.CancelCauseFunc
+	wait                  natWaitFunc
+	tasks                 sync.WaitGroup
 
 	mu       sync.Mutex
+	closed   bool
 	families [3]natResolverFamilyState
 }
 
@@ -83,6 +93,8 @@ type natResolverFamilyState struct {
 	respondingServers   int
 	agreeingServers     int
 	priming             bool
+	primeDone           chan struct{}
+	scheduleVersion     uint64
 }
 
 type natProbeResult struct {
@@ -92,6 +104,8 @@ type natProbeResult struct {
 }
 
 type natProbeFunc func(context.Context, AddressFamily, []string, int) (natProbeResult, error)
+
+type natWaitFunc func(context.Context, time.Duration) bool
 
 // NATResolverSnapshot is a concurrency-safe operational view. PublicIP is the
 // server public address and contains no credential or registered proxy tag.
@@ -123,7 +137,16 @@ func NewNATResolver(config NATResolverConfig) (*NATResolver, error) {
 }
 
 func newNATResolver(config NATResolverConfig, now func() time.Time, probe natProbeFunc) (*NATResolver, error) {
-	if now == nil || probe == nil {
+	return newNATResolverWithWait(config, now, probe, waitForNATRefresh)
+}
+
+func newNATResolverWithWait(
+	config NATResolverConfig,
+	now func() time.Time,
+	probe natProbeFunc,
+	wait natWaitFunc,
+) (*NATResolver, error) {
+	if now == nil || probe == nil || wait == nil {
 		return nil, fmt.Errorf("%w: nil internal dependency", ErrInvalidNATResolver)
 	}
 	if config.PublicIP.IsValid() {
@@ -134,7 +157,15 @@ func newNATResolver(config NATResolverConfig, now func() time.Time, probe natPro
 		if err := validatePublicEndpoint("configured NAT", netip.AddrPortFrom(address, 1)); err != nil {
 			return nil, fmt.Errorf("%w: public IP: %v", ErrInvalidNATResolver, err)
 		}
-		return &NATResolver{state: &natResolverState{static: address, now: now, probe: probe}}, nil
+		lifecycle, cancelLifecycle := context.WithCancelCause(context.Background())
+		return &NATResolver{state: &natResolverState{
+			static:          address,
+			now:             now,
+			probe:           probe,
+			lifecycle:       lifecycle,
+			cancelLifecycle: cancelLifecycle,
+			wait:            wait,
+		}}, nil
 	}
 	if len(config.STUNServers) == 0 {
 		return nil, fmt.Errorf("%w: at least one STUN server is required", ErrInvalidNATResolver)
@@ -164,16 +195,22 @@ func newNATResolver(config NATResolverConfig, now func() time.Time, probe natPro
 	if len(servers) == 0 || config.ProbeConcurrency > len(servers) {
 		return nil, fmt.Errorf("%w: probe concurrency exceeds unique STUN servers", ErrInvalidNATResolver)
 	}
+	refreshLead := min(config.CacheTTL, max(config.CacheTTL/2, time.Nanosecond))
+	lifecycle, cancelLifecycle := context.WithCancelCause(context.Background())
 	return &NATResolver{state: &natResolverState{
 		servers:               slices.Clone(servers),
 		probeTimeout:          config.ProbeTimeout,
 		probeConcurrency:      config.ProbeConcurrency,
 		cacheTTL:              config.CacheTTL,
-		refreshWindow:         min(config.CacheTTL/2, config.ProbeTimeout),
+		refreshLead:           refreshLead,
+		staleGrace:            min(refreshLead, config.ProbeTimeout),
 		failureBackoffInitial: config.FailureBackoffInitial,
 		failureBackoffMaximum: config.FailureBackoffMaximum,
 		now:                   now,
 		probe:                 probe,
+		lifecycle:             lifecycle,
+		cancelLifecycle:       cancelLifecycle,
+		wait:                  wait,
 	}}, nil
 }
 
@@ -209,6 +246,22 @@ func (r *NATResolver) Snapshot() NATResolverSnapshot {
 	}
 }
 
+// Close stops proactive refresh and retry tasks. It is safe to call Close
+// more than once. The resolver does not accept new work after Close starts.
+func (r *NATResolver) Close() {
+	if r == nil || r.state == nil {
+		return
+	}
+	state := r.state
+	state.mu.Lock()
+	if !state.closed {
+		state.closed = true
+		state.cancelLifecycle(ErrNATResolverClosed)
+	}
+	state.mu.Unlock()
+	state.tasks.Wait()
+}
+
 func (s *natResolverState) familySnapshot(family AddressFamily) NATResolverFamilySnapshot {
 	state := s.families[family]
 	return NATResolverFamilySnapshot{
@@ -227,9 +280,9 @@ func (s *natResolverState) familySnapshot(family AddressFamily) NATResolverFamil
 
 // TranslateCachedEndpoint replaces only a non-public or wildcard endpoint IP
 // with the cached public IP for the same address family. It retains the
-// endpoint port and never waits for network I/O. A near-expiry cache starts
-// one bounded background refresh. The last verified address stays available
-// for the same bounded window after expiry while that refresh completes.
+// endpoint port and never waits for network I/O. The resolver refreshes a
+// cached address at half its lifetime. The last verified address stays
+// available for one bounded window after expiry while a probe completes.
 func (r *NATResolver) TranslateCachedEndpoint(endpoint netip.AddrPort) (netip.AddrPort, error) {
 	if !endpoint.IsValid() || endpoint.Port() == 0 {
 		return netip.AddrPort{}, fmt.Errorf("%w: invalid proxy endpoint", ErrNATPublicIPDiscovery)
@@ -241,6 +294,15 @@ func (r *NATResolver) TranslateCachedEndpoint(endpoint netip.AddrPort) (netip.Ad
 	endpoint = netip.AddrPortFrom(address, endpoint.Port())
 	if validatePublicEndpoint("proxy", endpoint) == nil {
 		return endpoint, nil
+	}
+	if r == nil || r.state == nil {
+		return netip.AddrPort{}, fmt.Errorf("%w: uninitialized resolver", ErrNATPublicIPDiscovery)
+	}
+	r.state.mu.Lock()
+	closed := r.state.closed
+	r.state.mu.Unlock()
+	if closed {
+		return netip.AddrPort{}, ErrNATResolverClosed
 	}
 
 	snapshot := r.Snapshot()
@@ -263,7 +325,7 @@ func (r *NATResolver) TranslateCachedEndpoint(endpoint netip.AddrPort) (netip.Ad
 		return netip.AddrPort{}, fmt.Errorf("%w: no cached public IP for the proxy address family", ErrNATPublicIPDiscovery)
 	}
 	r.Prime(family)
-	if !cached.Ready && (cached.ExpiresAt.IsZero() || !r.state.now().Before(cached.ExpiresAt.Add(r.state.refreshWindow))) {
+	if !cached.Ready && (cached.ExpiresAt.IsZero() || !r.state.now().Before(cached.ExpiresAt.Add(r.state.staleGrace))) {
 		return netip.AddrPort{}, fmt.Errorf("%w: cached public IP expired for the proxy address family", ErrNATPublicIPDiscovery)
 	}
 	translated, err := translateNATClientAddress(endpoint, cached.PublicIP)
@@ -273,7 +335,7 @@ func (r *NATResolver) TranslateCachedEndpoint(endpoint netip.AddrPort) (netip.Ad
 	return translated, nil
 }
 
-// Prime starts one bounded background discovery or near-expiry refresh for
+// Prime starts one bounded background discovery or scheduled refresh for
 // family when no probe or failure backoff exists. It never waits for network
 // I/O and returns whether it started a goroutine.
 func (r *NATResolver) Prime(family AddressFamily) bool {
@@ -287,21 +349,27 @@ func (r *NATResolver) Prime(family AddressFamily) bool {
 	state.mu.Lock()
 	now := state.now()
 	cached := &state.families[family]
-	refresh := cached.address.IsValid() && !now.Before(cached.expiresAt.Add(-state.refreshWindow))
-	if cached.priming || cached.inFlight != nil || now.Before(cached.retryAt) ||
+	refresh := cached.address.IsValid() && !now.Before(cached.expiresAt.Add(-state.refreshLead))
+	if state.closed || cached.priming || cached.inFlight != nil || now.Before(cached.retryAt) ||
 		(cached.address.IsValid() && !refresh) {
 		state.mu.Unlock()
 		return false
 	}
 	cached.priming = true
-	state.mu.Unlock()
-
-	go func() {
-		_, _ = r.resolve(context.Background(), family, refresh)
+	cached.primeDone = make(chan struct{})
+	primeDone := cached.primeDone
+	state.tasks.Go(func() {
+		_, _ = r.resolve(state.lifecycle, family, refresh)
 		state.mu.Lock()
-		state.families[family].priming = false
+		cached := &state.families[family]
+		if cached.primeDone == primeDone {
+			cached.priming = false
+			cached.primeDone = nil
+			close(primeDone)
+		}
 		state.mu.Unlock()
-	}()
+	})
+	state.mu.Unlock()
 	return true
 }
 
@@ -323,6 +391,12 @@ func (r *NATResolver) resolve(ctx context.Context, family AddressFamily, forcePr
 	}
 	state := r.state
 	if state.static.IsValid() {
+		state.mu.Lock()
+		closed := state.closed
+		state.mu.Unlock()
+		if closed {
+			return netip.Addr{}, ErrNATResolverClosed
+		}
 		if addressFamily(state.static) != family {
 			return netip.Addr{}, fmt.Errorf("%w: configured public IP has the wrong address family", ErrNATPublicIPDiscovery)
 		}
@@ -331,6 +405,10 @@ func (r *NATResolver) resolve(ctx context.Context, family AddressFamily, forcePr
 
 	for {
 		state.mu.Lock()
+		if state.closed {
+			state.mu.Unlock()
+			return netip.Addr{}, ErrNATResolverClosed
+		}
 		now := state.now()
 		cached := &state.families[family]
 		if cached.address.IsValid() && now.Before(cached.expiresAt) && !forceProbe {
@@ -377,6 +455,7 @@ func (r *NATResolver) resolve(ctx context.Context, family AddressFamily, forcePr
 			cached.successes++
 			cached.respondingServers = result.respondingServers
 			cached.agreeingServers = result.agreeingServers
+			state.scheduleLocked(r, family, cached.expiresAt.Add(-state.refreshLead))
 		} else {
 			cached.consecutiveFailures++
 			cached.lastErr = err
@@ -385,6 +464,7 @@ func (r *NATResolver) resolve(ctx context.Context, family AddressFamily, forcePr
 			cached.respondingServers = 0
 			cached.agreeingServers = 0
 			cached.retryAt = state.now().Add(state.failureBackoff(cached.consecutiveFailures))
+			state.scheduleLocked(r, family, cached.retryAt)
 		}
 		close(inFlight)
 		cached.inFlight = nil
@@ -394,6 +474,55 @@ func (r *NATResolver) resolve(ctx context.Context, family AddressFamily, forcePr
 			return netip.Addr{}, fmt.Errorf("%w: %w", ErrNATPublicIPDiscovery, err)
 		}
 		return result.address.Unmap(), nil
+	}
+}
+
+func (s *natResolverState) scheduleLocked(resolver *NATResolver, family AddressFamily, at time.Time) {
+	if s.closed {
+		return
+	}
+	cached := &s.families[family]
+	cached.scheduleVersion++
+	version := cached.scheduleVersion
+	delay := max(at.Sub(s.now()), time.Duration(0))
+	s.tasks.Go(func() {
+		if !s.wait(s.lifecycle, delay) {
+			return
+		}
+		s.mu.Lock()
+		current := &s.families[family]
+		if s.closed || current.scheduleVersion != version {
+			s.mu.Unlock()
+			return
+		}
+		primeDone := current.primeDone
+		s.mu.Unlock()
+		if primeDone != nil {
+			select {
+			case <-primeDone:
+			case <-s.lifecycle.Done():
+				return
+			}
+			s.mu.Lock()
+			current = &s.families[family]
+			if s.closed || current.scheduleVersion != version {
+				s.mu.Unlock()
+				return
+			}
+			s.mu.Unlock()
+		}
+		resolver.Prime(family)
+	})
+}
+
+func waitForNATRefresh(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }
 

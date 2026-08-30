@@ -42,6 +42,7 @@ type middleEndMonitorCounters struct {
 	frontendOutputEvictions uint64
 	middleEndBindingsTotal  uint64
 	directFallbacksActive   int64
+	directFallbacksTotal    uint64
 }
 
 type middleEndPressureState struct {
@@ -117,6 +118,7 @@ func (m *middleEndMonitor) observe() {
 		frontendOutputEvictions: frontend.OutputEvictions,
 		middleEndBindingsTotal:  frontend.MiddleEndBindingsTotal,
 		directFallbacksActive:   frontend.DirectFallbacksActive,
+		directFallbacksTotal:    frontend.DirectFallbacksTotal,
 	}
 	previous := m.previous
 	if !previous.initialized && snapshot.NAT.Static {
@@ -149,12 +151,14 @@ func (m *middleEndMonitor) observe() {
 			log.Warn().Msg("Middle-End admission unavailable; new clients use direct fallback")
 		}
 	}
-	if current.directFallbacksActive > 0 && previous.directFallbacksActive == 0 {
+	if newFallbacks := middleEndCounterIncrease(current.directFallbacksTotal, previous.directFallbacksTotal); newFallbacks > 0 {
 		log.Warn().
+			Uint64("new_direct_fallbacks", newFallbacks).
 			Int64("active_direct_fallbacks", frontend.DirectFallbacksActive).
 			Uint64("direct_fallbacks_total", frontend.DirectFallbacksTotal).
-			Msg("Middle-End direct fallback sessions active; they remain direct until clients reconnect")
-	} else if current.directFallbacksActive == 0 && previous.directFallbacksActive > 0 {
+			Msg("Middle-End client sessions committed to direct fallback; they remain direct until clients reconnect")
+	}
+	if current.directFallbacksActive == 0 && previous.directFallbacksActive > 0 {
 		log.Info().Msg("Middle-End direct fallback sessions cleared")
 	}
 	if current.middleEndBindingsTotal > previous.middleEndBindingsTotal {
@@ -229,6 +233,13 @@ func (m *middleEndMonitor) observe() {
 	m.observeLinkPressure("active", snapshot.Supervisor.Active, snapshot.Capacity)
 	m.observeLinkPressure("retiring", snapshot.Supervisor.Retiring, snapshot.Capacity)
 	m.previous = current
+}
+
+func middleEndCounterIncrease(current, previous uint64) uint64 {
+	if current <= previous {
+		return 0
+	}
+	return current - previous
 }
 
 func logMiddleEndStaticNAT(family string, snapshot middleend.NATResolverFamilySnapshot) {

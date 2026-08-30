@@ -17,6 +17,7 @@ func serviceTestConfig(t *testing.T, source ArtifactSource) ServiceConfig {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(natResolver.Close)
 	return ServiceConfig{
 		ArtifactSource:         source,
 		ArtifactRefreshTimeout: time.Second,
@@ -41,6 +42,23 @@ func serviceTestConfig(t *testing.T, source ArtifactSource) ServiceConfig {
 			MaxPendingEventBytes:      8 << 20,
 		},
 		BindingLimits: fixedBindingTestLimits(),
+	}
+}
+
+func TestServiceCloseStopsOwnedNATResolver(t *testing.T) {
+	config := serviceTestConfig(t, artifactSourceFunc(func(context.Context) (RawArtifacts, error) {
+		return RawArtifacts{}, errors.New("unused")
+	}))
+	resolver := config.NATResolver
+	service, err := NewService(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolver.Resolve(t.Context(), AddressFamilyIPv4); !errors.Is(err, ErrNATResolverClosed) {
+		t.Fatalf("owned resolver after service Close error = %v", err)
 	}
 }
 

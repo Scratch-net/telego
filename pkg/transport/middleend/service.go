@@ -22,7 +22,8 @@ var (
 // ServiceConfig contains every production dependency and bound for the
 // complete gnet Middle-End subsystem. It has no defaults. ArtifactSource and
 // SOCKS5 must already be configured with their intended transports and
-// credentials; formatting this value never exposes them.
+// credentials. A successful NewService call transfers NATResolver ownership
+// to Service. Formatting this value never exposes credentials.
 type ServiceConfig struct {
 	ArtifactSource         ArtifactSource
 	ArtifactRefreshTimeout time.Duration
@@ -108,9 +109,10 @@ type ServiceCapacitySnapshot struct {
 	BindingResponseBytes int
 }
 
-// Service owns the artifact cache, shared gnet runtime, generation supervisor,
-// and coordinator. Start is deliberately tolerant of artifact and generation
-// outages: the frontend remains in pre-bind direct fallback while repair runs.
+// Service owns the NAT resolver, artifact cache, shared gnet runtime,
+// generation supervisor, and coordinator. Start is deliberately tolerant of
+// artifact and generation outages: the frontend remains in pre-bind direct
+// fallback while repair runs.
 type Service struct {
 	state *serviceState
 }
@@ -270,9 +272,9 @@ func (s *Service) Done() <-chan struct{} {
 	return s.state.done
 }
 
-// Close starts an idempotent ordered shutdown: coordinator, supervisor, gnet
-// runtime, then artifact cache. If ctx expires, shutdown continues in its own
-// goroutine and a later Close call can wait for the final result.
+// Close starts an idempotent ordered shutdown: coordinator, NAT resolver,
+// supervisor, gnet runtime, then artifact cache. If ctx expires, shutdown
+// continues and a later Close call can wait for the final result.
 func (s *Service) Close(ctx context.Context) error {
 	if s == nil || s.state == nil {
 		return nil
@@ -300,6 +302,7 @@ func (s *Service) Close(ctx context.Context) error {
 func (s *serviceState) close() {
 	var result error
 	result = errors.Join(result, s.coordinator.Close())
+	s.nat.Close()
 	result = errors.Join(result, s.supervisor.Close())
 	result = errors.Join(result, s.runtime.Stop(context.Background()))
 	result = errors.Join(result, s.cache.Close())
