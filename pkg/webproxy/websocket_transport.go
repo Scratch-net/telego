@@ -757,7 +757,7 @@ uplinkResults:
 		}
 	}
 	if transport.livenessExpired && transport.uplinkPending == 0 && transport.phase == webSocketOpen {
-		return gnet.Close
+		transport.touchLiveness(connection)
 	}
 	if action := h.pumpWebSocketWrites(connection, state, transport); action != gnet.None {
 		return action
