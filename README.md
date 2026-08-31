@@ -163,14 +163,18 @@ Both the public listener and the ME link engine use gnet. Telego keeps four phys
 
 Each ME request uses the public source IP of its selected link. This behavior supports SOCKS5 egress and hosts with multiple public IPs.
 
-A registered proxy can include its Telegram-issued proxy tag in each ME request. ME also works without a proxy tag.
+Telegram proxy registration and `proxy-tag` are optional. Without a tag, Telego sends untagged ME requests and ME still works.
+
+ME stays off by default because it changes the outbound topology and reserves persistent links and bounded queues. An upgrade does not enable these requirements silently.
+
+Before you enable ME, allow HTTPS to `core.telegram.org` and TCP to the signed ME endpoints. Private direct sockets also need UDP STUN access or a correct `nat-ip`. Any NAT on direct links must preserve TCP source ports.
 
 Add this section to enable ME:
 
 ```toml
 [middle-end]
 enabled = true
-# proxy-tag = "0123456789abcdef0123456789abcdef" # Tag issued by Telegram
+# proxy-tag = "0123456789abcdef0123456789abcdef" # Optional tag issued by Telegram
 # socks5 = "127.0.0.1:1080"
 # nat-ip = "YOUR_PUBLIC_IP" # Usually empty. Automatic STUN supports Docker bridge networks.
 ```
@@ -213,9 +217,9 @@ The `carrier` value selects one of four transports:
 | `websocket` | One multiplexed WebSocket for the WEB session | Forward HTTP/1.1 `Upgrade` and `Connection` headers to Telego. |
 | `websocket-lanes` | One WebSocket for each Telegram stream | Use this value for the official WebSocket lane option. Forward HTTP/1.1 upgrade headers to Telego. |
 
-The browser page is the active WEB carrier bridge. Keep its tab open while Telegram uses the proxy.
+Current Telegram Desktop manages the WEB carrier. The user does not need to open or keep a browser tab.
 
-In WebSocket modes, the page opens same-host `wss` connections through Nginx. In HTTPS modes, the page uses fetch requests and long polls.
+In WebSocket modes, the carrier opens same-host `wss` connections through Nginx. In HTTPS modes, it uses fetch requests and long polls.
 
 You must route every request from the Nginx TLS server to this listener. This rule prevents carrier headers from bypassing Telego.
 
@@ -320,7 +324,7 @@ enabled = false
 # Telegram Middle-End transport (optional; requires a restart)
 [middle-end]
 enabled = false
-# proxy-tag = "0123456789abcdef0123456789abcdef"
+# proxy-tag = "0123456789abcdef0123456789abcdef" # Optional tag issued by Telegram
 # socks5 = "127.0.0.1:1080"                # Defaults to [upstream].socks5
 # socks5-username = "proxy-user"
 # socks5-password = "proxy-password"

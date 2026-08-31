@@ -84,6 +84,15 @@ func TestMiddleEndMonitorCounterIncrease(t *testing.T) {
 	}
 }
 
+func TestMiddleEndSlotFailureHasClientImpact(t *testing.T) {
+	if middleEndSlotFailureHasClientImpact(0) {
+		t.Fatal("slot failure without affected bindings has client impact")
+	}
+	if !middleEndSlotFailureHasClientImpact(1) {
+		t.Fatal("slot failure with an affected binding lacks client impact")
+	}
+}
+
 func TestMiddleEndGenerationFailureRecovered(t *testing.T) {
 	for _, test := range []struct {
 		name        string

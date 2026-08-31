@@ -168,6 +168,9 @@ docker run -d \
     -v "$TELEGO_DIR/nginx/html:/var/www/html:ro" \
     -v "$TELEGO_DIR/certbot/conf:/etc/letsencrypt:ro" \
     -v "$TELEGO_DIR/certbot/www:/var/www/certbot:ro" \
+    --log-driver local \
+    --log-opt max-size=10m \
+    --log-opt max-file=3 \
     --restart unless-stopped \
     nginx:alpine
 
@@ -180,20 +183,19 @@ docker run -d \
     -p "$PORT:443" \
     --cap-add=NET_BIND_SERVICE \
     -v "$CONFIG_PATH:/config.toml:ro" \
+    --log-driver local \
+    --log-opt max-size=10m \
+    --log-opt max-file=3 \
     --restart unless-stopped \
     scratchnet/telego:latest
 
 # --- Step 5: Add cert renewal cron ---
-# Stops nginx to free port 80, runs certbot renew (standalone, same as initial),
-# then restarts nginx which picks up any new certs on start.
-# Uses ; before start so nginx always restarts even if certbot fails.
-CRON_CMD="0 3 * * * docker stop telego-nginx && docker run --rm -p 80:80 -v \"$TELEGO_DIR/certbot/conf:/etc/letsencrypt\" certbot/certbot renew --quiet; docker start telego-nginx"
-if ! crontab -l 2>/dev/null | grep -q "telego-nginx.*certbot"; then
-    (crontab -l 2>/dev/null; echo "$CRON_CMD") | crontab -
-    echo "=== Added cert renewal cron job ==="
-else
-    echo "=== Cert renewal cron already exists ==="
-fi
+# Certbot sets a marker only after it renews a certificate. The marker stays
+# in place if Nginx validation or reload fails, so the next run tries again.
+RENEW_MARKER="$TELEGO_DIR/certbot/conf/.telego-renewed"
+CRON_CMD="0 3 * * * docker run --rm -v \"$TELEGO_DIR/certbot/conf:/etc/letsencrypt\" -v \"$TELEGO_DIR/certbot/www:/var/www/certbot\" certbot/certbot renew --webroot -w /var/www/certbot --quiet --deploy-hook \"touch /etc/letsencrypt/.telego-renewed\" && if [ -f \"$RENEW_MARKER\" ]; then docker exec telego-nginx nginx -t && docker exec telego-nginx nginx -s reload && rm -f \"$RENEW_MARKER\"; fi # telego-cert-renew"
+(crontab -l 2>/dev/null | grep -v -E 'docker stop telego-nginx.*certbot/certbot renew|# telego-cert-renew$' || true; echo "$CRON_CMD") | crontab -
+echo "=== Installed cert renewal cron job ==="
 
 echo ""
 echo "=== Done ==="

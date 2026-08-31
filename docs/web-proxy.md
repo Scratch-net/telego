@@ -8,22 +8,90 @@ Existing MTProxy configurations do not start this listener. You must set `[web-p
 
 ## Traffic flow
 
-```text
-Internet :443
-    |
-    v
-Telego MTProxy :443
-    |-- authenticated MTProxy ----------> Telegram DC
-    |
-    `-- ordinary TLS --------------------> Nginx TLS :8443
-                                               |
-                                               `-- all requests --> Telego WEB :8080
-                                                                      |
-                                                                      |-- 418 --> public site
-                                                                      `-- 419 --> sanitized public request
+The deployment has one public listener and four private listeners or targets:
 
-Telego WEB stream OPEN --> local Telego MTProxy TCP or Unix socket --> Telegram DC
+| Port | Owner | Purpose |
+|------|-------|---------|
+| `443` | Telego | Public MTProxy and WEB TLS entry point. It is also the private backend for WEB streams. |
+| `8443` | Nginx | TLS termination for connections that Telego splices with PROXY protocol v2. |
+| `8444` | Nginx | Certificate source for Telego. This port does not carry client requests. |
+| `8080` | Telego | Private HTTP/1.1 listener for WEB carrier requests and website classification. |
+| `8090` | Nginx | Private ordinary website listener. |
+
+The same Telego and Nginx processes appear more than once in these flows. This is intentional.
+
+An authenticated MTProxy connection uses the direct proxy path:
+
+```text
+Telegram MTProxy client
+          |
+          | MTProxy or FakeTLS
+          v
+Telego public listener :443
+          |
+          | Middle-End or direct DC route
+          v
+Telegram DC
 ```
+
+A WEB carrier request first follows the TLS splice loop:
+
+```text
+Telegram Desktop
+          |
+          | HTTPS or WSS to the public hostname
+          v
+Telego public listener :443
+          |
+          | ordinary TLS splice with PROXY protocol v2
+          v
+Nginx TLS listener :8443
+          |
+          | decrypted HTTP/1.1 request
+          v
+Telego WEB listener :8080
+```
+
+When the WEB carrier sends an `OPEN` frame, Telego creates one private backend connection:
+
+```text
+Telego WEB listener :8080
+          |
+          | authenticated internal PROXY header and MTProxy stream
+          v
+Telego MTProxy backend :443
+          |
+          | Middle-End or direct DC route
+          v
+Telegram DC
+```
+
+Thus, one WEB stream enters Telego twice. The public entry terminates the carrier. The private backend entry terminates the MTProxy stream.
+
+An ordinary website request follows the same splice loop before Telego classifies it:
+
+```text
+Browser
+   |
+   v
+Telego :443 --> Nginx TLS :8443 --> Telego WEB :8080
+                                             |
+                                             | status 418
+                                             v
+                                  Nginx public site :8090
+```
+
+Nginx intercepts status `418` and sends the original request to its public-site listener. The response returns through Nginx and the Telego splice.
+
+If a carrier-shaped request fails authentication, Telego returns status `419`. Nginx removes carrier credentials before it sends a safe `GET` to port `8090`.
+
+Certificate collection is a separate control path:
+
+```text
+Telego certificate fetcher --> Nginx TLS :8444 --> certificate chain
+```
+
+Telego uses this path at startup and during certificate refresh. Port `8444` does not receive spliced TLS or website traffic.
 
 Do not publish the WEB listener to the Internet. Nginx is the only permitted client of this listener.
 
@@ -80,17 +148,17 @@ The `carrier` value selects one of these transports:
 
 If `carrier` is absent, Telego uses serialized `https`. Existing configurations keep their current behavior after an upgrade.
 
-### Browser page
+### Telegram Desktop carrier
 
-The browser page is the active WEB carrier bridge. Telegram Desktop exchanges WEB frames with this page through its local browser channel.
+Current Telegram Desktop manages the WEB carrier. The user does not need to open or keep a browser tab.
 
-Keep the tab open while Telegram uses the proxy. Closing the page closes the carrier and the WEB session.
+Telego supplies the carrier document during the authenticated WEB setup. This document is an internal protocol component.
 
-In `websocket` mode, the page opens one same-host `wss` connection. In `websocket-lanes` mode, it opens one connection for each active lane.
+In `websocket` mode, the carrier opens one same-host `wss` connection. In `websocket-lanes` mode, it opens one connection for each active lane.
 
 The WebSocket target is `wss://<WEB host>/api/v1/ws`. The bridge sends the bearer credential in `Sec-WebSocket-Protocol`.
 
-In `https` mode, the page uses serialized fetch requests and long polls. In `https-lanes` mode, it uses independent fetch and long-poll lanes.
+In `https` mode, the carrier uses serialized fetch requests and long polls. In `https-lanes` mode, it uses independent fetch and long-poll lanes.
 
 Telego derives `127.0.0.1:443` from the wildcard MTProxy bind. A Unix MTProxy bind produces the same Unix socket as the backend.
 
@@ -354,6 +422,7 @@ The example has these network properties:
 - Telego uses its own `127.0.0.1:443` listener for WEB backend streams.
 - Telego trusts only the fixed Nginx address `172.28.0.2/32` for `X-Forwarded-For`.
 - Port 8080 stays private and is not published on the VPS.
+- Nginx and Telego use the Docker `local` log driver. Each service keeps three 10 MB log files.
 
 Complete these actions before the first start:
 
@@ -428,7 +497,9 @@ Run one real renewal check:
 ./renew-certificate.sh
 ```
 
-The script runs `certbot renew`. If renewal succeeds, it runs `nginx -t` and reloads Nginx.
+The script runs `certbot renew`. If Certbot renews a certificate, the script runs `nginx -t` and reloads Nginx.
+
+If Nginx validation or reload fails, the renewal marker stays in place. The next timer run tries the reload again.
 
 The example includes a systemd service and timer. These files use `/opt/telego/examples/web-proxy` as the installation directory.
 

@@ -4,6 +4,22 @@ Telego can send authenticated MTProxy sessions through Telegram Middle-End (ME) 
 
 ME is disabled by default. Existing configurations keep the direct Telegram DC path.
 
+## Why ME is opt-in
+
+Telegram proxy registration and `proxy-tag` are not prerequisites. If the tag is empty, Telego omits it from each ME request. This does not disable ME.
+
+ME changes the outbound network topology. It also reserves persistent gnet links and bounded queues for each signed DC. Telego does not make these changes during an upgrade unless the operator enables ME.
+
+Before you enable ME, make sure that:
+
+- Telego can resolve DNS and fetch all three artifacts from `core.telegram.org` over HTTPS.
+- Telego can open TCP connections to the signed ME endpoints in those artifacts.
+- Telego can send UDP to the built-in STUN pool for private direct sockets, or `nat-ip` contains the correct public IP.
+- NAT for a direct ME link preserves the kernel-assigned TCP source port.
+- The process file-descriptor and memory limits cover the public connections, ME links, and bounded queues.
+
+SOCKS5 links do not use STUN. The SOCKS5 server must return its public `BND.ADDR:BND.PORT` tuple.
+
 ## Configuration
 
 Add this section to the configuration:
@@ -12,7 +28,7 @@ Add this section to the configuration:
 [middle-end]
 enabled = true
 
-# Use the tag that Telegram issued for this proxy.
+# Optional. Set this only if Telegram issued a tag for this proxy.
 # proxy-tag = "0123456789abcdef0123456789abcdef"
 
 # Route ME links and artifact requests through this SOCKS5 proxy.
@@ -156,9 +172,11 @@ Enable the Prometheus listener to inspect ME state. Start with these metrics:
 
 The queue metrics report current use, capacity, and lifetime high-water values. Telego logs thresholds at 80%, 95%, and 100%.
 
-Telego also logs route fallback, artifact failure, generation failure, physical-link repair, and binding eviction events.
+Telego logs route fallback, artifact failure, generation failure, failed physical-link replacement, and binding eviction events.
 
-Each physical-link failure log includes the signed DC, operation, exact error, and affected binding count.
+Telego writes a warning when a physical-link failure closes client bindings. The warning includes the signed DC, error, and affected binding count.
+
+Failures without client impact and successful replacements use the debug log level.
 
 Each direct-fallback commit log reports the new, active, and total session counts.
 

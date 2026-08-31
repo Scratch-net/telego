@@ -1004,18 +1004,32 @@ func TestDockerWebProxyOperationalContracts(t *testing.T) {
 	}
 	renewText := string(renewScript)
 	renewIndex := strings.Index(renewText, "certbot renew --webroot")
+	deployHookIndex := strings.Index(renewText, "--deploy-hook")
+	guardIndex := strings.Index(renewText, `if [ -f "$renewed_marker" ]`)
 	validateIndex := strings.Index(renewText, "nginx -t")
 	reloadIndex := strings.Index(renewText, "nginx -s reload")
-	if renewIndex < 0 || validateIndex <= renewIndex || reloadIndex <= validateIndex {
-		t.Fatal("renewal script must renew, validate Nginx, and reload Nginx in order")
+	removeMarkerIndex := strings.Index(renewText, `rm -f "$renewed_marker"`)
+	if renewIndex < 0 || deployHookIndex <= renewIndex || guardIndex <= deployHookIndex ||
+		validateIndex <= guardIndex || reloadIndex <= validateIndex || removeMarkerIndex <= reloadIndex {
+		t.Fatal("renewal script must reload Nginx only after the certificate deploy hook sets its marker")
 	}
 
 	composeConfig, err := os.ReadFile("../../examples/web-proxy/docker-compose.yml")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(composeConfig), "- proxy.example.com") {
+	composeText := string(composeConfig)
+	if !strings.Contains(composeText, "- proxy.example.com") {
 		t.Fatal("example lacks the certificate-host Docker DNS alias")
+	}
+	for setting, want := range map[string]int{
+		"driver: local":     2,
+		"max-size: \"10m\"": 2,
+		"max-file: \"3\"":   2,
+	} {
+		if got := strings.Count(composeText, setting); got != want {
+			t.Fatalf("example logging setting %q count = %d, want %d", setting, got, want)
+		}
 	}
 
 	setupGuide, err := os.ReadFile("../../docs/web-proxy.md")
@@ -1036,6 +1050,38 @@ func TestDockerWebProxyOperationalContracts(t *testing.T) {
 	}
 	if strings.Count(setupText, "docker compose up -d --force-recreate telego") < 2 {
 		t.Fatal("setup guide lacks explicit Telego recreation for configuration changes and rollback")
+	}
+}
+
+func TestDeployNginxOperationalContracts(t *testing.T) {
+	deployScript, err := os.ReadFile("../../deploy-nginx.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deployText := string(deployScript)
+	if strings.Contains(deployText, "docker stop telego-nginx &&") {
+		t.Fatal("deployment script stops Nginx for certificate renewal")
+	}
+	for _, required := range []string{
+		"certbot/certbot renew --webroot",
+		"--deploy-hook",
+		".telego-renewed",
+		"docker exec telego-nginx nginx -t",
+		"docker exec telego-nginx nginx -s reload",
+		"# telego-cert-renew",
+	} {
+		if !strings.Contains(deployText, required) {
+			t.Fatalf("deployment script lacks renewal contract %q", required)
+		}
+	}
+	for setting, want := range map[string]int{
+		"--log-driver local":     2,
+		"--log-opt max-size=10m": 2,
+		"--log-opt max-file=3":   2,
+	} {
+		if got := strings.Count(deployText, setting); got != want {
+			t.Fatalf("deployment logging setting %q count = %d, want %d", setting, got, want)
+		}
 	}
 }
 

@@ -209,24 +209,31 @@ func (m *middleEndMonitor) observe() {
 	}
 	if current.slotFailures > previous.slotFailures {
 		failure := snapshot.Supervisor.LastSlotFailure
-		log.Warn().
+		affectedBindings := middleEndCounterIncrease(
+			current.slotFailureAffectedBindings,
+			previous.slotFailureAffectedBindings,
+		)
+		event := log.Debug()
+		message := "Middle-End physical links closed; replacement started"
+		if middleEndSlotFailureHasClientImpact(affectedBindings) {
+			event = log.Warn()
+			message = "Middle-End physical links failed; affected client bindings closed before replacement"
+		}
+		event.
 			Uint64("new_failures", current.slotFailures-previous.slotFailures).
 			Uint64("failures_total", current.slotFailures).
-			Uint64("affected_bindings", middleEndCounterIncrease(
-				current.slotFailureAffectedBindings,
-				previous.slotFailureAffectedBindings,
-			)).
+			Uint64("affected_bindings", affectedBindings).
 			Uint64("affected_bindings_total", current.slotFailureAffectedBindings).
 			Int("last_dc", int(failure.DCID)).
 			Str("last_reason", string(failure.Reason)).
 			Err(failure.Error).
-			Msg("Middle-End physical links failed; bindings on each failed slot closed before replacement")
+			Msg(message)
 	}
 	if current.slotRepairSuccesses > previous.slotRepairSuccesses {
-		log.Info().
+		log.Debug().
 			Uint64("new_repairs", current.slotRepairSuccesses-previous.slotRepairSuccesses).
 			Uint64("repairs_total", current.slotRepairSuccesses).
-			Msg("Middle-End physical-link replacement finished; healthy generation bindings stayed in place")
+			Msg("Middle-End physical-link replacement finished")
 	}
 	if current.responseBackpressure > previous.responseBackpressure {
 		log.Warn().
@@ -267,6 +274,10 @@ func middleEndCounterIncrease(current, previous uint64) uint64 {
 		return 0
 	}
 	return current - previous
+}
+
+func middleEndSlotFailureHasClientImpact(affectedBindings uint64) bool {
+	return affectedBindings > 0
 }
 
 func middleEndGenerationFailureRecovered(snapshot middleend.ServiceSnapshot) bool {
