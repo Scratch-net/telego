@@ -18,6 +18,7 @@
 </p>
 
 <p align="center">
+  <a href="#quick-managed-install">Quick Install</a> •
   <a href="#features">Features</a> •
   <a href="#installation">Installation</a> •
   <a href="#quick-start">Quick Start</a> •
@@ -36,6 +37,25 @@
 ---
 
 > **Telegram blocked in your country?** telEgo's TLS fronting makes your proxy indistinguishable from regular HTTPS traffic to censors. [Get started in 2 minutes](#quick-start)
+
+---
+
+## Quick Managed Install
+
+Before installation, point a DNS hostname at the VPS.
+
+Make sure that Docker is available and public TCP ports 80 and 443 are free. Then run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Scratch-net/telego/main/examples/gateway/install.sh \
+  | sh -s -- --domain proxy.example.com --email admin@example.com
+```
+
+The installer configures Telego, Nginx, the TLS certificate, automatic renewal, and persistent host storage.
+
+If you already run Telego, [copy the existing users](examples/gateway/README.md#reuse-existing-users) into the generated `[secrets]` section.
+
+Read the [managed gateway guide](examples/gateway/README.md) for updates, backups, carrier selection, and removal.
 
 ---
 
@@ -248,6 +268,10 @@ The positional hostname is the FakeTLS mask hostname. The `--web-host` value is 
 The `--web-host` value must match `[web-proxy].hostname` and the TLS certificate in Nginx.
 
 Read the [native WEB proxy setup guide](docs/web-proxy.md) for the complete Nginx configuration, Docker setup, and rollback procedure.
+
+For a new VPS, use the [quick managed install](#quick-managed-install). Read the [gateway guide](examples/gateway/README.md) for full instructions.
+
+Use the [manual example](examples/web-proxy/README.md) for an existing website or a custom Nginx layout.
 
 The WEB configuration is inactive by default. Configurations without `[web-proxy]` continue to use the existing MTProxy startup path.
 

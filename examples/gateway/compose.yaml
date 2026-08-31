@@ -1,0 +1,76 @@
+services:
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    ports:
+      - "${GATEWAY_HTTP_PORT:-80}:80"
+      - "${GATEWAY_HTTPS_PORT:-443}:443"
+    volumes:
+      - ./state/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./state/nginx/watch-certificate.sh:/docker-entrypoint.d/40-watch-certificate.sh:ro
+      - ./state/site:/var/www/html:ro
+      - ./state/letsencrypt/conf:/etc/letsencrypt:ro
+      - ./state/letsencrypt/www:/var/www/certbot:ro
+      - ./state/runtime:/var/run/telego-gateway
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8090/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+  telego:
+    image: "${TELEGO_IMAGE:-scratchnet/telego:latest}"
+    restart: unless-stopped
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    network_mode: "service:nginx"
+    depends_on:
+      nginx:
+        condition: service_healthy
+    volumes:
+      - ./state/telego/config.toml:/config.toml:ro
+    command: ["run", "-c", "/config.toml", "-l"]
+
+  certbot:
+    image: certbot/certbot:latest
+    restart: unless-stopped
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    depends_on:
+      nginx:
+        condition: service_healthy
+    volumes:
+      - ./state/letsencrypt/conf:/etc/letsencrypt
+      - ./state/letsencrypt/lib:/var/lib/letsencrypt
+      - ./state/letsencrypt/www:/var/www/certbot
+      - ./state/runtime:/var/run/telego-gateway
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        trap 'exit 0' TERM INT
+        while :; do
+          certbot renew --webroot -w /var/www/certbot --quiet \
+            --deploy-hook 'touch /var/run/telego-gateway/certificate-renewed'
+          sleep 43200 &
+          wait $!
+        done
+
+  certbot-init:
+    image: certbot/certbot:latest
+    profiles: ["setup"]
+    volumes:
+      - ./state/letsencrypt/conf:/etc/letsencrypt
+      - ./state/letsencrypt/lib:/var/lib/letsencrypt
+    entrypoint: ["certbot"]
+    command: ["--version"]

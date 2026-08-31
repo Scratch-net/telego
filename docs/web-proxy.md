@@ -6,7 +6,44 @@ The WEB listener uses gnet and accepts private HTTP/1.1 traffic. Nginx keeps the
 
 Existing MTProxy configurations do not start this listener. You must set `[web-proxy].enabled = true` to enable it.
 
+## Contents
+
+- [Select a deployment](#select-a-deployment)
+- [Traffic flow](#traffic-flow)
+- [Requirements](#requirements)
+- [Configure Telego](#configure-telego)
+- [Configure Nginx](#configure-nginx)
+- [Check the configuration](#check-the-configuration)
+- [Docker](#docker)
+- [Existing installations](#existing-installations)
+- [Rollback](#rollback)
+- [Current scope](#current-scope)
+
+## Select a deployment
+
+Select the deployment that matches the host:
+
+| Deployment | Use case | Public port 443 owner | Certificate renewal |
+|---|---|---|---|
+| [Managed gateway](../examples/gateway/README.md) | A new VPS where MTProxy and WEB share port 443 | Telego | Automatic Certbot service |
+| [Manual shared-port setup](../examples/web-proxy/README.md) | An existing website or a custom Nginx layout | Telego | Existing operator job |
+| Existing TLS proxy | Synology, Nginx Proxy Manager, or another managed TLS service | Existing TLS proxy | Existing TLS service |
+
+The managed gateway keeps all configuration and certificate files in a host `state/` directory. Its setup script generates the private configuration.
+
+An existing TLS proxy can send decrypted HTTP to the private Telego WEB listener. Native MTProxy must use a different public port.
+
+The TLS proxy must send every request for the hostname through the WEB listener. It must also implement the [fallback contract](#fallback-contract).
+
+If the TLS proxy cannot implement this contract, put an adapter Nginx between the TLS proxy and Telego.
+
+Telegram Desktop fixes a WEB endpoint to HTTPS port 443. The client ignores a `port` parameter in a WEB proxy link.
+
+The official [WEB proxy reference](https://github.com/telegramdesktop/tproxy-server) documents this fixed port.
+
 ## Traffic flow
+
+The managed gateway and manual shared-port setup use the following traffic flow.
 
 The deployment has one public listener and four private listeners or targets:
 
@@ -97,14 +134,21 @@ Do not publish the WEB listener to the Internet. Nginx is the only permitted cli
 
 ## Requirements
 
-- Use a DNS hostname that points to the VPS.
-- Install a valid TLS certificate for that hostname in Nginx.
+All deployments have these requirements:
+
+- Use a DNS hostname that points to the public host.
+- Install a valid TLS certificate for that hostname in the TLS terminator.
+- Keep the public WEB endpoint on port 443.
+- Send every request for the hostname through the WEB listener.
+- Use request buffering for requests to the WEB listener.
+- Use HTTP/2 on the public TLS server with `https-lanes`.
+- Forward HTTP/1.1 upgrade headers for both WebSocket modes.
+- Use HTTP/1.1 between the TLS terminator and the WEB listener.
+
+The shared-port deployments have these additional requirements:
+
 - Keep port 443 assigned to Telego.
 - Configure Nginx as the TLS splice target.
-- Use Nginx request buffering for all requests to the WEB listener.
-- Use HTTP/2 on the public Nginx TLS server with `https-lanes`.
-- Forward HTTP/1.1 upgrade headers to Telego for both WebSocket modes.
-- Use HTTP/1.1 between Nginx and the WEB listener.
 
 The WEB carrier does not terminate TLS. It does not replace Nginx or certificate renewal.
 
@@ -239,7 +283,11 @@ These directives keep the private upstream on HTTP/1.1 and forward WebSocket upg
 
 The 40-second read timeout is longer than the 25-second WebSocket ping cycle. Telego closes an inactive WebSocket after two missed cycles.
 
-CAUTION: Never add `$http_sec_websocket_protocol` to an Nginx access log. `Sec-WebSocket-Protocol` contains the WEB bearer credential.
+CAUTION: Do not log `$request`, `$request_uri`, `$args`, or `$http_sec_websocket_protocol`.
+
+The bridge capability can appear in query arguments. `Sec-WebSocket-Protocol` contains the WEB session credential.
+
+Use `$request_method $uri $server_protocol` in the access log. This format excludes query arguments.
 
 The WEB listener checks the actual client `Host` value. Never replace `$http_host` with a trusted constant.
 
@@ -409,6 +457,21 @@ https://t.me/webproxy?server=proxy.example.com&secret=dd0123456789abcdef01234567
 Telego derives the plain and `dd` WEB credentials from each existing base secret. Do not add a second `desktop-dd` secret.
 
 ## Docker
+
+### Managed gateway
+
+Use the managed gateway for a new VPS. The gateway automates the first certificate, renewal, configuration generation, and service startup.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Scratch-net/telego/main/examples/gateway/install.sh \
+  | sh -s -- --domain proxy.example.com --email admin@example.com
+```
+
+The installer creates `telego-gateway/` in the current directory. It stores all persistent files under `telego-gateway/state/`.
+
+Read the [gateway README](../examples/gateway/README.md) for the complete procedure.
+
+### Manual Compose example
 
 The complete example is in [`examples/web-proxy`](../examples/web-proxy). It uses a private `172.28.0.0/24` bridge network.
 

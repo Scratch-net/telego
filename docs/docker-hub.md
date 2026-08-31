@@ -5,6 +5,7 @@ High-performance Telegram MTProxy in Go with Telegram Middle-End, TLS fronting, 
 - Source: [github.com/Scratch-net/telego](https://github.com/Scratch-net/telego)
 - Releases: [github.com/Scratch-net/telego/releases](https://github.com/Scratch-net/telego/releases)
 - WEB proxy guide: [docs/web-proxy.md](https://github.com/Scratch-net/telego/blob/main/docs/web-proxy.md)
+- Docker examples: [examples](https://github.com/Scratch-net/telego/tree/main/examples)
 - License: Apache-2.0
 
 The image uses `telego` as its entry point. It contains a static binary and no shell.
@@ -100,6 +101,21 @@ docker compose logs telego
 The native WEB proxy needs a DNS hostname, a valid TLS certificate, and Nginx. The Telego container keeps public port 443. Nginx uses private ports for TLS termination and sends authenticated WEB traffic back to Telego.
 
 Do not publish the private WEB listener to the Internet.
+
+### Managed gateway
+
+Use the managed gateway for a new VPS. It stores configuration and certificates on the host and renews the certificate automatically.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Scratch-net/telego/main/examples/gateway/install.sh \
+  | sh -s -- --domain proxy.example.com --email admin@example.com
+```
+
+The script generates the secret, requests the first certificate, starts the services, and prints the WEB links.
+
+Read the [managed gateway guide](https://github.com/Scratch-net/telego/blob/main/examples/gateway/README.md) for updates, backups, and removal.
+
+### Manual Compose setup
 
 The repository contains a complete Compose stack for all four WEB carrier modes:
 
