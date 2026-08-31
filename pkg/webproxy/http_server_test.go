@@ -304,8 +304,7 @@ func TestHTTPServerLongPollDoesNotBlockEventLoopAndNewestWins(t *testing.T) {
 		return result
 	}
 
-	firstContext, cancelFirst := context.WithCancel(context.Background())
-	defer cancelFirst()
+	firstContext := t.Context()
 	first := poll(firstContext)
 	waitForDownPoll(t, created.Session, true)
 
@@ -360,7 +359,7 @@ func TestHTTPServerSequentialPipelinedRequests(t *testing.T) {
 		t.Fatal(err)
 	}
 	reader := bufio.NewReader(connection)
-	for index := 0; index < 2; index++ {
+	for index := range 2 {
 		response, err := http.ReadResponse(reader, &http.Request{Method: "GET"})
 		if err != nil {
 			t.Fatalf("response %d: %v", index, err)
@@ -631,12 +630,10 @@ func startHTTPEchoBackend(t *testing.T) string {
 			if acceptErr != nil {
 				return
 			}
-			connections.Add(1)
-			go func() {
-				defer connections.Done()
+			connections.Go(func() {
 				defer connection.Close()
 				_, _ = io.Copy(connection, connection)
-			}()
+			})
 		}
 	}()
 	t.Cleanup(func() {

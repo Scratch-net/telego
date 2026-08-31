@@ -311,7 +311,7 @@ func (c *scriptedMEConn) Write(data []byte) (int, error) {
 			ping, err = ParsePing(frame.Payload)
 			if err == nil {
 				var pong []byte
-				pong, err = c.server.encodePayloadRuntime((Pong{ID: ping.ID}).MarshalBinary())
+				pong, err = c.server.encodePayloadRuntime(Pong(ping).MarshalBinary())
 				if err == nil {
 					c.reads = append(c.reads, scriptedRead{data: pong, err: c.pongReadErr})
 				}

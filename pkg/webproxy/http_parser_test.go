@@ -14,7 +14,7 @@ func TestParseCarrierRequestHeaderSplitAndCanonicalValues(t *testing.T) {
 		"Content-Length: 8\r\n" +
 		"X-Up-Seq: 1\r\n\r\n12345678"
 	headerEnd := strings.Index(raw, "\r\n\r\n") + 4
-	for split := 0; split < headerEnd; split++ {
+	for split := range headerEnd {
 		_, _, err := parseCarrierRequestHeader([]byte(raw[:split]))
 		if !errors.Is(err, errHTTPIncomplete) {
 			t.Fatalf("split %d error = %v, want incomplete", split, err)

@@ -4456,7 +4456,7 @@ func TestFixedBindingManagerProbeInitialFailureAndContextValidation(t *testing.T
 	if err := manager.Probe(t.Context(), 1); !errors.Is(err, ErrFixedBindingInitialFailure) || !errors.Is(err, startErr) {
 		t.Fatalf("Probe after initial failure = %v", err)
 	}
-	if err := manager.Probe(nil, 1); !errors.Is(err, ErrInvalidFixedBindingManager) {
+	if err := manager.Probe(nil, 1); !errors.Is(err, ErrInvalidFixedBindingManager) { //nolint:staticcheck // Verify that the API rejects a nil context.
 		t.Fatalf("Probe(nil) = %v", err)
 	}
 	canceled, cancel := context.WithCancel(t.Context())

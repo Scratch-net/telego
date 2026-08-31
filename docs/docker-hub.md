@@ -1,6 +1,6 @@
 # telEgo
 
-High-performance Telegram MTProxy in Go with TLS fronting and native WEB protocol support.
+High-performance Telegram MTProxy in Go with Telegram Middle-End, TLS fronting, and native WEB protocol support.
 
 - Source: [github.com/Scratch-net/telego](https://github.com/Scratch-net/telego)
 - Releases: [github.com/Scratch-net/telego/releases](https://github.com/Scratch-net/telego/releases)
@@ -11,14 +11,14 @@ The image uses `telego` as its entry point. It contains a static binary and no s
 
 ## Supported image tags
 
-Release `v0.5.4` publishes these tags:
+Release `v0.6.0` publishes these tags:
 
-- `scratchnet/telego:v0.5.4` — fixed release;
-- `scratchnet/telego:v0.5` — latest `v0.5.x` release;
+- `scratchnet/telego:v0.6.0` — fixed release;
+- `scratchnet/telego:v0.6` — latest `v0.6.x` release;
 - `scratchnet/telego:v0` — latest `v0.x` release;
 - `scratchnet/telego:latest` — latest stable release.
 
-The current manifests support Linux on AMD64 and ARM64.
+The current manifests support Linux on AMD64, ARM64, and ARMv7.
 
 Use a fixed release tag when you need repeatable deployments. Use `latest` when you want each pull to select the newest stable release.
 
@@ -27,14 +27,14 @@ Use a fixed release tag when you need repeatable deployments. Use `latest` when 
 Replace `www.google.com` with the FakeTLS mask hostname:
 
 ```bash
-docker run --rm scratchnet/telego:v0.5.4 \
+docker run --rm scratchnet/telego:v0.6.0 \
   generate www.google.com
 ```
 
 To also print Telegram WEB proxy links, add the public WEB hostname:
 
 ```bash
-docker run --rm scratchnet/telego:v0.5.4 \
+docker run --rm scratchnet/telego:v0.6.0 \
   generate www.google.com --web-host proxy.example.com
 ```
 
@@ -63,7 +63,7 @@ docker run -d \
   --restart unless-stopped \
   -p 443:443 \
   -v "$PWD/config.toml:/config.toml:ro" \
-  scratchnet/telego:v0.5.4 \
+  scratchnet/telego:v0.6.0 \
   run -c /config.toml -l
 ```
 
@@ -78,7 +78,7 @@ docker logs telego
 ```yaml
 services:
   telego:
-    image: scratchnet/telego:v0.5.4
+    image: scratchnet/telego:v0.6.0
     restart: unless-stopped
     ports:
       - "443:443"
@@ -117,7 +117,7 @@ Replace `proxy.example.com` in these files:
 Generate the secret and WEB links:
 
 ```bash
-docker run --rm scratchnet/telego:v0.5.4 \
+docker run --rm scratchnet/telego:v0.6.0 \
   generate proxy.example.com --web-host proxy.example.com
 ```
 

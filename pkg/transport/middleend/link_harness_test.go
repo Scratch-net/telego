@@ -306,7 +306,7 @@ func (p *fakeMiddleEndPeer) handleFrame(server *runtimeTestServer, frame Frame) 
 		if p.config.mode == fakePeerCloseAfterReady {
 			return nil
 		}
-		wire, err := server.encodePayloadRuntime((CloseExternal{ConnectionID: closeRequest.ConnectionID}).MarshalBinary())
+		wire, err := server.encodePayloadRuntime(CloseExternal(closeRequest).MarshalBinary())
 		if err != nil {
 			return err
 		}
@@ -319,7 +319,7 @@ func (p *fakeMiddleEndPeer) handleFrame(server *runtimeTestServer, frame Frame) 
 		if err := p.record(fakePeerRecord{operation: operation, keepaliveID: ping.ID}); err != nil {
 			return err
 		}
-		wire, err := server.encodePayloadRuntime((Pong{ID: ping.ID}).MarshalBinary())
+		wire, err := server.encodePayloadRuntime(Pong(ping).MarshalBinary())
 		if err != nil {
 			return err
 		}
@@ -1082,11 +1082,12 @@ func runPeerFailure(t *testing.T, factory clientLinkFactory, mode fakePeerMode, 
 	}
 	link := makeAndStartLink(t, factory, clientConn, limits)
 	beforeFailure := link.Snapshot()
-	if mode == fakePeerMalformedAfterRequest {
+	switch mode {
+	case fakePeerMalformedAfterRequest:
 		if err := link.TrySubmit(item.submission); err != nil {
 			t.Fatalf("TrySubmit: %v", err)
 		}
-	} else if mode == fakePeerCloseAfterReady {
+	case fakePeerCloseAfterReady:
 		if err := link.TrySubmit(LinkSubmission{SubmissionID: 1, Payload: (Ping{ID: pingID}).MarshalBinary()}); err != nil {
 			t.Fatalf("TrySubmit ping: %v", err)
 		}
@@ -3003,7 +3004,7 @@ func TestFakeMiddleEndPeerFragmentationCoalescingAndPayloadMatrix(t *testing.T) 
 	if err != nil {
 		t.Fatalf("ParsePing: %v", err)
 	}
-	if err := link.WritePayload(ctx, (Pong{ID: peerPing.ID}).MarshalBinary()); err != nil {
+	if err := link.WritePayload(ctx, Pong(peerPing).MarshalBinary()); err != nil {
 		t.Fatalf("write peer pong: %v", err)
 	}
 

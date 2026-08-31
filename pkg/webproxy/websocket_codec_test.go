@@ -207,7 +207,7 @@ func webSocketMessageStorageCapacity(message webSocketMessage) int {
 
 func TestWebSocketDecoderPartialHeadersAndPayload(t *testing.T) {
 	frame := maskedClientFrame(t, ws.OpBinary, true, bytes.Repeat([]byte("x"), 65536))
-	for split := 0; split < ws.MaxHeaderSize; split++ {
+	for split := range ws.MaxHeaderSize {
 		decoder := testWebSocketDecoder(t, maxWebSocketMessageBytes)
 		consumed, _, emitted, err := decoder.Decode(frame[:split])
 		if err != nil || consumed != 0 || emitted {

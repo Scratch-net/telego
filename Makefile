@@ -64,9 +64,11 @@ uninstall:
 	systemctl daemon-reload
 	@echo "Uninstalled. Config remains at $(SYSCONFDIR)"
 
-# Run tests with optimizations
+# Race-test gc_opt with gnet's portable poller. gnet's poll_opt uses unsafe
+# poll attachments that are incompatible with the race build's checkptr.
 test:
-	go test -tags="$(TAGS)" -race ./...
+	go test -tags="gc_opt" -race ./...
+	go test -tags="$(TAGS)" ./...
 
 # Run benchmarks
 bench:

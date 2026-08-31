@@ -38,7 +38,6 @@ const (
 	benchmarkResourceAttribution      = "fresh-resource-worker-process:engine-plus-submission-driver;separate-peer-process;sampler-infrastructure-before-post-topology-allocation-baseline;goroutine-and-heap-high-water-include-one-sampler;heap-peak-delta-from-pre-topology-worker-baseline"
 	sharedProtocolBenchmarkExpression = "^(BenchmarkClientBootstrapReadyEncode|BenchmarkClientBootstrapReadyFeed)$"
 	sharedProtocolAffinityAttestation = "taskset-before-go-runtime;all-process-threads-verified-at-each-benchmark-start-and-end"
-	engineBenchmarkDecisionDocument   = "docs/superpowers/specs/2026-08-29-middleend-link-engine-decision.md"
 	// Each allowed phase child receives an 8 KiB encoded-evidence budget. A
 	// golden test keeps the fixed worker-result envelope below 4 KiB; the other
 	// half is reserved for retained decimal time.Duration samples (20 digits and
@@ -539,8 +538,7 @@ func engineBenchmarkFixedJSONEnvelopeSize(workerCPUSet string, peerCPUSet string
 }
 
 func fillMaximumJSONScalars(value reflect.Value) {
-	for index := range value.NumField() {
-		field := value.Field(index)
+	for _, field := range value.Fields() {
 		switch field.Kind() {
 		case reflect.Struct:
 			fillMaximumJSONScalars(field)
@@ -1033,7 +1031,6 @@ func engineBenchmarkFixedSourcePaths(repositoryRoot string) []string {
 	return []string{
 		filepath.Join(repositoryRoot, "go.mod"),
 		filepath.Join(repositoryRoot, "go.sum"),
-		filepath.Join(repositoryRoot, filepath.FromSlash(engineBenchmarkDecisionDocument)),
 	}
 }
 
@@ -1717,9 +1714,9 @@ func TestEngineBenchmarkControlParsers(t *testing.T) {
 		t.Fatalf("maximum fixed worker-result envelope = %d bytes, ceiling %d", size, engineBenchmarkFixedJSONBytesPerChild)
 	}
 	paths := engineBenchmarkFixedSourcePaths("/repo")
-	wantDocument := filepath.Join("/repo", filepath.FromSlash(engineBenchmarkDecisionDocument))
-	if !slices.Contains(paths, wantDocument) {
-		t.Fatalf("source fingerprint paths omit %s", engineBenchmarkDecisionDocument)
+	wantPaths := []string{filepath.Join("/repo", "go.mod"), filepath.Join("/repo", "go.sum")}
+	if !slices.Equal(paths, wantPaths) {
+		t.Fatalf("source fingerprint paths = %v, want %v", paths, wantPaths)
 	}
 }
 

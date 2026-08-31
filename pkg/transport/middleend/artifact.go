@@ -43,7 +43,7 @@ var (
 	ErrInvalidProxyConfig  = errors.New("invalid Telegram proxy configuration")
 	ErrIncompleteArtifacts = errors.New("incomplete Telegram Middle-End artifacts")
 	ErrInvalidArtifactAPI  = errors.New("invalid Telegram artifact API configuration")
-	ErrArtifactCacheClosed = errors.New("Telegram artifact cache is closed")
+	ErrArtifactCacheClosed = errors.New("artifact cache is closed")
 )
 
 // DCID is Telegram's signed data-center identifier. Positive and negative

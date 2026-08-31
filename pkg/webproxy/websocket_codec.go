@@ -125,7 +125,7 @@ func (d *webSocketDecoder) decodeWindow(
 		work.limit = webSocketDecodePayloadLimit
 		return 0, work, message, false, nil
 	}
-	for frames := 0; frames < maxWebSocketFramesPerDecode; frames++ {
+	for range maxWebSocketFramesPerDecode {
 		if d.pending == nil {
 			if consumed == len(input) {
 				return consumed, work, message, false, nil

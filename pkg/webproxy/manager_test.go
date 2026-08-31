@@ -151,13 +151,11 @@ func TestBootstrapAuthorizationCreateIsAtomicAndIdempotent(t *testing.T) {
 	errorsSeen := make(chan error, callers)
 	var wait sync.WaitGroup
 	for range callers {
-		wait.Add(1)
-		go func() {
-			defer wait.Done()
+		wait.Go(func() {
 			result, createErr := authorization.Create("192.0.2.1", bytes.Clone(hello))
 			results <- result
 			errorsSeen <- createErr
-		}()
+		})
 	}
 	wait.Wait()
 	close(results)

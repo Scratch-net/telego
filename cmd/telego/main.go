@@ -461,7 +461,9 @@ func (c *VersionCmd) Run() error {
 		Str("description", "Production-grade Telegram MTProxy in Go").
 		Strs("features", []string{
 			"Event-driven gnet architecture",
+			"Telegram Middle-End upstream transport",
 			"TLS fronting with real cert fetching",
+			"Native Telegram WEB protocol",
 			"Splice mode for probe resistance",
 			"FakeTLS (ee) and raw (dd) protocol support",
 			"Multiple secrets per user",

@@ -48,7 +48,7 @@ func TestGenerationCoordinatorConfigValidationAndRedaction(t *testing.T) {
 	if err := coordinator.Trigger(); !errors.Is(err, ErrInvalidGenerationCoordinator) {
 		t.Fatalf("Trigger before Start error = %v", err)
 	}
-	if err := coordinator.Reconcile(nil); !errors.Is(err, ErrInvalidGenerationCoordinator) {
+	if err := coordinator.Reconcile(nil); !errors.Is(err, ErrInvalidGenerationCoordinator) { //nolint:staticcheck // Verify that the API rejects a nil context.
 		t.Fatalf("Reconcile nil context error = %v", err)
 	}
 }

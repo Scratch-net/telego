@@ -3236,7 +3236,7 @@ func clearLinkEventPacket(event *LinkEvent) {
 func allocateFixedBindingConnectionID() (int64, error) {
 	for {
 		current := fixedBindingConnectionIDs.Load()
-		if current >= math.MaxInt64 {
+		if current == math.MaxInt64 {
 			return 0, ErrFixedBindingConnectionIDExhausted
 		}
 		next := current + 1

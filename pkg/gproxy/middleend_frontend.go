@@ -732,7 +732,6 @@ func (h *ProxyHandler) handleMiddleEndToken(
 		return false, gnet.Close
 	}
 	if ok {
-		processedReason = true
 		action := h.writeMiddleEndEvent(c, ctx, client, event)
 		if !client.refreshOutput(c, outputReservation) {
 			action = gnet.Close
@@ -833,10 +832,7 @@ func (c *middleEndClient) armOutputRetry(connection gnet.Conn, remaining time.Du
 	if c.closed || c.retryTimer != nil {
 		return
 	}
-	delay := c.retryDelay
-	if delay > remaining {
-		delay = remaining
-	}
+	delay := min(c.retryDelay, remaining)
 	next := delay * 2
 	if next < delay || next > c.frontend.retryMax {
 		next = c.frontend.retryMax

@@ -252,12 +252,6 @@ func (r *GnetClientRuntime) removeLink(link *GnetClientLink) {
 	r.mu.Unlock()
 }
 
-func (r *GnetClientRuntime) isStopping() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.stopping
-}
-
 type gnetClientEventHandler struct {
 	gnet.BuiltinEventEngine
 	runtime *GnetClientRuntime

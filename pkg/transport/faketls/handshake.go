@@ -367,10 +367,7 @@ func clientOffersPQKeyShare(payload []byte) bool {
 				return false
 			}
 			kp := offset + 2
-			ksEnd := offset + extLen
-			if ksEnd > len(payload) {
-				ksEnd = len(payload)
-			}
+			ksEnd := min(offset+extLen, len(payload))
 			for kp+4 <= ksEnd {
 				group := binary.BigEndian.Uint16(payload[kp:])
 				if group == pqNamedGroup {

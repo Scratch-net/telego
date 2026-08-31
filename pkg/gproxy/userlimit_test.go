@@ -213,7 +213,11 @@ func TestUserIPLimiter_BlockExpires(t *testing.T) {
 }
 
 func TestUserIPLimiter_BlockTimeoutRefresh(t *testing.T) {
-	l := NewUserIPLimiter(2, 100*time.Millisecond)
+	const (
+		blockTimeout    = 2 * time.Second
+		refreshInterval = 750 * time.Millisecond
+	)
+	l := NewUserIPLimiter(2, blockTimeout)
 	defer l.Close()
 
 	secret := []byte("0123456789abcdef")
@@ -228,15 +232,15 @@ func TestUserIPLimiter_BlockTimeoutRefresh(t *testing.T) {
 
 	// Keep refreshing block by attempting connection
 	for i := range 3 {
-		time.Sleep(60 * time.Millisecond)
+		time.Sleep(refreshInterval)
 		_, ok := l.TryAcquire(ip1, secret, "test")
 		if ok {
 			t.Fatalf("IP1 should still be blocked at iteration %d", i)
 		}
 	}
 
-	// Total time: 180ms of refreshes, block should still be active
-	// because each attempt refreshes the TTL
+	// The attempts span 2.25 seconds, longer than the original TTL. Each
+	// successful refresh leaves 1.25 seconds of scheduler margin.
 }
 
 func TestUserIPLimiter_ConcurrentAccess(t *testing.T) {

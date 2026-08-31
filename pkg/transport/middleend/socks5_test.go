@@ -630,7 +630,7 @@ func TestSOCKS5DialContextValidatesTargetBeforeDial(t *testing.T) {
 	if dialCalled {
 		t.Fatal("dial function called for an invalid target")
 	}
-	if _, _, err := dialer.DialContext(nil, "192.0.2.1:443"); err == nil {
+	if _, _, err := dialer.DialContext(nil, "192.0.2.1:443"); err == nil { //nolint:staticcheck // Verify that the API rejects a nil context.
 		t.Fatal("DialContext(nil) succeeded")
 	}
 }

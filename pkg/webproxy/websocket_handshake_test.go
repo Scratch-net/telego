@@ -3,6 +3,7 @@ package webproxy
 import (
 	"encoding/base64"
 	"errors"
+	"maps"
 	"strings"
 	"testing"
 )
@@ -178,8 +179,6 @@ func FuzzParseWebSocketSubprotocol(f *testing.F) {
 func cloneCarrierRequest(request carrierRequest) carrierRequest {
 	cloned := request
 	cloned.headers = make(map[string]string, len(request.headers))
-	for name, value := range request.headers {
-		cloned.headers[name] = value
-	}
+	maps.Copy(cloned.headers, request.headers)
 	return cloned
 }
