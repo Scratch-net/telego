@@ -234,7 +234,7 @@ func (s *HTTPServer) Start(ctx context.Context) error {
 	case <-ctx.Done():
 		s.stopping.Store(true)
 		if engine := s.engine.Load(); engine != nil {
-			go func() { _ = engine.Stop(context.Background()) }()
+			go func() { _ = stopGnetEngine(context.Background(), s.done, engine.Stop) }()
 		}
 		return ctx.Err()
 	}
@@ -256,7 +256,7 @@ func (s *HTTPServer) Stop(ctx context.Context) error {
 		return s.loadRunError()
 	case <-s.ready:
 		if engine := s.engine.Load(); engine != nil {
-			if err := engine.Stop(ctx); err != nil {
+			if err := stopGnetEngine(ctx, s.done, engine.Stop); err != nil {
 				select {
 				case <-s.done:
 					return s.loadRunError()
@@ -274,6 +274,39 @@ func (s *HTTPServer) Stop(ctx context.Context) error {
 		return s.loadRunError()
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+// stopGnetEngine also watches Run completion because gnet can return from
+// OnBoot without marking its Engine as stopped. Waiting only in Engine.Stop
+// would then last until ctx expires.
+func stopGnetEngine(ctx context.Context, done <-chan struct{}, stop func(context.Context) error) error {
+	select {
+	case <-done:
+		return nil
+	default:
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	stopCtx, cancelStop := context.WithCancel(ctx)
+	defer cancelStop()
+	result := make(chan error, 1)
+	go func() { result <- stop(stopCtx) }()
+
+	select {
+	case <-done:
+		return nil
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+		select {
+		case <-done:
+			return nil
+		default:
+			return ctx.Err()
+		}
 	}
 }
 

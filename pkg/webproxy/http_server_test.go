@@ -409,6 +409,36 @@ func TestHTTPServerLifecycleAndConfiguration(t *testing.T) {
 	}
 }
 
+func TestStopGnetEngineReturnsWhenRunExitsDuringBoot(t *testing.T) {
+	done := make(chan struct{})
+	stopStarted := make(chan struct{})
+	stopReturned := make(chan struct{})
+	result := make(chan error, 1)
+
+	go func() {
+		result <- stopGnetEngine(t.Context(), done, func(ctx context.Context) error {
+			close(stopStarted)
+			<-ctx.Done()
+			close(stopReturned)
+			return ctx.Err()
+		})
+	}()
+
+	<-stopStarted
+	close(done)
+	if err := <-result; err != nil {
+		t.Fatalf("stopGnetEngine: %v", err)
+	}
+
+	waitCtx, cancelWait := context.WithTimeout(t.Context(), time.Second)
+	defer cancelWait()
+	select {
+	case <-stopReturned:
+	case <-waitCtx.Done():
+		t.Fatal("Engine.Stop remained blocked after Run exited")
+	}
+}
+
 func TestHTTPServerReportsBindFailure(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
