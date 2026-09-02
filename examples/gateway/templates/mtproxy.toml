@@ -11,11 +11,3 @@ cert-port = 8444
 splice-host = "127.0.0.1"
 splice-port = 8443
 splice-proxy-protocol = 2
-
-[web-proxy]
-enabled = true
-hostname = "__DOMAIN__"
-carrier = "__CARRIER__"
-bind-to = "127.0.0.1:8080"
-backend = "127.0.0.1:9443"
-trusted-proxy-cidrs = ["127.0.0.1/32"]

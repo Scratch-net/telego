@@ -67,7 +67,10 @@ for required_file in \
     README.md \
     .gitignore \
     templates/telego.toml \
+    templates/mtproxy.toml \
     templates/nginx.conf \
+    templates/nginx-web-server.conf \
+    templates/nginx-site-server.conf \
     templates/index.html \
     nginx/watch-certificate.sh
 do
@@ -77,13 +80,17 @@ do
 done
 
 mkdir -p "$install_root/templates" "$install_root/nginx"
+printf 'Installing the setup program, Docker Compose file, templates, and documentation.\n'
 install_file "$gateway_source/install.sh" "$install_root/install.sh" 755
 install_file "$gateway_source/setup.sh" "$install_root/setup.sh" 755
 install_file "$gateway_source/compose.yaml" "$install_root/compose.yaml" 644
 install_file "$gateway_source/README.md" "$install_root/README.md" 644
 install_file "$gateway_source/.gitignore" "$install_root/.gitignore" 644
 install_file "$gateway_source/templates/telego.toml" "$install_root/templates/telego.toml" 644
+install_file "$gateway_source/templates/mtproxy.toml" "$install_root/templates/mtproxy.toml" 644
 install_file "$gateway_source/templates/nginx.conf" "$install_root/templates/nginx.conf" 644
+install_file "$gateway_source/templates/nginx-web-server.conf" "$install_root/templates/nginx-web-server.conf" 644
+install_file "$gateway_source/templates/nginx-site-server.conf" "$install_root/templates/nginx-site-server.conf" 644
 install_file "$gateway_source/templates/index.html" "$install_root/templates/index.html" 644
 install_file "$gateway_source/nginx/watch-certificate.sh" "$install_root/nginx/watch-certificate.sh" 755
 
@@ -91,6 +98,12 @@ cleanup
 download_root=
 trap - 0 1 2 15
 
-printf 'Gateway files installed in %s.\n' "$install_root"
+printf 'Gateway program files are ready in %s.\n' "$install_root"
+if [ -d "$install_root/state" ]; then
+    printf 'Existing persistent state remains in %s/state.\n' "$install_root"
+else
+    printf 'The setup will create persistent state in %s/state.\n' "$install_root"
+fi
+printf 'Starting gateway setup.\n'
 cd "$install_root"
 ./setup.sh "$@"

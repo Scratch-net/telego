@@ -53,6 +53,10 @@ curl -fsSL https://raw.githubusercontent.com/Scratch-net/telego/main/examples/ga
 
 The installer configures Telego, Nginx, the TLS certificate, automatic renewal, and persistent host storage.
 
+By default, MTProxy and WEB share port 443. Use `--mtproxy-port 9443` to keep WEB on 443 and move MTProxy.
+
+Add `--no-web` if you only need MTProxy and the ordinary probe site.
+
 If you already run Telego, [copy the existing users](examples/gateway/README.md#reuse-existing-users) into the generated `[secrets]` section.
 
 Read the [managed gateway guide](examples/gateway/README.md) for updates, backups, carrier selection, and removal.
@@ -215,7 +219,7 @@ Read the [Middle-End operator guide](docs/middle-end.md) for topology, failure b
 
 Telego includes an optional WEB proxy for Telegram Desktop. It uses a separate private gnet HTTP/1.1 listener behind Nginx.
 
-Nginx keeps the real TLS certificate and the ordinary website. The existing MTProxy listener stays on public port 443.
+Nginx keeps the real TLS certificate and the ordinary website. MTProxy can share port 443 or use a different public port.
 
 Add this section to enable WEB for existing secrets:
 
@@ -269,7 +273,9 @@ The `--web-host` value must match `[web-proxy].hostname` and the TLS certificate
 
 Read the [native WEB proxy setup guide](docs/web-proxy.md) for the complete Nginx configuration, Docker setup, and rollback procedure.
 
-For a new VPS, use the [quick managed install](#quick-managed-install). Read the [gateway guide](examples/gateway/README.md) for full instructions.
+For a new VPS, use the [quick managed install](#quick-managed-install). The installer can also disable WEB or select a separate MTProxy port.
+
+Read the [gateway guide](examples/gateway/README.md) for full instructions.
 
 Use the [manual example](examples/web-proxy/README.md) for an existing website or a custom Nginx layout.
 

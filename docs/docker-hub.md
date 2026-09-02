@@ -96,9 +96,11 @@ docker compose up -d
 docker compose logs telego
 ```
 
-## Run MTProxy and WEB proxy on port 443
+## Run MTProxy and WEB proxy
 
-The native WEB proxy needs a DNS hostname, a valid TLS certificate, and Nginx. The Telego container keeps public port 443. Nginx uses private ports for TLS termination and sends authenticated WEB traffic back to Telego.
+The native WEB proxy needs a DNS hostname, a valid TLS certificate, and Nginx.
+
+By default, Telego owns public port 443. With separate ports, Nginx owns port 443 and sends WEB traffic to Telego.
 
 Do not publish the private WEB listener to the Internet.
 
@@ -111,7 +113,13 @@ curl -fsSL https://raw.githubusercontent.com/Scratch-net/telego/main/examples/ga
   | sh -s -- --domain proxy.example.com --email admin@example.com
 ```
 
-The script generates the secret, requests the first certificate, starts the services, and prints the WEB links.
+The script generates the secret, requests the first certificate, starts the services, and prints the proxy links.
+
+By default, MTProxy and WEB share public port 443. Add `--mtproxy-port 9443` to keep WEB on 443 and move MTProxy.
+
+With this option, WEB clients use `proxy.example.com:443`. MTProxy clients use `proxy.example.com:9443`.
+
+Add `--no-web` to install MTProxy without the WEB listener. The gateway keeps the ordinary TLS probe site.
 
 Read the [managed gateway guide](https://github.com/Scratch-net/telego/blob/main/examples/gateway/README.md) for updates, backups, and removal.
 

@@ -25,11 +25,17 @@ Select the deployment that matches the host:
 
 | Deployment | Use case | Public port 443 owner | Certificate renewal |
 |---|---|---|---|
-| [Managed gateway](../examples/gateway/README.md) | A new VPS where MTProxy and WEB share port 443 | Telego | Automatic Certbot service |
+| [Managed gateway](../examples/gateway/README.md) | A new VPS with shared or separate MTProxy and WEB ports | Telego or Nginx | Automatic Certbot service |
 | [Manual shared-port setup](../examples/web-proxy/README.md) | An existing website or a custom Nginx layout | Telego | Existing operator job |
 | Existing TLS proxy | Synology, Nginx Proxy Manager, or another managed TLS service | Existing TLS proxy | Existing TLS service |
 
 The managed gateway keeps all configuration and certificate files in a host `state/` directory. Its setup script generates the private configuration.
+
+By default, MTProxy and WEB share public port 443. Set `--mtproxy-port` to give MTProxy a different public port.
+
+With separate ports, Nginx owns public port 443. Telego owns the selected MTProxy port.
+
+For `--mtproxy-port 9443`, WEB clients use `proxy.example.com:443`. MTProxy clients use `proxy.example.com:9443`.
 
 An existing TLS proxy can send decrypted HTTP to the private Telego WEB listener. Native MTProxy must use a different public port.
 
@@ -43,17 +49,19 @@ The official [WEB proxy reference](https://github.com/telegramdesktop/tproxy-ser
 
 ## Traffic flow
 
-The managed gateway and manual shared-port setup use the following traffic flow.
+The default managed gateway and manual shared-port setup use the following traffic flow.
 
 The deployment has one public listener and four private listeners or targets:
 
 | Port | Owner | Purpose |
 |------|-------|---------|
-| `443` | Telego | Public MTProxy and WEB TLS entry point. It is also the private backend for WEB streams. |
+| `443` | Telego | Public MTProxy and WEB TLS entry point. |
 | `8443` | Nginx | TLS termination for connections that Telego splices with PROXY protocol v2. |
 | `8444` | Nginx | Certificate source for Telego. This port does not carry client requests. |
 | `8080` | Telego | Private HTTP/1.1 listener for WEB carrier requests and website classification. |
 | `8090` | Nginx | Private ordinary website listener. |
+
+The managed gateway maps public port 443 to private Telego port 9443. The manual example uses Telego port 443 directly.
 
 The same Telego and Nginx processes appear more than once in these flows. This is intentional.
 
@@ -96,7 +104,7 @@ Telego WEB listener :8080
           |
           | authenticated internal PROXY header and MTProxy stream
           v
-Telego MTProxy backend :443
+Telego MTProxy backend :443 or :9443
           |
           | Middle-End or direct DC route
           v
@@ -121,6 +129,21 @@ Telego :443 --> Nginx TLS :8443 --> Telego WEB :8080
 Nginx intercepts status `418` and sends the original request to its public-site listener. The response returns through Nginx and the Telego splice.
 
 If a carrier-shaped request fails authentication, Telego returns status `419`. Nginx removes carrier credentials before it sends a safe `GET` to port `8090`.
+
+The managed gateway also supports separate public ports:
+
+```text
+Telegram Desktop --> Nginx public TLS :443 --> Telego WEB :8080
+                                                    |
+                                                    v
+                                         Telego MTProxy :9443
+
+MTProxy client :9443 -------------------> Telego MTProxy :9443
+```
+
+The WEB backend always uses the private Telego listener. It does not connect through the public MTProxy port mapping.
+
+Unrecognized TLS probes on the MTProxy port still go to Nginx port 8443.
 
 Certificate collection is a separate control path:
 
@@ -210,6 +233,8 @@ Telego derives `127.0.0.1:443` from the wildcard MTProxy bind. A Unix MTProxy bi
 [web-proxy]
 backend = "127.0.0.1:443"
 ```
+
+The managed gateway sets this backend to `127.0.0.1:9443`. Docker maps the selected public MTProxy port to that private listener.
 
 Telego adds an authenticated internal PROXY header to every WEB backend stream.
 
@@ -468,6 +493,10 @@ curl -fsSL https://raw.githubusercontent.com/Scratch-net/telego/main/examples/ga
 ```
 
 The installer creates `telego-gateway/` in the current directory. It stores all persistent files under `telego-gateway/state/`.
+
+To keep WEB on port 443 and publish MTProxy on port 9443, add `--mtproxy-port 9443`.
+
+To run the managed gateway without WEB, add `--no-web`. Nginx still provides the certificate and ordinary probe site.
 
 Read the [gateway README](../examples/gateway/README.md) for the complete procedure.
 
