@@ -81,6 +81,8 @@ With `--no-web`, Nginx serves only the ordinary site. Telego still sends unrecog
 
 The private ports use the shared network namespace. Docker does not publish these ports directly.
 
+Telego derives the local WEB backend from its MTProxy bind. The generated configuration does not need a `backend` option.
+
 The private Nginx listener on port 8444 supplies the certificate and ServerHello template to Telego.
 
 ## Install the gateway

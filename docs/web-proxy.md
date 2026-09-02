@@ -227,14 +227,17 @@ The WebSocket target is `wss://<WEB host>/api/v1/ws`. The bridge sends the beare
 
 In `https` mode, the carrier uses serialized fetch requests and long polls. In `https-lanes` mode, it uses independent fetch and long-poll lanes.
 
-Telego derives `127.0.0.1:443` from the wildcard MTProxy bind. A Unix MTProxy bind produces the same Unix socket as the backend.
+Telego automatically derives `127.0.0.1:443` from the wildcard MTProxy bind. A Unix MTProxy bind produces the same Unix socket.
+
+Do not set `backend` for the usual layout. Set it only when WEB streams must use a different local MTProxy listener.
 
 ```toml
 [web-proxy]
+# Optional override:
 backend = "127.0.0.1:443"
 ```
 
-The managed gateway sets this backend to `127.0.0.1:9443`. Docker maps the selected public MTProxy port to that private listener.
+The managed gateway omits this option. Telego derives `127.0.0.1:9443` from its private MTProxy bind.
 
 Telego adds an authenticated internal PROXY header to every WEB backend stream.
 
@@ -511,7 +514,7 @@ The example has these network properties:
 - Telego uses `nginx:8443` for splice traffic.
 - Telego uses the `proxy.example.com:8444` Docker alias for certificate collection and the correct TLS SNI.
 - Nginx uses Telego's fixed private address `172.28.0.3:8080` for WEB HTTP traffic.
-- Telego uses its own `127.0.0.1:443` listener for WEB backend streams.
+- Telego derives and uses its own `127.0.0.1:443` listener for WEB backend streams.
 - Telego trusts only the fixed Nginx address `172.28.0.2/32` for `X-Forwarded-For`.
 - Port 8080 stays private and is not published on the VPS.
 - Nginx and Telego use the Docker `local` log driver. Each service keeps three 10 MB log files.

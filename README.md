@@ -232,6 +232,8 @@ bind-to = "127.0.0.1:8080"
 trusted-proxy-cidrs = ["127.0.0.1/32"]
 ```
 
+Telego automatically derives the local WEB backend from `[general].bind-to`. Most configurations do not need the `backend` option.
+
 The `carrier` value selects one of four transports:
 
 | Value | Transport | Requirements |
@@ -347,7 +349,7 @@ enabled = false
 # Other values: https, websocket, websocket-lanes
 # hostname = "proxy.example.com"            # Required public certificate hostname
 # bind-to = "127.0.0.1:8080"               # Private HTTP/1.1 listener
-# backend = "127.0.0.1:443"                # Derived TCP or Unix MTProxy backend
+# backend = "127.0.0.1:443"                # Optional override for the derived local backend
 # trusted-proxy-cidrs = ["127.0.0.1/32"]   # Nginx peers allowed to send X-Forwarded-For
 # num-event-loops = 0                       # 0 = automatic
 

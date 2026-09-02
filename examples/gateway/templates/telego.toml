@@ -17,5 +17,5 @@ enabled = true
 hostname = "__DOMAIN__"
 carrier = "__CARRIER__"
 bind-to = "127.0.0.1:8080"
-backend = "127.0.0.1:9443"
+# Telego derives the local MTProxy backend from [general].bind-to.
 trusted-proxy-cidrs = ["127.0.0.1/32"]

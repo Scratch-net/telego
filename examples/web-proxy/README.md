@@ -34,6 +34,8 @@ Read the [Docker procedure](../../docs/web-proxy.md#docker) in the complete WEB 
 
 Replace all example hostnames and secrets before you start the services.
 
+Telego derives the local WEB backend from `[general].bind-to`. The example does not need a `backend` option.
+
 ## Persistent data
 
 The Compose file stores certificates in these host directories:
