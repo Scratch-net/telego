@@ -7,7 +7,7 @@ RPMBUILD_OS   ?= $(RPMBUILD_OS:leap)
 RPMBUILD_OS   ?= $(RPMBUILD_OS:tumbleweed)
 RPMBUILD_VERN := $(shell echo "$(VERSION)" | awk -F '-' '{ print $$1 }' | sed 's/^v*//')
 RPMBUILD_VERB := $(shell echo "$(VERSION)" | awk -F "$(RPMBUILD_VERN)-" '{ print $$2 }' | sed 's/-/./g' )
-RPMBUILD_VERB := $(shell if [[ $(RPMBUILD_VERB) == "" ]]; then date -u +%Y%m%d.%H%M%S.%Z; else echo "$(RPMBUILD_VERB)"; fi)
+RPMBUILD_VERB := $(shell if [[ "$(RPMBUILD_VERB)" == "" ]]; then date -u +%Y%m%d.%H%M%S.%Z; else echo "$(RPMBUILD_VERB)"; fi)
 
 ## Creating space for assembly without interfering with the operating system.
 rpmbuild_make_workflow:
