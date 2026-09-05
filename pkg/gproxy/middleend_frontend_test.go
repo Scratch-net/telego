@@ -1232,7 +1232,7 @@ func TestMiddleEndNoFallbackAfterSuccessfulBind(t *testing.T) {
 		config.PrecommitFailure = MiddleEndPrecommitDirectFallback
 	})
 	var directDials atomic.Int64
-	handler.directDCDial = func(int, obfuscated2.ConnectionType) (*directDCConn, error) {
+	handler.directDCDial = func(context.Context, int, obfuscated2.ConnectionType) (*directDCConn, error) {
 		directDials.Add(1)
 		return nil, errors.New("unexpected direct fallback")
 	}
@@ -1460,7 +1460,7 @@ func TestMiddleEndPrecommitActionAndZeroPort(t *testing.T) {
 		frame := buildDeterministicO2ClientFrame(t, handler.config.Secrets[0].Key, 3, obfuscated2.ConnectionTypeIntermediate)
 		entered := make(chan struct{})
 		release := make(chan struct{})
-		handler.directDCDial = func(int, obfuscated2.ConnectionType) (*directDCConn, error) {
+		handler.directDCDial = func(context.Context, int, obfuscated2.ConnectionType) (*directDCConn, error) {
 			close(entered)
 			<-release
 			return nil, errors.New("injected direct dial stop")

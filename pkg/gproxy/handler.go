@@ -1,6 +1,7 @@
 package gproxy
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -33,7 +34,12 @@ type ProxyHandler struct {
 	idleTimeoutNs atomic.Int64
 
 	// DC client for outgoing connections
-	dcClient *gnet.Client
+	dcClient              *gnet.Client
+	stopDCClient          func() error
+	upstreamCloses        upstreamCloseBarriers
+	upstreamContext       context.Context
+	cancelUpstream        context.CancelFunc
+	upstreamStopRequested atomic.Bool
 
 	// Replay cache for anti-replay protection
 	replayCache *ReplayCache
@@ -58,24 +64,17 @@ type ProxyHandler struct {
 	// Hard limit for OOM protection (bytes per connection)
 	maxWriteBuffer int
 
-	// Cached backpressure thresholds (computed from maxWriteBuffer)
-	bpSoftLimit int // Start throttling above this (maxWriteBuffer / 2)
-	bpResumeAt  int // Resume full speed below this (maxWriteBuffer / 4)
-
-	// Buffer pools with stats
-	dcBufPool    *BufferPool // 64KB+ for batching writes
-	relayBufPool *BufferPool // 16KB for TLS record processing
+	// Buffer pool with stats.
+	dcBufPool *BufferPool // 64KB+ for batching writes
 
 	// Desync detector
 	desyncDetector *DesyncDetector
 
-	// Pending DC contexts: keyed by fd, used to eliminate race between Enroll and SetContext
-	pendingDCContexts sync.Map // int (fd) -> *DCConnContext
-
 	// directDCDial is the outbound connection seam. Production initializes it
 	// to dialDirectDC; tests replace it to verify handshake propagation without
 	// contacting Telegram.
-	directDCDial func(int, obfuscated2.ConnectionType) (*directDCConn, error)
+	directDCDial func(context.Context, int, obfuscated2.ConnectionType) (*directDCConn, error)
+	spliceDial   func(context.Context, string) (net.Conn, error)
 
 	// middleEnd is nil for the existing direct-only construction path. A
 	// non-nil frontend is injected explicitly and owns no source/runtime
@@ -96,7 +95,7 @@ type ProxyHandler struct {
 // relayEntry links an active relay's client connection to its context for the
 // OnTick silence sweep.
 type relayEntry struct {
-	conn gnet.Conn
+	conn clientEndpoint
 	ctx  *ConnContext
 }
 
@@ -120,13 +119,24 @@ func NewProxyHandler(cfg *Config, logger Logger) *ProxyHandler {
 		replayCache:    NewReplayCache(1000000, 10*time.Minute),
 		logger:         logger,
 		maxWriteBuffer: maxWriteBuf,
-		bpSoftLimit:    maxWriteBuf / 2,
-		bpResumeAt:     maxWriteBuf / 4,
 		dcBufPool:      NewBufferPool(64*1024 + 256), // 64KB + TLS header overhead
-		relayBufPool:   NewBufferPool(16 * 1024),     // 16KB TLS record
 		desyncDetector: NewDesyncDetector(),
 	}
 	h.directDCDial = h.dialDirectDC
+	h.spliceDial = dialSpliceTarget
+	h.upstreamContext, h.cancelUpstream = context.WithCancel(context.Background())
+	h.stopDCClient = sync.OnceValue(func() error {
+		h.upstreamStopRequested.Store(true)
+		h.cancelUpstream()
+		var err error
+		if h.dcClient != nil {
+			err = h.dcClient.Stop()
+		}
+		// Stop joins every owner and releases all socket buffers before an
+		// abandoned next-owner close barrier can release its logical charges.
+		h.upstreamCloses.retire()
+		return err
+	})
 
 	// Initialize hot-reloadable config atomically
 	h.idleTimeoutNs.Store(int64(cfg.IdleTimeout))
@@ -246,11 +256,8 @@ func silenceWedged(lastClientMs, lastServerMs, nowMs, thresholdMs int64) bool {
 // OnShutdown is called when the gnet engine shuts down.
 func (h *ProxyHandler) OnShutdown(eng gnet.Engine) {
 	h.logger.Info("gnet proxy shutting down")
-	if h.middleEnd != nil {
-		h.middleEnd.stop()
-	}
-	if h.dcClient != nil {
-		h.dcClient.Stop()
+	if err := h.stopServing(); err != nil {
+		h.logger.Warn("failed to stop upstream gnet client: %v", err)
 	}
 }
 
@@ -272,12 +279,18 @@ func (h *ProxyHandler) OnOpen(c gnet.Conn) ([]byte, gnet.Action) {
 	// Otherwise keep default StateDetectProtocol from NewConnContext
 
 	c.SetContext(ctx)
+	return nil, h.openClient(c, ctx)
+}
 
+func (h *ProxyHandler) openClient(c clientEndpoint, ctx *ConnContext) gnet.Action {
 	conns := atomic.AddInt64(&h.activeConns, 1)
+	if h.upstreamContext.Err() != nil {
+		return gnet.Close
+	}
 	h.logger.Info("[#%d] new connection from %s (active: %d)", ctx.id, c.RemoteAddr(), conns)
 	if h.config.MaxConnections > 0 && conns > int64(h.config.MaxConnections) {
 		h.logger.Info("[#%d] global connection limit reached: %d > %d", ctx.id, conns, h.config.MaxConnections)
-		return nil, h.failHandshake(ctx, handshakeFailureAdmission)
+		return h.failHandshake(ctx, handshakeFailureAdmission)
 	}
 
 	// Every peer consumes admission immediately. Unix WEB candidates use a
@@ -289,44 +302,38 @@ func (h *ProxyHandler) OnOpen(c gnet.Conn) ([]byte, gnet.Action) {
 		}
 	}
 	if !h.acquireInitialIPLimit(ctx, admissionAddress, conns) {
-		return nil, h.failHandshake(ctx, handshakeFailureAdmission)
+		return h.failHandshake(ctx, handshakeFailureAdmission)
 	}
 
-	// Set read deadline for handshake
+	// gnet does not support connection deadlines. The timer submits its state
+	// check to the owning loop so authentication and expiry cannot race.
 	handshakeTimeout := h.config.HandshakeTimeout
 	if handshakeTimeout <= 0 {
 		handshakeTimeout = 5 * time.Second
 	}
-	c.SetReadDeadline(time.Now().Add(handshakeTimeout))
+	h.startHandshakeTimer(c, ctx, handshakeTimeout)
 
-	// Active handshake timeout: close connection if still in pre-auth state.
-	// gnet's SetReadDeadline only triggers on read attempts; silent connections
-	// (no data sent) never trigger a read, so the deadline is never checked.
-	time.AfterFunc(handshakeTimeout, func() {
-		state := ctx.State()
-		if state != StateClosed && state != StateRelaying && state != StateSplicing && state != StateDialingDC && state != StateMiddleEnd {
-			h.recordHandshakeFailure(ctx, handshakeStageForState(state))
-			h.logger.Info("[#%d] handshake timeout from %s in state %s (active: %d)",
-				ctx.id, c.RemoteAddr(), state, atomic.LoadInt64(&h.activeConns))
-			c.Close()
-		}
-	})
-
-	return nil, gnet.None
+	return gnet.None
 }
 
 // OnClose is called when a connection is closed.
 func (h *ProxyHandler) OnClose(c gnet.Conn, err error) gnet.Action {
-	conns := atomic.AddInt64(&h.activeConns, -1)
-
 	ctx, ok := c.Context().(*ConnContext)
 	if !ok || ctx == nil {
-		h.logger.Debug("[?] connection closed without context (active: %d)", conns)
 		return gnet.None
 	}
+	return h.closeClient(c, ctx, err)
+}
+
+func (h *ProxyHandler) closeClient(c clientEndpoint, ctx *ConnContext, err error) gnet.Action {
+	if !ctx.closeStarted.CompareAndSwap(false, true) {
+		return gnet.None
+	}
+	conns := atomic.AddInt64(&h.activeConns, -1)
 
 	// Mark as closed FIRST - goroutines check this before proceeding
 	ctx.SetState(StateClosed)
+	ctx.stopConnectionTimers()
 	ctx.cancelSpliceDrain()
 	if h.middleEnd != nil {
 		if ctx.middleEnd != nil {
@@ -346,10 +353,7 @@ func (h *ProxyHandler) OnClose(c gnet.Conn, err error) gnet.Action {
 		relay.DCConn.Close()
 	}
 
-	// Close splice connection if active
-	if spliceConn := ctx.SpliceConn(); spliceConn != nil {
-		spliceConn.Close()
-	}
+	ctx.closeSplice()
 
 	// Release connection limit slots and check if authenticated
 	ctx.mu.Lock()
@@ -398,7 +402,10 @@ func (h *ProxyHandler) OnTraffic(c gnet.Conn) gnet.Action {
 	if !ok || ctx == nil {
 		return gnet.Close
 	}
+	return h.clientTraffic(c, ctx)
+}
 
+func (h *ProxyHandler) clientTraffic(c clientEndpoint, ctx *ConnContext) gnet.Action {
 	// Lock-free state read
 	switch ctx.State() {
 	case StateDetectProtocol:
@@ -414,7 +421,14 @@ func (h *ProxyHandler) OnTraffic(c gnet.Conn) gnet.Action {
 	case StateReadDDFrame:
 		return h.handleDDFrame(c, ctx)
 	case StateDialingDC:
-		// Still waiting for DC connection, buffer data
+		// Dialing must not turn an authenticated connection into an unbounded
+		// input queue while the upstream is unavailable.
+		ctx.mu.Lock()
+		pending := len(ctx.pendingData)
+		ctx.mu.Unlock()
+		if c.InboundBuffered() > max(h.maxWriteBuffer, relayBatchSize)-pending {
+			return gnet.Close
+		}
 		return gnet.None
 	case StateRelaying:
 		if ctx.ProtocolMode() == ModeDD {
@@ -433,7 +447,7 @@ func (h *ProxyHandler) OnTraffic(c gnet.Conn) gnet.Action {
 }
 
 // handleProxyProto parses incoming PROXY protocol header.
-func (h *ProxyHandler) handleProxyProto(c gnet.Conn, ctx *ConnContext) gnet.Action {
+func (h *ProxyHandler) handleProxyProto(c clientEndpoint, ctx *ConnContext) gnet.Action {
 	data, _ := c.Peek(-1)
 	if len(data) == 0 {
 		return gnet.None // Need data
@@ -522,7 +536,7 @@ func (h *ProxyHandler) handleProxyProto(c gnet.Conn, ctx *ConnContext) gnet.Acti
 	return h.handleDetectProtocol(c, ctx)
 }
 
-func (h *ProxyHandler) fallbackFromProxyProtocol(c gnet.Conn, ctx *ConnContext) gnet.Action {
+func (h *ProxyHandler) fallbackFromProxyProtocol(c clientEndpoint, ctx *ConnContext) gnet.Action {
 	if !h.acquireInitialIPLimit(ctx, c.RemoteAddr(), atomic.LoadInt64(&h.activeConns)) {
 		return h.failHandshake(ctx, handshakeFailureAdmission)
 	}

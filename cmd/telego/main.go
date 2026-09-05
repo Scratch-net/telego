@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -91,15 +92,12 @@ func (c *RunCmd) Run() error {
 			log.Error().Err(err).Msg("invalid WEB proxy config")
 			return err
 		}
-		internalAuth, authErr := gproxy.NewInternalProxyAuth()
-		if authErr != nil {
-			return fmt.Errorf("initialize WEB backend authentication: %w", authErr)
-		}
-		cfg.InternalProxyAuth = internalAuth
-		webRuntime, err = newWebProxyRuntime(webRuntimeConfig, internalAuth)
-		if err != nil {
-			log.Error().Err(err).Msg("failed to initialize WEB proxy")
-			return err
+		if webRuntimeConfig.BackendProxyProtocol {
+			internalAuth, authErr := gproxy.NewInternalProxyAuth()
+			if authErr != nil {
+				return fmt.Errorf("initialize WEB backend authentication: %w", authErr)
+			}
+			cfg.InternalProxyAuth = internalAuth
 		}
 	}
 
@@ -110,7 +108,7 @@ func (c *RunCmd) Run() error {
 		} else if err := printTelegramLinks(cfg.Secrets, cfg.BindAddr); err != nil {
 			log.Warn().Err(err).Msg("failed to generate Telegram links")
 		}
-		if webRuntime != nil {
+		if webRuntimeConfig.Enabled {
 			printWebProxyLinks(webRuntimeConfig.Hostname, webRuntimeConfig.Profiles)
 		}
 	}
@@ -173,15 +171,23 @@ func (c *RunCmd) Run() error {
 	if middleEndService != nil {
 		middleEndStatusMonitor = startMiddleEndMonitor(middleEndService, handler)
 	}
-	if webRuntime != nil {
+	stopProxyServices := func() {
+		shutdownProxyServices(webRuntime, shutdown, func() {
+			middleEndStatusMonitor.Stop()
+			closeMiddleEndService(middleEndService, middleEndRuntimeConfig)
+		}, webProxyLifecycleTimeout)
+	}
+	if webRuntimeConfig.Enabled {
+		webRuntime, err = newWebProxyRuntime(webRuntimeConfig, cfg.InternalProxyAuth, handler)
+		if err != nil {
+			stopProxyServices()
+			return fmt.Errorf("initialize WEB proxy: %w", err)
+		}
 		startCtx, cancel := context.WithTimeout(context.Background(), webProxyLifecycleTimeout)
 		err := webRuntime.Start(startCtx)
 		cancel()
 		if err != nil {
-			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), webProxyLifecycleTimeout)
-			_ = webRuntime.Shutdown(shutdownCtx)
-			shutdownCancel()
-			shutdown()
+			stopProxyServices()
 			log.Error().Err(err).Msg("failed to start WEB proxy")
 			return err
 		}
@@ -260,18 +266,7 @@ func (c *RunCmd) Run() error {
 
 	cleanup := func() {
 		hotReloader.Stop()
-		if webRuntime != nil {
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), webProxyLifecycleTimeout)
-			if err := webRuntime.Shutdown(shutdownCtx); err != nil {
-				log.Warn().Err(err).Msg("failed to shut down WEB proxy cleanly")
-			}
-			cancel()
-		}
-		shutdown()
-		if middleEndService != nil {
-			middleEndStatusMonitor.Stop()
-			closeMiddleEndService(middleEndService, middleEndRuntimeConfig)
-		}
+		stopProxyServices()
 		if metricsServer != nil {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			_ = metricsServer.Shutdown(shutdownCtx)
@@ -294,6 +289,25 @@ func (c *RunCmd) Run() error {
 		}
 		return fmt.Errorf("WEB HTTP server failed: %w", err)
 	}
+}
+
+// shutdownProxyServices keeps upstream owners alive until WEB cleanup finishes.
+// The timeout reports slow cleanup; it does not permit stopping dependencies.
+func shutdownProxyServices(runtime *webProxyRuntime, stopPublic, stopMiddleEnd func(), warningAfter time.Duration) {
+	if runtime != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), warningAfter)
+		err := runtime.Shutdown(ctx)
+		cancel()
+		if errors.Is(err, context.DeadlineExceeded) {
+			log.Warn().Msg("waiting for WEB session cleanup before stopping upstream services")
+			err = runtime.Shutdown(context.Background())
+		}
+		if err != nil {
+			log.Warn().Err(err).Msg("failed to shut down WEB proxy cleanly")
+		}
+	}
+	stopPublic()
+	stopMiddleEnd()
 }
 
 func closeMiddleEndService(service *middleend.Service, runtimeConfig config.MiddleEndRuntimeConfig) {

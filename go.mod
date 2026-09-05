@@ -1,5 +1,7 @@
 module github.com/scratch-net/telego
 
+replace github.com/panjf2000/gnet/v2 => ./third_party/gnet
+
 go 1.27
 
 require (

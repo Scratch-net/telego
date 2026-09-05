@@ -39,7 +39,7 @@ func testInternalProxyAuth(t *testing.T) *gproxy.InternalProxyAuth {
 }
 
 func TestNewWebProxyRuntimeDisabledHasNoRuntime(t *testing.T) {
-	runtime, err := newWebProxyRuntime(config.WebProxyRuntimeConfig{}, nil)
+	runtime, err := newWebProxyRuntime(config.WebProxyRuntimeConfig{}, nil, nil)
 	if err != nil {
 		t.Fatalf("newWebProxyRuntime: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestNewWebProxyRuntimeRejectsInvalidEnabledConfig(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			runtimeConfig := testWebRuntimeConfig(t, "127.0.0.1:0")
 			test.mutate(&runtimeConfig)
-			runtime, err := newWebProxyRuntime(runtimeConfig, testInternalProxyAuth(t))
+			runtime, err := newWebProxyRuntime(runtimeConfig, testInternalProxyAuth(t), nil)
 			if err == nil || runtime != nil {
 				t.Fatalf("runtime = %#v, error = %v", runtime, err)
 			}
@@ -79,14 +79,14 @@ func TestNewWebProxyRuntimeRejectsInvalidEnabledConfig(t *testing.T) {
 }
 
 func TestNewWebProxyRuntimeRequiresInternalAuthentication(t *testing.T) {
-	runtime, err := newWebProxyRuntime(testWebRuntimeConfig(t, "127.0.0.1:0"), nil)
+	runtime, err := newWebProxyRuntime(testWebRuntimeConfig(t, "127.0.0.1:0"), nil, nil)
 	if err == nil || runtime != nil || !strings.Contains(err.Error(), "internal backend authentication is required") {
 		t.Fatalf("runtime = %#v, error = %v", runtime, err)
 	}
 }
 
 func TestWebProxyRuntimeStartAndShutdown(t *testing.T) {
-	runtime, err := newWebProxyRuntime(testWebRuntimeConfig(t, "127.0.0.1:0"), testInternalProxyAuth(t))
+	runtime, err := newWebProxyRuntime(testWebRuntimeConfig(t, "127.0.0.1:0"), testInternalProxyAuth(t), nil)
 	if err != nil {
 		t.Fatalf("newWebProxyRuntime: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestWebProxyRuntimeReportsStartFailure(t *testing.T) {
 	}
 	defer occupied.Close()
 
-	runtime, err := newWebProxyRuntime(testWebRuntimeConfig(t, occupied.Addr().String()), testInternalProxyAuth(t))
+	runtime, err := newWebProxyRuntime(testWebRuntimeConfig(t, occupied.Addr().String()), testInternalProxyAuth(t), nil)
 	if err != nil {
 		t.Fatalf("newWebProxyRuntime: %v", err)
 	}

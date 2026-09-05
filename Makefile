@@ -1,4 +1,5 @@
-.PHONY: build install uninstall clean test bench run
+.PHONY: build install uninstall clean test test-gnet bench run
+.DEFAULT_GOAL := build
 
 # Build tags for gnet optimizations:
 #   poll_opt - Optimized epoll/kqueue pollers (lower latency)
@@ -66,9 +67,17 @@ uninstall:
 
 # Race-test gc_opt with gnet's portable poller. gnet's poll_opt uses unsafe
 # poll attachments that are incompatible with the race build's checkptr.
-test:
+test: test-gnet
 	go test -tags="gc_opt" -race ./...
 	go test -tags="$(TAGS)" ./...
+
+# The local dependency is a separate module, outside the root ./... pattern.
+test-gnet:
+	sh dist/test-gnet.sh
+
+.PHONY: test-rpm
+test-rpm:
+	sh dist/test-rpm.sh
 
 # Run benchmarks
 bench:

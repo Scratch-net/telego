@@ -4,6 +4,8 @@ go 1.27
 
 require github.com/panjf2000/gnet/v2 v2.10.0
 
+replace github.com/panjf2000/gnet/v2 => ../../third_party/gnet
+
 require (
 	github.com/panjf2000/ants/v2 v2.12.1 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect

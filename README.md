@@ -232,7 +232,9 @@ bind-to = "127.0.0.1:8080"
 trusted-proxy-cidrs = ["127.0.0.1/32"]
 ```
 
-Telego automatically derives the local WEB backend from `[general].bind-to`. Most configurations do not need the `backend` option.
+WEB streams enter the shared MTProxy session core directly on gnet. The default path creates no internal TCP or Unix connection.
+
+An explicit `backend` value selects a local TCP or Unix socket for compatibility. This path retains the authenticated PROXY preface. Nginx terminates real TLS in both paths.
 
 The `carrier` value selects one of four transports:
 
@@ -349,7 +351,7 @@ enabled = false
 # Other values: https, websocket, websocket-lanes
 # hostname = "proxy.example.com"            # Required public certificate hostname
 # bind-to = "127.0.0.1:8080"               # Private HTTP/1.1 listener
-# backend = "127.0.0.1:443"                # Optional override for the derived local backend
+# backend = "127.0.0.1:443"                # Explicit local socket compatibility path
 # trusted-proxy-cidrs = ["127.0.0.1/32"]   # Nginx peers allowed to send X-Forwarded-For
 # num-event-loops = 0                       # 0 = automatic
 

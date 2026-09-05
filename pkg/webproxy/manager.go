@@ -13,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/panjf2000/gnet/v2"
 )
 
 var (
@@ -75,13 +77,14 @@ type Capacity struct {
 // Manager owns WEB bootstrap tokens, authenticated sessions, and process-wide
 // stream and queue budgets.
 type Manager struct {
-	profiles    []Profile
-	carrier     CarrierMode
-	backendNet  string
-	backend     string
-	limits      Limits
-	timeouts    Timeouts
-	dialBackend BackendDialContextFunc
+	profiles       []Profile
+	carrier        CarrierMode
+	backendNet     string
+	backend        string
+	limits         Limits
+	timeouts       Timeouts
+	dialBackend    BackendDialContextFunc
+	backendFactory BackendFactory
 
 	mu           sync.Mutex
 	bootstraps   map[[sha256.Size]byte]*bootstrap
@@ -125,19 +128,20 @@ func NewManager(config ManagerConfig) (*Manager, error) {
 		}
 	}
 	manager := &Manager{
-		profiles:     append([]Profile(nil), config.Profiles...),
-		carrier:      config.Carrier,
-		backendNet:   backendNetwork,
-		backend:      backendAddress,
-		limits:       config.Limits,
-		timeouts:     config.Timeouts,
-		dialBackend:  dialBackend,
-		bootstraps:   make(map[[sha256.Size]byte]*bootstrap),
-		sessions:     make(map[[sha256.Size]byte]*Session),
-		closedTokens: make(map[[sha256.Size]byte]*closedToken),
-		stop:         make(chan struct{}),
-		cleanupDone:  make(chan struct{}),
-		shutdownDone: make(chan struct{}),
+		profiles:       append([]Profile(nil), config.Profiles...),
+		carrier:        config.Carrier,
+		backendNet:     backendNetwork,
+		backend:        backendAddress,
+		limits:         config.Limits,
+		timeouts:       config.Timeouts,
+		dialBackend:    dialBackend,
+		backendFactory: config.BackendFactory,
+		bootstraps:     make(map[[sha256.Size]byte]*bootstrap),
+		sessions:       make(map[[sha256.Size]byte]*Session),
+		closedTokens:   make(map[[sha256.Size]byte]*closedToken),
+		stop:           make(chan struct{}),
+		cleanupDone:    make(chan struct{}),
+		shutdownDone:   make(chan struct{}),
 	}
 	go manager.cleanupLoop()
 	return manager, nil
@@ -224,6 +228,10 @@ func (m *Manager) Create(token, clientIP string, body []byte) (CreateResult, err
 // Create parses HELLO only after bootstrap authentication, then atomically
 // creates or retries the session.
 func (a *BootstrapAuthorization) Create(clientIP string, body []byte) (CreateResult, error) {
+	return a.create(clientIP, body, nil)
+}
+
+func (a *BootstrapAuthorization) create(clientIP string, body []byte, owner gnet.EventLoop) (CreateResult, error) {
 	if a == nil || a.state == nil || a.state.manager == nil {
 		return CreateResult{}, ErrAuthentication
 	}
@@ -257,6 +265,9 @@ func (a *BootstrapAuthorization) Create(clientIP string, body []byte) (CreateRes
 	if m.closed {
 		return CreateResult{}, ErrClosed
 	}
+	if m.backendFactory != nil && owner == nil {
+		return CreateResult{}, ErrProtocol
+	}
 	if len(m.sessions) >= m.limits.MaxSessions {
 		m.recordBackpressure(carrierOperationCreate)
 		return CreateResult{}, ErrLimit
@@ -281,6 +292,8 @@ func (a *BootstrapAuthorization) Create(clientIP string, body []byte) (CreateRes
 		limits:                m.limits,
 		timeouts:              m.timeouts,
 		dialBackend:           m.dialBackend,
+		backendFactory:        m.backendFactory,
+		owner:                 owner,
 		budget:                m.changePendingBudget,
 		onCarrierRetry:        m.recordCarrierRetry,
 		onBackpressure:        m.recordBackpressure,
@@ -405,6 +418,20 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	}
 }
 
+func (m *Manager) retireBackendOwners(owners map[gnet.EventLoop]struct{}) {
+	m.mu.Lock()
+	sessions := make([]*Session, 0, len(m.sessions))
+	for _, session := range m.sessions {
+		if _, stopped := owners[session.owner]; stopped {
+			sessions = append(sessions, session)
+		}
+	}
+	m.mu.Unlock()
+	for _, session := range sessions {
+		session.retireBackendOwner()
+	}
+}
+
 func (m *Manager) acquireStream() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -446,6 +473,15 @@ func (m *Manager) changePendingBudget(byteDelta, itemDelta int, class pendingCla
 			reserveItems, _ = checkedMulInt(reserveItems, m.limits.MaxSessions)
 			byteLimit -= reserveBytes
 			itemLimit -= reserveItems
+		}
+		if m.backendFactory != nil && class != pendingControl && class != pendingHandoff {
+			reserveBytes, reserveItems := backendHandoffReserve(m.limits)
+			if class == pendingBackendInput {
+				reserveBytes /= 2
+				reserveItems /= 2
+			}
+			byteLimit -= reserveBytes * m.limits.MaxSessions
+			itemLimit -= reserveItems * m.limits.MaxSessions
 		}
 		if byteDelta < 0 || itemDelta < 0 ||
 			int64(byteDelta) > int64(byteLimit)-m.pendingBytes ||

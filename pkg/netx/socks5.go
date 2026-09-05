@@ -4,85 +4,67 @@ import (
 	"context"
 	"errors"
 	"net"
+	"time"
 
 	"golang.org/x/net/proxy"
 )
 
-var errNoHalfClose = errors.New("connection does not support half-close")
+// DialWithConn keeps ownership of the raw socket with us. The contextual Dial
+// method in x/net wraps it in a connection without SyscallConn or half-close.
+type socks5Connector interface {
+	DialWithConn(context.Context, net.Conn, string, string) (net.Addr, error)
+}
 
 // Socks5Dialer wraps a SOCKS5 proxy dialer with socket tuning.
 type Socks5Dialer struct {
 	ProxyAddr string
-	dialer    proxy.Dialer
+	dialer    socks5Connector
 }
 
 // NewSocks5Dialer creates a new SOCKS5 dialer.
 func NewSocks5Dialer(proxyAddr string) (*Socks5Dialer, error) {
-	// Create SOCKS5 dialer with direct connection as forward dialer
 	dialer, err := proxy.SOCKS5("tcp", proxyAddr, nil, proxy.Direct)
 	if err != nil {
 		return nil, err
 	}
 
-	return &Socks5Dialer{
-		ProxyAddr: proxyAddr,
-		dialer:    dialer,
-	}, nil
+	connector, ok := dialer.(socks5Connector)
+	if !ok {
+		return nil, errors.New("SOCKS5 dialer does not support contextual handshakes")
+	}
+	return &Socks5Dialer{ProxyAddr: proxyAddr, dialer: connector}, nil
 }
 
 // Dial connects to the address via SOCKS5 proxy.
 func (d *Socks5Dialer) Dial(network, address string) (Conn, error) {
-	conn, err := d.dialer.Dial(network, address)
-	if err != nil {
-		return nil, err
-	}
-
-	// Tune the connection if it's TCP
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		if err := TuneConn(tcpConn); err != nil {
-			conn.Close()
-			return nil, err
-		}
-		return tcpConn, nil
-	}
-
-	// Check if connection implements Conn interface (half-close support)
-	if c, ok := conn.(Conn); ok {
-		return c, nil
-	}
-
-	// Connection doesn't support half-close - close and return error
-	conn.Close()
-	return nil, errNoHalfClose
+	return d.DialContext(context.Background(), network, address)
 }
 
 // DialContext connects to the address via SOCKS5 proxy with context support.
 func (d *Socks5Dialer) DialContext(ctx context.Context, network, address string) (Conn, error) {
-	// Check if dialer supports context
-	if ctxDialer, ok := d.dialer.(proxy.ContextDialer); ok {
-		conn, err := ctxDialer.DialContext(ctx, network, address)
-		if err != nil {
-			return nil, err
-		}
-
-		if tcpConn, ok := conn.(*net.TCPConn); ok {
-			if err := TuneConn(tcpConn); err != nil {
-				conn.Close()
-				return nil, err
-			}
-			return tcpConn, nil
-		}
-
-		// Check if connection implements Conn interface (half-close support)
-		if c, ok := conn.(Conn); ok {
-			return c, nil
-		}
-
-		// Connection doesn't support half-close - close and return error
-		conn.Close()
-		return nil, errNoHalfClose
+	if ctx == nil {
+		return nil, errors.New("nil context")
 	}
+	// Bound both TCP establishment and the SOCKS greeting/CONNECT exchange.
+	ctx, cancel := context.WithTimeout(ctx, DialTimeout)
+	defer cancel()
 
-	// Fallback to non-context dial
-	return d.Dial(network, address)
+	conn, err := NewDialer().DialContext(ctx, "tcp", d.ProxyAddr)
+	if err != nil {
+		return nil, err
+	}
+	_, err = d.dialer.DialWithConn(ctx, conn, network, address)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		err = ctxErr
+	} else if err != nil {
+		// The socket deadline and context timer can fire in either order.
+		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= 0 {
+			err = context.DeadlineExceeded
+		}
+	}
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return conn, nil
 }

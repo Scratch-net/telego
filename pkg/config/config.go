@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"net"
+	"net/netip"
 	"os"
 	"slices"
 	"strings"
@@ -143,6 +144,8 @@ type WebProxyRuntimeConfig struct {
 	BindAddr             string
 	Hostname             string
 	Backend              string
+	LogicalBackend       bool
+	MTProxyAddr          net.Addr
 	Carrier              webproxy.CarrierMode
 	TrustedProxyCIDRs    []string
 	NumEventLoops        int
@@ -301,9 +304,9 @@ func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
 		cfg.MaxWriteBuffer = c.Performance.MaxWriteBufferMB * 1024 * 1024
 	}
 
-	// The native WEB backend always supplies a validated internal PROXY header.
-	// Public PROXY behavior remains controlled by [general].proxy-protocol.
-	cfg.InternalProxyProtocol = c.WebProxy.Enabled
+	// Explicit local WEB backends carry the process-local authentication
+	// preface. Logical streams supply trusted metadata directly to the core.
+	cfg.InternalProxyProtocol = c.WebProxy.Enabled && c.WebProxy.Backend != ""
 	cfg.WebProxyFingerprint = c.webProxyFingerprint()
 	cfg.MiddleEndFingerprint = c.middleEndFingerprint()
 	if c.MiddleEnd.Enabled {
@@ -344,13 +347,28 @@ func (c *Config) ToWebProxyRuntimeConfig(mtProxyBind string) (WebProxyRuntimeCon
 	if strings.HasPrefix(bindAddr, "unix://") || strings.HasPrefix(bindAddr, "/") {
 		return WebProxyRuntimeConfig{}, errors.New("web-proxy.bind-to must be a TCP address; Unix sockets cannot authenticate the Nginx peer")
 	}
-	backend := c.WebProxy.Backend
-	if backend == "" {
-		var err error
-		backend, err = deriveLocalWebBackend(mtProxyBind)
-		if err != nil {
-			return WebProxyRuntimeConfig{}, fmt.Errorf("web-proxy.backend is required: %w", err)
+	if strings.Contains(bindAddr, "://") && !strings.HasPrefix(bindAddr, "tcp://") {
+		return WebProxyRuntimeConfig{}, errors.New("web-proxy.bind-to must use TCP")
+	}
+	if _, _, err := net.SplitHostPort(strings.TrimPrefix(bindAddr, "tcp://")); err != nil {
+		return WebProxyRuntimeConfig{}, fmt.Errorf("invalid web-proxy.bind-to: %w", err)
+	}
+	for _, value := range c.WebProxy.TrustedProxyCIDRs {
+		prefix, err := netip.ParsePrefix(value)
+		if err != nil || prefix != prefix.Masked() || prefix.String() != value {
+			return WebProxyRuntimeConfig{}, fmt.Errorf("web-proxy.trusted-proxy-cidrs contains noncanonical CIDR %q", value)
 		}
+	}
+	backend := c.WebProxy.Backend
+	logicalBackend := backend == ""
+	var listenerAddr net.Addr
+	if logicalBackend {
+		listenerAddr, err = webProxyListenerAddr(mtProxyBind)
+		if err != nil {
+			return WebProxyRuntimeConfig{}, fmt.Errorf("invalid MTProxy listener for logical WEB streams: %w", err)
+		}
+	} else if err := webproxy.ValidateLocalBackend(backend); err != nil {
+		return WebProxyRuntimeConfig{}, fmt.Errorf("invalid web-proxy.backend: %w", err)
 	}
 
 	profiles := make([]webproxy.Profile, 0, len(c.Secrets)*2)
@@ -373,45 +391,44 @@ func (c *Config) ToWebProxyRuntimeConfig(mtProxyBind string) (WebProxyRuntimeCon
 			profiles = append(profiles, profile)
 		}
 	}
+	if len(profiles) == 0 {
+		return WebProxyRuntimeConfig{}, errors.New("WEB proxy requires at least one secret")
+	}
 
 	return WebProxyRuntimeConfig{
 		Enabled:              true,
 		BindAddr:             bindAddr,
 		Hostname:             hostname,
 		Backend:              backend,
+		LogicalBackend:       logicalBackend,
+		MTProxyAddr:          listenerAddr,
 		Carrier:              carrier,
-		TrustedProxyCIDRs:    append([]string(nil), c.WebProxy.TrustedProxyCIDRs...),
+		TrustedProxyCIDRs:    slices.Clone(c.WebProxy.TrustedProxyCIDRs),
 		NumEventLoops:        c.WebProxy.NumEventLoops,
 		Profiles:             profiles,
-		BackendProxyProtocol: true,
+		BackendProxyProtocol: !logicalBackend,
 	}, nil
 }
 
-func deriveLocalWebBackend(bindAddr string) (string, error) {
+func webProxyListenerAddr(bindAddr string) (net.Addr, error) {
 	address := strings.TrimPrefix(bindAddr, "tcp://")
 	if strings.HasPrefix(address, "unix://") || strings.HasPrefix(address, "/") {
 		path := strings.TrimPrefix(address, "unix://")
 		if !strings.HasPrefix(path, "/") || path == "/" {
-			return "", fmt.Errorf("invalid MTProxy Unix-socket bind %q", bindAddr)
+			return nil, fmt.Errorf("invalid MTProxy Unix-socket bind %q", bindAddr)
 		}
-		return "unix://" + path, nil
+		return &net.UnixAddr{Name: path, Net: "unix"}, nil
 	}
-	host, port, err := net.SplitHostPort(address)
+	tcpAddr, err := net.ResolveTCPAddr("tcp", address)
 	if err != nil {
-		return "", fmt.Errorf("cannot derive a TCP port from MTProxy bind %q", bindAddr)
+		return nil, err
 	}
-	switch host {
-	case "", "0.0.0.0", "127.0.0.1":
-		return net.JoinHostPort("127.0.0.1", port), nil
-	case "::", "::1":
-		return net.JoinHostPort("::1", port), nil
-	default:
-		ip := net.ParseIP(host)
-		if ip != nil && ip.IsLoopback() {
-			return net.JoinHostPort(host, port), nil
-		}
-		return "", fmt.Errorf("MTProxy bind %q is not wildcard or loopback", bindAddr)
+	if len(tcpAddr.IP) == 0 {
+		// gnet's tcp wildcard listener selects AF_INET6 and maps an empty IP
+		// to IPv6 unspecified. Keep the configured port, including zero.
+		tcpAddr.IP = net.IPv6zero
 	}
+	return tcpAddr, nil
 }
 
 func (c *Config) webProxyFingerprint() string {

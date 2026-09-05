@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/panjf2000/gnet/v2"
+	errorx "github.com/panjf2000/gnet/v2/pkg/errors"
 )
 
 const (
@@ -88,6 +89,8 @@ type HTTPServer struct {
 	runErr         error
 	readyOnce      sync.Once
 	trustedProxies []netip.Prefix
+	ownersMu       sync.Mutex
+	owners         map[gnet.EventLoop]struct{}
 }
 
 // NewHTTPServer validates a WEB HTTP engine without starting it.
@@ -216,6 +219,13 @@ func (s *HTTPServer) Start(ctx context.Context) error {
 	}
 	go func() {
 		err := gnet.Run(s.handler, address, options...)
+		// Run joins all loops before returning. Retire accepted but abandoned
+		// backend work before reporting engine completion to runtime shutdown.
+		s.ownersMu.Lock()
+		owners := s.owners
+		s.owners = nil
+		s.ownersMu.Unlock()
+		s.config.Manager.retireBackendOwners(owners)
 		s.runErrMu.Lock()
 		s.runErr = err
 		s.runErrMu.Unlock()
@@ -299,6 +309,16 @@ func stopGnetEngine(ctx context.Context, done <-chan struct{}, stop func(context
 	case <-done:
 		return nil
 	case err := <-result:
+		if errors.Is(err, errorx.ErrEngineInShutdown) {
+			// Engine.Stop can observe shutdown before Run has joined its loops.
+			// Only Run completion permits owner retirement and a successful Stop.
+			select {
+			case <-done:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 		return err
 	case <-ctx.Done():
 		select {
@@ -333,6 +353,15 @@ func (h *httpEventHandler) OnBoot(engine gnet.Engine) gnet.Action {
 func (*httpEventHandler) OnShutdown(gnet.Engine) {}
 
 func (h *httpEventHandler) OnOpen(connection gnet.Conn) ([]byte, gnet.Action) {
+	h.server.ownersMu.Lock()
+	if h.server.owners == nil {
+		h.server.owners = make(map[gnet.EventLoop]struct{})
+	}
+	h.server.owners[connection.EventLoop()] = struct{}{}
+	h.server.ownersMu.Unlock()
+	if backend, ok := connection.Context().(*socketBackend); ok {
+		return backend.onOpen(connection)
+	}
 	_ = connection.SetNoDelay(true)
 	state := &httpConnectionState{peerIP: remoteIP(connection.RemoteAddr())}
 	connection.SetContext(state)
@@ -340,7 +369,11 @@ func (h *httpEventHandler) OnOpen(connection gnet.Conn) ([]byte, gnet.Action) {
 	return nil, gnet.None
 }
 
-func (*httpEventHandler) OnClose(connection gnet.Conn, _ error) gnet.Action {
+func (*httpEventHandler) OnClose(connection gnet.Conn, err error) gnet.Action {
+	if backend, ok := connection.Context().(*socketBackend); ok {
+		backend.finish(err)
+		return gnet.None
+	}
 	if state, ok := connection.Context().(*httpConnectionState); ok {
 		state.close()
 	}
@@ -348,6 +381,9 @@ func (*httpEventHandler) OnClose(connection gnet.Conn, _ error) gnet.Action {
 }
 
 func (h *httpEventHandler) OnTraffic(connection gnet.Conn) gnet.Action {
+	if backend, ok := connection.Context().(*socketBackend); ok {
+		return backend.onTraffic(connection)
+	}
 	state, ok := connection.Context().(*httpConnectionState)
 	if !ok {
 		return gnet.Close
@@ -730,6 +766,7 @@ const (
 )
 
 type preparedRequest struct {
+	owner              gnet.EventLoop
 	request            carrierRequest
 	kind               requestKind
 	capability         Capability
@@ -1013,6 +1050,7 @@ func (h *httpEventHandler) dispatch(
 	request *preparedRequest,
 	body []byte,
 ) {
+	request.owner = connection.EventLoop()
 	ctx, cancel := context.WithCancel(context.Background())
 	operationTimeout := h.server.config.BodyTimeout
 	if request.kind == requestDown {
@@ -1106,7 +1144,7 @@ func (h *httpEventHandler) serve(
 		}, page.Body)
 
 	case requestCreate:
-		result, err := request.bootstrapAuth.Create(request.clientIP, body)
+		result, err := request.bootstrapAuth.create(request.clientIP, body, request.owner)
 		if err != nil {
 			if errors.Is(err, ErrLimit) || errors.Is(err, ErrBackpressure) {
 				return retryResponse()

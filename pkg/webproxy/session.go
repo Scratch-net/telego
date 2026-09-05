@@ -11,6 +11,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/panjf2000/gnet/v2"
 )
 
 type pendingClass uint8
@@ -19,6 +21,8 @@ const (
 	pendingUplink pendingClass = iota
 	pendingDownlink
 	pendingControl
+	pendingHandoff
+	pendingBackendInput
 )
 
 type sessionOptions struct {
@@ -30,6 +34,8 @@ type sessionOptions struct {
 	limits                Limits
 	timeouts              Timeouts
 	dialBackend           BackendDialContextFunc
+	backendFactory        BackendFactory
+	owner                 gnet.EventLoop
 	budget                func(int, int, pendingClass) bool
 	onFinished            func(*Session, sessionCloseReason)
 	onCarrierRetry        func(carrierOperation)
@@ -49,6 +55,7 @@ type streamState struct {
 	writes            [][]byte
 	writeNotify       chan struct{}
 	creditNotify      chan struct{}
+	writeOffset       int
 }
 
 type streamSnapshot struct {
@@ -100,18 +107,25 @@ func newCarrierLane() *carrierLane {
 // Session is one authenticated HTTPS carrier session. The serialized carrier
 // permits one uplink and downlink. The lanes carrier permits one pair per lane.
 type Session struct {
-	profile     Profile
-	carrier     CarrierMode
-	clientIP    string
-	backendNet  string
-	backend     string
-	limits      Limits
-	timeouts    Timeouts
-	dialBackend BackendDialContextFunc
-	budget      func(int, int, pendingClass) bool
+	profile        Profile
+	carrier        CarrierMode
+	clientIP       string
+	backendNet     string
+	backend        string
+	limits         Limits
+	timeouts       Timeouts
+	dialBackend    BackendDialContextFunc
+	backendFactory BackendFactory
+	owner          gnet.EventLoop
+	ownerStopped   bool
+	pumpQueued     bool
+	pumpPending    []*backendStream
+	pumpDirty      bool
+	budget         func(int, int, pendingClass) bool
 
 	mu              sync.Mutex
 	streams         map[uint32]*streamState
+	backends        map[*backendStream]struct{}
 	usedStreams     streamIDHistory
 	tombstones      boundedSet[uint32]
 	carrierLanes    map[uint32]*carrierLane
@@ -173,8 +187,11 @@ func newSession(options sessionOptions) *Session {
 		limits:                options.limits,
 		timeouts:              options.timeouts,
 		dialBackend:           options.dialBackend,
+		backendFactory:        options.backendFactory,
+		owner:                 options.owner,
 		budget:                options.budget,
 		streams:               make(map[uint32]*streamState),
+		backends:              make(map[*backendStream]struct{}),
 		tombstones:            newBoundedSet[uint32](options.limits.MaxClosedStreamIDs),
 		carrierLanes:          carrierLanes,
 		lastActivity:          time.Now(),
@@ -493,7 +510,12 @@ func (s *Session) processUp(
 
 	requestBackendCloses(closed)
 	for _, backend := range opened {
-		go s.runBackend(backend)
+		if s.backendFactory == nil {
+			go s.runBackend(backend)
+		}
+	}
+	if s.backendFactory != nil {
+		s.scheduleBackendPump()
 	}
 	if !applied {
 		s.closeWithReason(sessionCloseResource)
@@ -1003,14 +1025,16 @@ func (s *Session) applyBatchLocked(frames []Frame, reservedCost, reservedItems i
 func (s *Session) appendBackendWriteLocked(state *streamState, payload []byte) (int, int) {
 	cost := len(payload) + queueItemCost
 	items := 1
-	coalesce := len(state.writes) != 0 && len(state.writes[len(state.writes)-1])+len(payload) <= RelayDataChunk
+	coalesce := s.backendFactory == nil && len(state.writes) != 0 && len(state.writes[len(state.writes)-1])+len(payload) <= RelayDataChunk
 	if coalesce {
 		cost = len(payload)
 		items = 0
 		last := len(state.writes) - 1
 		state.writes[last] = append(state.writes[last], payload...)
 	} else {
-		state.writes = append(state.writes, bytes.Clone(payload))
+		owned := make([]byte, len(payload))
+		copy(owned, payload)
+		state.writes = append(state.writes, owned)
 	}
 	state.pendingWriteBytes += len(payload)
 	state.pendingWriteCost += cost
@@ -1200,6 +1224,11 @@ func (s *Session) queueFrameLocked(frameType FrameType, streamID uint32, payload
 
 func (s *Session) uplinkPendingLimits() (int, int) {
 	reserveCost, reserveItems, _ := pendingControlReserve(s.limits)
+	if s.backendFactory != nil {
+		cost, items := backendHandoffReserve(s.limits)
+		reserveCost += cost
+		reserveItems += items
+	}
 	return subtractReserve(
 		s.limits.MaxPendingPerSession,
 		s.limits.MaxPendingItemsPerSession,
@@ -1243,6 +1272,13 @@ func (s *Session) reservePendingLocked(cost, items int, class pendingClass) bool
 		costLimit, itemLimit = s.uplinkPendingLimits()
 	case pendingDownlink:
 		costLimit, itemLimit = s.downlinkPendingLimits()
+	case pendingHandoff:
+		reserveCost, reserveItems, _ := pendingControlReserve(s.limits)
+		costLimit, itemLimit = subtractReserve(costLimit, itemLimit, reserveCost, reserveItems)
+	case pendingBackendInput:
+		reserveCost, reserveItems, _ := pendingControlReserve(s.limits)
+		handoffCost, handoffItems := backendHandoffReserve(s.limits)
+		costLimit, itemLimit = subtractReserve(costLimit, itemLimit, reserveCost+handoffCost/2, reserveItems+handoffItems/2)
 	}
 	if cost <= 0 || items < 0 || cost > costLimit || items > itemLimit ||
 		s.pendingCost > costLimit-cost || s.pendingItems > itemLimit-items {
@@ -1257,6 +1293,11 @@ func (s *Session) reservePendingLocked(cost, items int, class pendingClass) bool
 }
 
 func (s *Session) releasePendingLocked(cost, items int) {
+	s.releasePendingQuietLocked(cost, items)
+	s.scheduleBackendPumpLocked()
+}
+
+func (s *Session) releasePendingQuietLocked(cost, items int) {
 	if cost == 0 && items == 0 {
 		return
 	}
@@ -1425,12 +1466,19 @@ func (s *Session) closeLocked(reason sessionCloseReason) []*backendStream {
 		backends = append(backends, state.backend)
 	}
 	s.streams = nil
-	if s.pendingCost != 0 || s.pendingItems != 0 {
+	// Owner backends retain their queue charges until OnClosed confirms the
+	// actual storage has been released. Other sessions cannot reuse them early.
+	retainedCost, retainedItems := 0, 0
+	for backend := range s.backends {
+		retainedCost += backend.inputCost + backend.outputCost
+		retainedItems += backend.inputItems + backend.outputItems
+	}
+	if s.pendingCost != retainedCost || s.pendingItems != retainedItems {
 		if s.budget != nil {
-			s.budget(-s.pendingCost, -s.pendingItems, pendingUplink)
+			s.budget(retainedCost-s.pendingCost, retainedItems-s.pendingItems, pendingUplink)
 		}
-		s.pendingCost = 0
-		s.pendingItems = 0
+		s.pendingCost = retainedCost
+		s.pendingItems = retainedItems
 	}
 	for _, lane := range s.carrierLanes {
 		lane.pendingFrames = nil
@@ -1488,28 +1536,44 @@ func signal(channel chan struct{}) {
 
 func requestBackendCloses(backends []*backendStream) {
 	for _, backend := range backends {
-		go backend.close()
+		if backend.session.backendFactory != nil {
+			backend.close()
+		} else {
+			go backend.close()
+		}
 	}
 }
 
 type backendStream struct {
-	session   *Session
-	id        uint32
-	ctx       context.Context
-	cancel    context.CancelFunc
-	connMu    sync.Mutex
-	conn      net.Conn
-	closeOnce sync.Once
+	session                 *Session
+	id                      uint32
+	ctx                     context.Context
+	cancel                  context.CancelFunc
+	connMu                  sync.Mutex
+	conn                    net.Conn
+	closeOnce               sync.Once
+	openOnce                sync.Once
+	finishOnce              sync.Once
+	logical                 Backend
+	started                 bool
+	opened                  bool
+	terminal                bool
+	inputCost, inputItems   int
+	outputCost, outputItems int
 }
 
 func newBackendStream(session *Session, id uint32) *backendStream {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &backendStream{
+	backend := &backendStream{
 		session: session,
 		id:      id,
 		ctx:     ctx,
 		cancel:  cancel,
 	}
+	if session.backendFactory != nil {
+		session.backends[backend] = struct{}{}
+	}
+	return backend
 }
 
 func (b *backendStream) run() {
@@ -1594,6 +1658,11 @@ func (b *backendStream) readLoop(connection net.Conn) {
 }
 
 func (b *backendStream) close() {
+	if b.session.backendFactory != nil {
+		b.cancel()
+		b.session.scheduleBackendPump()
+		return
+	}
 	b.closeOnce.Do(func() {
 		b.cancel()
 		b.connMu.Lock()

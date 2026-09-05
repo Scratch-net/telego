@@ -2,6 +2,7 @@ package gproxy
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -69,7 +70,7 @@ func (l *blockingDirectDialLogger) Debug(format string, args ...any) {
 
 func captureOutboundHandshake(handler *ProxyHandler) <-chan capturedOutboundHandshake {
 	captured := make(chan capturedOutboundHandshake, 1)
-	handler.directDCDial = func(dcID int, connectionType obfuscated2.ConnectionType) (*directDCConn, error) {
+	handler.directDCDial = func(_ context.Context, dcID int, connectionType obfuscated2.ConnectionType) (*directDCConn, error) {
 		var wire bytes.Buffer
 		_, _, err := writeDCHandshake(&wire, dcID, connectionType)
 		captured <- capturedOutboundHandshake{
@@ -225,7 +226,7 @@ func TestEEDirectRouteLeavesHandshakeStateBeforeBlockingDialLog(t *testing.T) {
 		TimeSkewTolerance: time.Minute,
 		HandshakeTimeout:  handshakeTimeout,
 	}, logger)
-	handler.directDCDial = func(int, obfuscated2.ConnectionType) (*directDCConn, error) {
+	handler.directDCDial = func(context.Context, int, obfuscated2.ConnectionType) (*directDCConn, error) {
 		return nil, net.ErrClosed
 	}
 	clientHello := buildTLSRecord(
@@ -285,7 +286,7 @@ func TestDDDirectRouteLeavesHandshakeStateBeforeBlockingAuthenticatedLog(t *test
 		Secrets:          []Secret{{Name: "test", Key: secret}},
 		HandshakeTimeout: handshakeTimeout,
 	}, logger)
-	handler.directDCDial = func(int, obfuscated2.ConnectionType) (*directDCConn, error) {
+	handler.directDCDial = func(context.Context, int, obfuscated2.ConnectionType) (*directDCConn, error) {
 		return nil, net.ErrClosed
 	}
 	connection := newTestMockGnetConn()
@@ -810,10 +811,11 @@ func TestHandleSplice_NoData(t *testing.T) {
 	ctx.SetState(StateSplicing)
 	mockConn.SetContext(ctx)
 
-	// Create a splice connection using net.Pipe
-	clientSide, _ := net.Pipe()
-	ctx.SetSpliceConn(clientSide)
-	defer clientSide.Close()
+	upstream := newTestMockGnetConn()
+	splice := &spliceConnContext{client: mockConn, clientCtx: ctx}
+	splice.upstream.Store(&spliceUpstream{conn: upstream, output: newRelayOutput(upstream, mockConn, ctx, handler.maxWriteBuffer)})
+	splice.active.Store(true)
+	ctx.splice.Store(splice)
 
 	// No data to read
 	mockConn.SetReadData(nil)

@@ -119,11 +119,11 @@ carrier = "https-lanes"
 # same host. For Docker, use 0.0.0.0:8080 and expose it only on a private network.
 # bind-to = "127.0.0.1:8080"
 
-# Telego automatically derives the local MTProxy backend for WEB streams.
-# Wildcard or loopback TCP binds produce a numeric loopback backend. An MTProxy
-# Unix bind produces the same Unix socket. Set backend only to override this.
-# Every WEB stream includes an authenticated internal PROXY header with the
-# client IP. Telego creates the process-local authentication token in memory.
+# Without backend, WEB streams use the shared MTProxy core on gnet directly.
+# The default path uses no internal TCP or Unix connection.
+# An explicit backend selects a local socket for compatibility.
+# This path retains the authenticated PROXY preface and the client IP.
+# Nginx terminates real TLS in both paths.
 # backend = "127.0.0.1:443"
 # backend = "unix:///run/telego/telego.sock"
 

@@ -65,14 +65,15 @@ Telego MTProxy :9443 (private target of public port 443)
     |
     `-- ordinary TLS --> Nginx :8443 --> Telego WEB :8080
                                               |
-                                              `--> local Telego MTProxy :9443
+                                              `--> shared MTProxy core --> Telegram
 ```
 
 The separate-port layout sends public WEB traffic directly to Nginx:
 
 ```text
-Internet :443  --> Nginx :443 --> Telego WEB :8080 --> Telego MTProxy :9443
-Internet :9443 -------------------------------------> Telego MTProxy :9443
+Internet :443 --> Nginx :443 --> Telego WEB :8080 --+--> shared MTProxy core --> Telegram
+                                                 |
+Internet :9443 --> Telego MTProxy :9443 ------------+
 ```
 
 In both layouts, Telego sends unrecognized MTProxy TLS probes to Nginx on private port 8443.
@@ -81,7 +82,7 @@ With `--no-web`, Nginx serves only the ordinary site. Telego still sends unrecog
 
 The private ports use the shared network namespace. Docker does not publish these ports directly.
 
-Telego derives the local WEB backend from its MTProxy bind. The generated configuration does not need a `backend` option.
+The generated configuration omits `backend`. WEB streams enter the shared MTProxy core directly on gnet. An explicit `backend` selects the local socket compatibility path.
 
 The private Nginx listener on port 8444 supplies the certificate and ServerHello template to Telego.
 

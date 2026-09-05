@@ -1,6 +1,7 @@
 /usr/sbin/telego                                    root:root                    0755
 /etc/sysconfig/telego                               root:root                    0644
-/etc/telego                                         root:root                    0644
+/etc/telego                                         root:telego                  0750
+/etc/telego/telego.toml                              root:telego                  0640
 /usr/share/telego                                   telego:telego                0700
 /var/log/telego                                     telego:telego                0750
-/run/telego                                         telego:telego                0777
+/run/telego                                         telego:telego                0755

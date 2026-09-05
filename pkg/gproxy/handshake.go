@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"strings"
-	"time"
 
 	"github.com/panjf2000/gnet/v2"
 
@@ -16,7 +15,7 @@ import (
 
 // handleDetectProtocol detects whether the client is using ee (TLS) or dd (raw) mode.
 // TLS traffic starts with 0x16 (handshake record type).
-func (h *ProxyHandler) handleDetectProtocol(c gnet.Conn, ctx *ConnContext) gnet.Action {
+func (h *ProxyHandler) handleDetectProtocol(c clientEndpoint, ctx *ConnContext) gnet.Action {
 	data, _ := c.Peek(5)
 	if len(data) < 5 {
 		// Need at least 5 bytes to detect protocol
@@ -44,7 +43,7 @@ func (h *ProxyHandler) handleDetectProtocol(c gnet.Conn, ctx *ConnContext) gnet.
 
 // handleDDFrame parses the raw obfuscated2 handshake frame (DD mode).
 // In DD mode, the 64-byte O2 frame comes directly without TLS wrapping.
-func (h *ProxyHandler) handleDDFrame(c gnet.Conn, ctx *ConnContext) gnet.Action {
+func (h *ProxyHandler) handleDDFrame(c clientEndpoint, ctx *ConnContext) gnet.Action {
 	data, _ := c.Peek(-1)
 	if len(data) < obfuscated2.FrameSize {
 		// Need more data
@@ -155,7 +154,7 @@ func (h *ProxyHandler) handleDDFrame(c gnet.Conn, ctx *ConnContext) gnet.Action 
 }
 
 // handleTLSHeader reads and validates the TLS record header (5 bytes).
-func (h *ProxyHandler) handleTLSHeader(c gnet.Conn, ctx *ConnContext) gnet.Action {
+func (h *ProxyHandler) handleTLSHeader(c clientEndpoint, ctx *ConnContext) gnet.Action {
 	data, _ := c.Peek(-1)
 	if len(data) < faketls.RecordHeaderSize {
 		// Need more data
@@ -196,7 +195,7 @@ func (h *ProxyHandler) handleTLSHeader(c gnet.Conn, ctx *ConnContext) gnet.Actio
 }
 
 // handleTLSPayload parses the ClientHello and sends ServerHello.
-func (h *ProxyHandler) handleTLSPayload(c gnet.Conn, ctx *ConnContext) gnet.Action {
+func (h *ProxyHandler) handleTLSPayload(c clientEndpoint, ctx *ConnContext) gnet.Action {
 	ctx.mu.Lock()
 	payloadLen := ctx.tlsPayloadLen
 	ctx.mu.Unlock()
@@ -248,6 +247,17 @@ func (h *ProxyHandler) handleTLSPayload(c gnet.Conn, ctx *ConnContext) gnet.Acti
 			}
 		}
 		return h.startSplice(c, ctx)
+	}
+
+	// A logical carrier can temporarily run out of shared output budget.
+	// Reserve before consuming the hello or committing replay/admission state.
+	if stream, ok := c.(*LogicalStream); ok {
+		release, ready := prepareClientOutput(c, stream.options.MaxOutputBytes)
+		if !ready {
+			stream.armInputRetry()
+			return gnet.None
+		}
+		defer release()
 	}
 
 	// Check replay
@@ -369,7 +379,9 @@ func (h *ProxyHandler) handleTLSPayload(c gnet.Conn, ctx *ConnContext) gnet.Acti
 	}
 
 	// Send ServerHello - Write() is safe here since we're in EventHandler
-	c.Write(response)
+	if written, err := c.Write(response); err != nil || written != len(response) {
+		return h.failHandshake(ctx, handshakeFailureTLSServerHello)
+	}
 
 	// Transition to reading obfuscated2 frame
 	ctx.SetState(StateReadO2Frame)
@@ -385,7 +397,7 @@ func (h *ProxyHandler) handleTLSPayload(c gnet.Conn, ctx *ConnContext) gnet.Acti
 
 // handleO2Frame parses the obfuscated2 handshake frame and initiates DC connection.
 // The O2 frame is wrapped in a TLS ApplicationData record, possibly preceded by ChangeCipherSpec.
-func (h *ProxyHandler) handleO2Frame(c gnet.Conn, ctx *ConnContext) gnet.Action {
+func (h *ProxyHandler) handleO2Frame(c clientEndpoint, ctx *ConnContext) gnet.Action {
 	data, _ := c.Peek(-1)
 
 	// Skip any ChangeCipherSpec records (0x14) that precede the ApplicationData
@@ -446,8 +458,16 @@ func (h *ProxyHandler) handleO2Frame(c gnet.Conn, ctx *ConnContext) gnet.Action 
 
 			// Check for extra data after the O2 frame in the same TLS record
 			var pendingData []byte
+			var pendingDataRelease func()
 			if len(payload) > obfuscated2.FrameSize {
 				extraData := payload[obfuscated2.FrameSize:]
+				if stream, ok := c.(*LogicalStream); ok {
+					if !stream.reserveAuxInput(len(extraData), 1) {
+						stream.armInputRetry()
+						return gnet.None
+					}
+					pendingDataRelease = func() { stream.releaseAuxInput(len(extraData), 1) }
+				}
 				pendingData = make([]byte, len(extraData))
 				copy(pendingData, extraData)
 			}
@@ -462,6 +482,7 @@ func (h *ProxyHandler) handleO2Frame(c gnet.Conn, ctx *ConnContext) gnet.Action 
 			ctx.encryptor = encryptor
 			ctx.decryptor = decryptor
 			ctx.pendingData = pendingData
+			ctx.pendingDataRelease = pendingDataRelease
 			ctx.mu.Unlock()
 
 			// Preserve the direct-only ordering: the authenticated connection is
@@ -484,77 +505,4 @@ func (h *ProxyHandler) handleO2Frame(c gnet.Conn, ctx *ConnContext) gnet.Action 
 		c.Discard(consumed)
 	}
 	return gnet.None
-}
-
-// startSplice transitions to splice mode for unrecognized clients.
-func (h *ProxyHandler) startSplice(c gnet.Conn, ctx *ConnContext) gnet.Action {
-	if h.config.SpliceHost == "" {
-		h.logger.Debug("[#%d] no splice host configured, closing", ctx.id)
-		return h.failHandshake(ctx, handshakeStageForState(ctx.State()))
-	}
-
-	ctx.SetState(StateSplicing)
-
-	// Clear handshake deadline, set splice idle timeout
-	spliceTimeout := h.config.SpliceIdleTimeout
-	if spliceTimeout <= 0 {
-		spliceTimeout = 30 * time.Second
-	}
-	c.SetReadDeadline(time.Now().Add(spliceTimeout))
-
-	h.logger.Debug("[#%d] splicing to %s:%d", ctx.id, h.config.SpliceHost, h.config.SplicePort)
-
-	// Dial mask host asynchronously
-	go h.dialSplice(c, ctx)
-
-	return gnet.None
-}
-
-// handleSplice forwards data to the splice target.
-func (h *ProxyHandler) handleSplice(c gnet.Conn, ctx *ConnContext) gnet.Action {
-	if ctx.spliceDrainRequested.Load() {
-		return h.handleSpliceDrain(c, ctx)
-	}
-
-	// Lock-free read of splice connection
-	spliceConn := ctx.SpliceConn()
-	if spliceConn == nil {
-		// Still waiting for splice connection
-		return gnet.None
-	}
-
-	// Peek data first - don't consume until write succeeds
-	data, _ := c.Peek(-1)
-	if len(data) == 0 {
-		return gnet.None
-	}
-
-	// Forward to splice target
-	n, err := spliceConn.Write(data)
-	if n > 0 {
-		// Discard only what was successfully written
-		c.Discard(n)
-	}
-	if err != nil {
-		return gnet.Close
-	}
-
-	return gnet.None
-}
-
-// handleSpliceDrain runs only on the client connection's event loop. A wake
-// timer keeps checking until gnet has flushed every queued upstream byte.
-func (h *ProxyHandler) handleSpliceDrain(c gnet.Conn, ctx *ConnContext) gnet.Action {
-	if buffered := c.InboundBuffered(); buffered > 0 {
-		_, _ = c.Discard(buffered)
-	}
-	if !ctx.isSpliceDraining() {
-		return gnet.None
-	}
-	if c.OutboundBuffered() != 0 {
-		ctx.armSpliceDrainWake(c)
-		return gnet.None
-	}
-	ctx.finishSpliceDrain()
-	return gnet.Close
 }

@@ -34,7 +34,7 @@ Read the [Docker procedure](../../docs/web-proxy.md#docker) in the complete WEB 
 
 Replace all example hostnames and secrets before you start the services.
 
-Telego derives the local WEB backend from `[general].bind-to`. The example does not need a `backend` option.
+The example omits `backend`. WEB streams enter the shared MTProxy core directly on gnet, without an internal socket connection. Nginx terminates real TLS.
 
 ## Persistent data
 

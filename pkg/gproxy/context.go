@@ -2,6 +2,7 @@
 package gproxy
 
 import (
+	"context"
 	"crypto/cipher"
 	"fmt"
 	"net"
@@ -81,6 +82,7 @@ type RelayContext struct {
 	DCConn    gnet.Conn     // gnet connection to Telegram DC (enrolled in dcClient)
 	DCEncrypt cipher.Stream // encrypt data TO DC
 	DCDecrypt cipher.Stream // decrypt data FROM DC
+	ToDC      *relayOutput  // bounded cross-loop output to the DC owner
 }
 
 // Global connection ID counter
@@ -92,7 +94,9 @@ type ConnContext struct {
 	id uint64
 
 	// Atomic state - no lock needed for reads
-	state atomic.Int32
+	state            atomic.Int32
+	closeStarted     atomic.Bool
+	directDialCancel context.CancelFunc // protected by mu; retired after setup
 	// handshakeFailureRecorded makes explicit failure accounting one-shot.
 	handshakeFailureRecorded atomic.Bool
 
@@ -124,22 +128,14 @@ type ConnContext struct {
 	relay atomic.Pointer[RelayContext]
 
 	// Buffered data from handshake (protected by mu)
-	pendingData []byte
+	pendingData        []byte
+	pendingDataRelease func()
 
-	// Splice connection - set once atomically when entering splice state
-	// After set, read without locking
-	spliceConn atomic.Pointer[net.Conn]
+	// The splice context connects two gnet owners. It is installed on the
+	// client owner before dialing so cancellation always has an owner.
+	splice atomic.Pointer[spliceConnContext]
 
-	// Splice flow control: signaled when client buffer has space
-	// Used to avoid busy-wait sleep in relaySpliceToClientLoop
-	spliceResume chan struct{}
-	spliceFlowMu sync.Mutex
-	// pending counts AsyncWrite submissions not processed by the event loop;
-	// outbound is the latest event-loop-owned gnet buffer measurement.
-	splicePendingBytes  int
-	spliceOutboundBytes int
-
-	// Splice shutdown is requested by the upstream reader goroutine after a
+	// Splice shutdown is requested by the upstream event loop after a
 	// clean EOF, then owned by the client connection's event loop until every
 	// queued byte has left gnet's outbound buffer.
 	spliceDrainRequested atomic.Bool
@@ -148,6 +144,8 @@ type ConnContext struct {
 	spliceDrainID        uint64
 	spliceDrainDeadline  *time.Timer
 	spliceDrainWake      *time.Timer
+	spliceDrainTail      []byte // client-owner EOF tail copied before gnet releases upstream
+	spliceDrainRelease   func()
 
 	// Real client address from PROXY protocol (if parsed)
 	// Protected by mu during handshake, immutable after
@@ -176,16 +174,17 @@ type ConnContext struct {
 	trafficIn  *atomic.Int64
 	trafficOut *atomic.Int64
 
-	// Backpressure state for hysteresis (avoids oscillation at threshold boundaries)
-	// Once throttled, stays throttled until buffer drops below resumeAt
-	throttledToDC atomic.Bool // Client->DC direction is throttled
-
 	// Relay-direction activity timestamps (Unix millis), updated from different
 	// event loops so accessed atomically. Drive the client-silence wedge breaker:
 	// when the server spoke more recently than the client, the client has an
 	// unanswered reply. Both 0 until the first relayed payload in each direction.
 	lastClientByteMs atomic.Int64 // last client->DC relayed payload
 	lastServerByteMs atomic.Int64 // last DC->client relayed payload
+
+	// Timers publish through atomic pointers because relay activity can come
+	// from another event loop. Each idle timer retains its original timeout.
+	authenticatedIdle atomic.Pointer[authenticatedIdleTimer]
+	handshakeTimer    atomic.Pointer[time.Timer]
 
 	// One-shot splice target override (resolved "host:port") set when an
 	// unauthenticated probe's SNI is on the mask safelist. Consumed by dialSplice.
@@ -254,21 +253,6 @@ func (c *ConnContext) Relay() *RelayContext {
 func (c *ConnContext) SetRelay(r *RelayContext) {
 	c.relay.Store(r)
 	c.state.Store(int32(StateRelaying))
-}
-
-// SpliceConn returns the splice connection (lock-free, may be nil).
-func (c *ConnContext) SpliceConn() net.Conn {
-	if ptr := c.spliceConn.Load(); ptr != nil {
-		return *ptr
-	}
-	return nil
-}
-
-// SetSpliceConn sets the splice connection and initializes flow control.
-func (c *ConnContext) SetSpliceConn(conn net.Conn) {
-	// Initialize flow control channel (buffered to allow non-blocking signal)
-	c.spliceResume = make(chan struct{}, 1)
-	c.spliceConn.Store(&conn)
 }
 
 // RealClientAddr returns the real client address from PROXY protocol.
@@ -341,8 +325,16 @@ func (c *ConnContext) o2Framing() obfuscated2.ConnectionType {
 // Should be called when the connection is closed.
 // Note: cipher.Stream internal state cannot be zeroed (opaque Go types).
 func (c *ConnContext) Cleanup() {
+	c.stopConnectionTimers()
+	if relay := c.Relay(); relay != nil && relay.ToDC != nil {
+		relay.ToDC.close()
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.directDialCancel != nil {
+		c.directDialCancel()
+		c.directDialCancel = nil
+	}
 
 	// Zero ClientHello sensitive fields
 	if c.clientHello != nil {
@@ -355,6 +347,11 @@ func (c *ConnContext) Cleanup() {
 	if c.pendingData != nil {
 		Zeroize(c.pendingData)
 		c.pendingData = nil
+	}
+
+	if c.pendingDataRelease != nil {
+		c.pendingDataRelease()
+		c.pendingDataRelease = nil
 	}
 
 	// Clear references (cipher streams can't be zeroed but break reference)

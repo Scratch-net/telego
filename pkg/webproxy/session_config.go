@@ -95,6 +95,7 @@ type ManagerConfig struct {
 	Timeouts           Timeouts
 	DialContext        DialContextFunc
 	BackendDialContext BackendDialContextFunc
+	BackendFactory     BackendFactory
 }
 
 // DefaultManagerConfig constructs a complete configuration using the protocol
@@ -121,8 +122,10 @@ func validateManagerConfig(config ManagerConfig) error {
 		}
 		capabilities[capability] = struct{}{}
 	}
-	if _, _, err := parseLocalBackend(config.Backend); err != nil {
-		return fmt.Errorf("%w: backend: %v", ErrInvalidManagerConfig, err)
+	if config.Backend != "" || config.BackendFactory == nil {
+		if _, _, err := parseLocalBackend(config.Backend); err != nil {
+			return fmt.Errorf("%w: backend: %v", ErrInvalidManagerConfig, err)
+		}
 	}
 	if !config.Carrier.valid() {
 		return fmt.Errorf("%w: unsupported carrier mode %q", ErrInvalidManagerConfig, config.Carrier)
@@ -203,6 +206,12 @@ func parseLocalBackend(address string) (network, target string, err error) {
 	return "tcp", net.JoinHostPort(host, port), nil
 }
 
+// ValidateLocalBackend checks an explicit numeric loopback TCP or Unix target.
+func ValidateLocalBackend(address string) error {
+	_, _, err := parseLocalBackend(address)
+	return err
+}
+
 func pendingControlReserve(limits Limits) (int, int, bool) {
 	streamItems, ok := checkedMulInt(limits.MaxStreamsPerSession, controlReserveItemsPerStream)
 	if !ok {
@@ -225,6 +234,20 @@ func pendingUplinkReserve(limits Limits) (int, int, bool) {
 	}
 	cost, ok := checkedAddInt(limits.MaxBodyBytes, overhead)
 	return cost, items, ok
+}
+
+// backendHandoffReserve leaves room for a complete maximum backend response
+// to coexist with its carrier encoding. Ordinary carrier admission cannot
+// consume it. Small configurations scale the reserve to their actual limits.
+func backendHandoffReserve(limits Limits) (int, int) {
+	controlBytes, controlItems, _ := pendingControlReserve(limits)
+	localBytes := max(0, limits.MaxPendingPerSession-controlBytes)
+	localItems := max(0, limits.MaxPendingItemsPerSession-controlItems)
+	globalBytes := max(0, limits.MaxPendingGlobal-controlBytes*limits.MaxSessions)
+	globalItems := max(0, limits.MaxPendingItemsGlobal-controlItems*limits.MaxSessions)
+	bytes := min(2*MaxFramePayload+2*RelayDataChunk, localBytes/2, (globalBytes/limits.MaxSessions)*3/4)
+	items := min(8, localItems/4, globalItems/limits.MaxSessions/4)
+	return bytes, items
 }
 
 func checkedAddInt(left, right int) (int, bool) {

@@ -275,7 +275,7 @@ func (f *middleEndFrontend) drainReady() {
 			_ = token.Ack()
 			return
 		}
-		if err := route.conn.Wake(nil); err != nil {
+		if err := wakeClient(route.conn); err != nil {
 			_ = route.conn.Close()
 		}
 	}
@@ -283,20 +283,20 @@ func (f *middleEndFrontend) drainReady() {
 
 func (f *middleEndFrontend) wakeAll() {
 	f.mu.Lock()
-	connections := make([]gnet.Conn, 0, len(f.routes))
+	connections := make([]clientEndpoint, 0, len(f.routes))
 	for _, route := range f.routes {
 		connections = append(connections, route.conn)
 	}
 	f.mu.Unlock()
 	for _, connection := range connections {
-		if err := connection.Wake(nil); err != nil {
+		if err := wakeClient(connection); err != nil {
 			_ = connection.Close()
 		}
 	}
 }
 
 type middleEndRoute struct {
-	conn   gnet.Conn
+	conn   clientEndpoint
 	client *middleEndClient
 
 	mu     sync.Mutex
@@ -352,6 +352,7 @@ type middleEndClient struct {
 	drs                   *faketls.DRSState
 	pendingCipher         []byte
 	pendingCipherRetained int
+	pendingCipherRelease  func()
 	pendingPlain          []byte
 	pendingPlainRetained  int
 	waiting               *middleend.ProxyRequest
@@ -369,7 +370,7 @@ type middleEndClient struct {
 	outputEvicting      atomic.Bool
 }
 
-func (h *ProxyHandler) commitAuthenticatedRoute(c gnet.Conn, ctx *ConnContext) gnet.Action {
+func (h *ProxyHandler) commitAuthenticatedRoute(c clientEndpoint, ctx *ConnContext) gnet.Action {
 	if h.middleEnd == nil {
 		return h.startDirectRoute(c, ctx)
 	}
@@ -395,23 +396,24 @@ func (h *ProxyHandler) commitAuthenticatedRoute(c gnet.Conn, ctx *ConnContext) g
 	return gnet.Close
 }
 
-func (h *ProxyHandler) startDirectRoute(c gnet.Conn, ctx *ConnContext) gnet.Action {
+func (h *ProxyHandler) startDirectRoute(c clientEndpoint, ctx *ConnContext) gnet.Action {
 	ctx.SetState(StateDialingDC)
-	c.SetReadDeadline(time.Time{})
-	if idleTimeout := h.IdleTimeout(); idleTimeout > 0 {
-		c.SetReadDeadline(time.Now().Add(idleTimeout))
-	}
-	go h.dialDC(c, ctx)
+	ctx.startAuthenticatedIdle(c, h.IdleTimeout())
+	done := retainLogicalWork(c)
+	go func() { defer done(); h.dialDC(c, ctx) }()
 	return gnet.None
 }
 
 func (f *middleEndFrontend) commit(
-	c gnet.Conn,
+	c clientEndpoint,
 	ctx *ConnContext,
 	enableDRS bool,
 	enableSplitTLS bool,
 	idleTimeout time.Duration,
 ) (bool, error) {
+	if stream, ok := c.(*LogicalStream); ok && stream.options.MaxOutputBytes < middleEndMaxEncodedResponse {
+		return false, fmt.Errorf("%w: logical output limit cannot hold one response", ErrMiddleEndClientBackpressure)
+	}
 	ctx.mu.Lock()
 	dcID := ctx.dcID
 	connectionType := ctx.o2ConnectionType
@@ -508,16 +510,15 @@ func (f *middleEndFrontend) commit(
 	ctx.encryptor = nil
 	ctx.decryptor = nil
 	ctx.pendingData = nil
+	client.pendingCipherRelease = ctx.pendingDataRelease
+	ctx.pendingDataRelease = nil
 	ctx.middleEnd = client
 	ctx.mu.Unlock()
 	ctx.SetState(StateMiddleEnd)
 	f.mu.Unlock()
 
-	c.SetReadDeadline(time.Time{})
-	if idleTimeout > 0 {
-		c.SetReadDeadline(time.Now().Add(idleTimeout))
-	}
-	if err := c.Wake(nil); err != nil {
+	ctx.startAuthenticatedIdle(c, idleTimeout)
+	if err := wakeClient(c); err != nil {
 		return true, fmt.Errorf("wake committed Middle-End client: %w", err)
 	}
 	return true, nil
@@ -542,7 +543,7 @@ func (f *middleEndFrontend) closeDirectFallback(connectionID uint64) {
 }
 
 func middleEndClientTuple(
-	c gnet.Conn,
+	c clientEndpoint,
 	ctx *ConnContext,
 ) (netip.AddrPort, netip.AddrPort, error) {
 	remote := c.RemoteAddr()
@@ -600,7 +601,7 @@ func middleEndAddrPort(
 	return netip.AddrPortFrom(addr, addrPort.Port()), nil
 }
 
-func (h *ProxyHandler) handleMiddleEnd(c gnet.Conn, ctx *ConnContext) gnet.Action {
+func (h *ProxyHandler) handleMiddleEnd(c clientEndpoint, ctx *ConnContext) gnet.Action {
 	client := ctx.middleEnd
 	if client == nil || client.binding == nil {
 		return gnet.Close
@@ -632,7 +633,13 @@ func (h *ProxyHandler) handleMiddleEnd(c gnet.Conn, ctx *ConnContext) gnet.Actio
 		return action
 	}
 
+	inputBefore := c.InboundBuffered()
 	packet, ok, err := client.nextPacket(c)
+	if c.InboundBuffered() < inputBefore {
+		// Packet assembly can span many reads. Consumed payload refreshes the
+		// idle timer, while the silence breaker waits for a relayed request.
+		ctx.refreshAuthenticatedIdle()
+	}
 	if err != nil {
 		h.logger.Debug("[%s] decode Middle-End client packet: %v", ctx.LogPrefix(), err)
 		return gnet.Close
@@ -644,7 +651,7 @@ func (h *ProxyHandler) handleMiddleEnd(c gnet.Conn, ctx *ConnContext) gnet.Actio
 }
 
 func (h *ProxyHandler) handleMiddleEndToken(
-	c gnet.Conn,
+	c clientEndpoint,
 	ctx *ConnContext,
 	client *middleEndClient,
 ) (bool, gnet.Action) {
@@ -725,6 +732,13 @@ func (h *ProxyHandler) handleMiddleEndToken(
 		return true, gnet.None
 	}
 	outputReservation := int64(middleEndMaxEncodedResponse)
+	releaseOutput, prepared := prepareClientOutput(c, middleEndMaxEncodedResponse)
+	if !prepared {
+		client.frontend.outputBudget.release(outputReservation)
+		client.armOutputRetry(c, client.frontend.stallTimeout)
+		return true, gnet.None
+	}
+	defer releaseOutput()
 
 	event, ok, err := token.TryNextEvent()
 	if err != nil {
@@ -774,16 +788,16 @@ func (c *middleEndClient) finishToken(token *middleend.ClientReadyToken) error {
 	return token.Ack()
 }
 
-func (c *middleEndClient) outputHeadroom(connection gnet.Conn, maximum int) bool {
+func (c *middleEndClient) outputHeadroom(connection clientEndpoint, maximum int) bool {
 	return connection.OutboundBuffered() <= maximum-middleEndMaxEncodedResponse
 }
 
-func (c *middleEndClient) beginOrderlyClose(connection gnet.Conn) gnet.Action {
+func (c *middleEndClient) beginOrderlyClose(connection clientEndpoint) gnet.Action {
 	c.closeAfterDrain = true
 	return c.continueOrderlyClose(connection)
 }
 
-func (c *middleEndClient) continueOrderlyClose(connection gnet.Conn) gnet.Action {
+func (c *middleEndClient) continueOrderlyClose(connection clientEndpoint) gnet.Action {
 	if connection.OutboundBuffered() == 0 {
 		c.resetOutputProgress()
 		return gnet.Close
@@ -794,7 +808,7 @@ func (c *middleEndClient) continueOrderlyClose(connection gnet.Conn) gnet.Action
 	return gnet.None
 }
 
-func (c *middleEndClient) waitForOutput(connection gnet.Conn) bool {
+func (c *middleEndClient) waitForOutput(connection clientEndpoint) bool {
 	now := time.Now()
 	if c.outputStallDeadline.IsZero() {
 		c.outputStallDeadline = now.Add(c.frontend.stallTimeout)
@@ -806,7 +820,7 @@ func (c *middleEndClient) waitForOutput(connection gnet.Conn) bool {
 	return true
 }
 
-func (c *middleEndClient) refreshOutput(connection gnet.Conn, reservation int64) bool {
+func (c *middleEndClient) refreshOutput(connection clientEndpoint, reservation int64) bool {
 	current, previous := c.reconcileOutput(connection, reservation)
 	if current == 0 {
 		c.resetOutputProgress()
@@ -826,7 +840,7 @@ func (c *middleEndClient) refreshOutput(connection gnet.Conn, reservation int64)
 	return true
 }
 
-func (c *middleEndClient) armOutputRetry(connection gnet.Conn, remaining time.Duration) {
+func (c *middleEndClient) armOutputRetry(connection clientEndpoint, remaining time.Duration) {
 	c.retryMu.Lock()
 	defer c.retryMu.Unlock()
 	if c.closed || c.retryTimer != nil {
@@ -846,7 +860,7 @@ func (c *middleEndClient) armOutputRetry(connection gnet.Conn, remaining time.Du
 		}
 		c.retryTimer = nil
 		c.retryMu.Unlock()
-		if err := connection.Wake(nil); err != nil {
+		if err := wakeClient(connection); err != nil {
 			_ = connection.Close()
 		}
 	})
@@ -907,14 +921,12 @@ func (h *ProxyHandler) prepareMiddleEndRequest(
 	if counter := ctx.TrafficIn(); counter != nil {
 		counter.Add(int64(packetSize))
 	}
-	if h.clientSilenceCloseMs > 0 {
-		ctx.lastClientByteMs.Store(time.Now().UnixMilli())
-	}
+	ctx.recordClientActivity()
 	return gnet.None
 }
 
 func (h *ProxyHandler) writeMiddleEndEvent(
-	c gnet.Conn,
+	c clientEndpoint,
 	ctx *ConnContext,
 	client *middleEndClient,
 	event middleend.LinkEvent,
@@ -950,13 +962,11 @@ func (h *ProxyHandler) writeMiddleEndEvent(
 	if counter := ctx.TrafficOut(); counter != nil {
 		counter.Add(int64(payloadSize))
 	}
-	if h.clientSilenceCloseMs > 0 {
-		ctx.lastServerByteMs.Store(time.Now().UnixMilli())
-	}
+	ctx.recordServerActivity()
 	return gnet.None
 }
 
-func (c *middleEndClient) writeWire(connection gnet.Conn, wire []byte) error {
+func (c *middleEndClient) writeWire(connection clientEndpoint, wire []byte) error {
 	if c.mode == ModeDD {
 		out := make([]byte, len(wire))
 		defer clear(out)
@@ -996,7 +1006,7 @@ func (c *middleEndClient) writeWire(connection gnet.Conn, wire []byte) error {
 	return writeAllOwner(connection, out)
 }
 
-func writeAllOwner(connection gnet.Conn, wire []byte) error {
+func writeAllOwner(connection clientEndpoint, wire []byte) error {
 	written, err := connection.Write(wire)
 	if err != nil {
 		return err
@@ -1007,7 +1017,7 @@ func writeAllOwner(connection gnet.Conn, wire []byte) error {
 	return nil
 }
 
-func (c *middleEndClient) nextPacket(connection gnet.Conn) (middleend.ClientPacket, bool, error) {
+func (c *middleEndClient) nextPacket(connection clientEndpoint) (middleend.ClientPacket, bool, error) {
 	tlsRecords := 0
 	for {
 		packet, ok, err := c.decoder.Next()
@@ -1038,6 +1048,10 @@ func (c *middleEndClient) nextPacket(connection gnet.Conn) (middleend.ClientPack
 			if len(c.pendingCipher) == 0 {
 				c.pendingCipher = nil
 				c.pendingCipherRetained = 0
+				if c.pendingCipherRelease != nil {
+					c.pendingCipherRelease()
+					c.pendingCipherRelease = nil
+				}
 			}
 			continue
 		}
@@ -1076,7 +1090,7 @@ func (c *middleEndClient) nextPacket(connection gnet.Conn) (middleend.ClientPack
 			return middleend.ClientPacket{}, false, nil
 		}
 		if tlsRecords == middleEndTLSRecordWorkLimit {
-			if err := connection.Wake(nil); err != nil {
+			if err := wakeClient(connection); err != nil {
 				return middleend.ClientPacket{}, false, err
 			}
 			return middleend.ClientPacket{}, false, nil
@@ -1139,6 +1153,10 @@ func (c *middleEndClient) clearOwnerState() {
 	clear(c.pendingPlain)
 	c.pendingCipher = nil
 	c.pendingCipherRetained = 0
+	if c.pendingCipherRelease != nil {
+		c.pendingCipherRelease()
+		c.pendingCipherRelease = nil
+	}
 	c.pendingPlain = nil
 	c.pendingPlainRetained = 0
 	c.decryptor = nil

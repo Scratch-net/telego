@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -753,7 +755,7 @@ num-event-loops = 2
 	if err != nil {
 		t.Fatalf("ToGProxyConfig: %v", err)
 	}
-	if !proxyConfig.InternalProxyProtocol || proxyConfig.WebProxyFingerprint == "" {
+	if proxyConfig.InternalProxyProtocol || proxyConfig.WebProxyFingerprint == "" {
 		t.Fatalf("gproxy WEB integration = internal %t fingerprint %q", proxyConfig.InternalProxyProtocol, proxyConfig.WebProxyFingerprint)
 	}
 	runtime, err := cfg.ToWebProxyRuntimeConfig(cfg.General.BindTo)
@@ -761,8 +763,8 @@ num-event-loops = 2
 		t.Fatalf("ToWebProxyRuntimeConfig: %v", err)
 	}
 	if !runtime.Enabled || runtime.BindAddr != "127.0.0.1:9080" ||
-		runtime.Hostname != "proxy.example.com" || runtime.Backend != "127.0.0.1:443" ||
-		runtime.Carrier != webproxy.CarrierHTTPSLanes || runtime.NumEventLoops != 2 || !runtime.BackendProxyProtocol {
+		runtime.Hostname != "proxy.example.com" || runtime.Backend != "" || !runtime.LogicalBackend ||
+		runtime.Carrier != webproxy.CarrierHTTPSLanes || runtime.NumEventLoops != 2 || runtime.BackendProxyProtocol {
 		t.Fatalf("runtime = %+v", runtime)
 	}
 	if len(runtime.TrustedProxyCIDRs) != 1 || runtime.TrustedProxyCIDRs[0] != "127.0.0.1/32" {
@@ -793,7 +795,7 @@ func TestWebProxyConfigDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToWebProxyRuntimeConfig: %v", err)
 	}
-	if runtime.BindAddr != "127.0.0.1:8080" || runtime.Backend != "127.0.0.1:8443" ||
+	if runtime.BindAddr != "127.0.0.1:8080" || runtime.Backend != "" || !runtime.LogicalBackend ||
 		runtime.Carrier != webproxy.CarrierHTTPS {
 		t.Fatalf("defaults = bind %q backend %q carrier %q", runtime.BindAddr, runtime.Backend, runtime.Carrier)
 	}
@@ -824,7 +826,7 @@ func TestWebProxyConfigAcceptsWebSocketCarriers(t *testing.T) {
 	}
 }
 
-func TestWebProxyConfigDerivesUnixMTProxyBackend(t *testing.T) {
+func TestWebProxyConfigKeepsUnixListenerMetadataForLogicalBackend(t *testing.T) {
 	cfg := Config{
 		Secrets:  map[string]string{"alice": "0123456789abcdef0123456789abcdef"},
 		WebProxy: WebProxyConfig{Enabled: true, Hostname: "proxy.example.com"},
@@ -833,8 +835,61 @@ func TestWebProxyConfigDerivesUnixMTProxyBackend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToWebProxyRuntimeConfig: %v", err)
 	}
-	if runtime.Backend != "unix:///run/telego/telego.sock" {
-		t.Fatalf("backend = %q", runtime.Backend)
+	if runtime.Backend != "" || !runtime.LogicalBackend || runtime.MTProxyAddr.String() != "/run/telego/telego.sock" || runtime.MTProxyAddr.Network() != "unix" {
+		t.Fatalf("logical backend metadata = %+v", runtime)
+	}
+}
+
+func TestWebProxyLogicalBackendPreservesListenerAddress(t *testing.T) {
+	for _, bind := range []string{":443", "0.0.0.0:443", "[::]:443", "192.0.2.1:8443", "127.0.0.1:0"} {
+		t.Run(bind, func(t *testing.T) {
+			cfg := Config{
+				Secrets:  map[string]string{"alice": "0123456789abcdef0123456789abcdef"},
+				WebProxy: WebProxyConfig{Enabled: true, Hostname: "proxy.example.com"},
+			}
+			runtime, err := cfg.ToWebProxyRuntimeConfig(bind)
+			if err != nil {
+				t.Fatal(err)
+			}
+			address, ok := runtime.MTProxyAddr.(*net.TCPAddr)
+			if !ok || !address.AddrPort().IsValid() {
+				t.Fatalf("logical listener address = %#v", runtime.MTProxyAddr)
+			}
+			resolved, err := net.ResolveTCPAddr("tcp", bind)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if address.Port != resolved.Port {
+				t.Fatalf("logical listener port = %d, want configured %d", address.Port, resolved.Port)
+			}
+			if bind == ":443" && !address.IP.Equal(net.IPv6zero) {
+				t.Fatalf("implicit wildcard IP = %s, want gnet IPv6 wildcard", address.IP)
+			}
+			if !runtime.LogicalBackend || runtime.Backend != "" || runtime.BackendProxyProtocol {
+				t.Fatalf("omitted backend opened compatibility route: %+v", runtime)
+			}
+		})
+	}
+}
+
+func TestWebProxyExplicitBackendRetainsAuthenticatedSocketRoute(t *testing.T) {
+	for _, backend := range []string{"127.0.0.1:443", "[::1]:443", "unix:///run/telego/telego.sock"} {
+		cfg := Config{
+			Secrets:     map[string]string{"alice": "0123456789abcdef0123456789abcdef"},
+			WebProxy:    WebProxyConfig{Enabled: true, Hostname: "proxy.example.com", Backend: backend},
+			TLSFronting: TLSFrontingConfig{MaskHost: "proxy.example.com"},
+		}
+		runtime, err := cfg.ToWebProxyRuntimeConfig(":443")
+		if err != nil {
+			t.Fatal(err)
+		}
+		proxyConfig, err := cfg.ToGProxyConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if runtime.LogicalBackend || runtime.Backend != backend || !runtime.BackendProxyProtocol || !proxyConfig.InternalProxyProtocol {
+			t.Fatalf("explicit backend changed selection: %+v", runtime)
+		}
 	}
 }
 
@@ -940,6 +995,11 @@ func TestDockerWebProxyExampleConfig(t *testing.T) {
 	}
 	managerConfig := webproxy.DefaultManagerConfig(runtime.Profiles, runtime.Backend)
 	managerConfig.Carrier = runtime.Carrier
+	if runtime.LogicalBackend {
+		managerConfig.BackendFactory = func(webproxy.BackendOpenOptions) (webproxy.Backend, error) {
+			return nil, errors.New("configuration validation does not open logical streams")
+		}
+	}
 	manager, err := webproxy.NewManager(managerConfig)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
@@ -1100,7 +1160,14 @@ func TestWebProxyConfigRequiresExplicitValuesWhenNotDerivable(t *testing.T) {
 		{name: "canonical hostname", bind: "0.0.0.0:443", mutate: func(c *Config) { c.WebProxy.Hostname = "Proxy.Example.com" }, wantErr: "invalid web-proxy.hostname"},
 		{name: "event loops", bind: "0.0.0.0:443", mutate: func(c *Config) { c.WebProxy.Hostname = "proxy.example.com"; c.WebProxy.NumEventLoops = -1 }, wantErr: "cannot be negative"},
 		{name: "carrier", bind: "0.0.0.0:443", mutate: func(c *Config) { c.WebProxy.Hostname = "proxy.example.com"; c.WebProxy.Carrier = "quic" }, wantErr: "unsupported WEB carrier mode"},
-		{name: "interface backend", bind: "192.0.2.1:443", mutate: func(c *Config) { c.WebProxy.Hostname = "proxy.example.com" }, wantErr: "not wildcard or loopback"},
+		{name: "nonlocal explicit backend", bind: "192.0.2.1:443", mutate: func(c *Config) {
+			c.WebProxy.Hostname = "proxy.example.com"
+			c.WebProxy.Backend = "192.0.2.1:443"
+		}, wantErr: "invalid web-proxy.backend"},
+		{name: "noncanonical trusted CIDR", bind: ":443", mutate: func(c *Config) {
+			c.WebProxy.Hostname = "proxy.example.com"
+			c.WebProxy.TrustedProxyCIDRs = []string{"127.0.0.1/8"}
+		}, wantErr: "noncanonical CIDR"},
 		{name: "unix HTTP bind", bind: "0.0.0.0:443", mutate: func(c *Config) {
 			c.WebProxy.Hostname = "proxy.example.com"
 			c.WebProxy.BindTo = "unix:///run/telego-web.sock"

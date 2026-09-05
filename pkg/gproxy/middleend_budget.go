@@ -2,8 +2,6 @@ package gproxy
 
 import (
 	"sync/atomic"
-
-	"github.com/panjf2000/gnet/v2"
 )
 
 // MiddleEndFrontendStats is a redacted snapshot of bytes retained between the
@@ -103,7 +101,7 @@ func (f *middleEndFrontend) stats() MiddleEndFrontendStats {
 	}
 }
 
-func (c *middleEndClient) retainedInputBytes(connection gnet.Conn) int64 {
+func (c *middleEndClient) retainedInputBytes(connection clientEndpoint) int64 {
 	retained := connection.InboundBuffered() + c.pendingCipherRetained + c.pendingPlainRetained
 	if c.decoder != nil {
 		retained += c.decoder.RetainedCapacityBytes()
@@ -114,7 +112,7 @@ func (c *middleEndClient) retainedInputBytes(connection gnet.Conn) int64 {
 	return int64(retained)
 }
 
-func (c *middleEndClient) reconcileInput(connection gnet.Conn) bool {
+func (c *middleEndClient) reconcileInput(connection clientEndpoint) bool {
 	current := c.retainedInputBytes(connection)
 	delta := current - c.inputAccounted
 	if delta == 0 {
@@ -129,7 +127,7 @@ func (c *middleEndClient) reconcileInput(connection gnet.Conn) bool {
 	return false
 }
 
-func (c *middleEndClient) reconcileOutput(connection gnet.Conn, reservation int64) (current, previous int) {
+func (c *middleEndClient) reconcileOutput(connection clientEndpoint, reservation int64) (current, previous int) {
 	current = connection.OutboundBuffered()
 	previousBytes := c.outputAccounted.Swap(int64(current))
 	c.frontend.outputBudget.observe(int64(current) - previousBytes - reservation)

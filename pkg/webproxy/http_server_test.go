@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -12,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	errorx "github.com/panjf2000/gnet/v2/pkg/errors"
 )
 
 func TestHTTPServerRouteSessionEndToEnd(t *testing.T) {
@@ -409,6 +412,44 @@ func TestHTTPServerLifecycleAndConfiguration(t *testing.T) {
 	}
 }
 
+func TestStopGnetEngineAlreadyStoppingWaitsForRunOrContext(t *testing.T) {
+	for _, canceled := range []bool{false, true} {
+		t.Run(map[bool]string{false: "run completes", true: "caller cancels"}[canceled], func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			done, stopReturned := make(chan struct{}), make(chan struct{})
+			result := make(chan error, 1)
+			go func() {
+				result <- stopGnetEngine(ctx, done, func(context.Context) error {
+					close(stopReturned)
+					return errorx.ErrEngineInShutdown
+				})
+			}()
+			<-stopReturned
+			select {
+			case err := <-result:
+				t.Fatalf("Stop returned before Run completion or caller cancellation: %v", err)
+			default:
+			}
+			var want error
+			if canceled {
+				want = context.Canceled
+				cancel()
+			} else {
+				close(done)
+			}
+			select {
+			case err := <-result:
+				if !errors.Is(err, want) {
+					t.Fatalf("Stop result = %v, want %v", err, want)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("Stop did not observe completion")
+			}
+		})
+	}
+}
+
 func TestStopGnetEngineReturnsWhenRunExitsDuringBoot(t *testing.T) {
 	done := make(chan struct{})
 	stopStarted := make(chan struct{})
@@ -577,6 +618,11 @@ func newHTTPTestApplicationWithConfig(
 	t.Cleanup(func() {
 		stopContext, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer stopCancel()
+		if manager.backendFactory != nil {
+			if err := manager.Shutdown(stopContext); err != nil {
+				t.Errorf("owner backend shutdown: %v", err)
+			}
+		}
 		if err := server.Stop(stopContext); err != nil {
 			t.Errorf("HTTP server Stop: %v", err)
 		}

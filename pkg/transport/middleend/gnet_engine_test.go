@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/panjf2000/gnet/v2"
+	errorx "github.com/panjf2000/gnet/v2/pkg/errors"
 )
 
 func TestGnetClientLinkConformance(t *testing.T) {
@@ -851,6 +852,88 @@ func TestGnetClientRuntimeConcurrentStopUsesOneResult(t *testing.T) {
 		if err != nil {
 			t.Fatalf("concurrent Stop: %v", err)
 		}
+	}
+}
+
+func TestGnetClientRuntimeFatalOwnerRetiresCreatedAndPendingLinks(t *testing.T) {
+	gnetRuntime, err := NewGnetClientRuntime(GnetClientRuntimeConfig{EventLoops: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := gnetRuntime.Stop(ctx); err != nil && !errors.Is(err, ErrGnetRuntimeStopped) {
+			t.Errorf("runtime cleanup: %v", err)
+		}
+	})
+	limits := LinkLimits{MaxPendingSubmissions: 1, MaxPendingSubmissionBytes: KeepalivePayloadSize, MaxPendingEvents: 1, MaxPendingEventBytes: KeepalivePayloadSize}
+	links := make([]*GnetClientLink, 0, 3)
+	peers := make([]*fakeMiddleEndPeer, 0, 3)
+	for range 3 {
+		conn, peer := dialFakeMiddleEnd(t, fakePeerConfig{})
+		link, err := gnetRuntime.NewClientLink(conn.(*net.TCPConn), newTestBootstrap(t), limits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		links = append(links, link.(*GnetClientLink))
+		peers = append(peers, peer)
+	}
+	if err := links[0].Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	links[0].mu.Lock()
+	owner := links[0].owner
+	links[0].mu.Unlock()
+	entered, release := make(chan struct{}), make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(unblock)
+	if err := owner.Execute(t.Context(), gnet.RunnableFunc(func(context.Context) error {
+		close(entered)
+		<-release
+		return errorx.ErrEngineShutdown
+	})); err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	if err := links[0].TrySubmit(LinkSubmission{SubmissionID: 1, Payload: (Ping{ID: 1}).MarshalBinary()}); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan error, 1)
+	go func() { started <- links[2].Start(t.Context()) }()
+	waitForLinkSnapshot(t, links[2], func(snapshot LinkSnapshot) bool { return snapshot.State == LinkStateBootstrapping })
+	// No explicit runtime Stop occurs until automatic retirement has finished.
+	unblock()
+	select {
+	case <-gnetRuntime.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("fatal owner exit did not retire the Middle-End runtime")
+	}
+	select {
+	case err := <-started:
+		if err == nil {
+			t.Fatal("pending link Start succeeded after owner failure")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("owner failure stranded pending link Start")
+	}
+	if err := gnetRuntime.Stop(t.Context()); !errors.Is(err, ErrGnetRuntimeStopped) {
+		t.Fatalf("runtime failure result = %v", err)
+	}
+	for index, link := range links {
+		waitLinkDone(t, link)
+		if link.Err() == nil {
+			t.Errorf("link %d lost its terminal error", index)
+		}
+		if snapshot := link.Snapshot(); snapshot.State != LinkStateClosed || snapshot.PendingSubmissions != 0 || snapshot.PendingSubmissionBytes != 0 {
+			t.Errorf("link %d retained resources: %+v", index, snapshot)
+		}
+		if err := waitFakePeer(t, peers[index]); err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("peer %d: %v", index, err)
+		}
+	}
+	if _, err := gnetRuntime.NewClientLink(links[1].conn, newTestBootstrap(t), limits); !errors.Is(err, ErrGnetRuntimeStopped) {
+		t.Fatalf("runtime accepted new link after failure: %v", err)
 	}
 }
 

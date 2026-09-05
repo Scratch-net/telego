@@ -97,21 +97,32 @@ Nginx TLS listener :8443
 Telego WEB listener :8080
 ```
 
-When the WEB carrier sends an `OPEN` frame, Telego creates one private backend connection:
+When the WEB carrier sends an `OPEN` frame, Telego creates a logical stream in the shared MTProxy session core:
 
 ```text
 Telego WEB listener :8080
           |
-          | authenticated internal PROXY header and MTProxy stream
+          | bounded logical stream in the same process
           v
-Telego MTProxy backend :443 or :9443
+Shared MTProxy session core
           |
           | Middle-End or direct DC route
           v
 Telegram DC
 ```
 
-Thus, one WEB stream enters Telego twice. The public entry terminates the carrier. The private backend entry terminates the MTProxy stream.
+Each logical stream keeps one gnet owner. The shared core handles authentication, limits, and routing for native and WEB streams.
+
+WEB limits cover carrier queues and logical stream queues. Middle-End packet decoders and request queues use separate, bounded process-wide Middle-End budgets.
+
+A logical close releases WEB-owned data and detaches the route. The Middle-End manager retains ownership of requests and close controls that it already accepted.
+
+During normal shutdown, Telego waits for WEB session cleanup before it stops HTTP and upstream services. A five-second warning does not bypass this order.
+
+The [local gnet patch](../third_party/gnet/TELEGO.md) provides client shutdown completion and enrollment cleanup.
+Telego releases its abandoned queued work after the owner stops.
+
+The default WEB path creates no internal socket connection. Nginx still terminates real TLS.
 
 An ordinary website request follows the same splice loop before Telego classifies it:
 
@@ -133,15 +144,17 @@ If a carrier-shaped request fails authentication, Telego returns status `419`. N
 The managed gateway also supports separate public ports:
 
 ```text
-Telegram Desktop --> Nginx public TLS :443 --> Telego WEB :8080
-                                                    |
-                                                    v
-                                         Telego MTProxy :9443
-
-MTProxy client :9443 -------------------> Telego MTProxy :9443
+Telegram Desktop --> Nginx TLS :443 --> Telego WEB :8080
+                                                |
+                                                | logical stream
+                                                v
+                                    Shared MTProxy session core --> Telegram
+                                                ^
+                                                |
+MTProxy client :9443 --> Telego MTProxy :9443 ----+
 ```
 
-The WEB backend always uses the private Telego listener. It does not connect through the public MTProxy port mapping.
+WEB streams enter the shared core directly in both layouts. An explicit `backend` selects a local socket connection for compatibility.
 
 Unrecognized TLS probes on the MTProxy port still go to Nginx port 8443.
 
@@ -227,27 +240,27 @@ The WebSocket target is `wss://<WEB host>/api/v1/ws`. The bridge sends the beare
 
 In `https` mode, the carrier uses serialized fetch requests and long polls. In `https-lanes` mode, it uses independent fetch and long-poll lanes.
 
-Telego automatically derives `127.0.0.1:443` from the wildcard MTProxy bind. A Unix MTProxy bind produces the same Unix socket.
+Without `backend`, WEB streams use the shared MTProxy session core directly. This path uses trusted client metadata and bounded queues inside Telego.
 
-Do not set `backend` for the usual layout. Set it only when WEB streams must use a different local MTProxy listener.
+If a deployment requires a local socket connection, set `backend` explicitly:
 
 ```toml
 [web-proxy]
-# Optional override:
+# Explicit local socket compatibility path:
 backend = "127.0.0.1:443"
 ```
 
-The managed gateway omits this option. Telego derives `127.0.0.1:9443` from its private MTProxy bind.
+The managed gateway omits this option. Its WEB streams use the shared core without an internal socket connection.
 
-Telego adds an authenticated internal PROXY header to every WEB backend stream.
+Explicit backends accept numeric loopback TCP addresses or absolute Unix socket paths. These connections use gnet and retain the authenticated PROXY preface.
 
-Telego creates a random token at each process start. The token stays in memory and is not part of the configuration.
+For explicit backends, Telego creates a random token at process start. The token stays in memory and is not part of the configuration.
 
-Telego accepts the internal header only after a constant-time token check.
+Telego compares the token in constant time before it accepts a compatibility PROXY header.
 
 With `proxy-protocol = false`, a different loopback or Unix peer cannot supply the client IP.
 
-The header contains the client IP that Nginx supplied. Connection and user limits use this IP instead of the loopback address.
+The shared core receives the client IP from trusted WEB metadata. The compatibility header carries the same client IP. Connection and user limits use this IP.
 
 If `trusted-proxy-cidrs` is empty, Telego ignores `X-Forwarded-For`. All WEB sessions then use the Nginx peer IP for limits and statistics.
 
@@ -514,7 +527,7 @@ The example has these network properties:
 - Telego uses `nginx:8443` for splice traffic.
 - Telego uses the `proxy.example.com:8444` Docker alias for certificate collection and the correct TLS SNI.
 - Nginx uses Telego's fixed private address `172.28.0.3:8080` for WEB HTTP traffic.
-- Telego derives and uses its own `127.0.0.1:443` listener for WEB backend streams.
+- WEB streams enter the shared MTProxy core directly on gnet. The example omits the socket `backend` option.
 - Telego trusts only the fixed Nginx address `172.28.0.2/32` for `X-Forwarded-For`.
 - Port 8080 stays private and is not published on the VPS.
 - Nginx and Telego use the Docker `local` log driver. Each service keeps three 10 MB log files.

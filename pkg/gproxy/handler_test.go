@@ -321,10 +321,6 @@ func TestNewProxyHandler(t *testing.T) {
 	if handler.dcBufPool == nil {
 		t.Error("dcBufPool should be created")
 	}
-	if handler.relayBufPool == nil {
-		t.Error("relayBufPool should be created")
-	}
-
 	// Check desync detector is created
 	if handler.desyncDetector == nil {
 		t.Error("desyncDetector should be created")
@@ -515,16 +511,8 @@ func TestProxyHandler_BackpressureLimits(t *testing.T) {
 
 	handler := NewProxyHandler(cfg, nil)
 
-	// Soft limit should be half of max
-	expectedSoft := 2 * 1024 * 1024
-	if handler.bpSoftLimit != expectedSoft {
-		t.Errorf("bpSoftLimit: got %d, want %d", handler.bpSoftLimit, expectedSoft)
-	}
-
-	// Resume threshold should be quarter of max
-	expectedResume := 1 * 1024 * 1024
-	if handler.bpResumeAt != expectedResume {
-		t.Errorf("bpResumeAt: got %d, want %d", handler.bpResumeAt, expectedResume)
+	if handler.maxWriteBuffer != cfg.MaxWriteBuffer {
+		t.Errorf("maxWriteBuffer: got %d, want %d", handler.maxWriteBuffer, cfg.MaxWriteBuffer)
 	}
 }
 
@@ -1164,6 +1152,27 @@ func TestOnTraffic_ProxyProtocolState(t *testing.T) {
 		t.Errorf("expected protocol detect or TLS state, got %v", state)
 	}
 	_ = action
+}
+
+func TestOnTraffic_DialingInputIncludesPendingHandshakeBytes(t *testing.T) {
+	for _, pending := range []int{0, 64} {
+		for _, excess := range []int{0, 1} {
+			handler := NewProxyHandler(&Config{MaxWriteBuffer: relayBatchSize}, &testLogger{})
+			conn := newTestMockGnetConn()
+			ctx := NewConnContext()
+			ctx.SetState(StateDialingDC)
+			ctx.pendingData = make([]byte, pending)
+			conn.SetContext(ctx)
+			conn.SetReadData(make([]byte, relayBatchSize-pending+excess))
+			want := gnet.None
+			if excess > 0 {
+				want = gnet.Close
+			}
+			if got := handler.OnTraffic(conn); got != want {
+				t.Errorf("pending %d, excess %d: action = %v, want %v", pending, excess, got, want)
+			}
+		}
+	}
 }
 
 // TestOnTraffic_StateDispatch tests OnTraffic state machine dispatch.

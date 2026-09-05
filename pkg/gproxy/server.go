@@ -11,8 +11,6 @@ import (
 	"github.com/panjf2000/gnet/v2"
 
 	"github.com/scratch-net/telego/pkg/dc"
-	"github.com/scratch-net/telego/pkg/tlsfront"
-	"github.com/scratch-net/telego/pkg/transport/faketls"
 )
 
 const (
@@ -208,6 +206,12 @@ func runWithPreparedHandler(
 	handler *ProxyHandler,
 ) (shutdown func(), errCh <-chan error) {
 	ch := make(chan error, 1)
+	var reported atomic.Bool
+	report := func(err error) {
+		if reported.CompareAndSwap(false, true) {
+			ch <- err
+		}
+	}
 
 	// Probe DC addresses at startup and sort by RTT
 	dc.SetProbeLogger(logger.Info)
@@ -220,73 +224,47 @@ func runWithPreparedHandler(
 	}
 	dc.Init()
 
+	// Initialize the upstream owner before the handler can be published to
+	// in-process WEB. Only the public listener starts asynchronously.
+	dcHandler := &dcEventHandler{proxy: handler}
+	dcClient, err := gnet.NewClient(
+		dcHandler,
+		gnet.WithMulticore(cfg.Multicore),
+		gnet.WithLockOSThread(cfg.LockOSThread),
+		gnet.WithReadBufferCap(128*1024),
+		gnet.WithWriteBufferCap(256*1024),
+	)
+	if err != nil {
+		handler.cancelUpstream()
+		report(fmt.Errorf("failed to create DC client: %w", err))
+		return func() {}, ch
+	}
+	monitorDone, err := handler.startDCClient(dcClient, report)
+	if err != nil {
+		report(fmt.Errorf("failed to start DC client: %w", err))
+		return func() {}, ch
+	}
+	if cfg.Socks5Addr != "" {
+		logger.Debug("DC client started with SOCKS5 proxy: %s", cfg.Socks5Addr)
+	} else {
+		logger.Debug("DC client started with %d event loops", cfg.NumEventLoop)
+	}
+	handler.prepareFrontends()
+	if handler.certFetcher != nil {
+		handler.certFetcher.StartBackgroundRefresh(cfg.CertHost, cfg.CertPort)
+	}
+	if handler.serverHelloFetcher != nil {
+		handler.serverHelloFetcher.StartBackgroundRefresh()
+	}
+
 	// Use atomic pointer to store engine reference
 	var engPtr atomic.Pointer[gnet.Engine]
 	// Signal that engine is ready
 	ready := make(chan struct{})
+	runDone := make(chan struct{})
 
 	go func() {
-		// Initialize DC client for outgoing connections
-		dcHandler := &dcEventHandler{proxy: handler}
-		dcClient, err := gnet.NewClient(
-			dcHandler,
-			gnet.WithMulticore(cfg.Multicore),
-			gnet.WithLockOSThread(cfg.LockOSThread),
-			gnet.WithReadBufferCap(128*1024),  // 128KB read buffer
-			gnet.WithWriteBufferCap(256*1024), // 256KB write buffer - more batching to DC
-		)
-		if err != nil {
-			ch <- fmt.Errorf("failed to create DC client: %w", err)
-			return
-		}
-		if err := dcClient.Start(); err != nil {
-			ch <- fmt.Errorf("failed to start DC client: %w", err)
-			return
-		}
-		handler.dcClient = dcClient
-		if cfg.Socks5Addr != "" {
-			logger.Debug("DC client started with SOCKS5 proxy: %s", cfg.Socks5Addr)
-		} else {
-			logger.Debug("DC client started with %d event loops", cfg.NumEventLoop)
-		}
-
-		// Correct a skewed server clock from an HTTP Date header (once, at startup)
-		// so the handshake time-skew check doesn't reject every client.
-		if cfg.ClockSyncURL != "" {
-			if off, err := faketls.SyncClock(cfg.ClockSyncURL, 0); err != nil {
-				logger.Warn("Clock sync from %s failed: %v (using local clock)", cfg.ClockSyncURL, err)
-			} else {
-				logger.Info("Clock sync from %s: offset %+ds applied", cfg.ClockSyncURL, off)
-			}
-		}
-
-		// Initialize TLS fronting if configured
-		if cfg.MaskHost != "" && cfg.FetchRealCert {
-			handler.certFetcher = tlsfront.NewCertFetcher(cfg.CertRefreshHours, cfg.MaskHost)
-
-			// Fetch certificate synchronously at startup
-			logger.Debug("Fetching TLS certificate from %s:%d (SNI: %s)...", cfg.CertHost, cfg.CertPort, cfg.MaskHost)
-			cert, err := handler.certFetcher.FetchCert(cfg.CertHost, cfg.CertPort)
-			if err != nil {
-				logger.Warn("Failed to fetch certificate: %v (will retry in background)", err)
-			} else {
-				logger.Debug("Certificate fetched: %d certs in chain", len(cert.Chain))
-			}
-
-			// Start background refresh
-			handler.certFetcher.StartBackgroundRefresh(cfg.CertHost, cfg.CertPort)
-
-			// Initialize ServerHello fetcher for hybrid mode (real TLS fingerprint)
-			handler.serverHelloFetcher = tlsfront.NewServerHelloFetcher(cfg.CertHost, cfg.CertPort)
-			logger.Debug("Fetching real ServerHello from %s:%d for hybrid TLS mode...", cfg.CertHost, cfg.CertPort)
-			_, _, err = handler.serverHelloFetcher.GetServerHelloTemplate()
-			if err != nil {
-				logger.Warn("Failed to fetch ServerHello template: %v (will retry)", err)
-			} else {
-				logger.Info("Hybrid TLS mode enabled: using real ServerHello from %s", cfg.CertHost)
-			}
-			handler.serverHelloFetcher.StartBackgroundRefresh()
-		}
+		defer close(runDone)
 
 		// Custom handler to capture engine
 		wrapper := &engineCaptureHandler{
@@ -311,7 +289,11 @@ func runWithPreparedHandler(
 		logger.Info("Starting gnet proxy on %s (multicore=%v, reuseport=%v)",
 			cfg.BindAddr, cfg.Multicore, cfg.ReusePort)
 
-		ch <- gnet.Run(wrapper, addr, opts...)
+		publicErr := handler.runPublicEngine(wrapper, addr, opts...)
+		// Run can fail before OnShutdown. Join the upstream client and watcher
+		// on every exit before publishing the public engine's terminal result.
+		<-monitorDone
+		report(publicErr)
 	}()
 
 	shutdownFn := func() {
@@ -320,6 +302,8 @@ func runWithPreparedHandler(
 		defer cancel()
 
 		select {
+		case <-runDone:
+			return
 		case <-ready:
 			if eng := engPtr.Load(); eng != nil {
 				eng.Stop(ctx)

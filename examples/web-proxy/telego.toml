@@ -20,5 +20,5 @@ hostname = "proxy.example.com"
 # recommendation until comparative benchmarks exist.
 carrier = "https-lanes"
 bind-to = "0.0.0.0:8080"
-# Telego derives the local MTProxy backend from [general].bind-to.
+# Without backend, WEB streams enter the shared MTProxy core directly on gnet.
 trusted-proxy-cidrs = ["172.28.0.2/32"]

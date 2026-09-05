@@ -116,7 +116,23 @@ func NewGnetClientRuntime(config GnetClientRuntimeConfig) (*GnetClientRuntime, e
 	if err := client.Start(); err != nil {
 		return nil, fmt.Errorf("start Middle-End gnet runtime: %w", err)
 	}
+	// The local gnet client closes Done after automatic owner/enrollment
+	// cleanup. One runtime watcher also retires links that never enrolled.
+	go runtime.monitorClient()
 	return runtime, nil
+}
+
+func (r *GnetClientRuntime) monitorClient() {
+	<-r.client.Done()
+	r.mu.Lock()
+	if !r.stopping {
+		r.stopErr = r.client.Err()
+		if r.stopErr == nil {
+			r.stopErr = ErrGnetRuntimeStopped
+		}
+	}
+	r.mu.Unlock()
+	r.beginStop()
 }
 
 func gnetClientOptions(config GnetClientRuntimeConfig) []gnet.Option {
@@ -208,10 +224,11 @@ func (r *GnetClientRuntime) beginStop() {
 func (r *GnetClientRuntime) stop() {
 	r.mu.Lock()
 	links := slices.Collect(maps.Keys(r.links))
+	terminalErr := r.stopErr
 	r.mu.Unlock()
 
 	for _, link := range links {
-		link.requestTerminal(nil)
+		link.requestTerminal(terminalErr)
 	}
 	// The runtime mutex orders every enrolls.Add before this Wait: setting
 	// stopping under the same mutex prevents a later Add from succeeding.
@@ -223,7 +240,9 @@ func (r *GnetClientRuntime) stop() {
 	}
 
 	r.mu.Lock()
-	r.stopErr = stopErr
+	if r.stopErr == nil {
+		r.stopErr = stopErr
+	}
 	close(r.done)
 	r.mu.Unlock()
 }
@@ -398,6 +417,9 @@ func (l *GnetClientLink) Start(ctx context.Context) error {
 	}
 
 	if _, err := l.runtime.enroll(l.conn, l); err != nil {
+		// Early lifecycle rejection has not transferred this socket to gnet.
+		// The link owns it from construction, including failed enrollment.
+		_ = l.conn.Close()
 		l.requestTerminal(fmt.Errorf("enroll Middle-End gnet link: %w", err))
 		l.finalizeAfterStreamClose()
 		return l.waitStartResult()

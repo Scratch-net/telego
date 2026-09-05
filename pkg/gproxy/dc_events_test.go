@@ -30,27 +30,6 @@ func TestDCConnContext_Fields(t *testing.T) {
 	}
 }
 
-func TestDCConnContext_ThrottleState(t *testing.T) {
-	dcCtx := &DCConnContext{}
-
-	// Initially not throttled
-	if dcCtx.throttledToClient.Load() {
-		t.Error("should not be throttled initially")
-	}
-
-	// Set throttled
-	dcCtx.throttledToClient.Store(true)
-	if !dcCtx.throttledToClient.Load() {
-		t.Error("should be throttled after Store(true)")
-	}
-
-	// Clear throttled
-	dcCtx.throttledToClient.Store(false)
-	if dcCtx.throttledToClient.Load() {
-		t.Error("should not be throttled after Store(false)")
-	}
-}
-
 func TestDcEventHandler_GetDCContext(t *testing.T) {
 	logger := &testLogger{}
 	handler := NewProxyHandler(&Config{}, logger)
@@ -77,7 +56,7 @@ func TestDcEventHandler_GetDCContext(t *testing.T) {
 	}
 }
 
-func TestDcEventHandler_GetDCContext_PendingMap(t *testing.T) {
+func TestDcEventHandler_GetDCContext_DoesNotUseDescriptor(t *testing.T) {
 	logger := &testLogger{}
 	handler := NewProxyHandler(&Config{}, logger)
 
@@ -85,17 +64,11 @@ func TestDcEventHandler_GetDCContext_PendingMap(t *testing.T) {
 	mockConn := newTestMockGnetConn()
 	mockConn.SetFD(12345)
 
-	// Store in pending map
-	dcCtx := &DCConnContext{
-		ClientCtx: NewConnContext(),
-	}
-	handler.pendingDCContexts.Store(12345, dcCtx)
-	defer handler.pendingDCContexts.Delete(12345)
-
-	// Should find via pending map fallback
+	// gnet duplicates the enrolled descriptor, so only EnrollContext may
+	// publish connection state. A descriptor alone cannot identify it.
 	ctx := dcHandler.getDCContext(mockConn)
-	if ctx != dcCtx {
-		t.Error("should find context via pending map")
+	if ctx != nil {
+		t.Error("descriptor must not supply an uninstalled context")
 	}
 }
 
@@ -232,18 +205,6 @@ func TestHandleDCTraffic_NoData(t *testing.T) {
 	// Either None (no data) or Close (nil ciphers) is acceptable
 	if action != 0 && action != 1 {
 		t.Errorf("unexpected action: %d", action)
-	}
-}
-
-// BenchmarkDCConnContext_ThrottleState benchmarks atomic operations
-func BenchmarkDCConnContext_ThrottleState(b *testing.B) {
-	dcCtx := &DCConnContext{}
-
-	b.ResetTimer()
-	for b.Loop() {
-		dcCtx.throttledToClient.Store(true)
-		_ = dcCtx.throttledToClient.Load()
-		dcCtx.throttledToClient.Store(false)
 	}
 }
 
@@ -408,6 +369,9 @@ func TestHandleDCTraffic_Backpressure(t *testing.T) {
 		ClientEncrypt: &mockStream{},
 	}
 	mockDCConn.SetContext(dcCtx)
+	dcCtx.ToClient = newRelayOutput(mockClientConn, mockDCConn, clientCtx, handler.maxWriteBuffer)
+	dcCtx.ToClient.buffered = mockClientConn.OutboundBuffered()
+	t.Cleanup(dcCtx.ToClient.close)
 
 	// Large data
 	testData := make([]byte, 100*1024)
@@ -415,9 +379,8 @@ func TestHandleDCTraffic_Backpressure(t *testing.T) {
 
 	handler.handleDCTraffic(mockDCConn, dcCtx)
 
-	// Should be throttled
-	if !dcCtx.throttledToClient.Load() {
-		t.Error("should be throttled due to client backpressure")
+	if len(mockClientConn.GetAsyncWrites()) != 0 || mockDCConn.InboundBuffered() != len(testData) {
+		t.Error("saturated output must leave DC data untouched")
 	}
 }
 

@@ -13,6 +13,7 @@ ARG DATE="unknown"
 
 WORKDIR /src
 COPY go.mod go.sum ./
+COPY third_party/gnet/go.mod third_party/gnet/go.sum ./third_party/gnet/
 RUN go mod download
 
 COPY . .

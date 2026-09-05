@@ -1,62 +1,41 @@
-## Creating an RPM distribution of the application.
-## To build an RPM package, an installed RPM development environment is required.
+# Build the openSUSE x86_64 package. Keep the staging files for inspection.
+RPMBUILD_DIST := $(MAKEFILE_DIR)dist
+RPMBUILD_DIR := $(MAKEFILE_DIR).build/rpmbuild
+RPMBUILD_VERSION := $(patsubst v%,%,$(VERSION))
+RPMBUILD_VERN := $(firstword $(subst -, ,$(RPMBUILD_VERSION)))
+ifneq ($(findstring -,$(RPMBUILD_VERSION)),)
+RPMBUILD_VERB := $(subst -,.,$(patsubst $(RPMBUILD_VERN)-%,%,$(RPMBUILD_VERSION)))
+else
+RPMBUILD_VERB := $(shell date -u +%Y%m%d.%H%M%S.UTC)
+endif
+RPMBUILD_PACKAGE := telego-$(RPMBUILD_VERN)-$(RPMBUILD_VERB).x86_64.rpm
 
-RPMBUILD_DIST := ${MAKEFILE_DIR}dist
-RPMBUILD_DIR  := ${MAKEFILE_DIR}.build/rpmbuild
-RPMBUILD_OS   ?= $(RPMBUILD_OS:leap)
-RPMBUILD_OS   ?= $(RPMBUILD_OS:tumbleweed)
-RPMBUILD_VERN := $(shell echo "$(VERSION)" | awk -F '-' '{ print $$1 }' | sed 's/^v*//')
-RPMBUILD_VERB := $(shell echo "$(VERSION)" | awk -F "$(RPMBUILD_VERN)-" '{ print $$2 }' | sed 's/-/./g' )
-RPMBUILD_VERB := $(shell if [[ $(RPMBUILD_VERB) == "" ]]; then date -u +%Y%m%d.%H%M%S.%Z; else echo "$(RPMBUILD_VERB)"; fi)
+.PHONY: rpmbuild_make_workflow rpmbuild_copy_files rpmbuild_environment_set rpm
 
-## Creating space for assembly without interfering with the operating system.
 rpmbuild_make_workflow:
-	@echo "Creating an RPMBUILD workspace."
-	@mkdir -p ${RPMBUILD_DIR}/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}; true
-.PHONY: rpmbuild_make_workflow
+	@mkdir -p "$(RPMBUILD_DIR)/BUILD" "$(RPMBUILD_DIR)/BUILDROOT" \
+		"$(RPMBUILD_DIR)/RPMS" "$(RPMBUILD_DIR)/SOURCES" \
+		"$(RPMBUILD_DIR)/SPECS" "$(RPMBUILD_DIR)/SRPMS"
 
-## Copying the necessary files to the workspace.
-rpmbuild_copy_files: rpmbuild_make_workflow
-	@echo "Copying files."
-	@if [ -f "$(BINARY)" ]; \
-		then mv -v -f "$(BINARY)" "${RPMBUILD_DIR}/SOURCES/telego"; \
-	else \
-		echo "File '$(BINARY)' not found."; \
-		exit 1; \
-	fi
-	@if [ -f "$(MAKEFILE_DIR)config.example.toml" ]; \
-		then cp -v -f "$(MAKEFILE_DIR)config.example.toml" ${RPMBUILD_DIR}/SOURCES/telego.toml; \
-	else \
-		echo "File '"$(MAKEFILE_DIR)config.example.toml"' not found."; \
-		exit 1; \
-	fi
-	@cp -v -f "$(RPMBUILD_DIST)/rpmbuild.spec" "${RPMBUILD_DIR}/SPECS/telego.spec"
-	@cp -v -f "$(RPMBUILD_DIST)/rpmbuild.service" "${RPMBUILD_DIR}/SOURCES/telego.service"
-	@cp -v -f "$(RPMBUILD_DIST)/rpmbuild.sysconfig" "${RPMBUILD_DIR}/SOURCES/telego.sysconfig"
-	@cp -v -f "$(RPMBUILD_DIST)/rpmbuild.logrotate" "${RPMBUILD_DIR}/SOURCES/telego.logrotate"
-	@cp -v -f "$(RPMBUILD_DIST)/rpmbuild.permissions" "${RPMBUILD_DIR}/SOURCES/telego.permissions"
-	@cp -v -f "$(RPMBUILD_DIST)/rpmbuild.tmpfilesd" "${RPMBUILD_DIR}/SOURCES/telego.tmpfilesd"
-	@cp -v -f "$(RPMBUILD_DIST)/rpmbuild.target" "${RPMBUILD_DIR}/SOURCES/telego.target"
-.PHONY: rpmbuild_copy_files
+# Both prerequisites must finish before staging, including under make -j.
+rpmbuild_copy_files: build rpmbuild_make_workflow
+	cp -p "$(BINARY)" "$(RPMBUILD_DIR)/SOURCES/telego"
+	cp -p "$(MAKEFILE_DIR)config.example.toml" "$(RPMBUILD_DIR)/SOURCES/telego.toml"
+	cp -p "$(RPMBUILD_DIST)/rpmbuild.spec" "$(RPMBUILD_DIR)/SPECS/telego.spec"
+	cp -p "$(RPMBUILD_DIST)/rpmbuild.service" "$(RPMBUILD_DIR)/SOURCES/telego.service"
+	cp -p "$(RPMBUILD_DIST)/rpmbuild.sysconfig" "$(RPMBUILD_DIR)/SOURCES/telego.sysconfig"
+	cp -p "$(RPMBUILD_DIST)/rpmbuild.logrotate" "$(RPMBUILD_DIR)/SOURCES/telego.logrotate"
+	cp -p "$(RPMBUILD_DIST)/rpmbuild.permissions" "$(RPMBUILD_DIR)/SOURCES/telego.permissions"
+	cp -p "$(RPMBUILD_DIST)/rpmbuild.tmpfilesd" "$(RPMBUILD_DIR)/SOURCES/telego.tmpfilesd"
+	cp -p "$(RPMBUILD_DIST)/rpmbuild.target" "$(RPMBUILD_DIR)/SOURCES/telego.target"
 
 rpmbuild_environment_set:
-	@echo "Making environment."
-	@export RPMBUILD_OS=$(RPMBUILD_OS)
-	@export RPMBUILD_OS=$(RPMBUILD_OS)
-	@echo "- version: '$(RPMBUILD_VERN)'"
-	@echo "- release build: '$(RPMBUILD_VERB)'"
-.PHONY: rpmbuild_environment_set
+	@printf 'RPM version: %s\nRPM release: %s\n' "$(RPMBUILD_VERN)" "$(RPMBUILD_VERB)"
 
-## Building an RPM package.
-rpm: build rpmbuild_copy_files rpmbuild_environment_set
-	@echo "Building the RPM package."
-	@RPMBUILD_OS="${RPMBUILD_OS}" rpmbuild \
-		--target x86_64 \
-		--define "debug_package %{nil}" \
-		--define "_topdir ${RPMBUILD_DIR}" \
+rpm: rpmbuild_copy_files rpmbuild_environment_set
+	rpmbuild --target x86_64 \
+		--define "_topdir $(RPMBUILD_DIR)" \
 		--define "_app_version_number $(RPMBUILD_VERN)" \
 		--define "_app_version_build $(RPMBUILD_VERB)" \
-		-bb "${RPMBUILD_DIR}/SPECS/telego.spec"
-	@cp -v "${RPMBUILD_DIR}/RPMS/x86_64/"*.rpm "${MAKEFILE_DIR}"
-	@rm -rf "${MAKEFILE_DIR}.build"
-.PHONY: rpm
+		-bb "$(RPMBUILD_DIR)/SPECS/telego.spec"
+	cp -p "$(RPMBUILD_DIR)/RPMS/x86_64/$(RPMBUILD_PACKAGE)" "$(MAKEFILE_DIR)"

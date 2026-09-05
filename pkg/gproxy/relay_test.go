@@ -285,6 +285,9 @@ func TestHandleRelay_BackpressureThrottling(t *testing.T) {
 	}
 	ctx.SetRelay(relay)
 	mockConn.SetContext(ctx)
+	relay.ToDC = newRelayOutput(mockDCConn, mockConn, ctx, handler.maxWriteBuffer)
+	relay.ToDC.buffered = mockDCConn.OutboundBuffered()
+	t.Cleanup(relay.ToDC.close)
 
 	// Create a large amount of data
 	var data []byte
@@ -299,9 +302,8 @@ func TestHandleRelay_BackpressureThrottling(t *testing.T) {
 		t.Errorf("handleRelay should return gnet.None, got %d", action)
 	}
 
-	// Should be throttled
-	if !ctx.throttledToDC.Load() {
-		t.Error("connection should be throttled due to backpressure")
+	if len(mockDCConn.GetAsyncWrites()) != 0 || mockConn.InboundBuffered() != len(data) {
+		t.Error("saturated output must leave client data untouched")
 	}
 }
 

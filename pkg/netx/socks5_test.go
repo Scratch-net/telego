@@ -141,17 +141,6 @@ func TestSocks5Dialer_DialContext_Timeout(t *testing.T) {
 	}
 }
 
-func TestErrNoHalfClose(t *testing.T) {
-	if errNoHalfClose == nil {
-		t.Error("errNoHalfClose should not be nil")
-	}
-
-	expected := "connection does not support half-close"
-	if errNoHalfClose.Error() != expected {
-		t.Errorf("errNoHalfClose: got %q, want %q", errNoHalfClose.Error(), expected)
-	}
-}
-
 // TestSocks5Dialer_Fields tests dialer field access
 func TestSocks5Dialer_Fields(t *testing.T) {
 	dialer, _ := NewSocks5Dialer("proxy.test:1080")
@@ -374,10 +363,7 @@ func TestSocks5Dialer_DialWithMock(t *testing.T) {
 	}
 }
 
-// TestSocks5Dialer_DialContextWithMock tests DialContext with mock SOCKS5 server.
-// Note: The golang.org/x/net/proxy library returns connections that may not
-// implement the Conn interface (half-close support), so this test verifies
-// that behavior is handled correctly.
+// TestSocks5Dialer_DialContextWithMock requires a usable raw SOCKS transport.
 func TestSocks5Dialer_DialContextWithMock(t *testing.T) {
 	proxyAddr, targetAddr, cleanup := startMockSocks5Server(t)
 	defer cleanup()
@@ -387,21 +373,15 @@ func TestSocks5Dialer_DialContextWithMock(t *testing.T) {
 		t.Fatalf("NewSocks5Dialer failed: %v", err)
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	conn, err := dialer.DialContext(ctx, "tcp", targetAddr)
-
-	// The proxy library's connection may not support half-close,
-	// which is expected behavior - we verify the error is appropriate
 	if err != nil {
-		if err == errNoHalfClose {
-			t.Log("Connection correctly rejected for lack of half-close support")
-			return
-		}
-		// Other errors are also acceptable as long as we don't crash
-		t.Logf("DialContext returned error (may be expected): %v", err)
-		return
+		t.Fatalf("DialContext failed: %v", err)
 	}
 	defer conn.Close()
+	if _, ok := conn.(*net.TCPConn); !ok {
+		t.Fatalf("DialContext returned %T, want *net.TCPConn", conn)
+	}
 
 	// If we got a connection, verify it works
 	testData := []byte("hello context")
