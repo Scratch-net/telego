@@ -67,6 +67,10 @@ dockers_v2:
       - "v{{ .Major }}"
       - "v{{ .Major }}.{{ .Minor }}"
       - "latest"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+      - linux/arm/v7
     dockerfile: dist/Dockerfile
     labels:
       org.opencontainers.image.created: "{{ .Date }}"
