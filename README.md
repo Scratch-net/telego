@@ -36,7 +36,7 @@
 
 ---
 
-> **Telegram blocked in your country?** telEgo's TLS fronting makes your proxy indistinguishable from regular HTTPS traffic to censors. [Get started in 2 minutes](#quick-start)
+> **Telegram blocked in your country?** telEgo shapes proxy traffic as TLS records and forwards unrecognized connections to the mask host. [Quick start](#quick-start)
 
 ---
 
@@ -69,13 +69,13 @@ Read the [managed gateway guide](examples/gateway/README.md) for updates, backup
 - **Event-driven I/O** — Built on [gnet](https://github.com/panjf2000/gnet) with epoll/kqueue for maximum efficiency
 - **Telegram Middle-End** — Routes authenticated MTProxy and native WEB streams through persistent gnet link pools
 - **Native WEB Proxy** — Optional gnet HTTPS or WebSocket carrier for Telegram Desktop behind Nginx
-- **Zero-copy relaying** — Direct buffer manipulation without intermediate copies
-- **Buffer pooling** — Striped sync.Pool design eliminates allocations in hot paths
+- **Owned-buffer relaying** — Output buffers remain owned until socket drain or disposal
+- **Buffer pooling** — Reuses buffers where their lifetime permits, with retained-memory accounting for queued output
 - **Optimized TCP** — `TCP_NODELAY`, `TCP_QUICKACK`, 64KB buffers, `SO_REUSEPORT`
 
 ### Security
-- **TLS Fronting** — Fetches real certificates from mask host for perfect camouflage
-- **Probe Resistance** — Forwards unrecognized clients to mask host (indistinguishable from HTTPS)
+- **TLS Fronting** — Uses the mask host's TLS profile to shape FakeTLS handshakes
+- **Probe Resistance** — Forwards unrecognized clients to the mask host
 - **Replay Protection** — 64-shard LRU cache with TTL expiration ([hashicorp/golang-lru](https://github.com/hashicorp/golang-lru))
 - **Key Zeroization** — Sensitive data (session IDs, random bytes) zeroed on connection close
 - **Desync Detection** — Detects crypto state divergence via abnormal frame sizes
@@ -111,6 +111,8 @@ Read the [managed gateway guide](examples/gateway/README.md) for updates, backup
 
 ### From Source
 
+Source builds require Go 1.27 or later and the complete repository, including `third_party/gnet`.
+
 ```bash
 git clone https://github.com/Scratch-net/telego.git
 cd telego
@@ -121,11 +123,8 @@ make build
 
 Download from [Releases](https://github.com/Scratch-net/telego/releases/latest).
 
-### Go Install
-
-```bash
-go install github.com/scratch-net/telego/cmd/telego@latest
-```
+The local gnet replacement prevents installation with `go install …@version`.
+Use the source build or a pre-built binary instead.
 
 ---
 
@@ -172,7 +171,7 @@ telEgo supports two MTProxy protocol variants on a single port with auto-detecti
 | **FakeTLS (ee)** | `ee...` | TLS-wrapped Obfuscated2 | Maximum stealth, censorship bypass |
 | **Raw (dd)** | `dd...` | Plain Obfuscated2 | Compatibility, lower overhead |
 
-**FakeTLS (ee)** wraps traffic in TLS 1.3 records, making it indistinguishable from HTTPS. The secret includes the mask hostname for SNI validation. Unrecognized connections are forwarded to the mask host for probe resistance.
+**FakeTLS (ee)** wraps traffic in TLS records that imitate HTTPS. The secret includes the mask hostname for SNI validation. Telego forwards unrecognized connections to the mask host for probe resistance.
 
 **Raw (dd)** sends Obfuscated2 directly without TLS wrapping. Lower overhead but easier to fingerprint. Useful for compatibility with older clients or when TLS fronting isn't needed.
 
@@ -192,7 +191,7 @@ Telegram proxy registration and `proxy-tag` are optional. Without a tag, Telego 
 
 ME stays off by default because it changes the outbound topology and reserves persistent links and bounded queues. An upgrade does not enable these requirements silently.
 
-Before you enable ME, allow HTTPS to `core.telegram.org` and TCP to the signed ME endpoints. Private direct sockets also need UDP STUN access or a correct `nat-ip`. Any NAT on direct links must preserve TCP source ports.
+Before you enable ME, allow HTTPS to `core.telegram.org` and TCP to the ME endpoints in the Telegram artifacts. Private direct sockets also need UDP STUN access or a correct `nat-ip`. Any NAT on direct links must preserve TCP source ports.
 
 Add this section to enable ME:
 
@@ -207,6 +206,10 @@ enabled = true
 Restart Telego after a change to this section. If the section is absent or `enabled` is `false`, ME stays disabled.
 
 Telego replaces a failed link in place. Healthy bindings and healthy DC pools stay on their existing physical links.
+
+Unused links become eligible for refresh after 45–60 seconds. Telego completes the replacement handshake and RPC probe before it retires the current link.
+
+The current link stays available during preparation. A new client binding cancels the replacement.
 
 Before ME is ready, the direct DC path stays available. If ME cannot accept a binding, the direct DC path also stays available.
 
@@ -457,7 +460,7 @@ max-connections-per-ip = 100  # DoS protection
 max-ips-per-user = 3          # Sharing protection
 
 [secrets]
-user1 = "..."
+user1 = "0123456789abcdef0123456789abcdef"
 
 [tls-fronting]
 mask-host = "www.google.com"
@@ -584,11 +587,11 @@ kill -HUP $(pidof telego)
 **Automatic:** Config file changes are detected via fsnotify (Linux inotify).
 
 **Hot-reloadable fields:**
-- `log-level` — Applied immediately
-- `idle-timeout` — Applies to new connections
 
-**Require restart:**
-- `bind-to`, `secrets`, `tls-fronting.*`, `proxy-protocol`, `web-proxy.*`, `middle-end.*`, `max-connections-per-ip`, `max-ips-per-user`, `handshake-timeout`
+- `[general].log-level` — Applied immediately
+- `[performance].idle-timeout` — Applies to new connections
+
+All other configuration changes require a restart, including secrets, listeners, TLS fronting, WEB, ME, metrics, diagnostics, upstream routing, and connection limits.
 
 ---
 
@@ -713,6 +716,9 @@ To disable diagnostics, set `diagnostics = false`. Then restart Telego.
 | `telego_middleend_slot_failure_total` | Counter | Physical-link failures |
 | `telego_middleend_slot_failure_affected_bindings_total` | Counter | Bindings terminated by physical-link failures |
 | `telego_middleend_slot_repair_total` | Counter | Physical-link replacement results |
+| `telego_middleend_slot_refreshes_active` | Gauge | Refresh candidate reservations by generation role and signed DC, including cleanup |
+| `telego_middleend_slot_refresh_total` | Counter | Lifetime refresh results by signed DC: `success`, `failure`, or `canceled` |
+| `telego_middleend_zero_ready_transitions_total` | Counter | Lifetime losses of all ready links for an admitting signed DC |
 | `telego_middleend_frontend_routes_active` | Gauge | Active ME and direct-fallback routes |
 | `telego_middleend_frontend_route_commits_total` | Counter | Lifetime ME and direct-fallback route selections |
 

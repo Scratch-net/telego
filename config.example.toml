@@ -173,9 +173,15 @@ enabled = false
 
 # Telego derives the other limits. Each signed DC gets four gnet links in the active generation.
 # Liveness probes run every 5s. A link fails after 100s without a valid probe response.
+# Unused links become eligible for refresh after 45–60s.
+# A replacement has 10s to complete its handshake and return a matching RPC pong.
+# The current link stays available during preparation. A new client binding cancels the replacement.
+# Each manager permits one candidate per signed DC and eight in total, including cleanup.
+# Failed candidates leave the current link unchanged. Existing client bindings never move between links.
 # Artifact rotation prepares one candidate, then drains the old generation for up to 90s.
 # New clients use direct DC links until an active generation is ready.
 # Use the `telego_middleend_*` metrics to compare queue use with configured capacity.
+# Refresh outcomes and zero-ready transitions record replacement results and losses of per-DC availability.
 # Telego also logs admission, repair, refresh, queue pressure, and binding eviction events.
 # Telego logs the process descriptor limit and the direct-fallback minimum at startup.
 # The active-ready log reports live and two-generation payload-capacity ceilings.

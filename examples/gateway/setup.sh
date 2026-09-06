@@ -333,6 +333,7 @@ progress "Refreshing managed helper files"
 cp "$gateway_root/nginx/watch-certificate.sh" "$state_root/nginx/watch-certificate.sh"
 chmod 755 \
     "$state_root/site" \
+    "$state_root/letsencrypt/www" \
     "$state_root/nginx/watch-certificate.sh"
 
 printf '%s\n' "TELEGO_IMAGE=$telego_image" > "$gateway_root/.env"

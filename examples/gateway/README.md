@@ -239,7 +239,20 @@ docker compose exec -T nginx nginx -s reload
 
 ## Update the services
 
-Run the installation command again to update the gateway files. Use the same domain, carrier, port, and WEB options.
+Open the existing gateway directory that contains `state/` before the update.
+
+Use the same domain, email, carrier, port, and WEB arguments as the existing installation.
+If the image is pinned, include the selected `--image` value.
+
+For the default shared-port layout, run:
+
+```bash
+TELEGO_GATEWAY_DIR="$PWD" ./install.sh \
+  --domain proxy.example.com --email admin@example.com
+```
+
+The `TELEGO_GATEWAY_DIR` value targets the existing installation.
+Without this value, an installer run inside the gateway directory creates a nested `telego-gateway/` installation with separate state.
 
 The installer preserves the complete `state/` directory. The setup script writes the selected Telego image to `.env`.
 
@@ -252,6 +265,10 @@ docker compose ps
 ```
 
 The Certbot service runs certificate renewal every 12 hours. Nginx reloads only after a successful renewal.
+
+Setup gives `state/letsencrypt/www` mode `0755` so Nginx workers can read ACME challenges. Certificate and configuration directories remain private.
+
+This update procedure also applies the webroot permission change to an existing gateway. A Telego image update alone does not update host permissions.
 
 ## Stop or remove the gateway
 

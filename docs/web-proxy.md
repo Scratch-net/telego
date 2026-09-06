@@ -413,11 +413,6 @@ Add a second TLS listener for Telego certificate collection:
 ```nginx
 server {
     listen 127.0.0.1:8444 ssl default_server;
-    ssl_reject_handshake on;
-}
-
-server {
-    listen 127.0.0.1:8444 ssl;
     server_name proxy.example.com;
 
     ssl_certificate     /etc/letsencrypt/live/proxy.example.com/fullchain.pem;
@@ -428,6 +423,10 @@ server {
     }
 }
 ```
+
+This private listener serves the certificate by default. The ServerHello collector connects to `cert-host` without DNS SNI when that value is an IP address.
+
+Keep this listener on loopback. The public TLS listener retains its rejecting default server.
 
 Keep the existing port 80 server for ACME challenges and HTTPS redirects. Keep the existing certificate-renewal job.
 
@@ -573,7 +572,6 @@ Replace the email address and hostname in this command. The command must finish 
 Run these commands in order:
 
 ```bash
-cd examples/web-proxy
 docker compose config --quiet
 docker compose up -d nginx
 docker compose exec -T nginx nginx -t

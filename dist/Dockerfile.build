@@ -1,6 +1,6 @@
 # Multi-stage build for local Docker builds
-# Usage: docker build -f Dockerfile.build -t telego .
-# With version: docker build -f Dockerfile.build --build-arg VERSION=v1.0.0 -t telego .
+# Usage: docker build -f dist/Dockerfile.build -t telego .
+# With version: docker build -f dist/Dockerfile.build --build-arg VERSION=v0.6.1 -t telego .
 
 FROM alpine:latest AS certificates
 
