@@ -253,6 +253,11 @@ loop:
 		n, err = unix.Write(c.fd, iov[0])
 	}
 	_, _ = c.outboundBuffer.Discard(n)
+	// Owned-slice releases can close this connection reentrantly. Its fd may
+	// already be reused, so do not update or write through it after callbacks.
+	if !c.opened || el.connections.getConn(c.fd) != c {
+		return nil
+	}
 	switch err {
 	case nil:
 	case unix.EAGAIN:

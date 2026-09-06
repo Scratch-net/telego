@@ -43,7 +43,7 @@ func wakeClient(c clientEndpoint) error {
 
 func asyncWriteClient(c clientEndpoint, data []byte, callback func(error) error) error {
 	if stream, ok := c.(*LogicalStream); ok {
-		err := stream.execute(gnet.RunnableFunc(func(context.Context) error {
+		err := stream.executeOrderedOutput(gnet.RunnableFunc(func(context.Context) error {
 			err := stream.writeReserved(data)
 			return callback(err)
 		}))
@@ -55,6 +55,16 @@ func asyncWriteClient(c clientEndpoint, data []byte, callback func(error) error)
 	return c.(gnet.Conn).AsyncWrite(data, func(_ gnet.Conn, err error) error {
 		return callback(err)
 	})
+}
+
+// executeAfterClientOutput orders the splice EOF barrier after every logical
+// write. Native AsyncWrite uses gnet's high-priority queue, so the ordinary
+// low-priority owner task already follows its earlier native submissions.
+func executeAfterClientOutput(c clientEndpoint, run gnet.Runnable) error {
+	if stream, ok := c.(*LogicalStream); ok {
+		return stream.executeOrderedOutput(run)
+	}
+	return executeClient(c, run)
 }
 
 func reserveClientOutput(c clientEndpoint, want, minimum int) int {

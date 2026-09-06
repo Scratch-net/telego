@@ -114,6 +114,28 @@ After a successful probe, Telego publishes the candidate in one operation. The p
 
 Steady state contains one generation. Artifact rotation contains a maximum of two generations.
 
+## Unused-link refresh
+
+Telego prepares replacements for unused links before it retires the current links. Candidate preparation does not remove an admitted slot.
+
+An unused link has no client bindings or pending client work. This state also includes a previously used link after its last binding leaves.
+
+The refresh starts after 45–60s of unused time. Different slots have different deadlines to spread the work.
+
+Candidate preparation has a 10s deadline. A candidate must complete the ME handshake and return a matching RPC pong before Telego publishes it.
+
+The current link stays available during preparation. If a client binds to that link, Telego discards the candidate and preserves the client binding.
+
+Telego also requires empty client queues and exclusive probe ownership before publication. Existing client bindings never move to a different physical link.
+
+A failed candidate leaves the current link unchanged. Telego retries with a bounded positive delay.
+
+Each manager permits at most one candidate reservation per signed DC and eight reservations in total. A reservation remains active through candidate cleanup or old-link cleanup.
+
+Rotation and shutdown cancel candidate work. The link probe schedule remains independent of this refresh schedule.
+
+This refresh manages connection turnover. It does not establish Telegram's private timeout policy or guarantee that a peer keeps an unused connection open.
+
 ## Link repair
 
 Telego sends a probe to every physical link every 5s. A link fails when a valid response does not arrive within 100s.
@@ -133,6 +155,9 @@ Telego derives the operational limits below. Most installations do not need an o
 | Limit | Default | Behavior |
 |---|---:|---|
 | Links for each signed DC | 4 | Fixed from the minimum in the official implementation |
+| Refresh reservations for each manager | 8 | At most one for each signed DC, including cleanup |
+| Unused-link refresh delay | 45–60s | Staggered across physical slots |
+| Refresh preparation deadline | 10s | Covers construction, handshake, and the matching pong |
 | Public connections | 10,000 | `max-connections` can only reduce this value |
 | Link request queue | 4,096 items and 2MiB | Fixed for each physical link |
 | Link response queue | 4,096 items and 2MiB | Fixed for each physical link |
@@ -150,6 +175,16 @@ Telego derives the operational limits below. Most installations do not need an o
 
 The byte budgets are independent ceilings. Do not add them together as one shared queue.
 
+The reported payload capacity includes the link queues for eight extra candidates per manager. Rotation reserves capacity for at most two managers.
+
+For an artifact set with 48 admitted links, the logical link allowance is 56 for one manager and 112 during rotation.
+
+These values are not process file-descriptor limits. Socket closure, bootstrap, listeners, and runtime resources also use descriptors.
+
+For enrolled ME sockets, gnet can retain one descriptor per ME event loop after logical closure and before physical closure.
+
+This allowance covers only that close-completion interval. Bootstrap and enrollment can temporarily duplicate descriptors and require separate capacity.
+
 The `queue-budget-mb` range is 2 through 32. A value of `0` selects the default and its extra 16KiB permit.
 
 ## Metrics and logs
@@ -166,15 +201,30 @@ Enable the Prometheus listener to inspect ME state. Start with these metrics:
 | `telego_middleend_slot_failure_affected_bindings_total` | Bindings that physical-link failures terminated |
 | `telego_middleend_slot_repairs_active` | Physical slots that Telego currently replaces |
 | `telego_middleend_slot_repair_total` | Successful and failed physical-slot replacements |
+| `telego_middleend_slot_refreshes_active` | Candidate reservations by generation role and signed DC, including cleanup |
+| `telego_middleend_slot_refresh_total` | Service-lifetime refresh outcomes by signed DC: `success`, `failure`, or `canceled` |
+| `telego_middleend_zero_ready_transitions_total` | Service-lifetime losses of all ready slots in an admitting manager, by signed DC |
 | `telego_middleend_artifact_state` | Applied and pending artifact state |
 | `telego_middleend_artifact_refresh_total` | Artifact refresh results |
 | `telego_middleend_generation_apply_total` | Generation startup and rotation results |
 
 The queue metrics report current use, capacity, and lifetime high-water values. Telego logs thresholds at 80%, 95%, and 100%.
 
+The ready-link metric counts the current link during candidate preparation. Candidate reservations appear separately in `telego_middleend_slot_refreshes_active`.
+
+The refresh and zero-ready counters persist across generation rotation. The zero-ready counter excludes initial startup, intentional retirement, and shutdown.
+
+The manager records each zero-ready transition directly. A gap can increase this counter even if the next metrics sample already shows a recovered pool.
+
+Canceled refreshes include new client use and intentional lifecycle changes. They do not count as failed replacements.
+
 Telego logs route fallback, artifact failure, generation failure, failed physical-link replacement, and binding eviction events.
 
-Telego writes a warning when a physical-link failure closes client bindings. The warning includes the signed DC, error, and affected binding count.
+If a physical-link failure closes client bindings, Telego writes a warning. The warning includes the signed DC, fixed reason, and affected binding count.
+
+The last failure also reports `last_age_ms`, peer EOF status, and whether that link previously accepted a client request.
+
+The manager starts this age clock at initialization of the ready link. The value does not measure the full TCP connection lifetime.
 
 Failures without client impact and successful replacements use the debug log level.
 
@@ -199,6 +249,8 @@ If you add a SOCKS5 proxy, make sure that it accepts remote DNS and the configur
 If ME becomes ready after clients connect, reconnect those clients. Existing direct routes stay direct by design.
 
 If repair failures increase, inspect `telego_middleend_links` by signed DC. A healthy DC pool stays available during repair of another pool.
+
+If the zero-ready counter increases, inspect the affected signed DC and the refresh outcomes. A recovered gauge does not erase the recorded gap.
 
 If a queue reaches 80%, inspect its high-water metric and capacity. Reduce `max-connections` before you reduce `queue-budget-mb`.
 

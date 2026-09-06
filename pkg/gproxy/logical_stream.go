@@ -90,6 +90,12 @@ type LogicalStream struct {
 	outputItems    int
 	reservedBytes  int
 	reservedItems  int
+
+	outputOrderMu sync.Mutex
+	outputHead    *logicalOutputTask
+	outputTail    *logicalOutputTask
+	outputRunning bool
+	outputError   error
 }
 
 func (h *ProxyHandler) OpenLogicalStream(options LogicalStreamOptions) (*LogicalStream, error) {

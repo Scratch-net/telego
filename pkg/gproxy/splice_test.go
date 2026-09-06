@@ -252,7 +252,7 @@ func TestSpliceGnetStalledNginxDoesNotBlockAnotherClient(t *testing.T) {
 		if queued+buffered > server.handler.maxWriteBuffer {
 			t.Fatalf("stalled splice output exceeded bound: %d", queued+buffered)
 		}
-		if buffered > 0 && waiting > 0 {
+		if waiting > 0 && queued+buffered > 0 && relaySocketBackpressured(t, output, deadline) {
 			break
 		}
 		if time.Now().After(deadline) {

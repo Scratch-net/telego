@@ -759,6 +759,13 @@ uplinkResults:
 	if transport.livenessExpired && transport.uplinkPending == 0 && transport.phase == webSocketOpen {
 		transport.touchLiveness(connection)
 	}
+	if transport.phase == webSocketClosing {
+		// A blocked close write can span many read callbacks. Drop each read
+		// without decoding it; the existing write deadline still bounds close.
+		if _, err := connection.Discard(connection.InboundBuffered()); err != nil {
+			return gnet.Close
+		}
+	}
 	if action := h.pumpWebSocketWrites(connection, state, transport); action != gnet.None {
 		return action
 	}

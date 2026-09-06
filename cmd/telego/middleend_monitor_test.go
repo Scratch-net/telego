@@ -10,12 +10,13 @@ import (
 func TestMiddleEndPayloadCapacityCountsIndependentBudgetsOnce(t *testing.T) {
 	snapshot := middleend.ServiceSnapshot{
 		Capacity: middleend.ServiceCapacitySnapshot{
-			LinkSubmissionBytes:  11,
-			LinkEventBytes:       13,
-			ManagerRequestBytes:  17,
-			ManagerControlBytes:  19,
-			ManagerResponseBytes: 23,
-			BindingResponseBytes: 1_000,
+			MaxRefreshCandidatesPerManager: 8,
+			LinkSubmissionBytes:            11,
+			LinkEventBytes:                 13,
+			ManagerRequestBytes:            17,
+			ManagerControlBytes:            19,
+			ManagerResponseBytes:           23,
+			BindingResponseBytes:           1_000,
 		},
 		Supervisor: middleend.GenerationSupervisorSnapshot{
 			Active:   &middleend.FixedBindingManagerSnapshot{Slots: make([]middleend.FixedBindingSlotSnapshot, 2)},
@@ -27,20 +28,38 @@ func TestMiddleEndPayloadCapacityCountsIndependentBudgetsOnce(t *testing.T) {
 	live, rotation := middleEndPayloadCapacity(snapshot, frontend)
 	const managerCapacity = 17 + 19 + 23
 	const perLinkCapacity = 11 + 13
-	wantLive := int64(29 + 31 + 2*managerCapacity + 3*perLinkCapacity)
-	wantRotation := int64(29 + 31 + 2*(managerCapacity+2*perLinkCapacity))
+	wantLive := int64(29 + 31 + 2*managerCapacity + (3+2*8)*perLinkCapacity)
+	wantRotation := int64(29 + 31 + 2*(managerCapacity+(2+8)*perLinkCapacity))
 	if live != wantLive || rotation != wantRotation {
 		t.Fatalf("payload capacities = live %d rotation %d, want live %d rotation %d", live, rotation, wantLive, wantRotation)
 	}
 }
 
 func TestMiddleEndPayloadCapacityHandlesMissingGenerations(t *testing.T) {
-	live, rotation := middleEndPayloadCapacity(middleend.ServiceSnapshot{}, gproxy.MiddleEndFrontendStats{
+	live, rotation := middleEndPayloadCapacity(middleend.ServiceSnapshot{
+		Capacity: middleend.ServiceCapacitySnapshot{MaxRefreshCandidatesPerManager: 8},
+	}, gproxy.MiddleEndFrontendStats{
 		InputBytesLimit:  29,
 		OutputBytesLimit: 31,
 	})
 	if live != 60 || rotation != 60 {
 		t.Fatalf("payload capacities = live %d rotation %d, want 60 and 60", live, rotation)
+	}
+}
+
+func TestMiddleEndMonitorRefreshTotalsUseServiceLifetimeCounters(t *testing.T) {
+	snapshot := middleend.GenerationSupervisorSnapshot{
+		DCs: []middleend.FixedBindingDCSnapshot{
+			{DCID: -2, SlotRefreshSuccesses: 11, SlotRefreshFailures: 2, SlotRefreshCanceled: 3},
+			{DCID: 2, SlotRefreshSuccesses: 17, SlotRefreshFailures: 5, SlotRefreshCanceled: 7},
+		},
+		Active: &middleend.FixedBindingManagerSnapshot{
+			DCs: []middleend.FixedBindingDCSnapshot{{DCID: 2, SlotRefreshSuccesses: 1}},
+		},
+	}
+	successes, failures, canceled := middleEndSlotRefreshTotals(snapshot)
+	if successes != 28 || failures != 7 || canceled != 10 {
+		t.Fatalf("refresh totals = %d/%d/%d, want 28/7/10", successes, failures, canceled)
 	}
 }
 

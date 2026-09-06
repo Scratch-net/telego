@@ -37,6 +37,7 @@ type sessionOptions struct {
 	backendFactory        BackendFactory
 	owner                 gnet.EventLoop
 	budget                func(int, int, pendingClass) bool
+	manager               *Manager
 	onFinished            func(*Session, sessionCloseReason)
 	onCarrierRetry        func(carrierOperation)
 	onBackpressure        func(carrierOperation)
@@ -122,6 +123,7 @@ type Session struct {
 	pumpPending    []*backendStream
 	pumpDirty      bool
 	budget         func(int, int, pendingClass) bool
+	manager        *Manager
 
 	mu              sync.Mutex
 	streams         map[uint32]*streamState
@@ -190,6 +192,7 @@ func newSession(options sessionOptions) *Session {
 		backendFactory:        options.backendFactory,
 		owner:                 options.owner,
 		budget:                options.budget,
+		manager:               options.manager,
 		streams:               make(map[uint32]*streamState),
 		backends:              make(map[*backendStream]struct{}),
 		tombstones:            newBoundedSet[uint32](options.limits.MaxClosedStreamIDs),
@@ -1262,6 +1265,10 @@ func (s *Session) dataFrameAllowanceLocked(limit int) int {
 }
 
 func (s *Session) reservePendingLocked(cost, items int, class pendingClass) bool {
+	return s.reserveBackendPendingLocked(nil, cost, items, class)
+}
+
+func (s *Session) reserveBackendPendingLocked(backend *backendStream, cost, items int, class pendingClass) bool {
 	if cost == 0 && items == 0 {
 		return true
 	}
@@ -1284,8 +1291,14 @@ func (s *Session) reservePendingLocked(cost, items int, class pendingClass) bool
 		s.pendingCost > costLimit-cost || s.pendingItems > itemLimit-items {
 		return false
 	}
-	if s.budget != nil && !s.budget(cost, items, class) {
-		return false
+	if backend != nil && s.manager != nil {
+		if !s.manager.reserveBackendPending(backend, cost, items, class) {
+			return false
+		}
+	} else if s.budget != nil {
+		if !s.budget(cost, items, class) {
+			return false
+		}
 	}
 	s.pendingCost += cost
 	s.pendingItems += items
@@ -1659,7 +1672,7 @@ func (b *backendStream) readLoop(connection net.Conn) {
 
 func (b *backendStream) close() {
 	if b.session.backendFactory != nil {
-		b.cancel()
+		b.cancelContext()
 		b.session.scheduleBackendPump()
 		return
 	}
@@ -1676,4 +1689,7 @@ func (b *backendStream) close() {
 
 func (b *backendStream) cancelContext() {
 	b.cancel()
+	if b.session.manager != nil {
+		b.session.manager.cancelBackendBudgetWait(b)
+	}
 }

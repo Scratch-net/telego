@@ -92,21 +92,22 @@ type ServiceSnapshot struct {
 // ServiceCapacitySnapshot contains only non-secret production bounds needed
 // to interpret queue and high-water metrics.
 type ServiceCapacitySnapshot struct {
-	EventLoops           int
-	LinksPerDC           int
-	MaxResidentBindings  int
-	LinkSubmissionItems  int
-	LinkSubmissionBytes  int
-	LinkEventItems       int
-	LinkEventBytes       int
-	ManagerRequestItems  int
-	ManagerRequestBytes  int
-	ManagerControlItems  int
-	ManagerControlBytes  int
-	ManagerResponseItems int
-	ManagerResponseBytes int
-	BindingResponseItems int
-	BindingResponseBytes int
+	MaxRefreshCandidatesPerManager int
+	EventLoops                     int
+	LinksPerDC                     int
+	MaxResidentBindings            int
+	LinkSubmissionItems            int
+	LinkSubmissionBytes            int
+	LinkEventItems                 int
+	LinkEventBytes                 int
+	ManagerRequestItems            int
+	ManagerRequestBytes            int
+	ManagerControlItems            int
+	ManagerControlBytes            int
+	ManagerResponseItems           int
+	ManagerResponseBytes           int
+	BindingResponseItems           int
+	BindingResponseBytes           int
 }
 
 // Service owns the NAT resolver, artifact cache, shared gnet runtime,
@@ -191,21 +192,22 @@ func NewService(config ServiceConfig) (*Service, error) {
 		coordinator: coordinator,
 		nat:         config.NATResolver,
 		capacity: ServiceCapacitySnapshot{
-			EventLoops:           config.Runtime.EventLoops,
-			LinksPerDC:           config.LinksPerDC,
-			MaxResidentBindings:  config.BindingLimits.MaxResidentBindings,
-			LinkSubmissionItems:  config.LinkLimits.MaxPendingSubmissions,
-			LinkSubmissionBytes:  config.LinkLimits.MaxPendingSubmissionBytes,
-			LinkEventItems:       config.LinkLimits.MaxPendingEvents,
-			LinkEventBytes:       config.LinkLimits.MaxPendingEventBytes,
-			ManagerRequestItems:  config.BindingLimits.MaxPendingRequestItems,
-			ManagerRequestBytes:  config.BindingLimits.MaxPendingRequestBytes,
-			ManagerControlItems:  config.BindingLimits.MaxPendingControlItems,
-			ManagerControlBytes:  config.BindingLimits.MaxPendingControlBytes,
-			ManagerResponseItems: config.BindingLimits.MaxPendingResponseItems,
-			ManagerResponseBytes: config.BindingLimits.MaxPendingResponseBytes,
-			BindingResponseItems: config.BindingLimits.MaxPendingResponseItemsPerBinding,
-			BindingResponseBytes: config.BindingLimits.MaxPendingResponseBytesPerBinding,
+			MaxRefreshCandidatesPerManager: maxRefreshCandidatesPerManager,
+			EventLoops:                     config.Runtime.EventLoops,
+			LinksPerDC:                     config.LinksPerDC,
+			MaxResidentBindings:            config.BindingLimits.MaxResidentBindings,
+			LinkSubmissionItems:            config.LinkLimits.MaxPendingSubmissions,
+			LinkSubmissionBytes:            config.LinkLimits.MaxPendingSubmissionBytes,
+			LinkEventItems:                 config.LinkLimits.MaxPendingEvents,
+			LinkEventBytes:                 config.LinkLimits.MaxPendingEventBytes,
+			ManagerRequestItems:            config.BindingLimits.MaxPendingRequestItems,
+			ManagerRequestBytes:            config.BindingLimits.MaxPendingRequestBytes,
+			ManagerControlItems:            config.BindingLimits.MaxPendingControlItems,
+			ManagerControlBytes:            config.BindingLimits.MaxPendingControlBytes,
+			ManagerResponseItems:           config.BindingLimits.MaxPendingResponseItems,
+			ManagerResponseBytes:           config.BindingLimits.MaxPendingResponseBytes,
+			BindingResponseItems:           config.BindingLimits.MaxPendingResponseItemsPerBinding,
+			BindingResponseBytes:           config.BindingLimits.MaxPendingResponseBytesPerBinding,
 		},
 		done: make(chan struct{}),
 	}}, nil

@@ -6,7 +6,6 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/panjf2000/gnet/v2"
 )
@@ -72,7 +71,9 @@ type socketBackend struct {
 	requested               atomic.Bool
 	closed                  bool
 	inputBytes, outputBytes int
-	drainTimer              *time.Timer
+	inputItems, outputItems int
+	outputCost              int
+	outputHead, outputTail  *socketOutputChunk
 	cancelDial              func() bool
 	openOnce                sync.Once
 	closeOnce               sync.Once
@@ -82,6 +83,12 @@ type socketBackend struct {
 	setupComplete           bool
 	disposalReady           bool
 	disposalErr             error
+}
+
+type socketOutputChunk struct {
+	data   []byte
+	offset int
+	next   *socketOutputChunk
 }
 
 func (b *socketBackend) opened(err error) {
@@ -118,20 +125,35 @@ func (b *socketBackend) onTraffic(c gnet.Conn) gnet.Action {
 		return gnet.Close
 	}
 	inbound := c.InboundBuffered()
-	if inbound > b.options.MaxOutputBytes {
+	if inbound > b.options.MaxOutputBytes-b.outputCost {
 		return gnet.Close
 	}
-	if growth := inbound - b.outputBytes; growth > 0 {
-		items := 0
-		if b.outputBytes == 0 {
-			items = 1
-		}
-		if !reserveBackendBudget(b.options.OutputBudget, growth, items) {
+	if inbound > 0 {
+		if b.options.MaxOutputItems > 0 && b.outputItems >= b.options.MaxOutputItems {
 			return gnet.Close
 		}
-		b.outputBytes = inbound
+		if !reserveBackendBudget(b.options.OutputBudget, inbound, 1) {
+			return gnet.Close
+		}
+		// Consume the complete owner read. Leaving a suffix in gnet would let
+		// its pooled ring retain capacity that unread-byte counts cannot show.
+		data := make([]byte, inbound)
+		read, err := c.Read(data)
+		if err != nil || read != inbound {
+			releaseBackendBudget(b.options.OutputBudget, inbound, 1)
+			return gnet.Close
+		}
+		chunk := &socketOutputChunk{data: data}
+		if b.outputTail == nil {
+			b.outputHead = chunk
+		} else {
+			b.outputTail.next = chunk
+		}
+		b.outputTail = chunk
+		b.outputBytes += inbound
+		b.outputCost += inbound
+		b.outputItems++
 	}
-	b.refreshWriteBuffer()
 	b.notify()
 	return gnet.None
 }
@@ -143,29 +165,29 @@ func (b *socketBackend) TryWrite(data []byte) (int, error) {
 	if b.conn == nil || len(data) == 0 {
 		return 0, nil
 	}
-	b.refreshWriteBuffer()
 	n := min(len(data), RelayDataChunk, b.options.MaxInputBytes-b.inputBytes)
-	if n <= 0 {
-		b.armDrain()
+	if n <= 0 || (b.options.MaxInputItems > 0 && b.inputItems >= b.options.MaxInputItems) {
 		return 0, nil
 	}
-	items := 0
-	if b.inputBytes == 0 {
-		items = 1
+	writer, ok := b.conn.(gnet.OwnedWriter)
+	if !ok {
+		return 0, io.ErrClosedPipe
 	}
-	if !reserveBackendBudget(b.options.InputBudget, n, items) {
+	if !reserveBackendBudget(b.options.InputBudget, n, 1) {
 		return 0, nil
 	}
 	b.inputBytes += n
-	written, err := b.conn.Write(data[:n])
-	if b.closed {
-		return written, err
-	}
-	b.refreshWriteBuffer()
-	if b.inputBytes > 0 {
-		b.armDrain()
-	}
-	return written, err
+	b.inputItems++
+	owned := make([]byte, n)
+	copy(owned, data)
+	return writer.WriteOwned(owned, func(error) {
+		b.inputBytes -= n
+		b.inputItems--
+		releaseBackendBudget(b.options.InputBudget, n, 1)
+		if !b.closed {
+			b.notify()
+		}
+	})
 }
 
 func (b *socketBackend) TryRead(data []byte) (int, error) {
@@ -175,59 +197,30 @@ func (b *socketBackend) TryRead(data []byte) (int, error) {
 	if b.conn == nil || b.outputBytes == 0 || len(data) == 0 {
 		return 0, nil
 	}
-	n := min(len(data), b.outputBytes, RelayDataChunk)
-	read, err := b.conn.Read(data[:n])
-	if read == 0 {
-		return 0, err
+	limit := min(len(data), b.outputBytes, RelayDataChunk)
+	read := 0
+	for read < limit {
+		chunk := b.outputHead
+		n := copy(data[read:limit], chunk.data[chunk.offset:])
+		chunk.offset += n
+		read += n
+		b.outputBytes -= n
+		if chunk.offset == len(chunk.data) {
+			b.outputHead = chunk.next
+			if b.outputHead == nil {
+				b.outputTail = nil
+			}
+			cost := cap(chunk.data)
+			chunk.data, chunk.next = nil, nil
+			b.outputCost -= cost
+			b.outputItems--
+			releaseBackendBudget(b.options.OutputBudget, cost, 1)
+		}
 	}
-	b.outputBytes -= read
-	items := 0
-	if b.outputBytes == 0 {
-		items = 1
-	}
-	releaseBackendBudget(b.options.OutputBudget, read, items)
-	return read, err
+	return read, nil
 }
 
 func (b *socketBackend) ReadableBytes() int { return b.outputBytes }
-
-func (b *socketBackend) refreshWriteBuffer() {
-	if b.closed || b.conn == nil {
-		return
-	}
-	buffered := b.conn.OutboundBuffered()
-	if released := b.inputBytes - buffered; released > 0 {
-		items := 0
-		if buffered == 0 {
-			items = 1
-		}
-		b.inputBytes = buffered
-		releaseBackendBudget(b.options.InputBudget, released, items)
-	}
-}
-
-func (b *socketBackend) armDrain() {
-	if b.drainTimer != nil || b.closed {
-		return
-	}
-	b.drainTimer = time.AfterFunc(drainCheckInterval, func() {
-		_ = b.options.Owner.Execute(context.Background(), gnet.RunnableFunc(func(context.Context) error {
-			b.drainTimer = nil
-			if b.closed {
-				return nil
-			}
-			before := b.inputBytes
-			b.refreshWriteBuffer()
-			if b.inputBytes < before {
-				b.notify()
-			}
-			if b.inputBytes > 0 {
-				b.armDrain()
-			}
-			return nil
-		}))
-	})
-}
 
 func (b *socketBackend) Close() error {
 	if !b.requested.CompareAndSwap(false, true) || b.retired.Load() {
@@ -248,10 +241,6 @@ func (b *socketBackend) finish(err error) {
 		return
 	}
 	b.closed = true
-	if b.drainTimer != nil {
-		b.drainTimer.Stop()
-		b.drainTimer = nil
-	}
 	if b.conn == nil {
 		b.requestDisposal(err)
 		return
@@ -272,10 +261,6 @@ func (b *socketBackend) OwnerStopped() {
 	}
 	b.requested.Store(true)
 	b.closed = true
-	if b.drainTimer != nil {
-		b.drainTimer.Stop()
-		b.drainTimer = nil
-	}
 	b.requestDisposal(io.EOF)
 }
 
@@ -303,12 +288,20 @@ func (b *socketBackend) requestDisposal(err error) {
 func (b *socketBackend) dispose(err error) {
 	b.disposeOnce.Do(func() {
 		if b.inputBytes > 0 {
-			releaseBackendBudget(b.options.InputBudget, b.inputBytes, 1)
+			releaseBackendBudget(b.options.InputBudget, b.inputBytes, b.inputItems)
 			b.inputBytes = 0
+			b.inputItems = 0
 		}
-		if b.outputBytes > 0 {
-			releaseBackendBudget(b.options.OutputBudget, b.outputBytes, 1)
-			b.outputBytes = 0
+		if b.outputCost > 0 {
+			for chunk := b.outputHead; chunk != nil; {
+				next := chunk.next
+				chunk.data, chunk.next = nil, nil
+				chunk = next
+			}
+			b.outputHead, b.outputTail = nil, nil
+			cost, items := b.outputCost, b.outputItems
+			b.outputBytes, b.outputCost, b.outputItems = 0, 0, 0
+			releaseBackendBudget(b.options.OutputBudget, cost, items)
 		}
 		if err == nil {
 			err = io.EOF

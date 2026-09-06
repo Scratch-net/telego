@@ -37,6 +37,10 @@ type middleEndMonitorCounters struct {
 	slotFailureAffectedBindings uint64
 	slotRepairSuccesses         uint64
 	slotRepairFailures          uint64
+	slotRefreshSuccesses        uint64
+	slotRefreshFailures         uint64
+	slotRefreshCanceled         uint64
+	zeroReadyTransitions        map[middleend.DCID]uint64
 	responseBackpressure        uint64
 	controlBackpressure         uint64
 	frontendInputPressure       uint64
@@ -101,6 +105,7 @@ func (m *middleEndMonitor) observe() {
 		frontend = m.frontend.MiddleEndFrontendStats()
 	}
 	responseBackpressure, controlBackpressure := middleEndBackpressureTotals(snapshot.Supervisor)
+	refreshSuccesses, refreshFailures, refreshCanceled := middleEndSlotRefreshTotals(snapshot.Supervisor)
 	current := middleEndMonitorCounters{
 		initialized:                 true,
 		admitting:                   snapshot.Supervisor.Admitting,
@@ -115,6 +120,10 @@ func (m *middleEndMonitor) observe() {
 		slotFailureAffectedBindings: snapshot.Supervisor.SlotFailureAffectedBindings,
 		slotRepairSuccesses:         snapshot.Supervisor.SlotRepairSuccesses,
 		slotRepairFailures:          snapshot.Supervisor.SlotRepairFailures,
+		slotRefreshSuccesses:        refreshSuccesses,
+		slotRefreshFailures:         refreshFailures,
+		slotRefreshCanceled:         refreshCanceled,
+		zeroReadyTransitions:        make(map[middleend.DCID]uint64, len(snapshot.Supervisor.DCs)),
 		responseBackpressure:        responseBackpressure,
 		controlBackpressure:         controlBackpressure,
 		frontendInputPressure:       frontend.InputBackpressureEvents,
@@ -144,8 +153,12 @@ func (m *middleEndMonitor) observe() {
 	if !previous.initialized || current.admitting != previous.admitting {
 		if current.admitting {
 			livePayloadCapacity, rotationPayloadCapacity := middleEndPayloadCapacity(snapshot, frontend)
+			liveLinkCapacity, rotationLinkCapacity := middleEndLinkCapacity(snapshot)
 			log.Info().
 				Int("active_links", middleEndManagerLinks(snapshot.Supervisor.Active)).
+				Int("refresh_candidates_per_manager", snapshot.Capacity.MaxRefreshCandidatesPerManager).
+				Int("live_me_link_capacity", liveLinkCapacity).
+				Int("rotation_me_link_capacity", rotationLinkCapacity).
 				Int64("active_middleend_bindings", frontend.MiddleEndBindingsActive).
 				Int64("active_direct_fallbacks", frontend.DirectFallbacksActive).
 				Int64("live_payload_capacity_bytes", livePayloadCapacity).
@@ -226,7 +239,9 @@ func (m *middleEndMonitor) observe() {
 			Uint64("affected_bindings_total", current.slotFailureAffectedBindings).
 			Int("last_dc", int(failure.DCID)).
 			Str("last_reason", string(failure.Reason)).
-			Err(failure.Error).
+			Bool("last_peer_eof", failure.PeerEOF).
+			Bool("last_used", failure.Used).
+			Int64("last_age_ms", max(0, failure.Age.Milliseconds())).
 			Msg(message)
 	}
 	if current.slotRepairSuccesses > previous.slotRepairSuccesses {
@@ -234,6 +249,34 @@ func (m *middleEndMonitor) observe() {
 			Uint64("new_repairs", current.slotRepairSuccesses-previous.slotRepairSuccesses).
 			Uint64("repairs_total", current.slotRepairSuccesses).
 			Msg("Middle-End physical-link replacement finished")
+	}
+	if failures := middleEndCounterIncrease(current.slotRefreshFailures, previous.slotRefreshFailures); failures > 0 {
+		log.Warn().
+			Uint64("new_failures", failures).
+			Uint64("failures_total", current.slotRefreshFailures).
+			Msg("Middle-End unused-link refresh failed. The current link remains available unless it fails independently")
+	}
+	if successes := middleEndCounterIncrease(current.slotRefreshSuccesses, previous.slotRefreshSuccesses); successes > 0 {
+		log.Debug().
+			Uint64("new_refreshes", successes).
+			Uint64("refreshes_total", current.slotRefreshSuccesses).
+			Msg("Middle-End unused-link refresh finished")
+	}
+	if canceled := middleEndCounterIncrease(current.slotRefreshCanceled, previous.slotRefreshCanceled); canceled > 0 {
+		log.Debug().
+			Uint64("new_cancellations", canceled).
+			Uint64("cancellations_total", current.slotRefreshCanceled).
+			Msg("Middle-End unused-link refresh canceled after a lifecycle or client-use change")
+	}
+	for _, dc := range snapshot.Supervisor.DCs {
+		current.zeroReadyTransitions[dc.DCID] = dc.ZeroReadyTransitions
+		if changes := middleEndCounterIncrease(dc.ZeroReadyTransitions, previous.zeroReadyTransitions[dc.DCID]); changes > 0 {
+			log.Warn().
+				Int("dc", int(dc.DCID)).
+				Uint64("new_transitions", changes).
+				Uint64("transitions_total", dc.ZeroReadyTransitions).
+				Msg("Middle-End DC pool lost all ready links")
+		}
 	}
 	if current.responseBackpressure > previous.responseBackpressure {
 		log.Warn().
@@ -339,7 +382,7 @@ func middleEndPayloadCapacity(snapshot middleend.ServiceSnapshot, frontend gprox
 		managerCapacity := int64(capacity.ManagerRequestBytes) +
 			int64(capacity.ManagerControlBytes) +
 			int64(capacity.ManagerResponseBytes)
-		linkCapacity := int64(len(manager.Slots)) *
+		linkCapacity := int64(len(manager.Slots)+capacity.MaxRefreshCandidatesPerManager) *
 			(int64(capacity.LinkSubmissionBytes) + int64(capacity.LinkEventBytes))
 		return managerCapacity + linkCapacity
 	}
@@ -349,6 +392,15 @@ func middleEndPayloadCapacity(snapshot middleend.ServiceSnapshot, frontend gprox
 	live = frontendCapacity + activeCapacity + retiringCapacity
 	rotation = frontendCapacity + 2*max(activeCapacity, retiringCapacity)
 	return live, rotation
+}
+
+func middleEndSlotRefreshTotals(snapshot middleend.GenerationSupervisorSnapshot) (successes, failures, canceled uint64) {
+	for _, dc := range snapshot.DCs {
+		successes += dc.SlotRefreshSuccesses
+		failures += dc.SlotRefreshFailures
+		canceled += dc.SlotRefreshCanceled
+	}
+	return successes, failures, canceled
 }
 
 func middleEndBackpressureTotals(snapshot middleend.GenerationSupervisorSnapshot) (response, control uint64) {

@@ -106,8 +106,27 @@ type UpstreamConfig struct {
 
 // MetricsConfig configures the Prometheus metrics endpoint.
 type MetricsConfig struct {
-	BindTo string `toml:"bind-to"` // Address to bind metrics server (empty = disabled)
-	Path   string `toml:"path"`    // Metrics path (default: /metrics)
+	BindTo      string `toml:"bind-to"`     // Address to bind metrics server (empty = disabled)
+	Path        string `toml:"path"`        // Metrics path (default: /metrics)
+	Diagnostics bool   `toml:"diagnostics"` // Private on-demand runtime profiles (default: disabled)
+}
+
+// Validate rejects diagnostics that can bind beyond a literal loopback address.
+func (c MetricsConfig) Validate() error {
+	if !c.Diagnostics {
+		return nil
+	}
+	address, err := netip.ParseAddrPort(c.BindTo)
+	if err != nil || address.Port() == 0 || address.Addr().Zone() != "" || !address.Addr().Unmap().IsLoopback() {
+		return errors.New("metrics diagnostics require a literal loopback IP and a port from 1 to 65535")
+	}
+	if strings.HasPrefix(c.Path, "/debug/pprof") {
+		return errors.New("metrics path conflicts with the reserved diagnostics paths")
+	}
+	if c.Path != "" && (!strings.HasPrefix(c.Path, "/") || strings.ContainsAny(c.Path, " %{}\t\r\n")) {
+		return errors.New("metrics path must be an absolute HTTP path without patterns or escapes")
+	}
+	return nil
 }
 
 // WebProxyConfig configures the optional private WEB carrier listener. Nginx
@@ -180,12 +199,18 @@ func Load(path string) (*Config, error) {
 	if err := toml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
+	if err := cfg.Metrics.Validate(); err != nil {
+		return nil, err
+	}
 
 	return &cfg, nil
 }
 
 // ToGProxyConfig converts to gproxy.Config.
 func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
+	if err := c.Metrics.Validate(); err != nil {
+		return gproxy.Config{}, err
+	}
 	cfg := gproxy.DefaultConfig()
 
 	// Bind address: [general] takes precedence over top-level (backwards compat)

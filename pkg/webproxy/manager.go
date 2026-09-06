@@ -85,6 +85,11 @@ type Manager struct {
 	timeouts       Timeouts
 	dialBackend    BackendDialContextFunc
 	backendFactory BackendFactory
+	budgetWake     chan struct{}
+	budgetWaiters  map[backendBudgetKey]*list.Element
+	budgetQueue    list.List
+	budgetActive   *backendBudgetWake
+	budgetTasks    map[*backendBudgetWake]struct{}
 
 	mu           sync.Mutex
 	bootstraps   map[[sha256.Size]byte]*bootstrap
@@ -136,6 +141,7 @@ func NewManager(config ManagerConfig) (*Manager, error) {
 		timeouts:       config.Timeouts,
 		dialBackend:    dialBackend,
 		backendFactory: config.BackendFactory,
+		budgetWake:     make(chan struct{}, 1),
 		bootstraps:     make(map[[sha256.Size]byte]*bootstrap),
 		sessions:       make(map[[sha256.Size]byte]*Session),
 		closedTokens:   make(map[[sha256.Size]byte]*closedToken),
@@ -295,6 +301,7 @@ func (a *BootstrapAuthorization) create(clientIP string, body []byte, owner gnet
 		backendFactory:        m.backendFactory,
 		owner:                 owner,
 		budget:                m.changePendingBudget,
+		manager:               m,
 		onCarrierRetry:        m.recordCarrierRetry,
 		onBackpressure:        m.recordBackpressure,
 		acquireStream:         m.acquireStream,
@@ -419,6 +426,7 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 }
 
 func (m *Manager) retireBackendOwners(owners map[gnet.EventLoop]struct{}) {
+	m.retireBudgetOwners(owners)
 	m.mu.Lock()
 	sessions := make([]*Session, 0, len(m.sessions))
 	for _, session := range m.sessions {
@@ -464,25 +472,34 @@ func (m *Manager) streamFinished() {
 func (m *Manager) changePendingBudget(byteDelta, itemDelta int, class pendingClass) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.changePendingBudgetLocked(byteDelta, itemDelta, class)
+}
+
+func (m *Manager) pendingBudgetLimits(class pendingClass) (int, int) {
+	byteLimit := m.limits.MaxPendingGlobal
+	itemLimit := m.limits.MaxPendingItemsGlobal
+	if class != pendingControl {
+		reserveBytes, reserveItems, _ := pendingControlReserve(m.limits)
+		reserveBytes, _ = checkedMulInt(reserveBytes, m.limits.MaxSessions)
+		reserveItems, _ = checkedMulInt(reserveItems, m.limits.MaxSessions)
+		byteLimit -= reserveBytes
+		itemLimit -= reserveItems
+	}
+	if m.backendFactory != nil && class != pendingControl && class != pendingHandoff {
+		reserveBytes, reserveItems := backendHandoffReserve(m.limits)
+		if class == pendingBackendInput {
+			reserveBytes /= 2
+			reserveItems /= 2
+		}
+		byteLimit -= reserveBytes * m.limits.MaxSessions
+		itemLimit -= reserveItems * m.limits.MaxSessions
+	}
+	return byteLimit, itemLimit
+}
+
+func (m *Manager) changePendingBudgetLocked(byteDelta, itemDelta int, class pendingClass) bool {
 	if byteDelta > 0 || itemDelta > 0 {
-		byteLimit := m.limits.MaxPendingGlobal
-		itemLimit := m.limits.MaxPendingItemsGlobal
-		if class != pendingControl {
-			reserveBytes, reserveItems, _ := pendingControlReserve(m.limits)
-			reserveBytes, _ = checkedMulInt(reserveBytes, m.limits.MaxSessions)
-			reserveItems, _ = checkedMulInt(reserveItems, m.limits.MaxSessions)
-			byteLimit -= reserveBytes
-			itemLimit -= reserveItems
-		}
-		if m.backendFactory != nil && class != pendingControl && class != pendingHandoff {
-			reserveBytes, reserveItems := backendHandoffReserve(m.limits)
-			if class == pendingBackendInput {
-				reserveBytes /= 2
-				reserveItems /= 2
-			}
-			byteLimit -= reserveBytes * m.limits.MaxSessions
-			itemLimit -= reserveItems * m.limits.MaxSessions
-		}
+		byteLimit, itemLimit := m.pendingBudgetLimits(class)
 		if byteDelta < 0 || itemDelta < 0 ||
 			int64(byteDelta) > int64(byteLimit)-m.pendingBytes ||
 			int64(itemDelta) > int64(itemLimit)-m.pendingItems {
@@ -493,6 +510,9 @@ func (m *Manager) changePendingBudget(byteDelta, itemDelta int, class pendingCla
 	m.pendingItems += int64(itemDelta)
 	if m.pendingBytes < 0 || m.pendingItems < 0 {
 		panic("negative WEB global pending budget")
+	}
+	if byteDelta < 0 || itemDelta < 0 {
+		m.signalBudgetWaitersLocked()
 	}
 	return true
 }
@@ -585,6 +605,8 @@ func (m *Manager) cleanupLoop() {
 			}
 		case <-m.stop:
 			return
+		case <-m.budgetWake:
+			m.wakeBudgetWaiter()
 		}
 	}
 }

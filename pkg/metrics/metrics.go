@@ -22,8 +22,9 @@ import (
 
 // Server wraps the metrics HTTP server.
 type Server struct {
-	httpServer *http.Server
-	provider   *sdkmetric.MeterProvider
+	httpServer  *http.Server
+	provider    *sdkmetric.MeterProvider
+	diagnostics *diagnostics
 }
 
 // StatsProvider provides user statistics for metrics.
@@ -52,15 +53,19 @@ type MiddleEndStatsProvider interface {
 
 // Config configures the metrics server.
 type Config struct {
-	BindAddr   string
-	Path       string
-	ProxyStats ProxyStatsProvider
-	WebStats   WebStatsProvider
-	MiddleEnd  MiddleEndStatsProvider
+	BindAddr    string
+	Path        string
+	Diagnostics bool
+	ProxyStats  ProxyStatsProvider
+	WebStats    WebStatsProvider
+	MiddleEnd   MiddleEndStatsProvider
 }
 
 // NewServer creates a new metrics server.
 func NewServer(cfg Config, limiter StatsProvider) (*Server, error) {
+	if err := validateDiagnosticsConfig(cfg); err != nil {
+		return nil, err
+	}
 	// Create Prometheus exporter
 	exporter, err := prometheus.New()
 	if err != nil {
@@ -99,10 +104,21 @@ func NewServer(cfg Config, limiter StatsProvider) (*Server, error) {
 		Addr:    cfg.BindAddr,
 		Handler: mux,
 	}
+	var profiles *diagnostics
+	if cfg.Diagnostics {
+		profiles = newDiagnostics()
+		profiles.register(mux)
+		httpServer.ReadHeaderTimeout = 3 * time.Second
+		httpServer.ReadTimeout = 5 * time.Second
+		httpServer.WriteTimeout = diagnosticsRequestTimeout
+		httpServer.IdleTimeout = 30 * time.Second
+		httpServer.MaxHeaderBytes = 8 << 10
+	}
 
 	return &Server{
-		httpServer: httpServer,
-		provider:   provider,
+		httpServer:  httpServer,
+		provider:    provider,
+		diagnostics: profiles,
 	}, nil
 }
 
@@ -112,21 +128,22 @@ func registerMiddleEndMetrics(meter metric.Meter, provider MiddleEndStatsProvide
 		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
 			capacity := provider.Snapshot().Capacity
 			for resource, value := range map[string]int{
-				"event_loops":            capacity.EventLoops,
-				"links_per_dc":           capacity.LinksPerDC,
-				"resident_bindings":      capacity.MaxResidentBindings,
-				"link_submission_items":  capacity.LinkSubmissionItems,
-				"link_submission_bytes":  capacity.LinkSubmissionBytes,
-				"link_event_items":       capacity.LinkEventItems,
-				"link_event_bytes":       capacity.LinkEventBytes,
-				"manager_request_items":  capacity.ManagerRequestItems,
-				"manager_request_bytes":  capacity.ManagerRequestBytes,
-				"manager_control_items":  capacity.ManagerControlItems,
-				"manager_control_bytes":  capacity.ManagerControlBytes,
-				"manager_response_items": capacity.ManagerResponseItems,
-				"manager_response_bytes": capacity.ManagerResponseBytes,
-				"binding_response_items": capacity.BindingResponseItems,
-				"binding_response_bytes": capacity.BindingResponseBytes,
+				"refresh_candidates_per_manager": capacity.MaxRefreshCandidatesPerManager,
+				"event_loops":                    capacity.EventLoops,
+				"links_per_dc":                   capacity.LinksPerDC,
+				"resident_bindings":              capacity.MaxResidentBindings,
+				"link_submission_items":          capacity.LinkSubmissionItems,
+				"link_submission_bytes":          capacity.LinkSubmissionBytes,
+				"link_event_items":               capacity.LinkEventItems,
+				"link_event_bytes":               capacity.LinkEventBytes,
+				"manager_request_items":          capacity.ManagerRequestItems,
+				"manager_request_bytes":          capacity.ManagerRequestBytes,
+				"manager_control_items":          capacity.ManagerControlItems,
+				"manager_control_bytes":          capacity.ManagerControlBytes,
+				"manager_response_items":         capacity.ManagerResponseItems,
+				"manager_response_bytes":         capacity.ManagerResponseBytes,
+				"binding_response_items":         capacity.BindingResponseItems,
+				"binding_response_bytes":         capacity.BindingResponseBytes,
 			} {
 				observer.Observe(int64(value), metric.WithAttributes(attribute.String("resource", resource)))
 			}
@@ -246,6 +263,7 @@ func registerMiddleEndMetrics(meter metric.Meter, provider MiddleEndStatsProvide
 	)
 	registerMiddleEndManagerQueueMetrics(meter, provider)
 	registerMiddleEndLinkQueueMetrics(meter, provider)
+	registerMiddleEndRefreshMetrics(meter, provider)
 }
 
 type middleEndLinkMetricKey struct {
@@ -775,6 +793,9 @@ func (s *Server) Start() error {
 
 // Shutdown gracefully shuts down the metrics server.
 func (s *Server) Shutdown(ctx context.Context) error {
+	if s.diagnostics != nil {
+		s.diagnostics.cancel()
+	}
 	if err := s.httpServer.Shutdown(ctx); err != nil {
 		return err
 	}

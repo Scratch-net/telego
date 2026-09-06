@@ -18,6 +18,14 @@ Telego maintains local changes for client shutdown completion, enrollment owners
 Poller changes serialize notifications with descriptor closure and discard queued tasks after the owner stops.
 Modified source files identify the Telego changes. The upstream copyright notices remain.
 
+The optional `OwnedWriter` API retains caller-owned output slices until socket drain or disposal.
+Telego charges each complete allocation until its release callback runs. Partial writes do not release that charge.
+Buffer operations unlink the complete processed batch before release callbacks run. These callbacks can reenter the connection without duplicate writes.
+Ordinary `Write` and `AsyncWrite` retain their existing copy semantics.
+
+`ExecuteHighPriority` submits owned writes through the Unix high-priority FIFO queue.
+Unsupported owners, including the Windows owner, return an error instead of an unordered fallback.
+
 Test-only changes restrict the default-poller example to its supported build and remove a guaranteed-reuse assumption from the `sync.Pool` test.
 UDP proxy tests use ephemeral backend ports and clean up partial setup.
 Device-specific IPv6 tests skip only when the selected interface has no IPv6 address.
@@ -37,18 +45,22 @@ Its gate uses a non-race build.
 `registration_shutdown_regression_test.go` checks accepted enrollment during owner shutdown through the upstream public APIs.
 The test fails on the recorded upstream revision and passes with this patch.
 
+The `owned_write_*_test.go` tests cover real partial socket writes, disposal, and reentrant release callbacks.
+The buffer tests cover mixed ordinary and owned output, partial consumption, and release on close.
+
 ## Update
 
 1. Compare the new upstream source with the revision in this document.
 2. Preserve the upstream license, copyright notices, and tests.
-3. Reapply the local lifecycle changes and their regression tests.
+3. Reapply the local lifecycle and owned-buffer changes with their regression tests.
 4. Update the module requirements, replacements, and this provenance together.
 5. Run `make test` from the repository root.
 6. Build the Linux release targets with `poll_opt,gc_opt`.
 
-If upstream includes the required lifecycle APIs and regression fixes, remove both local replacements in the same reviewed change.
+If upstream includes the required lifecycle and owned-buffer APIs, remove both local replacements in the same reviewed change.
+The upstream implementation must pass the local regression tests.
 
 ## Rollback
 
 Restore the prior Telego source and local dependency together.
-Do not remove only the replacement directives. The Telego integration uses the local lifecycle APIs.
+Do not remove only the replacement directives. The Telego integration uses the local lifecycle and owned-buffer APIs.

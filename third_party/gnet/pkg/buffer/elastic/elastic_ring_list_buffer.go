@@ -14,6 +14,8 @@
 
 package elastic
 
+// Telego local modification: optional owned output slices. See TELEGO.md.
+
 import (
 	"io"
 	"math"
@@ -97,6 +99,12 @@ func (mb *Buffer) Write(p []byte) (n int, err error) {
 	return mb.ringBuffer.Write(p)
 }
 
+// AppendOwned preserves existing ring/list ordering without copying p.
+// release follows linkedlist.Buffer.AppendOwned's ownership contract.
+func (mb *Buffer) AppendOwned(p []byte, release func(error)) {
+	mb.listBuffer.AppendOwned(p, release)
+}
+
 // Writev appends multiple byte slices to this buffer.
 func (mb *Buffer) Writev(bs [][]byte) (int, error) {
 	if !mb.listBuffer.IsEmpty() || mb.ringBuffer.Buffered() >= mb.maxStaticBytes {
@@ -141,8 +149,10 @@ func (mb *Buffer) ReadFrom(r io.Reader) (int64, error) {
 
 // WriteTo implements io.WriterTo.
 func (mb *Buffer) WriteTo(w io.Writer) (n int64, err error) {
-	if n, err = mb.ringBuffer.WriteTo(w); err != nil {
-		return
+	if !mb.ringBuffer.IsEmpty() {
+		if n, err = mb.ringBuffer.WriteTo(w); err != nil {
+			return
+		}
 	}
 	var m int64
 	m, err = mb.listBuffer.WriteTo(w)

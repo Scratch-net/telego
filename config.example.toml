@@ -221,3 +221,8 @@ num-event-loops = 0
 
 # Metrics path (default: /metrics)
 # path = "/metrics"
+
+# Private runtime profiles (default: disabled). A restart applies this option.
+# This option requires a literal loopback bind address and a nonzero port.
+# Do not forward these routes through Nginx or another public proxy.
+# diagnostics = false

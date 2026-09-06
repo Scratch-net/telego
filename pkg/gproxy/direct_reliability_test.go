@@ -168,7 +168,7 @@ func TestDirectRelayStalledSocketResumesAfterDrain(t *testing.T) {
 		if queued+buffered > limit {
 			t.Fatalf("output grew beyond limit: queued %d buffered %d", queued, buffered)
 		}
-		if waiting > 0 && buffered > 0 {
+		if waiting > 0 && queued+buffered > 0 && relaySocketBackpressured(t, relay.ToDC, deadline) {
 			break
 		}
 	}
@@ -187,6 +187,36 @@ func TestDirectRelayStalledSocketResumesAfterDrain(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatal("socket drain did not resume the buffered input in order")
+	}
+}
+
+// Owned writes remain charged in queued until their final byte drains. Check
+// the actual socket on its owner after earlier HIGH submissions, so a stalled
+// task queue alone cannot satisfy these socket-backpressure fixtures.
+func relaySocketBackpressured(t *testing.T, output *relayOutput, deadline time.Time) bool {
+	t.Helper()
+	for {
+		var retained, waiting, socketBuffered int
+		runLogicalOwner(t, clientOwner(output.destination), func() {
+			socketBuffered = output.destination.OutboundBuffered()
+			output.mu.Lock()
+			retained, waiting = output.queued+output.buffered, output.waiting
+			output.mu.Unlock()
+		})
+		if retained > output.limit {
+			t.Fatalf("socket output exceeded retained limit: %d > %d", retained, output.limit)
+		}
+		if waiting == 0 || retained == 0 {
+			return false
+		}
+		if socketBuffered > 0 {
+			return true
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("pending relay submissions did not reach the socket owner")
+		}
+		// Do not inject another burst while reservations are still blocked.
+		time.Sleep(time.Millisecond)
 	}
 }
 

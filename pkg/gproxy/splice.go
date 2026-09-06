@@ -1,7 +1,6 @@
 package gproxy
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -195,7 +194,8 @@ func relaySpliceBytes(source clientEndpoint, output *relayOutput, ctx *ConnConte
 	if n == 0 {
 		return gnet.None
 	}
-	buffer := bytes.Clone(data[:n])
+	buffer := make([]byte, n)
+	copy(buffer, data[:n])
 	if discarded, err := source.Discard(n); err != nil || discarded != n {
 		output.cancelReservation(n)
 		return gnet.Close
@@ -244,7 +244,8 @@ func (splice *spliceConnContext) onClose(conn gnet.Conn, err error) gnet.Action 
 		}
 		release = func() { stream.releaseAuxInput(size, 1) }
 	}
-	tail := bytes.Clone(data)
+	tail := make([]byte, len(data))
+	copy(tail, data)
 	splice.proxy.beginSpliceClientDrain(splice.client, splice.clientCtx, tail, release)
 	return gnet.None
 }
@@ -262,15 +263,15 @@ func (ctx *ConnContext) closeSplice() {
 	}
 }
 
-// AsyncWrite precedes this lower-priority owner task. It therefore observes
-// every earlier submission before it starts draining the retained EOF tail.
+// The output barrier follows every earlier write before it starts draining
+// the retained EOF tail, including logical writes on gnet's two task queues.
 func (h *ProxyHandler) beginSpliceClientDrain(client clientEndpoint, ctx *ConnContext, tail []byte, releases ...func()) {
 	var release func()
 	if len(releases) > 0 {
 		release = releases[0]
 	}
 	ctx.spliceDrainRequested.Store(true)
-	err := executeClient(client, gnet.RunnableFunc(func(context.Context) error {
+	err := executeAfterClientOutput(client, gnet.RunnableFunc(func(context.Context) error {
 		if ctx.State() == StateClosed {
 			clear(tail)
 			if release != nil {

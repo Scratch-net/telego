@@ -27,6 +27,7 @@ type relayOutput struct {
 	queued          int
 	inflight        int
 	buffered        int
+	ownedNative     bool
 	waiting         int
 	timer           *time.Timer
 	closed          bool
@@ -38,10 +39,19 @@ type relayOutput struct {
 
 type relayPendingWrite struct {
 	complete func(error)
+	data     []byte
 }
 
 func newRelayOutput(destination, source clientEndpoint, client *ConnContext, limit int) *relayOutput {
-	return &relayOutput{destination: destination, source: source, client: client, limit: limit}
+	_, owned := destination.(gnet.OwnedWriter)
+	if owned {
+		// Owned output requires the same priority queue as native AsyncWrite.
+		// Owners without it (including Windows) keep their original write path.
+		_, owned = clientOwner(destination).(interface {
+			ExecuteHighPriority(context.Context, gnet.Runnable) error
+		})
+	}
+	return &relayOutput{destination: destination, source: source, client: client, limit: limit, ownedNative: owned}
 }
 
 // reserve is called before advancing any cipher. minimum allows a TLS record
@@ -140,7 +150,18 @@ func (o *relayOutput) refresh(completed int) {
 		o.inflight--
 	}
 	if !o.destinationGone {
-		o.buffered = o.destination.OutboundBuffered()
+		if o.ownedNative {
+			// queued keeps the whole borrowed allocation until its release
+			// callback. Preserve an earlier ordinary handshake's backlog until
+			// it drains; completion of an owned write proves its prefix drained.
+			if completed > 0 {
+				o.buffered = 0
+			} else {
+				o.buffered = min(o.buffered, o.destination.OutboundBuffered())
+			}
+		} else {
+			o.buffered = o.destination.OutboundBuffered()
+		}
 	}
 	o.releaseDrainedLocked()
 	if o.closed || o.client.State() == StateClosed {
@@ -172,19 +193,20 @@ func (o *relayOutput) refresh(completed int) {
 func (o *relayOutput) write(data []byte, release func()) error {
 	finishWork := retainLogicalWork(o.source)
 	size := len(data)
-	pending := &relayPendingWrite{}
+	pending := &relayPendingWrite{data: data}
 	finalize := func(err error) {
 		o.mu.Lock()
 		delete(o.pendingWrites, pending)
+		pending.data = nil
 		o.mu.Unlock()
+		if release != nil {
+			release()
+		}
 		if err != nil {
 			o.fail()
 			o.completeFailed(size)
 		} else {
 			o.refresh(size)
-		}
-		if release != nil {
-			release()
 		}
 		finishWork()
 	}
@@ -211,10 +233,30 @@ func (o *relayOutput) write(data []byte, release func()) error {
 		o.pendingWrites[pending] = struct{}{}
 		o.mu.Unlock()
 	}
-	err := asyncWriteClient(o.destination, data, func(err error) error {
-		done(err)
-		return nil
-	})
+	var err error
+	if o.ownedNative {
+		writer := o.destination.(gnet.OwnedWriter)
+		err = gnet.ExecuteHighPriority(clientOwner(o.destination), context.Background(), gnet.RunnableFunc(func(context.Context) error {
+			o.mu.Lock()
+			payload := pending.data
+			pending.data = nil
+			o.mu.Unlock()
+			if payload == nil {
+				return nil
+			}
+			if o.client.State() == StateClosed {
+				done(net.ErrClosed)
+				return nil
+			}
+			_, writeErr := writer.WriteOwned(payload, done)
+			return writeErr
+		}))
+	} else {
+		err = asyncWriteClient(o.destination, data, func(err error) error {
+			done(err)
+			return nil
+		})
+	}
 	if err != nil {
 		done(err)
 	}

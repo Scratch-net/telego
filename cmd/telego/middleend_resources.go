@@ -4,6 +4,7 @@ import (
 	"errors"
 
 	"github.com/scratch-net/telego/pkg/log"
+	"github.com/scratch-net/telego/pkg/transport/middleend"
 )
 
 var errFileDescriptorLimitUnavailable = errors.New("file-descriptor limit is unavailable on this platform")
@@ -18,6 +19,23 @@ func middleEndDirectFallbackFDMinimum(maxConnections int) uint64 {
 		return 0
 	}
 	return 2 * uint64(maxConnections)
+}
+
+// middleEndLinkCapacity includes reserved refresh candidates in the logical
+// link allowance. It is not a process descriptor limit: bootstrap sockets,
+// close completion, listeners, and runtime descriptors have separate lifetimes.
+// After logical closure, each ME owner loop can still hold one enrolled socket
+// until gnet finishes that OnClose call and physically closes the descriptor.
+func middleEndLinkCapacity(snapshot middleend.ServiceSnapshot) (live, rotation int) {
+	generationCapacity := func(manager *middleend.FixedBindingManagerSnapshot) int {
+		if manager == nil {
+			return 0
+		}
+		return len(manager.Slots) + snapshot.Capacity.MaxRefreshCandidatesPerManager
+	}
+	active := generationCapacity(snapshot.Supervisor.Active)
+	retiring := generationCapacity(snapshot.Supervisor.Retiring)
+	return active + retiring, 2 * max(active, retiring)
 }
 
 func logMiddleEndFileDescriptorCapacity(maxConnections int) {

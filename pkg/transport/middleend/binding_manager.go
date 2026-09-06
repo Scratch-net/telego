@@ -13,6 +13,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 var (
@@ -257,6 +258,18 @@ type fixedBindingSlot struct {
 	err          error
 	probe        *fixedBindingProbe
 	consumerDone chan struct{}
+
+	// Each published slot pointer is one physical incarnation. Refresh never
+	// changes its link while its consumer or a captured probe can still run.
+	retired      bool
+	refreshing   bool
+	bindEpoch    uint64
+	startedAt    time.Time
+	unusedSince  time.Time
+	refreshAfter time.Time
+	refreshDelay time.Duration
+	refreshRetry time.Duration
+	used         bool
 }
 
 type fixedBindingSlotRepair func(context.Context, DCID) (FixedBindingSlot, error)
@@ -276,6 +289,7 @@ type fixedBindingManager struct {
 
 	residentBindings int
 	accepting        bool
+	coverageEnabled  bool
 	drained          chan struct{}
 	drainedSet       bool
 	pending          int
@@ -304,6 +318,14 @@ type fixedBindingManager struct {
 	repairContext               context.Context
 	cancelRepairs               context.CancelCauseFunc
 	operations                  sync.WaitGroup
+	refreshContext              context.Context
+	cancelRefreshes             context.CancelCauseFunc
+	refreshes                   int
+	refreshDCs                  map[DCID]*slotRefreshAttempt
+	repairCandidates            map[*fixedBindingSlot]slotLinkChannels
+	refreshNext                 int
+	dcCounters                  map[DCID]FixedBindingDCSnapshot
+	dcObserver                  func(FixedBindingDCSnapshot)
 
 	ready      chan struct{}
 	readyHead  *clientBinding
@@ -416,6 +438,7 @@ type outboundItem struct {
 
 type fixedBindingProbe struct {
 	slot      *fixedBindingSlot
+	events    <-chan LinkEvent
 	id        uint64
 	done      chan struct{}
 	result    error
@@ -428,7 +451,8 @@ type fixedBindingProbe struct {
 // pointer-backed representation is safe to copy and does not expose links,
 // locks, queues, or retained payloads through formatting. It does not own
 // endpoint selection, dialing, bootstraps, engine runtimes, retries,
-// migrations, or frontend state.
+// migrations, or frontend state. An optional factory supplies replacement
+// links; the manager owns their validation and bounded refresh lifecycle.
 type FixedBindingManager struct {
 	state *fixedBindingManager
 }
@@ -440,6 +464,7 @@ type FixedBindingSlotSnapshot struct {
 
 	Failed           bool
 	Repairing        bool
+	Refreshing       bool
 	ResidentBindings int
 	RequestItems     int
 	RequestBytes     int
@@ -478,6 +503,22 @@ type FixedBindingSlotFailureSnapshot struct {
 	Reason           FixedBindingSlotFailureReason
 	AffectedBindings int
 	Error            error
+	Age              time.Duration
+	Used             bool // This incarnation accepted at least one client proxy request.
+	PeerEOF          bool
+}
+
+// FixedBindingDCSnapshot contains bounded per-DC coverage and counters.
+// ZeroReadyTransitions counts a ready manager losing its last admitted slot,
+// excluding startup and intentional quiescence.
+type FixedBindingDCSnapshot struct {
+	DCID                 DCID
+	ReadySlots           int
+	RefreshingSlots      int
+	ZeroReadyTransitions uint64
+	SlotRefreshSuccesses uint64
+	SlotRefreshFailures  uint64
+	SlotRefreshCanceled  uint64
 }
 
 // FixedBindingManagerSnapshot is a concurrency-safe payload-free view of one
@@ -510,6 +551,8 @@ type FixedBindingManagerSnapshot struct {
 	SlotRepairSuccesses         uint64
 	SlotRepairFailures          uint64
 	RepairingSlots              int
+	RefreshingSlots             int
+	DCs                         []FixedBindingDCSnapshot
 	Slots                       []FixedBindingSlotSnapshot
 }
 
@@ -630,19 +673,23 @@ func newFixedBindingManager(
 	}
 
 	manager := &fixedBindingManager{
-		limits:     limits,
-		state:      fixedBindingManagerCreated,
-		accepting:  true,
-		drained:    make(chan struct{}),
-		slots:      make(map[DCID]*fixedBindingSlot, len(slots)),
-		slotGroups: make(map[DCID][]*fixedBindingSlot, len(slots)),
-		bindNext:   make(map[DCID]int, len(slots)),
-		order:      make([]*fixedBindingSlot, 0, len(slots)),
-		byID:       make(map[int64]*clientBinding),
-		startDone:  make(chan struct{}),
-		done:       make(chan struct{}),
-		ready:      make(chan struct{}, 1),
-		repairLink: repairLink,
+		limits:           limits,
+		state:            fixedBindingManagerCreated,
+		accepting:        true,
+		coverageEnabled:  true,
+		drained:          make(chan struct{}),
+		slots:            make(map[DCID]*fixedBindingSlot, len(slots)),
+		slotGroups:       make(map[DCID][]*fixedBindingSlot, len(slots)),
+		bindNext:         make(map[DCID]int, len(slots)),
+		order:            make([]*fixedBindingSlot, 0, len(slots)),
+		byID:             make(map[int64]*clientBinding),
+		startDone:        make(chan struct{}),
+		done:             make(chan struct{}),
+		ready:            make(chan struct{}, 1),
+		repairLink:       repairLink,
+		refreshDCs:       make(map[DCID]*slotRefreshAttempt),
+		repairCandidates: make(map[*fixedBindingSlot]slotLinkChannels),
+		dcCounters:       make(map[DCID]FixedBindingDCSnapshot),
 	}
 	seenEvents := make(map[<-chan LinkEvent]struct{}, len(slots))
 	seenCapacity := make(map[<-chan struct{}]struct{}, len(slots))
@@ -678,8 +725,10 @@ func newFixedBindingManager(
 		}
 		manager.slotGroups[configured.DCID] = append(manager.slotGroups[configured.DCID], slot)
 		manager.order = append(manager.order, slot)
+		manager.dcCounters[configured.DCID] = FixedBindingDCSnapshot{DCID: configured.DCID}
 	}
 	manager.repairContext, manager.cancelRepairs = context.WithCancelCause(context.Background())
+	manager.refreshContext, manager.cancelRefreshes = context.WithCancelCause(context.Background())
 	return &FixedBindingManager{state: manager}, nil
 }
 
@@ -811,6 +860,9 @@ func (m *fixedBindingManager) startFirst(ctx context.Context) error {
 	m.mu.Lock()
 	if m.state == fixedBindingManagerStarting {
 		m.state = fixedBindingManagerReady
+		for index, slot := range m.order {
+			m.initializeSlotRefreshLocked(slot, index, time.Now())
+		}
 		m.publishStartLocked(nil)
 		m.mu.Unlock()
 		return nil
@@ -898,6 +950,8 @@ func (m *FixedBindingManager) Snapshot() FixedBindingManagerSnapshot {
 		SlotRepairSuccesses:         state.slotRepairSuccesses,
 		SlotRepairFailures:          state.slotRepairFailures,
 		Slots:                       make([]FixedBindingSlotSnapshot, len(state.order)),
+		RefreshingSlots:             state.refreshes,
+		DCs:                         state.dcSnapshotsLocked(),
 	}
 	links := make([]ClientLink, len(state.order))
 	for index, slot := range state.order {
@@ -905,6 +959,7 @@ func (m *FixedBindingManager) Snapshot() FixedBindingManagerSnapshot {
 			DCID:                   slot.dcID,
 			Failed:                 slot.failed,
 			Repairing:              slot.repairing,
+			Refreshing:             slot.refreshing,
 			ResidentBindings:       slot.resident,
 			RequestItems:           slot.requestItems,
 			RequestBytes:           slot.requestBytes,
@@ -933,7 +988,8 @@ func (m *FixedBindingManager) Snapshot() FixedBindingManagerSnapshot {
 
 // Quiesce permanently stops new Bind admission and returns a stable channel
 // that closes when every binding resident at the admission boundary has left
-// the manager. Existing bindings, probes, and link consumers remain active.
+// the manager and refresh candidates have completed cleanup. Existing
+// bindings, probes, and link consumers remain active.
 // Quiesce is concurrent and idempotent and may be called before Start.
 func (m *FixedBindingManager) Quiesce() <-chan struct{} {
 	if m == nil || m.state == nil {
@@ -943,6 +999,7 @@ func (m *FixedBindingManager) Quiesce() <-chan struct{} {
 	}
 	m.state.mu.Lock()
 	m.state.accepting = false
+	m.state.cancelRefreshes(ErrFixedBindingManagerQuiesced)
 	m.state.publishDrainedLocked()
 	drained := m.state.drained
 	m.state.mu.Unlock()
@@ -1010,6 +1067,10 @@ func (m *fixedBindingManager) bind(dcID DCID, consumerMode fixedBindingConsumerM
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w: every link for DC %d", ErrFixedBindingLimit, dcID)
 	}
+	if slot.bindEpoch == math.MaxUint64 {
+		m.mu.Unlock()
+		return nil, ErrFixedBindingLimit
+	}
 	connectionID, err := allocateFixedBindingConnectionID()
 	if err != nil {
 		m.mu.Unlock()
@@ -1029,6 +1090,8 @@ func (m *fixedBindingManager) bind(dcID DCID, consumerMode fixedBindingConsumerM
 	m.byID[connectionID] = state
 	slot.bindings[state] = struct{}{}
 	slot.resident++
+	slot.bindEpoch++
+	slot.unusedSince = time.Time{}
 	m.residentBindings++
 	m.mu.Unlock()
 	return &ClientBinding{state: state}, nil
@@ -1145,6 +1208,10 @@ func (m *fixedBindingManager) probeSlot(ctx context.Context, dcID DCID, slot *fi
 		m.mu.Unlock()
 		return err
 	}
+	if slot.retired {
+		m.mu.Unlock()
+		return nil
+	}
 	if slot.failed {
 		err := slot.err
 		m.mu.Unlock()
@@ -1182,7 +1249,7 @@ func (m *fixedBindingManager) probeSlot(ctx context.Context, dcID DCID, slot *fi
 		return err
 	}
 	payload = payload[:len(payload):len(payload)]
-	probe := &fixedBindingProbe{slot: slot, id: pingID, done: make(chan struct{})}
+	probe := &fixedBindingProbe{slot: slot, events: slot.events, id: pingID, done: make(chan struct{})}
 	item := &outboundItem{
 		kind:  outboundProbe,
 		probe: probe,
@@ -1209,11 +1276,7 @@ func (m *fixedBindingManager) probeSlot(ctx context.Context, dcID DCID, slot *fi
 	case <-probe.done:
 		return m.probeResult(probe)
 	case <-ctx.Done():
-		probeErr := m.cancelProbe(probe, fmt.Errorf("probe fixed-binding DC %d: %w", dcID, context.Cause(ctx)))
-		if errors.Is(context.Cause(ctx), context.DeadlineExceeded) {
-			m.failSlot(slot, probeErr, FixedBindingSlotFailureProbeTimeout)
-		}
-		return probeErr
+		return m.cancelProbe(probe, fmt.Errorf("probe fixed-binding DC %d: %w", dcID, context.Cause(ctx)))
 	}
 }
 
@@ -1325,23 +1388,36 @@ func (m *fixedBindingManager) repairSlot(ctx context.Context, slot *fixedBinding
 	if nilClientLink(link) {
 		return fmt.Errorf("%w: DC %d replacement factory returned a nil link", ErrFixedBindingSlotRepair, slot.dcID)
 	}
+	events := link.Events()
+	capacity := link.SubmissionReady()
+	m.mu.Lock()
+	alias := m.linkChannelsOwnedLocked(events, capacity)
+	if !alias {
+		m.repairCandidates[slot] = slotLinkChannels{events: events, capacity: capacity}
+	}
+	m.mu.Unlock()
+	if alias {
+		return fmt.Errorf("%w: DC %d replacement reused an owned notification channel", ErrFixedBindingSlotRepair, slot.dcID)
+	}
+	defer func() {
+		if !repaired {
+			closeRefreshCandidate(link, events)
+		}
+		m.mu.Lock()
+		delete(m.repairCandidates, slot)
+		m.mu.Unlock()
+	}()
 	if replacement.DCID != slot.dcID {
-		_ = link.Close()
 		return fmt.Errorf("%w: DC %d replacement returned signed DC %d", ErrFixedBindingSlotRepair, slot.dcID, replacement.DCID)
 	}
 	replacement.SourceIP = replacement.SourceIP.Unmap()
 	if err := validatePublicEndpoint("replacement source", netip.AddrPortFrom(replacement.SourceIP, 1)); err != nil {
-		_ = link.Close()
 		return fmt.Errorf("%w: DC %d replacement source IP: %v", ErrFixedBindingSlotRepair, slot.dcID, err)
 	}
-	events := link.Events()
-	capacity := link.SubmissionReady()
 	if events == nil || capacity == nil {
-		_ = link.Close()
 		return fmt.Errorf("%w: DC %d replacement has a nil notification channel", ErrFixedBindingSlotRepair, slot.dcID)
 	}
 	if err := link.Start(ctx); err != nil {
-		_ = link.Close()
 		return fmt.Errorf("%w: DC %d start replacement: %w", ErrFixedBindingSlotRepair, slot.dcID, err)
 	}
 	select {
@@ -1350,7 +1426,6 @@ func (m *fixedBindingManager) repairSlot(ctx context.Context, slot *fixedBinding
 		if err == nil {
 			err = ErrLinkClosed
 		}
-		_ = link.Close()
 		return fmt.Errorf("%w: DC %d replacement closed before publication: %w", ErrFixedBindingSlotRepair, slot.dcID, err)
 	default:
 	}
@@ -1358,28 +1433,11 @@ func (m *fixedBindingManager) repairSlot(ctx context.Context, slot *fixedBinding
 	m.mu.Lock()
 	if m.state != fixedBindingManagerReady || !slot.failed || !slot.repairing {
 		m.mu.Unlock()
-		_ = link.Close()
 		return fmt.Errorf("%w: DC %d manager changed during replacement", ErrFixedBindingSlotRepair, slot.dcID)
-	}
-	if events == slot.events || capacity == slot.capacity {
-		m.mu.Unlock()
-		_ = link.Close()
-		return fmt.Errorf("%w: DC %d replacement reused a failed notification channel", ErrFixedBindingSlotRepair, slot.dcID)
-	}
-	for _, other := range m.order {
-		if other == slot {
-			continue
-		}
-		if events == other.events || capacity == other.capacity {
-			m.mu.Unlock()
-			_ = link.Close()
-			return fmt.Errorf("%w: DC %d replacement duplicated another slot notification channel", ErrFixedBindingSlotRepair, slot.dcID)
-		}
 	}
 	if slot.outHead != nil || slot.requestItems != 0 || slot.requestBytes != 0 ||
 		slot.controlItems != 0 || slot.controlBytes != 0 || slot.probe != nil {
 		m.mu.Unlock()
-		_ = link.Close()
 		return fmt.Errorf("%w: DC %d failed slot retained outbound work", ErrFixedBindingSlotRepair, slot.dcID)
 	}
 	slot.link = link
@@ -1391,6 +1449,7 @@ func (m *fixedBindingManager) repairSlot(ctx context.Context, slot *fixedBinding
 	slot.repairing = false
 	slot.err = nil
 	slot.consumerDone = make(chan struct{})
+	m.initializeSlotRefreshLocked(slot, slices.Index(m.order, slot), time.Now())
 	m.slotRepairSuccesses++
 	m.consumers.Go(func() { m.consumeSlot(slot) })
 	m.mu.Unlock()
@@ -1412,6 +1471,11 @@ func (m *fixedBindingManager) cancelProbe(probe *fixedBindingProbe, cause error)
 	m.completeProbeLocked(probe, cause)
 	result := probe.result
 	m.mu.Unlock()
+	// A matching pong can complete the probe before cancellation wins the
+	// caller's select. Do not turn that successful probe into a timeout.
+	if result != nil && errors.Is(cause, context.DeadlineExceeded) {
+		m.failSlotIncarnation(probe.slot, probe.events, result, FixedBindingSlotFailureProbeTimeout)
+	}
 	return result
 }
 
@@ -2406,11 +2470,12 @@ func (b *clientBinding) beginClose() {
 			m.mu.Unlock()
 			return
 		}
+		events := b.slot.events
 		m.mu.Unlock()
 		if errors.Is(err, ErrFixedBindingSubmissionIDExhausted) {
 			m.exhaustSubmissionIDs()
 		} else {
-			m.failSlot(b.slot, err, FixedBindingSlotFailureControlSubmission)
+			m.failSlotIncarnation(b.slot, events, err, FixedBindingSlotFailureControlSubmission)
 		}
 		return
 	}
@@ -2472,6 +2537,7 @@ func (m *fixedBindingManager) beginTerminal(err error) {
 	}
 	m.state = fixedBindingManagerClosing
 	m.cancelRepairs(m.closedWorkErrorLocked())
+	m.cancelRefreshes(m.closedWorkErrorLocked())
 	for _, slot := range m.order {
 		m.cancelSlotOutboundLocked(slot, m.closedWorkErrorLocked())
 		for binding := range slot.bindings {
@@ -2563,7 +2629,7 @@ func (m *fixedBindingManager) consumeSlot(slot *fixedBindingSlot) {
 				continue
 			}
 			if err := m.routeEvent(slot, event); err != nil {
-				m.failSlot(slot, err, FixedBindingSlotFailureEventRouting)
+				m.failSlotIncarnation(slot, events, err, FixedBindingSlotFailureEventRouting)
 			}
 		case <-slot.requestWake:
 			m.dispatchSlotOnce(slot)
@@ -2578,16 +2644,22 @@ func (m *fixedBindingManager) consumeSlot(slot *fixedBindingSlot) {
 	failed := slot.failed
 	m.mu.Unlock()
 	if state != fixedBindingManagerClosing && state != fixedBindingManagerClosed && !failed {
+		m.mu.Lock()
+		retired := slot.retired
+		m.mu.Unlock()
+		if retired {
+			return
+		}
 		if linkErr == nil {
 			linkErr = ErrLinkClosed
 		}
-		m.failSlot(slot, linkErr, FixedBindingSlotFailureLinkTerminal)
+		m.failSlotIncarnation(slot, events, linkErr, FixedBindingSlotFailureLinkTerminal)
 	}
 }
 
 func (m *fixedBindingManager) dispatchSlotOnce(slot *fixedBindingSlot) {
 	m.mu.Lock()
-	if m.state != fixedBindingManagerReady || slot.failed {
+	if m.state != fixedBindingManagerReady || slot.failed || slot.retired {
 		m.mu.Unlock()
 		return
 	}
@@ -2605,6 +2677,7 @@ func (m *fixedBindingManager) dispatchSlotOnce(slot *fixedBindingSlot) {
 	}
 	item.attempting = true
 	submission := item.submission
+	events := slot.events
 	if item.kind == outboundRequest {
 		submission = item.request.submission
 	}
@@ -2630,7 +2703,7 @@ func (m *fixedBindingManager) dispatchSlotOnce(slot *fixedBindingSlot) {
 	if err != nil && !errors.Is(err, ErrLinkBackpressure) &&
 		(!errors.Is(err, ErrLinkSubmissionTooLarge) || item.kind != outboundRequest) &&
 		state != fixedBindingManagerClosing && state != fixedBindingManagerClosed {
-		m.failSlot(slot, err, FixedBindingSlotFailureSubmission)
+		m.failSlotIncarnation(slot, events, err, FixedBindingSlotFailureSubmission)
 	}
 }
 
@@ -2659,6 +2732,7 @@ func (m *fixedBindingManager) finishRequestAttemptLocked(slot *fixedBindingSlot,
 	binding := request.binding
 	if err == nil {
 		submissionID := request.submission.SubmissionID
+		slot.used = true
 		m.removeOutboundLocked(slot, item)
 		m.releaseRequestChargeLocked(request)
 		request.submission = LinkSubmission{}
@@ -2738,6 +2812,13 @@ func (m *fixedBindingManager) signalSlotLocked(slot *fixedBindingSlot) {
 }
 
 func (m *fixedBindingManager) routeEvent(slot *fixedBindingSlot, event LinkEvent) error {
+	m.mu.Lock()
+	retired := slot.retired
+	m.mu.Unlock()
+	if retired {
+		clearLinkEventPacket(&event)
+		return nil
+	}
 	if err := validateFixedBindingLinkEvent(event); err != nil {
 		clearLinkEventPacket(&event)
 		return fmt.Errorf("%w: DC %d: %v", ErrFixedBindingProtocol, slot.dcID, err)
@@ -2747,7 +2828,7 @@ func (m *fixedBindingManager) routeEvent(slot *fixedBindingSlot, event LinkEvent
 		return nil
 	case LinkEventPong:
 		m.mu.Lock()
-		if m.state != fixedBindingManagerClosing && m.state != fixedBindingManagerClosed && !slot.failed {
+		if m.state != fixedBindingManagerClosing && m.state != fixedBindingManagerClosed && !slot.failed && !slot.retired {
 			probe := slot.probe
 			if probe != nil && probe.submitted && probe.id == event.KeepaliveID {
 				m.completeProbeLocked(probe, nil)
@@ -2760,7 +2841,7 @@ func (m *fixedBindingManager) routeEvent(slot *fixedBindingSlot, event LinkEvent
 		return fmt.Errorf("%w: DC %d emitted event kind %d", ErrFixedBindingProtocol, slot.dcID, event.Kind)
 	}
 	m.mu.Lock()
-	if m.state == fixedBindingManagerClosing || m.state == fixedBindingManagerClosed || slot.failed {
+	if m.state == fixedBindingManagerClosing || m.state == fixedBindingManagerClosed || slot.failed || slot.retired {
 		m.mu.Unlock()
 		clearLinkEventPacket(&event)
 		return nil
@@ -3032,12 +3113,31 @@ func (m *fixedBindingManager) failSlot(
 	cause error,
 	reason FixedBindingSlotFailureReason,
 ) {
+	m.recordSlotFailure(slot, nil, cause, reason, false)
+}
+
+func (m *fixedBindingManager) failSlotIncarnation(
+	slot *fixedBindingSlot,
+	events <-chan LinkEvent,
+	cause error,
+	reason FixedBindingSlotFailureReason,
+) {
+	m.recordSlotFailure(slot, events, cause, reason, false)
+}
+
+func (m *fixedBindingManager) recordSlotFailure(
+	slot *fixedBindingSlot,
+	events <-chan LinkEvent,
+	cause error,
+	reason FixedBindingSlotFailureReason,
+	retiredTerminal bool,
+) {
 	if cause == nil {
 		cause = ErrLinkClosed
 	}
 	wrapped := fmt.Errorf("%w: DC %d: %w", ErrFixedBindingSlotFailed, slot.dcID, cause)
 	m.mu.Lock()
-	if slot.failed {
+	if slot.failed || (slot.retired && !retiredTerminal) || (events != nil && events != slot.events) {
 		m.mu.Unlock()
 		return
 	}
@@ -3076,18 +3176,35 @@ func (m *fixedBindingManager) failSlot(
 		Reason:           reason,
 		AffectedBindings: affectedBindings,
 		Error:            wrapped,
+		Age:              slotAge(slot, time.Now()),
+		Used:             slot.used,
+		PeerEOF:          errors.Is(cause, io.EOF),
 	}
+	dcChange := FixedBindingDCSnapshot{DCID: slot.dcID}
+	if !starting && m.accepting && m.coverageEnabled && !slot.retired && m.readySlotsLocked(slot.dcID) == 0 {
+		dcChange.ZeroReadyTransitions = 1
+		counter := m.dcCounters[slot.dcID]
+		counter.ZeroReadyTransitions++
+		m.dcCounters[slot.dcID] = counter
+	}
+	dcObserver := m.dcObserver
+	failedLink := slot.link
 	m.lastSlotFailure = failure
 	observer := m.slotFailureObserver
 	m.mu.Unlock()
 	if observer != nil {
 		observer(failure)
 	}
+	if dcObserver != nil && dcChange.ZeroReadyTransitions != 0 {
+		dcObserver(dcChange)
+	}
 	if starting {
 		m.beginTerminal(fmt.Errorf("%w: %w", ErrFixedBindingInitialFailure, wrapped))
 		return
 	}
-	_ = slot.link.Close()
+	if !retiredTerminal {
+		_ = failedLink.Close()
+	}
 }
 
 func (m *fixedBindingManager) terminalizeBinding(binding *clientBinding, cause error) {
@@ -3198,12 +3315,16 @@ func (m *fixedBindingManager) releaseBindingResidentLocked(binding *clientBindin
 	delete(binding.slot.bindings, binding)
 	binding.resident = false
 	binding.slot.resident--
+	if binding.slot.resident == 0 {
+		binding.slot.unusedSince = time.Now()
+		binding.slot.refreshAfter = binding.slot.unusedSince.Add(binding.slot.refreshDelay)
+	}
 	m.residentBindings--
 	m.publishDrainedLocked()
 }
 
 func (m *fixedBindingManager) publishDrainedLocked() {
-	if m.accepting || m.residentBindings != 0 || m.drainedSet {
+	if m.accepting || m.residentBindings != 0 || m.refreshes != 0 || m.drainedSet {
 		return
 	}
 	m.drainedSet = true

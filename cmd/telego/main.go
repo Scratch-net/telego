@@ -202,9 +202,10 @@ func (c *RunCmd) Run() error {
 	if fileCfg.Metrics.BindTo != "" {
 		var err error
 		metricsConfig := metrics.Config{
-			BindAddr:   fileCfg.Metrics.BindTo,
-			Path:       fileCfg.Metrics.Path,
-			ProxyStats: handler,
+			BindAddr:    fileCfg.Metrics.BindTo,
+			Path:        fileCfg.Metrics.Path,
+			Diagnostics: fileCfg.Metrics.Diagnostics,
+			ProxyStats:  handler,
 		}
 		if webRuntime != nil {
 			metricsConfig.WebStats = webRuntime.manager

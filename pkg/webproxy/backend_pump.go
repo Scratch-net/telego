@@ -142,7 +142,7 @@ func (b *backendStream) pump() bool {
 		progress = readProgress || progress
 	}
 	if err != nil {
-		b.cancel()
+		b.cancelContext()
 		_ = backend.Close()
 	}
 	return progress && err == nil
@@ -235,7 +235,7 @@ func (b *backendStream) queueBudget(input bool) BackendBudget {
 			if input {
 				class = pendingBackendInput
 			}
-			if !s.reservePendingLocked(cost, items, class) {
+			if !s.reserveBackendPendingLocked(b, cost, items, class) {
 				return false
 			}
 			if input {
@@ -338,7 +338,7 @@ func (b *backendStream) pumpRead(backend Backend) (bool, error) {
 	// The handoff partition prevents a full ordinary queue from blocking this
 	// ownership transfer. The reservation follows the encoded frame afterward.
 	cost := allowance + FrameHeaderSize + queueItemCost
-	if !s.reservePendingLocked(cost, 1, pendingHandoff) {
+	if !s.reserveBackendPendingLocked(b, cost, 1, pendingHandoff) {
 		s.mu.Unlock()
 		return false, nil
 	}

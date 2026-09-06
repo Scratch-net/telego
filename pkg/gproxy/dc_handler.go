@@ -335,8 +335,12 @@ func buildProxyProtocolV1(src, dst *net.TCPAddr) []byte {
 	if src.IP.To4() == nil {
 		proto = "TCP6"
 	}
-	return fmt.Appendf(nil, "PROXY %s %s %s %d %d\r\n",
+	header := fmt.Sprintf("PROXY %s %s %s %d %d\r\n",
 		proto, src.IP.String(), dst.IP.String(), src.Port, dst.Port)
+	// The retained wire buffer must have the capacity charged by its relay.
+	wire := make([]byte, len(header))
+	copy(wire, header)
+	return wire
 }
 
 // proxyProtocolV2Sig is the 12-byte signature for PROXY protocol v2.

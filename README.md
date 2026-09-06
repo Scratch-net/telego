@@ -89,6 +89,7 @@ Read the [managed gateway guide](examples/gateway/README.md) for updates, backup
 ### Operations
 - **Multi-user Support** — Named secrets with per-user tracking and logging
 - **ME Link Repair** — Replaces failed physical links without moving healthy bindings or rebuilding every DC pool
+- **ME Link Refresh** — Prepares replacements for unused links before retirement, with bounded candidates and per-DC availability counters
 - **Connection Tracking** — Unique connection IDs for easy log correlation
 - **Connection Limits** — Per-IP connection limits and per-user IP limits with smart blocking (only blocks IPs with active connections when evicted, allowing legitimate reconnections)
 - **Prometheus Metrics** — Per-user connection counts, traffic, and blocked IP statistics
@@ -382,6 +383,7 @@ num-event-loops = 0          # 0 = auto (all CPU cores)
 [metrics]
 # bind-to = "127.0.0.1:9090"  # Metrics endpoint (empty = disabled)
 # path = "/metrics"           # Metrics path
+# diagnostics = false         # Private on-demand profiles. Requires a loopback bind and a restart.
 ```
 
 ---
@@ -645,6 +647,44 @@ telEgo exposes Prometheus metrics when configured:
 [metrics]
 bind-to = "127.0.0.1:9090"
 ```
+
+### Private runtime diagnostics
+
+Diagnostics are disabled by default. They use the existing metrics listener, without another server or continuous profiling.
+The configuration requires a literal loopback address and a port from 1 to 65535. DNS names, wildcard addresses, and public addresses are rejected.
+With diagnostics enabled, the metrics path cannot contain patterns or percent escapes, or use the reserved `/debug/pprof` prefix.
+
+To enable diagnostics, add `diagnostics = true` to `[metrics]`. Then restart Telego.
+Do not forward the diagnostics routes through Nginx or another public proxy.
+
+Profiles contain internal process details.
+Requests require a literal loopback HTTP host and a loopback peer. The hostname `localhost` is not accepted.
+
+| Route | Output |
+|-------|--------|
+| `/debug/pprof/goroutineleak` | A fresh, filtered text profile with `debug=1` |
+| `/debug/pprof/heap` | A binary heap profile |
+| `/debug/pprof/allocs` | A binary allocation profile |
+| `/debug/pprof/goroutine` | A binary goroutine profile |
+| `/debug/pprof/profile?seconds=10` | A binary CPU profile |
+
+Only GET requests are accepted. The CPU duration defaults to 10 seconds and accepts integers from 1 to 15.
+The leak route accepts only optional `debug=1`. The other snapshot routes accept only optional `debug=0`.
+The index, command line, symbol, trace, block, and mutex routes are unavailable.
+
+One profile request can run at a time. Concurrent requests receive HTTP 503 instead of entering a queue.
+Responses have an 8 MiB limit and a 20-second request timeout. HTTP 413 indicates that a profile exceeds the response limit.
+
+Client cancellation or server shutdown stops CPU profiling. The runtime completes an active leak-detection GC before it can return.
+The response limit does not bound internal runtime memory or GC duration. A fresh leak profile runs GC and adds temporary load.
+
+For a local leak snapshot, run:
+
+```sh
+curl --fail --max-time 25 http://127.0.0.1:9090/debug/pprof/goroutineleak
+```
+
+To disable diagnostics, set `diagnostics = false`. Then restart Telego.
 
 ### Available Metrics
 

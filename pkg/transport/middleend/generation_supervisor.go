@@ -81,6 +81,7 @@ type GenerationSupervisorSnapshot struct {
 	LastSlotFailure             FixedBindingSlotFailureSnapshot
 	SlotRepairSuccesses         uint64
 	SlotRepairFailures          uint64
+	DCs                         []FixedBindingDCSnapshot
 	LastError                   error
 }
 
@@ -112,6 +113,7 @@ type generationSupervisorState struct {
 	repairing                   bool
 	closing                     bool
 	closeResult                 error
+	dcCounters                  map[DCID]FixedBindingDCSnapshot
 
 	ready               chan struct{}
 	done                chan struct{}
@@ -149,6 +151,7 @@ func NewFixedBindingGenerationSupervisor(config GenerationSupervisorConfig) (*Fi
 		cancelRoot:  cancelRoot,
 		ready:       make(chan struct{}, 1),
 		done:        make(chan struct{}),
+		dcCounters:  make(map[DCID]FixedBindingDCSnapshot),
 	}}, nil
 }
 
@@ -227,10 +230,11 @@ func (s *FixedBindingGenerationSupervisor) Rotate(ctx context.Context, factory F
 		state.closeGeneration(candidate)
 		return ErrGenerationChanged
 	}
-	state.active = candidate
-	state.retiring = oldActive
-	state.lastFactory = factory
-	state.addSourceLocked(candidate)
+	if !state.publishGenerationLocked(candidate, oldActive) {
+		state.mu.Unlock()
+		state.closeGeneration(candidate)
+		return ErrGenerationChanged
+	}
 	state.mu.Unlock()
 	state.startGeneration(candidate)
 	state.retireRoutine(oldActive)
@@ -285,9 +289,11 @@ func (s *generationSupervisorState) ensureActive(ctx context.Context, fallback F
 		s.closeGeneration(candidate)
 		return ErrGenerationChanged
 	}
-	s.active = candidate
-	s.lastFactory = factory
-	s.addSourceLocked(candidate)
+	if !s.publishGenerationLocked(candidate, s.retiring) {
+		s.mu.Unlock()
+		s.closeGeneration(candidate)
+		return ErrGenerationChanged
+	}
 	s.mu.Unlock()
 	s.startGeneration(candidate)
 	return nil
@@ -323,6 +329,10 @@ func (s *generationSupervisorState) prepareGeneration(parent context.Context, fa
 		return nil, fmt.Errorf("%w: factory returned a manager that was already started", ErrInvalidGenerationSupervisor)
 	}
 	manager.state.slotFailureObserver = s.recordSlotFailure
+	manager.state.dcObserver = s.recordDCChange
+	// Bootstrap and initial admission failures are real link failures, but
+	// they are not losses of coverage from an admitted generation.
+	manager.state.coverageEnabled = false
 	manager.state.mu.Unlock()
 	if err := manager.Start(prepareContext); err != nil {
 		s.closeGeneration(generation)
@@ -349,6 +359,18 @@ func (s *generationSupervisorState) recordSlotFailure(failure FixedBindingSlotFa
 	s.mu.Unlock()
 }
 
+func (s *generationSupervisorState) recordDCChange(delta FixedBindingDCSnapshot) {
+	s.mu.Lock()
+	counters := s.dcCounters[delta.DCID]
+	counters.DCID = delta.DCID
+	counters.ZeroReadyTransitions += delta.ZeroReadyTransitions
+	counters.SlotRefreshSuccesses += delta.SlotRefreshSuccesses
+	counters.SlotRefreshFailures += delta.SlotRefreshFailures
+	counters.SlotRefreshCanceled += delta.SlotRefreshCanceled
+	s.dcCounters[delta.DCID] = counters
+	s.mu.Unlock()
+}
+
 func (s *generationSupervisorState) ownsManager(manager *FixedBindingManager) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -369,9 +391,50 @@ func (s *generationSupervisorState) addSourceLocked(generation *supervisedGenera
 	s.sources = append(s.sources, generation)
 }
 
+// publishGenerationLocked holds supervisor.mu on entry. Manager callbacks
+// acquire supervisor.mu only after releasing manager.mu. Holding both locks
+// makes coverage activation and publication one boundary for failure delivery.
+func (s *generationSupervisorState) publishGenerationLocked(candidate, retiring *supervisedGeneration) bool {
+	m := candidate.manager.state
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.state != fixedBindingManagerReady || !m.accepting {
+		return false
+	}
+	for _, dcID := range candidate.dcIDs {
+		if m.readySlotsLocked(dcID) == 0 {
+			return false
+		}
+	}
+	m.coverageEnabled = true
+	s.active = candidate
+	s.retiring = retiring
+	s.lastFactory = candidate.factory
+	s.addSourceLocked(candidate)
+	return true
+}
+
 func (s *generationSupervisorState) startGeneration(generation *supervisedGeneration) {
 	s.workers.Go(func() { s.watchGenerationReady(generation) })
 	s.workers.Go(func() { s.watchGenerationLiveness(generation) })
+	s.workers.Go(func() { s.watchGenerationRefresh(generation) })
+}
+
+func (s *generationSupervisorState) watchGenerationRefresh(generation *supervisedGeneration) {
+	ctx, cancel := context.WithCancel(s.rootContext)
+	defer cancel()
+	ticker := time.NewTicker(slotRefreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-generation.liveStop:
+			return
+		case now := <-ticker.C:
+			generation.manager.state.refreshUnusedSlots(ctx, now)
+		}
+	}
 }
 
 func (s *generationSupervisorState) watchGenerationReady(generation *supervisedGeneration) {
@@ -810,6 +873,10 @@ func (s *FixedBindingGenerationSupervisor) Snapshot() GenerationSupervisorSnapsh
 		LastError:                   state.lastErr,
 	}
 	var activeManager, retiringManager *FixedBindingManager
+	counters := make(map[DCID]FixedBindingDCSnapshot, len(state.dcCounters))
+	for dcID, dc := range state.dcCounters {
+		counters[dcID] = dc
+	}
 	if state.active != nil {
 		result.ActiveDCIDs = slices.Clone(state.active.dcIDs)
 		activeManager = state.active.manager
@@ -825,6 +892,23 @@ func (s *FixedBindingGenerationSupervisor) Snapshot() GenerationSupervisorSnapsh
 	if retiringManager != nil {
 		result.Retiring = new(retiringManager.Snapshot())
 	}
+	for _, manager := range []*FixedBindingManagerSnapshot{result.Active, result.Retiring} {
+		if manager == nil {
+			continue
+		}
+		for _, dc := range manager.DCs {
+			current := counters[dc.DCID]
+			current.DCID = dc.DCID
+			current.ReadySlots += dc.ReadySlots
+			current.RefreshingSlots += dc.RefreshingSlots
+			counters[dc.DCID] = current
+		}
+	}
+	result.DCs = make([]FixedBindingDCSnapshot, 0, len(counters))
+	for _, dc := range counters {
+		result.DCs = append(result.DCs, dc)
+	}
+	slices.SortFunc(result.DCs, func(a, b FixedBindingDCSnapshot) int { return int(a.DCID) - int(b.DCID) })
 	return result
 }
 
