@@ -125,6 +125,12 @@ func TestSpliceGnetCleanEOFDrainsBufferedTail(t *testing.T) {
 	server := newSpliceTestServer(t, Config{MaxWriteBuffer: 1024 * 1024},
 		func(context.Context, string) (net.Conn, error) { return socket, nil }, nil)
 	client := server.connect(t)
+	// The bulk response exceeds the pre-activation input limit. The separate
+	// early-EOF test covers input that arrives before activation.
+	awaitSpliceCondition(t, "splice activation", func() bool {
+		splice := client.ctx.splice.Load()
+		return splice != nil && splice.active.Load()
+	})
 	if err := client.peer.SetReadBuffer(64 * 1024); err != nil {
 		t.Fatal(err)
 	}
