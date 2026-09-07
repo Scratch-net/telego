@@ -23,23 +23,19 @@ var (
 	ErrGenerationChanged = errors.New("Middle-End generation changed during rotation")
 	// ErrGenerationProbe reports a failed all-DC admission or liveness probe.
 	ErrGenerationProbe = errors.New("Middle-End generation probe failed")
-	// ErrGenerationDrainTimeout reports a retiring generation that did
-	// not drain before its explicit hard deadline.
-	ErrGenerationDrainTimeout = errors.New("Middle-End generation drain deadline reached")
 )
 
 // GenerationSupervisorConfig contains every operational duration used by the
 // supervisor. It has no defaults. PreparationTimeout bounds factory, manager
 // startup, and initial all-DC probing. ProbeInterval and ProbeFailureTimeout
-// control admitted-generation liveness. DrainTimeout is the hard deadline for
-// a retiring active generation. RepairBackoffInitial and
+// control admitted-generation liveness. Retirement has no time deadline.
+// RepairBackoffInitial and
 // RepairBackoffMaximum bound exponential repair delays. Each delay adds up to
 // 50 percent positive jitter.
 type GenerationSupervisorConfig struct {
 	PreparationTimeout   time.Duration
 	ProbeInterval        time.Duration
 	ProbeFailureTimeout  time.Duration
-	DrainTimeout         time.Duration
 	RepairBackoffInitial time.Duration
 	RepairBackoffMaximum time.Duration
 }
@@ -47,7 +43,7 @@ type GenerationSupervisorConfig struct {
 // Validate rejects missing or internally inconsistent durations.
 func (c GenerationSupervisorConfig) Validate() error {
 	if c.PreparationTimeout <= 0 || c.ProbeInterval <= 0 ||
-		c.ProbeFailureTimeout <= 0 || c.DrainTimeout <= 0 ||
+		c.ProbeFailureTimeout <= 0 ||
 		c.RepairBackoffInitial <= 0 || c.RepairBackoffMaximum <= 0 {
 		return fmt.Errorf("%w: every duration must be positive", ErrInvalidGenerationSupervisor)
 	}
@@ -66,6 +62,38 @@ func (c GenerationSupervisorConfig) Validate() error {
 // owned manager behind when it returns an error.
 type FixedBindingGenerationFactory func(context.Context) (*FixedBindingManager, error)
 
+// A checked artifact application retains this identity across retries and
+// background recovery. Function values cannot identify an applied artifact.
+type generationFactoryPlan struct {
+	build FixedBindingGenerationFactory
+}
+
+// GenerationRetirementReason identifies capacity-driven interruption. Natural
+// draining and shutdown do not produce a forced-retirement record.
+type GenerationRetirementReason string
+
+const (
+	GenerationRetirementArtifactCapacity GenerationRetirementReason = "artifact_capacity"
+	GenerationRetirementRecoveryCapacity GenerationRetirementReason = "recovery_capacity"
+)
+
+// GenerationForcedRetirementSnapshot describes one winning terminal claim.
+type GenerationForcedRetirementSnapshot struct {
+	Sequence         uint64
+	At               time.Time
+	Reason           GenerationRetirementReason
+	AffectedBindings int
+	GenerationID     uint64
+	Role             GenerationRole
+}
+
+// GenerationForcedRetirementCounter contains service-lifetime capacity counts.
+type GenerationForcedRetirementCounter struct {
+	Reason           GenerationRetirementReason
+	Retirements      uint64
+	AffectedBindings uint64
+}
+
 // GenerationSupervisorSnapshot is a concurrency-safe operational view. DC
 // slices are defensive sorted copies. Admitting is true only for a healthy
 // active generation.
@@ -83,6 +111,9 @@ type GenerationSupervisorSnapshot struct {
 	SlotRepairFailures          uint64
 	DCs                         []FixedBindingDCSnapshot
 	LastError                   error
+	ForcedRetirements           []GenerationForcedRetirementCounter
+	LastForcedRetirement        GenerationForcedRetirementSnapshot
+	DiagnosticRecordsDropped    uint64
 }
 
 // FixedBindingGenerationSupervisor owns one active and at most one retiring
@@ -105,7 +136,7 @@ type generationSupervisorState struct {
 	active                      *supervisedGeneration
 	retiring                    *supervisedGeneration
 	sources                     []*supervisedGeneration
-	lastFactory                 FixedBindingGenerationFactory
+	lastPlan                    *generationFactoryPlan
 	lastErr                     error
 	lastSlotFailure             FixedBindingSlotFailureSnapshot
 	slotFailures                uint64
@@ -114,6 +145,10 @@ type generationSupervisorState struct {
 	closing                     bool
 	closeResult                 error
 	dcCounters                  map[DCID]FixedBindingDCSnapshot
+	forcedRetirements           [2]GenerationForcedRetirementCounter
+	lastForcedRetirement        GenerationForcedRetirementSnapshot
+	diagnostics                 generationDiagnosticJournal
+	nextGenerationID            uint64
 
 	ready               chan struct{}
 	done                chan struct{}
@@ -127,14 +162,14 @@ type generationSupervisorState struct {
 
 type supervisedGeneration struct {
 	manager *FixedBindingManager
-	factory FixedBindingGenerationFactory
+	plan    *generationFactoryPlan
 	dcIDs   []DCID
 
-	failed        atomic.Bool
-	intentional   atomic.Bool
-	slotRepairing atomic.Bool
-	liveStop      chan struct{}
-	stopOnce      sync.Once
+	failed      atomic.Bool
+	intentional atomic.Bool
+	liveStop    chan struct{}
+	stopOnce    sync.Once
+	retireOnce  sync.Once
 }
 
 // NewFixedBindingGenerationSupervisor constructs an empty source. Call Start
@@ -152,6 +187,10 @@ func NewFixedBindingGenerationSupervisor(config GenerationSupervisorConfig) (*Fi
 		ready:       make(chan struct{}, 1),
 		done:        make(chan struct{}),
 		dcCounters:  make(map[DCID]FixedBindingDCSnapshot),
+		forcedRetirements: [2]GenerationForcedRetirementCounter{
+			{Reason: GenerationRetirementArtifactCapacity},
+			{Reason: GenerationRetirementRecoveryCapacity},
+		},
 	}}, nil
 }
 
@@ -175,12 +214,7 @@ func (s *FixedBindingGenerationSupervisor) Start(ctx context.Context, factory Fi
 	}
 	state := s.state
 	state.transitions.Lock()
-	state.mu.Lock()
-	if state.lastFactory == nil {
-		state.lastFactory = factory
-	}
-	state.mu.Unlock()
-	err := state.ensureActive(ctx, factory)
+	err := state.ensureActive(ctx, &generationFactoryPlan{build: factory})
 	state.transitions.Unlock()
 	if err != nil {
 		state.requestRepair()
@@ -190,8 +224,8 @@ func (s *FixedBindingGenerationSupervisor) Start(ctx context.Context, factory Fi
 
 // Rotate prepares one candidate from factory while the current active remains
 // available. Publication is atomic; the old active then quiesces and drains
-// naturally until DrainTimeout. Steady state owns one generation and rotation
-// owns at most two.
+// naturally. A previous retiree closes before candidate construction, keeping
+// at most two live managers, including the unpublished candidate.
 func (s *FixedBindingGenerationSupervisor) Rotate(ctx context.Context, factory FixedBindingGenerationFactory) error {
 	if err := validateGenerationOperation(ctx, factory); err != nil {
 		return err
@@ -203,41 +237,102 @@ func (s *FixedBindingGenerationSupervisor) Rotate(ctx context.Context, factory F
 	state.transitions.Lock()
 	defer state.transitions.Unlock()
 
-	if err := state.waitForRetiring(ctx); err != nil {
-		return err
+	return state.rotateActive(ctx, &generationFactoryPlan{build: factory})
+}
+
+// applyFactory atomically adopts the latest checked artifact plan and selects
+// rotation or recovery. Publication differs from idempotent acknowledgement
+// of a plan that background recovery already published.
+func (s *FixedBindingGenerationSupervisor) applyFactory(ctx context.Context, plan *generationFactoryPlan) (bool, error) {
+	if plan == nil {
+		return false, fmt.Errorf("%w: nil factory plan", ErrInvalidGenerationSupervisor)
+	}
+	if err := validateGenerationOperation(ctx, plan.build); err != nil {
+		return false, err
+	}
+	if s == nil || s.state == nil {
+		return false, ErrGenerationUnavailable
+	}
+	state := s.state
+	state.transitions.Lock()
+	// Cancellation can win while the caller waits for another transition.
+	if err := validateGenerationOperation(ctx, plan.build); err != nil {
+		state.transitions.Unlock()
+		return false, err
 	}
 	state.mu.Lock()
 	if state.closing {
 		state.mu.Unlock()
-		return ErrGenerationUnavailable
+		state.transitions.Unlock()
+		return false, ErrGenerationUnavailable
 	}
-	oldActive := state.active
-	if !healthyGeneration(oldActive) {
+	state.lastPlan = plan
+	active := state.active
+	healthy := healthyGeneration(active)
+	if healthy && active.plan == plan {
 		state.mu.Unlock()
-		return fmt.Errorf("%w: rotation requires a healthy active generation", ErrGenerationUnavailable)
+		state.transitions.Unlock()
+		return false, nil
 	}
 	state.mu.Unlock()
-
-	candidate, err := state.prepareGeneration(ctx, factory)
+	var err error
+	if healthy {
+		err = state.rotateActive(ctx, plan)
+	} else {
+		err = state.ensureActive(ctx, plan)
+	}
+	state.transitions.Unlock()
 	if err != nil {
-		state.recordError(err)
+		state.requestRepair()
+	}
+	return err == nil, err
+}
+
+// The caller holds transitions until candidate cleanup or publication ends.
+func (s *generationSupervisorState) rotateActive(ctx context.Context, plan *generationFactoryPlan) error {
+	if err := validateGenerationOperation(ctx, plan.build); err != nil {
 		return err
 	}
-
-	state.mu.Lock()
-	if state.closing || state.active != oldActive || !healthyGeneration(oldActive) || state.retiring != nil {
-		state.mu.Unlock()
-		state.closeGeneration(candidate)
+	s.mu.Lock()
+	oldActive := s.active
+	if s.closing || !healthyGeneration(oldActive) {
+		s.mu.Unlock()
+		return fmt.Errorf("%w: rotation requires a healthy active generation", ErrGenerationUnavailable)
+	}
+	s.lastPlan = plan
+	s.mu.Unlock()
+	if err := s.evictRetiring(ctx, GenerationRetirementArtifactCapacity); err != nil {
+		return err
+	}
+	if err := validateGenerationOperation(ctx, plan.build); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	changed := s.closing || s.active != oldActive || !healthyGeneration(oldActive)
+	s.mu.Unlock()
+	if changed {
 		return ErrGenerationChanged
 	}
-	if !state.publishGenerationLocked(candidate, oldActive) {
-		state.mu.Unlock()
-		state.closeGeneration(candidate)
+	candidate, err := s.prepareGeneration(ctx, plan.build)
+	if err != nil {
+		s.recordError(err)
+		return err
+	}
+	candidate.plan = plan
+	s.mu.Lock()
+	if context.Cause(ctx) != nil || s.closing || s.active != oldActive || !healthyGeneration(oldActive) || s.retiring != nil {
+		s.mu.Unlock()
+		s.closeGeneration(candidate)
 		return ErrGenerationChanged
 	}
-	state.mu.Unlock()
-	state.startGeneration(candidate)
-	state.retireRoutine(oldActive)
+	if !s.publishGenerationLocked(candidate, oldActive) {
+		s.mu.Unlock()
+		s.closeGeneration(candidate)
+		return ErrGenerationChanged
+	}
+	s.mu.Unlock()
+	s.startGeneration(candidate)
+	s.retireRoutine(oldActive)
 	return nil
 }
 
@@ -254,7 +349,10 @@ func validateGenerationOperation(ctx context.Context, factory FixedBindingGenera
 	return nil
 }
 
-func (s *generationSupervisorState) ensureActive(ctx context.Context, fallback FixedBindingGenerationFactory) error {
+func (s *generationSupervisorState) ensureActive(ctx context.Context, plan *generationFactoryPlan) error {
+	if cause := context.Cause(ctx); cause != nil {
+		return fmt.Errorf("%w: %w", ErrGenerationUnavailable, cause)
+	}
 	s.mu.Lock()
 	if s.closing {
 		s.mu.Unlock()
@@ -264,27 +362,32 @@ func (s *generationSupervisorState) ensureActive(ctx context.Context, fallback F
 		s.mu.Unlock()
 		return nil
 	}
-	if s.active != nil {
-		s.mu.Unlock()
-		return fmt.Errorf("%w: active generation is failed", ErrGenerationUnavailable)
-	}
-	factory := fallback
-	if factory == nil {
-		factory = s.lastFactory
+	failedActive := s.active
+	if plan == nil {
+		plan = s.lastPlan
+	} else {
+		s.lastPlan = plan
 	}
 	s.mu.Unlock()
-	if factory == nil {
+	if plan == nil || plan.build == nil {
 		return fmt.Errorf("%w: no recovery factory", ErrGenerationUnavailable)
 	}
+	if failedActive != nil {
+		s.retireFailedActive(failedActive)
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return fmt.Errorf("%w: %w", ErrGenerationUnavailable, cause)
+	}
 
-	candidate, err := s.prepareGeneration(ctx, factory)
+	candidate, err := s.prepareGeneration(ctx, plan.build)
 	if err != nil {
 		s.recordError(err)
 		return err
 	}
 
+	candidate.plan = plan
 	s.mu.Lock()
-	if s.closing || s.active != nil {
+	if context.Cause(ctx) != nil || s.closing || s.active != nil {
 		s.mu.Unlock()
 		s.closeGeneration(candidate)
 		return ErrGenerationChanged
@@ -300,6 +403,12 @@ func (s *generationSupervisorState) ensureActive(ctx context.Context, fallback F
 }
 
 func (s *generationSupervisorState) prepareGeneration(parent context.Context, factory FixedBindingGenerationFactory) (*supervisedGeneration, error) {
+	if cause := context.Cause(s.rootContext); cause != nil {
+		return nil, fmt.Errorf("%w: %w", ErrGenerationUnavailable, cause)
+	}
+	if cause := context.Cause(parent); cause != nil {
+		return nil, fmt.Errorf("%w: %w", ErrGenerationUnavailable, cause)
+	}
 	prepareContext, cancel := context.WithTimeout(parent, s.config.PreparationTimeout)
 	stopRoot := context.AfterFunc(s.rootContext, cancel)
 	defer func() {
@@ -319,9 +428,12 @@ func (s *generationSupervisorState) prepareGeneration(parent context.Context, fa
 	}
 	generation := &supervisedGeneration{
 		manager:  manager,
-		factory:  factory,
 		liveStop: make(chan struct{}),
 	}
+	s.mu.Lock()
+	s.nextGenerationID++
+	generationID := s.nextGenerationID
+	s.mu.Unlock()
 	manager.state.mu.Lock()
 	if manager.state.state != fixedBindingManagerCreated {
 		manager.state.mu.Unlock()
@@ -329,6 +441,15 @@ func (s *generationSupervisorState) prepareGeneration(parent context.Context, fa
 		return nil, fmt.Errorf("%w: factory returned a manager that was already started", ErrInvalidGenerationSupervisor)
 	}
 	manager.state.slotFailureObserver = s.recordSlotFailure
+	manager.state.generationID = generationID
+	manager.state.generationRole = GenerationRoleCandidate
+	manager.state.slotRepairObserver = func(success bool) {
+		if success {
+			s.slotRepairSuccesses.Add(1)
+		} else {
+			s.slotRepairFailures.Add(1)
+		}
+	}
 	manager.state.dcObserver = s.recordDCChange
 	// Bootstrap and initial admission failures are real link failures, but
 	// they are not losses of coverage from an admitted generation.
@@ -356,6 +477,11 @@ func (s *generationSupervisorState) recordSlotFailure(failure FixedBindingSlotFa
 	s.slotFailureAffectedBindings += uint64(failure.AffectedBindings)
 	failure.Sequence = s.slotFailures
 	s.lastSlotFailure = failure
+	record := failure.diagnostic
+	record.Kind = GenerationDiagnosticSlotFailure
+	record.FailureSequence = failure.Sequence
+	record.AffectedBindings = failure.AffectedBindings
+	s.diagnostics.append(record)
 	s.mu.Unlock()
 }
 
@@ -392,25 +518,36 @@ func (s *generationSupervisorState) addSourceLocked(generation *supervisedGenera
 }
 
 // publishGenerationLocked holds supervisor.mu on entry. Manager callbacks
-// acquire supervisor.mu only after releasing manager.mu. Holding both locks
-// makes coverage activation and publication one boundary for failure delivery.
+// acquire supervisor.mu only after releasing manager.mu. Candidate admission
+// is checked under its lock. That lock is released before quiescing the old
+// manager, and the retiring role becomes visible only after quiescence.
 func (s *generationSupervisorState) publishGenerationLocked(candidate, retiring *supervisedGeneration) bool {
 	m := candidate.manager.state
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.state != fixedBindingManagerReady || !m.accepting {
+		m.mu.Unlock()
 		return false
 	}
 	for _, dcID := range candidate.dcIDs {
 		if m.readySlotsLocked(dcID) == 0 {
+			m.mu.Unlock()
 			return false
 		}
 	}
 	m.coverageEnabled = true
+	m.generationRole = GenerationRoleActive
 	s.active = candidate
-	s.retiring = retiring
-	s.lastFactory = candidate.factory
+	s.lastPlan = candidate.plan
 	s.addSourceLocked(candidate)
+	m.mu.Unlock()
+	// Supervisor readers and binding admission remain excluded throughout.
+	// Never hold two manager locks, and never expose a retiree that can still
+	// claim or publish a replacement. A rejected candidate changes neither.
+	if retiring != nil {
+		retiring.manager.quiesceWithRole(GenerationRoleRetiring)
+		retiring.intentional.Store(true)
+	}
+	s.retiring = retiring
 	return true
 }
 
@@ -462,80 +599,116 @@ func (s *generationSupervisorState) watchGenerationReady(generation *supervisedG
 }
 
 func (s *generationSupervisorState) watchGenerationLiveness(generation *supervisedGeneration) {
-	ticker := time.NewTicker(s.config.ProbeInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-s.rootContext.Done():
-			return
-		case <-generation.liveStop:
-			return
-		case <-ticker.C:
-			if err := s.probeGeneration(s.rootContext, generation, s.config.ProbeFailureTimeout); err != nil {
-				if context.Cause(s.rootContext) != nil || generation.intentional.Load() {
-					return
-				}
-				if generation.manager.state.canRepairSlots() {
-					s.requestSlotRepair(generation, err)
-					continue
-				}
-				s.failGeneration(generation, err)
-				return
-			}
-		}
+	ctx, cancel := context.WithCancel(s.rootContext)
+	m := generation.manager.state
+	m.mu.Lock()
+	slots := len(m.order)
+	m.mu.Unlock()
+	var workers sync.WaitGroup
+	for index := range slots {
+		workers.Go(func() { s.watchGenerationSlot(ctx, generation, index) })
 	}
+	select {
+	case <-ctx.Done():
+	case <-generation.liveStop:
+	case <-generation.manager.Done():
+	}
+	cancel()
+	workers.Wait()
 }
 
-func (s *generationSupervisorState) requestSlotRepair(generation *supervisedGeneration, cause error) {
-	if generation == nil || generation.failed.Load() || generation.intentional.Load() ||
-		!generation.slotRepairing.CompareAndSwap(false, true) {
-		return
-	}
-	s.recordError(fmt.Errorf("repair degraded Middle-End generation: %w", cause))
-	s.workers.Go(func() {
-		defer generation.slotRepairing.Store(false)
-		s.repairGenerationSlots(generation)
-	})
-}
-
-func (s *generationSupervisorState) repairGenerationSlots(generation *supervisedGeneration) {
+// Each stable slot ordinal has one maintenance worker. A silent probe or slow
+// repair can delay only that ordinal. Refresh replaces its slot pointer, so
+// every pass reloads the current incarnation under the manager lock.
+func (s *generationSupervisorState) watchGenerationSlot(ctx context.Context, generation *supervisedGeneration, index int) {
+	m := generation.manager.state
+	delay := s.config.ProbeInterval
 	backoff := s.config.RepairBackoffInitial
 	for {
-		if generation.failed.Load() || generation.intentional.Load() {
+		m.mu.Lock()
+		if m.state != fixedBindingManagerReady {
+			m.mu.Unlock()
 			return
 		}
-		repairContext, cancel := context.WithTimeout(s.rootContext, s.config.ProbeFailureTimeout)
-		beforeSuccesses, beforeFailures := generation.manager.state.slotRepairCounts()
-		err := generation.manager.state.repairFailedSlots(repairContext)
-		afterSuccesses, afterFailures := generation.manager.state.slotRepairCounts()
-		if afterSuccesses > beforeSuccesses {
-			s.slotRepairSuccesses.Add(afterSuccesses - beforeSuccesses)
-		}
-		if afterFailures > beforeFailures {
-			s.slotRepairFailures.Add(afterFailures - beforeFailures)
-		}
-		cancel()
-		if err == nil {
+		slot := m.order[index]
+		if slot.retired {
+			m.mu.Unlock()
 			return
 		}
-		if context.Cause(s.rootContext) != nil || generation.intentional.Load() {
-			return
+		var failed <-chan struct{}
+		if !slot.failed {
+			failed = slot.consumerDone
 		}
-		s.recordError(err)
-		timer := time.NewTimer(jitteredRetryDelay(backoff))
-		backoff = nextRepairBackoff(backoff, s.config.RepairBackoffMaximum)
+		m.mu.Unlock()
+		timer := time.NewTimer(delay)
 		select {
-		case <-s.rootContext.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
+		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-generation.liveStop:
-			if !timer.Stop() {
-				<-timer.C
-			}
-			return
+		case <-failed:
+			timer.Stop()
 		case <-timer.C:
+		}
+		if context.Cause(ctx) != nil {
+			return
+		}
+		m.mu.Lock()
+		slot = m.order[index]
+		isFailed, canRepair, accepting := slot.failed, m.repairLink != nil, m.accepting
+		cause := slot.err
+		m.mu.Unlock()
+		delay = s.config.ProbeInterval
+		if !isFailed {
+			if !accepting && m.retireUnusedSlot(slot) {
+				return
+			}
+			probeContext, cancel := context.WithTimeout(ctx, s.config.ProbeFailureTimeout)
+			err := m.probeSlot(probeContext, slot.dcID, slot)
+			cancel()
+			if err == nil || errors.Is(err, ErrFixedBindingProbePending) {
+				backoff = s.config.RepairBackoffInitial
+				continue
+			}
+			if context.Cause(ctx) != nil {
+				return
+			}
+			cause = fmt.Errorf("%w: DC %d: %w", ErrGenerationProbe, slot.dcID, err)
+			s.recordError(cause)
+		}
+		if generation.intentional.Load() || !accepting {
+			m.mu.Lock()
+			current := m.order[index]
+			terminal := m.state != fixedBindingManagerReady || current.failed || current.retired
+			m.mu.Unlock()
+			if terminal {
+				return
+			}
+			// Admission pressure can reject a probe without failing its link.
+			// Retiring healthy links retry; they never start replacements.
+			continue
+		}
+		if !canRepair {
+			s.failGeneration(generation, cause)
+			m.mu.Lock()
+			current := m.order[index]
+			terminal := m.state != fixedBindingManagerReady || current.failed || current.retired
+			m.mu.Unlock()
+			if terminal {
+				return
+			}
+			continue
+		}
+		repairContext, cancel := context.WithTimeout(ctx, s.config.PreparationTimeout)
+		attempted, err := m.repairFailedSlot(repairContext, slot)
+		cancel()
+		if err != nil && context.Cause(ctx) == nil {
+			s.recordError(err)
+		}
+		if attempted && err != nil {
+			delay = jitteredRetryDelay(backoff)
+			backoff = nextRepairBackoff(backoff, s.config.RepairBackoffMaximum)
+		} else {
+			backoff = s.config.RepairBackoffInitial
 		}
 	}
 }
@@ -568,52 +741,35 @@ func (s *generationSupervisorState) failGeneration(generation *supervisedGenerat
 	if !generation.failed.CompareAndSwap(false, true) {
 		return
 	}
-	generation.stopLiveness()
 	s.recordError(fmt.Errorf("%w: %w", ErrGenerationUnavailable, cause))
 
 	s.transitions.Lock()
 	defer s.transitions.Unlock()
 
+	s.retireFailedActive(generation)
+	s.requestRepair()
+}
+
+// retireFailedActive runs under transitions, including when the latest
+// artifact application reaches that boundary before the failure watcher.
+func (s *generationSupervisorState) retireFailedActive(generation *supervisedGeneration) {
 	s.mu.Lock()
-	if s.closing {
+	if s.closing || s.active != generation {
 		s.mu.Unlock()
 		return
 	}
-	owned := false
-	retire := false
-	var displacedRetiring *supervisedGeneration
-	switch {
-	case s.active == generation:
-		owned = true
-		s.active = nil
-		displacedRetiring = s.retiring
-		s.retiring = generation
-		retire = true
-	case s.retiring == generation:
-		owned = true
-		s.retiring = nil
-	}
-	s.mu.Unlock()
-	if !owned {
-		return
-	}
-
+	generation.manager.quiesceWithRole(GenerationRoleRetiring)
 	generation.intentional.Store(true)
+	s.active = nil
+	displaced := s.retiring
+	s.retiring = generation
+	generation.failed.Store(true)
+	s.mu.Unlock()
+	s.retireRoutine(generation)
+	if displaced != nil && displaced != generation {
+		s.forceRetireGeneration(displaced, GenerationRetirementRecoveryCapacity)
+	}
 	s.signalReady()
-	if retire {
-		// A liveness probe has already isolated each failed physical link.
-		// Quiescing the manager preserves bindings on its remaining healthy
-		// links while all new admission moves to the promoted generation.
-		s.retireRoutine(generation)
-	} else {
-		s.closeGeneration(generation)
-	}
-	if displacedRetiring != nil && displacedRetiring != generation {
-		// Free the sole retiring role before repair constructs another active
-		// manager, keeping the whole topology at two live generations.
-		s.closeGeneration(displacedRetiring)
-	}
-	s.requestRepair()
 }
 
 func (s *generationSupervisorState) requestRepair() {
@@ -637,13 +793,7 @@ func (s *generationSupervisorState) repairLoop() {
 		default:
 		}
 		s.transitions.Lock()
-		s.mu.Lock()
-		factory := s.lastFactory
-		if s.active != nil {
-			factory = s.active.factory
-		}
-		s.mu.Unlock()
-		err := s.ensureActive(s.rootContext, factory)
+		err := s.ensureActive(s.rootContext, nil)
 		if err == nil {
 			s.finishRepair()
 			s.transitions.Unlock()
@@ -687,33 +837,22 @@ func (s *generationSupervisorState) finishRepair() {
 }
 
 func (s *generationSupervisorState) retireRoutine(generation *supervisedGeneration) {
-	generation.intentional.Store(true)
-	generation.stopLiveness()
-	drained := generation.manager.Quiesce()
-	s.workers.Go(func() {
-		timer := time.NewTimer(s.config.DrainTimeout)
-		timedOut := false
-		select {
-		case <-s.rootContext.Done():
-			if !timer.Stop() {
-				<-timer.C
+	generation.retireOnce.Do(func() {
+		generation.intentional.Store(true)
+		drained := generation.manager.Quiesce()
+		s.workers.Go(func() {
+			select {
+			case <-s.rootContext.Done():
+			case <-generation.manager.Done():
+			case <-drained:
 			}
-		case <-drained:
-			if !timer.Stop() {
-				<-timer.C
+			s.closeGeneration(generation)
+			s.mu.Lock()
+			if s.retiring == generation {
+				s.retiring = nil
 			}
-		case <-timer.C:
-			timedOut = true
-		}
-		if timedOut {
-			s.recordError(ErrGenerationDrainTimeout)
-		}
-		s.closeGeneration(generation)
-		s.mu.Lock()
-		if s.retiring == generation {
-			s.retiring = nil
-		}
-		s.mu.Unlock()
+			s.mu.Unlock()
+		})
 	})
 }
 
@@ -735,27 +874,68 @@ func (g *supervisedGeneration) stopLiveness() {
 }
 
 func healthyGeneration(generation *supervisedGeneration) bool {
-	return generation != nil && !generation.failed.Load() && !generation.intentional.Load()
+	if generation == nil || generation.failed.Load() || generation.intentional.Load() {
+		return false
+	}
+	// A terminal manager can precede its asynchronous failure watcher. Never
+	// acknowledge its artifact plan as currently applied during that window.
+	m := generation.manager.state
+	m.mu.Lock()
+	healthy := m.state == fixedBindingManagerReady && m.accepting
+	m.mu.Unlock()
+	return healthy
 }
 
-func (s *generationSupervisorState) waitForRetiring(ctx context.Context) error {
-	for {
+func (s *generationSupervisorState) evictRetiring(ctx context.Context, reason GenerationRetirementReason) error {
+	s.mu.Lock()
+	retiring := s.retiring
+	closing := s.closing
+	s.mu.Unlock()
+	if cause := context.Cause(ctx); cause != nil {
+		return fmt.Errorf("%w: %w", ErrGenerationUnavailable, cause)
+	}
+	if closing {
+		return ErrGenerationUnavailable
+	}
+	if retiring != nil {
+		s.forceRetireGeneration(retiring, reason)
 		s.mu.Lock()
-		retiring := s.retiring
-		closing := s.closing
+		if s.retiring == retiring {
+			s.retiring = nil
+		}
 		s.mu.Unlock()
-		if closing {
-			return ErrGenerationUnavailable
-		}
-		if retiring == nil {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("wait for retiring Middle-End generation: %w", context.Cause(ctx))
-		case <-retiring.manager.Done():
+	}
+	return nil
+}
+
+func (s *generationSupervisorState) forceRetireGeneration(generation *supervisedGeneration, reason GenerationRetirementReason) {
+	generation.intentional.Store(true)
+	generation.stopLiveness()
+	generation.manager.Quiesce()
+	s.mu.Lock()
+	if !s.closing {
+		// The terminal claim takes manager.mu in the established lock order.
+		// It never closes a link or invokes a manager observer synchronously.
+		if record, won := generation.manager.state.beginForcedRetirement(reason); won {
+			record.Sequence = s.lastForcedRetirement.Sequence + 1
+			s.lastForcedRetirement = record
+			s.diagnostics.append(GenerationDiagnosticRecord{
+				Kind: GenerationDiagnosticForcedRetirement, At: record.At,
+				GenerationID: record.GenerationID, Role: record.Role,
+				RetirementReason: record.Reason, AffectedBindings: record.AffectedBindings,
+			})
+			for index := range s.forcedRetirements {
+				counter := &s.forcedRetirements[index]
+				if counter.Reason == reason {
+					counter.Retirements++
+					counter.AffectedBindings += uint64(record.AffectedBindings)
+				}
+			}
 		}
 	}
+	s.mu.Unlock()
+	// Done is a capacity boundary, not merely the removal of a role pointer.
+	s.closeGeneration(generation)
 }
 
 // Bind fixes a new client to the current healthy active manager. Selection and
@@ -871,6 +1051,9 @@ func (s *FixedBindingGenerationSupervisor) Snapshot() GenerationSupervisorSnapsh
 		SlotRepairSuccesses:         state.slotRepairSuccesses.Load(),
 		SlotRepairFailures:          state.slotRepairFailures.Load(),
 		LastError:                   state.lastErr,
+		ForcedRetirements:           slices.Clone(state.forcedRetirements[:]),
+		LastForcedRetirement:        state.lastForcedRetirement,
+		DiagnosticRecordsDropped:    state.diagnostics.dropped,
 	}
 	var activeManager, retiringManager *FixedBindingManager
 	counters := make(map[DCID]FixedBindingDCSnapshot, len(state.dcCounters))

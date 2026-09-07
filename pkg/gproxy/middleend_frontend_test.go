@@ -1787,7 +1787,6 @@ func TestMiddleEndSupervisorWakesClientWhenRetiringGenerationIsForcedClosed(t *t
 		PreparationTimeout:   time.Second,
 		ProbeInterval:        10 * time.Second,
 		ProbeFailureTimeout:  30 * time.Second,
-		DrainTimeout:         time.Hour,
 		RepairBackoffInitial: time.Millisecond,
 		RepairBackoffMaximum: 10 * time.Millisecond,
 	})

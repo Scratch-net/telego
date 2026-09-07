@@ -264,6 +264,7 @@ func registerMiddleEndMetrics(meter metric.Meter, provider MiddleEndStatsProvide
 	registerMiddleEndManagerQueueMetrics(meter, provider)
 	registerMiddleEndLinkQueueMetrics(meter, provider)
 	registerMiddleEndRefreshMetrics(meter, provider)
+	registerMiddleEndDiagnosticMetrics(meter, provider)
 }
 
 type middleEndLinkMetricKey struct {

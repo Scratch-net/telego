@@ -44,7 +44,6 @@ var (
 	middleEndPreparationTimeout     = 100 * time.Second
 	middleEndProbeInterval          = 5 * time.Second
 	middleEndProbeFailureTimeout    = 100 * time.Second
-	middleEndDrainTimeout           = 90 * time.Second
 	middleEndRepairBackoffInitial   = 500 * time.Millisecond
 	middleEndRepairBackoffMaximum   = 30 * time.Second
 	middleEndEndpointDialTimeout    = 3 * time.Second
@@ -182,7 +181,6 @@ func (c *Config) ToMiddleEndRuntimeConfig() (MiddleEndRuntimeConfig, error) {
 			PreparationTimeout:   middleEndPreparationTimeout,
 			ProbeInterval:        middleEndProbeInterval,
 			ProbeFailureTimeout:  middleEndProbeFailureTimeout,
-			DrainTimeout:         middleEndDrainTimeout,
 			RepairBackoffInitial: middleEndRepairBackoffInitial,
 			RepairBackoffMaximum: middleEndRepairBackoffMaximum,
 		},

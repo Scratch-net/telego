@@ -85,6 +85,7 @@ func (b *generationFactoryTestLinkBuilder) NewClientLink(
 ) (ClientLink, error) {
 	_ = conn.Close()
 	link := newFixedBindingFakeLink()
+	respondToFixedBindingPings(link)
 	b.mu.Lock()
 	if len(b.startErrs) > len(b.links) {
 		link.startErr = b.startErrs[len(b.links)]

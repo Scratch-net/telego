@@ -207,9 +207,19 @@ Restart Telego after a change to this section. If the section is absent or `enab
 
 Telego replaces a failed link in place. Healthy bindings and healthy DC pools stay on their existing physical links.
 
+Each physical slot has independent probes and repair. A slow slot does not stop probes on the other slots.
+
+Before a repaired link accepts bindings, its replacement must complete the handshake and return a matching RPC pong within 10 seconds.
+
 Unused links become eligible for refresh after 45–60 seconds. Telego completes the replacement handshake and RPC probe before it retires the current link.
 
 The current link stays available during preparation. A new client binding cancels the replacement.
+
+After artifact rotation, healthy old bindings keep their links and probes without a retirement deadline. Retiring generations do not repair or refresh links.
+
+Telego permits at most two live generation managers, including a candidate. Before the next candidate needs this capacity, Telego closes the oldest retiring generation.
+
+This capacity retirement can interrupt old bindings. A failed candidate leaves the active generation unchanged but cannot restore those interrupted bindings.
 
 Before ME is ready, the direct DC path stays available. If ME cannot accept a binding, the direct DC path also stays available.
 
@@ -715,6 +725,9 @@ To disable diagnostics, set `diagnostics = false`. Then restart Telego.
 | `telego_middleend_links` | Gauge | ME links by generation role, signed DC, and state |
 | `telego_middleend_slot_failure_total` | Counter | Physical-link failures |
 | `telego_middleend_slot_failure_affected_bindings_total` | Counter | Bindings terminated by physical-link failures |
+| `telego_middleend_forced_retirement_total` | Counter | Capacity retirements by `reason`: `artifact_capacity` or `recovery_capacity` |
+| `telego_middleend_forced_retirement_affected_bindings_total` | Counter | Bindings interrupted by capacity retirement, by `reason` |
+| `telego_middleend_diagnostic_records_dropped_total` | Counter | Diagnostic records rejected by the full journal. This metric has no labels. |
 | `telego_middleend_slot_repair_total` | Counter | Physical-link replacement results |
 | `telego_middleend_slot_refreshes_active` | Gauge | Refresh candidate reservations by generation role and signed DC, including cleanup |
 | `telego_middleend_slot_refresh_total` | Counter | Lifetime refresh results by signed DC: `success`, `failure`, or `canceled` |

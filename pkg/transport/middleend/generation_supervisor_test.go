@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -183,7 +184,6 @@ func generationTestConfig() GenerationSupervisorConfig {
 		PreparationTimeout:   time.Second,
 		ProbeInterval:        time.Hour,
 		ProbeFailureTimeout:  2 * time.Hour,
-		DrainTimeout:         time.Second,
 		RepairBackoffInitial: time.Millisecond,
 		RepairBackoffMaximum: 5 * time.Millisecond,
 	}
@@ -210,7 +210,7 @@ func TestGenerationSupervisorConfigValidationAndRedaction(t *testing.T) {
 	}
 	invalid := []GenerationSupervisorConfig{
 		{},
-		{PreparationTimeout: time.Second, ProbeInterval: time.Second, ProbeFailureTimeout: time.Second, DrainTimeout: time.Second},
+		{PreparationTimeout: time.Second, ProbeInterval: time.Second, ProbeFailureTimeout: time.Second},
 		func() GenerationSupervisorConfig {
 			config := valid
 			config.RepairBackoffInitial = 2 * time.Second
@@ -306,7 +306,7 @@ func TestGenerationSupervisorRotationCanChangeArtifactCoverage(t *testing.T) {
 	}
 }
 
-func TestGenerationSupervisorEnsureActiveRejectsFailedPublishedGeneration(t *testing.T) {
+func TestGenerationSupervisorApplyFactoryRecoversFailedPublishedGeneration(t *testing.T) {
 	dcIDs := []DCID{1}
 	active := newGenerationTestManager(t, dcIDs, true)
 	factory := &generationTestFactory{steps: []generationTestFactoryStep{{manager: active.manager}}}
@@ -314,16 +314,25 @@ func TestGenerationSupervisorEnsureActiveRejectsFailedPublishedGeneration(t *tes
 	if err := supervisor.Start(t.Context(), factory.build); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+	binding, err := supervisor.Bind(1)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	supervisor.state.mu.Lock()
 	failed := supervisor.state.active
 	failed.failed.Store(true)
 	supervisor.state.mu.Unlock()
-	t.Cleanup(func() { failed.failed.Store(false) })
-
-	err := supervisor.state.ensureActive(t.Context(), factory.build)
-	if !errors.Is(err, ErrGenerationUnavailable) {
-		t.Fatalf("ensure active error = %v, want unavailable", err)
+	replacement := newGenerationTestManager(t, dcIDs, true)
+	plan := &generationFactoryPlan{build: func(context.Context) (*FixedBindingManager, error) { return replacement.manager, nil }}
+	if published, err := supervisor.applyFactory(t.Context(), plan); err != nil || !published {
+		t.Fatalf("apply latest factory = %t, %v", published, err)
+	}
+	if supervisor.state.active.plan != plan || channelClosed(active.manager.Done()) {
+		t.Fatal("new plan did not recover admission while preserving the healthy remainder")
+	}
+	if err := binding.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -436,27 +445,38 @@ func TestGenerationSupervisorRotationNeverExceedsTwoLiveManagers(t *testing.T) {
 		t.Fatalf("live managers with one retiring = %d, want 2", live)
 	}
 
-	secondFactory := &generationTestFactory{}
-	waitContext, cancelWait := context.WithTimeout(t.Context(), 20*time.Millisecond)
-	defer cancelWait()
-	if err := supervisor.Rotate(waitContext, secondFactory.build); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("second Rotate error = %v, want retiring wait deadline", err)
-	}
-	if calls := secondFactory.callCount(); calls != 0 {
-		t.Fatalf("second rotation factory calls with an existing retiree = %d", calls)
-	}
+	third := newGenerationTestManager(t, dcIDs, true)
+	managers = append(managers, third)
+	releaseThird := make(chan struct{})
+	third.links[1].startGate = releaseThird
+	go func() {
+		rotateResult <- supervisor.Rotate(t.Context(), func(context.Context) (*FixedBindingManager, error) {
+			if !channelClosed(oldActive.manager.Done()) {
+				return nil, errors.New("oldest manager still live at third construction")
+			}
+			return third.manager, nil
+		})
+	}()
+	waitGenerationTestLinkStarts(t, third.links[1], 1)
 	if live := countStartedLiveGenerationTestManagers(managers); live != 2 {
-		t.Fatalf("live managers after rejected overlapping rotation = %d, want 2", live)
+		t.Fatalf("live managers while third starts = %d, want 2", live)
 	}
-
-	if err := oldBinding.Close(); err != nil {
-		t.Fatalf("Close old binding: %v", err)
+	current, err := supervisor.Bind(1)
+	if err != nil || current.state.manager != newActive.manager.state {
+		t.Fatalf("middle active lost admission during third preparation: %v", err)
 	}
-	waitGenerationCondition(t, supervisor, time.Second, func(snapshot GenerationSupervisorSnapshot) bool {
-		return len(snapshot.RetiringDCIDs) == 0
-	})
-	if live := countStartedLiveGenerationTestManagers(managers); live != 1 {
-		t.Fatalf("live managers after drain = %d, want 1", live)
+	if _, err := oldBinding.NextEvent(t.Context()); err == nil {
+		t.Fatal("capacity retirement did not terminate oldest binding")
+	}
+	close(releaseThird)
+	if err := <-rotateResult; err != nil {
+		t.Fatalf("third Rotate: %v", err)
+	}
+	if snapshot := supervisor.Snapshot(); snapshot.LastForcedRetirement.Reason != GenerationRetirementArtifactCapacity || snapshot.LastForcedRetirement.AffectedBindings != 1 {
+		t.Fatalf("capacity record = %+v", snapshot.LastForcedRetirement)
+	}
+	if err := current.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -466,7 +486,6 @@ func TestGenerationSupervisorRepairsFailedSlotWithoutRetiringGeneration(t *testi
 		PreparationTimeout:   time.Second,
 		ProbeInterval:        5 * time.Millisecond,
 		ProbeFailureTimeout:  30 * time.Millisecond,
-		DrainTimeout:         time.Second,
 		RepairBackoffInitial: time.Millisecond,
 		RepairBackoffMaximum: 5 * time.Millisecond,
 	}
@@ -567,7 +586,6 @@ func TestGenerationSupervisorRepairsLostDCCoverageWithoutRetiringGeneration(t *t
 		PreparationTimeout:   time.Second,
 		ProbeInterval:        5 * time.Millisecond,
 		ProbeFailureTimeout:  30 * time.Millisecond,
-		DrainTimeout:         time.Second,
 		RepairBackoffInitial: time.Millisecond,
 		RepairBackoffMaximum: 5 * time.Millisecond,
 	}
@@ -625,7 +643,6 @@ func TestGenerationSupervisorLostOneDCCoverageKeepsOtherDCAdmittingDuringRepair(
 		PreparationTimeout:   time.Second,
 		ProbeInterval:        5 * time.Millisecond,
 		ProbeFailureTimeout:  200 * time.Millisecond,
-		DrainTimeout:         time.Second,
 		RepairBackoffInitial: time.Millisecond,
 		RepairBackoffMaximum: 5 * time.Millisecond,
 	}
@@ -710,7 +727,6 @@ func TestGenerationSupervisorFailedActiveFallsBackUntilReplacement(t *testing.T)
 		PreparationTimeout:   time.Second,
 		ProbeInterval:        5 * time.Millisecond,
 		ProbeFailureTimeout:  30 * time.Millisecond,
-		DrainTimeout:         time.Second,
 		RepairBackoffInitial: time.Millisecond,
 		RepairBackoffMaximum: 5 * time.Millisecond,
 	}
@@ -755,7 +771,6 @@ func TestGenerationSupervisorFailedActiveDrainsHealthyPooledBindings(t *testing.
 		PreparationTimeout:   time.Second,
 		ProbeInterval:        5 * time.Millisecond,
 		ProbeFailureTimeout:  30 * time.Millisecond,
-		DrainTimeout:         time.Second,
 		RepairBackoffInitial: time.Millisecond,
 		RepairBackoffMaximum: 5 * time.Millisecond,
 	}
@@ -839,7 +854,6 @@ func TestGenerationSupervisorFailedActiveDisplacesOlderRetiringBeforeRepair(t *t
 		PreparationTimeout:   time.Second,
 		ProbeInterval:        5 * time.Millisecond,
 		ProbeFailureTimeout:  30 * time.Millisecond,
-		DrainTimeout:         time.Second,
 		RepairBackoffInitial: time.Millisecond,
 		RepairBackoffMaximum: 5 * time.Millisecond,
 	}
@@ -903,7 +917,6 @@ func TestGenerationSupervisorStartupFailureFallsBackUntilRepair(t *testing.T) {
 		PreparationTimeout:   time.Second,
 		ProbeInterval:        5 * time.Millisecond,
 		ProbeFailureTimeout:  30 * time.Millisecond,
-		DrainTimeout:         time.Second,
 		RepairBackoffInitial: time.Millisecond,
 		RepairBackoffMaximum: 5 * time.Millisecond,
 	}
@@ -986,36 +999,47 @@ func TestGenerationSupervisorReadinessIncludesRetiringBinding(t *testing.T) {
 	}
 }
 
-func TestGenerationSupervisorDrainDeadlineForceClosesRetiring(t *testing.T) {
-	dcIDs := []DCID{1}
-	config := generationTestConfig()
-	config.DrainTimeout = 20 * time.Millisecond
-	oldActive := newGenerationTestManager(t, dcIDs, true)
-	initial := &generationTestFactory{steps: []generationTestFactoryStep{{manager: oldActive.manager}}}
-	newActive := newGenerationTestManager(t, dcIDs, true)
-	rotation := &generationTestFactory{steps: []generationTestFactoryStep{{manager: newActive.manager}}}
-	supervisor := newGenerationTestSupervisor(t, config)
-	if err := supervisor.Start(t.Context(), initial.build); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	if _, err := supervisor.Bind(1); err != nil {
-		t.Fatalf("Bind old: %v", err)
-	}
-	if err := supervisor.Rotate(t.Context(), rotation.build); err != nil {
-		t.Fatalf("Rotate: %v", err)
-	}
-	waitGenerationCondition(t, supervisor, time.Second, func(snapshot GenerationSupervisorSnapshot) bool {
-		return len(snapshot.RetiringDCIDs) == 0 && errors.Is(snapshot.LastError, ErrGenerationDrainTimeout)
+func TestGenerationSupervisorRetiringGenerationKeepsProbingWithoutDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		config := generationTestConfig()
+		config.ProbeInterval = time.Second
+		config.ProbeFailureTimeout = 5 * time.Second
+		old := newGenerationTestManager(t, []DCID{1}, true)
+		next := newGenerationTestManager(t, []DCID{1}, true)
+		supervisor := newGenerationTestSupervisor(t, config)
+		if err := supervisor.Start(t.Context(), func(context.Context) (*FixedBindingManager, error) { return old.manager, nil }); err != nil {
+			t.Fatal(err)
+		}
+		binding, err := supervisor.Bind(1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := supervisor.Rotate(t.Context(), func(context.Context) (*FixedBindingManager, error) { return next.manager, nil }); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		before := len(old.links[1].attemptedSubmissions())
+		time.Sleep(3 * time.Minute)
+		synctest.Wait()
+		if channelClosed(old.manager.Done()) || supervisor.Snapshot().Retiring == nil {
+			t.Fatal("healthy bound retiree closed after the former deadline")
+		}
+		if after := len(old.links[1].attemptedSubmissions()); after <= before+90 {
+			t.Fatalf("retiring PINGs = %d -> %d", before, after)
+		}
+		old.links[1].emit(LinkEvent{Kind: LinkEventSimpleAck, ConnectionID: binding.ConnectionID(), ConfirmKey: 17})
+		event, err := binding.NextEvent(t.Context())
+		if err != nil || event.ConfirmKey != 17 {
+			t.Fatalf("healthy retiring response: %+v, %v", event, err)
+		}
+		if err := binding.Close(); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if !channelClosed(old.manager.Done()) || supervisor.Snapshot().LastForcedRetirement.Sequence != 0 {
+			t.Fatal("last binding did not drain naturally without a forced retirement")
+		}
 	})
-	select {
-	case <-oldActive.manager.Done():
-	case <-time.After(time.Second):
-		t.Fatal("retiring manager did not close after drain deadline")
-	}
-	_, _, closes, _, _ := oldActive.links[1].stats()
-	if closes != 1 {
-		t.Fatalf("retiring link closes = %d, want 1", closes)
-	}
 }
 
 func TestGenerationSupervisorRejectsFactoryManagerReuse(t *testing.T) {

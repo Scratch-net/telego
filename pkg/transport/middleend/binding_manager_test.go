@@ -3551,6 +3551,7 @@ func TestFixedBindingManagerRepairsFailedSlotWithoutMovingHealthyBindings(t *tes
 	failedLink := newFixedBindingFakeLink()
 	healthyLink := newFixedBindingFakeLink()
 	replacement := newFixedBindingFakeLink()
+	respondToFixedBindingPings(replacement)
 	manager, err := newFixedBindingManager(
 		[]FixedBindingSlot{{DCID: 2, Link: failedLink}, {DCID: 2, Link: healthyLink}},
 		fixedBindingTestLimits(),
@@ -3609,7 +3610,7 @@ func TestFixedBindingManagerRepairsFailedSlotWithoutMovingHealthyBindings(t *tes
 	}
 	waitFixedBindingCondition(t, func() bool {
 		_, _, _, submissions, _ := replacement.stats()
-		return len(submissions) == 1
+		return len(submissions) == 2 // Candidate PING, then the client request.
 	})
 
 	eventContext, cancel := context.WithTimeout(t.Context(), time.Second)
@@ -3644,6 +3645,7 @@ func TestFixedBindingManagerRetriesAfterReplacementStartFailure(t *testing.T) {
 	badReplacement := newFixedBindingFakeLink()
 	badReplacement.startErr = startFailure
 	goodReplacement := newFixedBindingFakeLink()
+	respondToFixedBindingPings(goodReplacement)
 	attempt := 0
 	manager, err := newFixedBindingManager(
 		[]FixedBindingSlot{{DCID: 2, Link: failedLink}, {DCID: 2, Link: healthyLink}},

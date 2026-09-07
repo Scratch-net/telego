@@ -102,17 +102,37 @@ Telegram reconnects a client after its selected physical link fails. The new TCP
 
 ## Link topology
 
-Telego keeps one active generation in steady state. This generation has four gnet links for each signed DC in Telegram's current artifacts.
+Telego keeps one active generation. This generation has four gnet links for each signed DC in Telegram's current artifacts.
 
 The pool selects a least-loaded healthy link for each new binding. The binding stays on that physical link until the binding closes.
 
-Telego fetches the three official Telegram artifacts once per day. A failed refresh keeps the last known good generation.
+## Artifact refresh and generation rotation
+
+Telego fetches the three official Telegram artifacts once per day. Failed candidate attempts do not prevent the next scheduled fetch.
+
+A failed fetch does not discard the active generation or the last valid artifacts. Telego can still retry a pending candidate from those artifacts.
+
+New artifact content replaces the pending candidate plan. Recovery uses the latest valid plan, even after a failed rotation attempt.
+
+If the artifacts return to the applied content, Telego restores that content as the recovery source. An already matching healthy generation needs no replacement.
 
 If artifact content changes, Telego prepares and probes one candidate generation. The active generation continues to accept bindings during this work.
 
-After a successful probe, Telego publishes the candidate in one operation. The previous active generation drains for a maximum of 90s.
+After a successful probe, Telego publishes the candidate in one operation. New bindings use this active generation.
 
-Steady state contains one generation. Artifact rotation contains a maximum of two generations.
+The previous generation accepts no new bindings. Its healthy links keep their existing bindings and independent probes without a retirement deadline.
+
+Telego closes each unused old link after its bindings, queues, and pending work are empty. Retiring generations do not repair failed links or refresh unused links.
+
+Telego applies the same retirement policy to healthy links that remain after a generation failure.
+
+Telego permits at most two live generation managers, including an unpublished candidate. Before another candidate needs this capacity, Telego closes the oldest retiring manager and waits for its cleanup.
+
+This capacity retirement can interrupt old bindings. The current active generation stays available during candidate preparation.
+
+If the candidate fails, the active generation stays unchanged. The failure cannot restore bindings that capacity retirement already closed.
+
+Shutdown closes the remaining managers and waits for cleanup. It does not wait indefinitely for client bindings to drain.
 
 ## Unused-link refresh
 
@@ -138,13 +158,17 @@ This refresh manages connection turnover. It does not establish Telegram's priva
 
 ## Link repair
 
-Telego sends a probe to every physical link every 5s. A link fails when a valid response does not arrive within 100s.
+Each physical slot has an independent probe and repair worker. The normal probe interval is 5s, with a 100s response deadline.
 
-An ordinary link failure starts an in-place replacement of that slot. Telego does not replace the complete generation for this failure.
+A slow probe or repair does not stop probes or failure detection on other slots.
+
+An ordinary link failure in the active generation starts an in-place replacement of that slot. Telego does not replace the complete generation for this failure.
 
 Bindings on the failed slot close. Bindings on other slots and other DC pools stay on their current links.
 
-New bindings can use the repaired slot after its replacement passes startup. Failed replacements use bounded retries with positive jitter.
+Each replacement has 10s to complete preparation, including the handshake and a matching RPC pong. Only then can new bindings use the repaired slot.
+
+Failed replacements use bounded retries with positive jitter. Each failed slot permits one repair attempt at a time.
 
 A manager-wide failure removes ME admission. New connections use direct fallback while Telego builds a new active generation.
 
@@ -157,7 +181,7 @@ Telego derives the operational limits below. Most installations do not need an o
 | Links for each signed DC | 4 | Fixed from the minimum in the official implementation |
 | Refresh reservations for each manager | 8 | At most one for each signed DC, including cleanup |
 | Unused-link refresh delay | 45–60s | Staggered across physical slots |
-| Refresh preparation deadline | 10s | Covers construction, handshake, and the matching pong |
+| Replacement preparation deadline | 10s | Bounds repair and refresh preparation, including the handshake and matching pong |
 | Public connections | 10,000 | `max-connections` can only reduce this value |
 | Link request queue | 4,096 items and 2MiB | Fixed for each physical link |
 | Link response queue | 4,096 items and 2MiB | Fixed for each physical link |
@@ -171,7 +195,8 @@ Telego derives the operational limits below. Most installations do not need an o
 | NAT result cache | 10 minutes | Matches the public telemt cache period |
 | NAT proactive refresh | 5 minutes after success | Does not depend on client traffic |
 | Generation preparation timeout | 100s | Covers construction, startup, and the first all-DC probe |
-| Retiring generation drain | 90s | Closes remaining bindings after the deadline |
+| Live generation managers | 2 | Includes an unpublished candidate and managers with unfinished cleanup |
+| Retiring generation deadline | None | Healthy bindings remain until natural closure, failure, capacity retirement, or shutdown |
 
 The byte budgets are independent ceilings. Do not add them together as one shared queue.
 
@@ -199,6 +224,9 @@ Enable the Prometheus listener to inspect ME state. Start with these metrics:
 | `telego_middleend_links` | Physical links by generation role, signed DC, and state |
 | `telego_middleend_slot_failure_total` | Physical-link failures during the service lifetime |
 | `telego_middleend_slot_failure_affected_bindings_total` | Bindings that physical-link failures terminated |
+| `telego_middleend_forced_retirement_total` | Capacity retirements by `reason`: `artifact_capacity` or `recovery_capacity` |
+| `telego_middleend_forced_retirement_affected_bindings_total` | Bindings that capacity retirements interrupted, by `reason` |
+| `telego_middleend_diagnostic_records_dropped_total` | Diagnostic records rejected because the journal was full. This metric has no labels. |
 | `telego_middleend_slot_repairs_active` | Physical slots that Telego currently replaces |
 | `telego_middleend_slot_repair_total` | Successful and failed physical-slot replacements |
 | `telego_middleend_slot_refreshes_active` | Candidate reservations by generation role and signed DC, including cleanup |
@@ -206,7 +234,7 @@ Enable the Prometheus listener to inspect ME state. Start with these metrics:
 | `telego_middleend_zero_ready_transitions_total` | Service-lifetime losses of all ready slots in an admitting manager, by signed DC |
 | `telego_middleend_artifact_state` | Applied and pending artifact state |
 | `telego_middleend_artifact_refresh_total` | Artifact refresh results |
-| `telego_middleend_generation_apply_total` | Generation startup and rotation results |
+| `telego_middleend_generation_apply_total` | Coordinator results for generation application, including adoption after background recovery |
 
 The queue metrics report current use, capacity, and lifetime high-water values. Telego logs thresholds at 80%, 95%, and 100%.
 
@@ -218,15 +246,49 @@ The manager records each zero-ready transition directly. A gap can increase this
 
 Canceled refreshes include new client use and intentional lifecycle changes. They do not count as failed replacements.
 
+Capacity retirements have separate counters from physical-link failures. Natural retirement and shutdown do not increase the capacity-retirement counters.
+
+The affected-binding count includes only bindings that the capacity retirement actually interrupts. Already terminal bindings and bindings with a close in progress do not count.
+
+The generation-application counter does not count every background publication. A return to already matching active content does not increase its success count.
+
 Telego logs route fallback, artifact failure, generation failure, failed physical-link replacement, and binding eviction events.
 
-If a physical-link failure closes client bindings, Telego writes a warning. The warning includes the signed DC, fixed reason, and affected binding count.
+### Failure diagnostics
 
-The last failure also reports `last_age_ms`, peer EOF status, and whether that link previously accepted a client request.
+Telego keeps a service-wide journal for physical-link failures and capacity retirements. The journal retains the first 256 unacknowledged records.
 
-The manager starts this age clock at initialization of the ready link. The value does not measure the full TCP connection lifetime.
+If the journal is full, Telego rejects new records and increases the dropped-record counter. Failure totals and the last-failure summary still advance.
 
-Failures without client impact and successful replacements use the debug log level.
+The monitor emits at most 256 records per observation, with a normal interval of 5s. Records without client impact use INFO.
+
+Records with client impact and increases in dropped records use WARN. Successful link replacements still use DEBUG.
+
+Each record identifies the generation and its role at the event, not at log emission. Physical-link records also identify the signed DC, slot ordinal, and incarnation.
+
+The slot ordinal starts at zero and stays fixed within its manager. The incarnation increases after a successful repair or refresh.
+
+Physical-link records contain the failure reason, affected-binding count, safe error classification, link age, peer EOF status, and previous client use.
+
+The manager starts the age clock at initialization of the ready link. This age does not measure the full TCP connection lifetime.
+
+The probe history includes local queue acceptance, link submission acceptance, the deadline, and the last matching pong. Submission acceptance does not prove transmission on the network.
+
+Queue counts and byte counts describe the manager slot before failure cleanup. They do not describe the engine queues before failure.
+
+Record timestamps describe local observations, not exact remote failure times. Sequence numbers describe arrival order at the supervisor.
+
+Diagnostic records exclude raw errors, addresses, credentials, client identities, and packet contents. Unknown errors use a fixed redacted description.
+
+The monitor acknowledges the copied journal boundary after log emission. Records that arrive during emission remain available for the next observation.
+
+Independent journal reads do not remove records. Acknowledgement does not prove durable log storage, and process failure can lose unacknowledged records.
+
+The journal and its counters survive generation changes. A service restart resets them.
+
+Generation identities, slot incarnations, probe identities, and error text do not become Prometheus labels.
+
+### Other events
 
 Each direct-fallback commit log reports the new, active, and total session counts.
 
@@ -251,6 +313,10 @@ If ME becomes ready after clients connect, reconnect those clients. Existing dir
 If repair failures increase, inspect `telego_middleend_links` by signed DC. A healthy DC pool stays available during repair of another pool.
 
 If the zero-ready counter increases, inspect the affected signed DC and the refresh outcomes. A recovered gauge does not erase the recorded gap.
+
+If capacity retirements interrupt bindings, inspect the retirement reason and artifact or recovery events. This counter does not indicate a physical-link failure.
+
+If diagnostic drops increase, treat the interval as incomplete evidence. A later failure record cannot reconstruct the missing records.
 
 If a queue reaches 80%, inspect its high-water metric and capacity. Reduce `max-connections` before you reduce `queue-budget-mb`.
 

@@ -172,16 +172,24 @@ enabled = false
 # queue-budget-mb = 0
 
 # Telego derives the other limits. Each signed DC gets four gnet links in the active generation.
-# Liveness probes run every 5s. A link fails after 100s without a valid probe response.
+# Each physical slot has independent probes and repair. The probe interval is 5s, with a 100s response deadline.
 # Unused links become eligible for refresh after 45–60s.
-# A replacement has 10s to complete its handshake and return a matching RPC pong.
-# The current link stays available during preparation. A new client binding cancels the replacement.
-# Each manager permits one candidate per signed DC and eight in total, including cleanup.
-# Failed candidates leave the current link unchanged. Existing client bindings never move between links.
-# Artifact rotation prepares one candidate, then drains the old generation for up to 90s.
+# Repair and refresh replacements have 10s to complete preparation, including the handshake and a matching RPC pong.
+# During unused-link refresh, the current link stays available. A new client binding cancels the replacement.
+# Each manager permits one refresh candidate per signed DC and eight in total, including cleanup.
+# Failed refresh candidates leave the current link unchanged. Existing client bindings never move between links.
+# Artifact rotation preserves healthy old bindings and their probes without a retirement deadline.
+# Retiring generations do not repair or refresh links. Empty old links close after all pending work finishes.
+# At most two generation managers remain live, including a candidate and unfinished cleanup.
+# Before another candidate needs this capacity, Telego closes the oldest retiring generation and waits for cleanup.
+# This capacity retirement can interrupt old bindings. A failed candidate cannot restore those bindings.
+# Scheduled artifact fetches continue during candidate retries. Recovery uses the latest valid artifact plan.
 # New clients use direct DC links until an active generation is ready.
 # Use the `telego_middleend_*` metrics to compare queue use with configured capacity.
 # Refresh outcomes and zero-ready transitions record replacement results and losses of per-DC availability.
+# Capacity-retirement counters distinguish intentional interruptions from physical-link failures.
+# The diagnostic journal retains the first 256 unseen failures or capacity retirements. Overflow increases the dropped-record counter.
+# The monitor emits each retained record at INFO, or WARN for client impact. Log emission does not guarantee durable storage.
 # Telego also logs admission, repair, refresh, queue pressure, and binding eviction events.
 # Telego logs the process descriptor limit and the direct-fallback minimum at startup.
 # The active-ready log reports live and two-generation payload-capacity ceilings.

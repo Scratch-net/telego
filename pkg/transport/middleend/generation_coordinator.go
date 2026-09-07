@@ -19,8 +19,8 @@ var (
 )
 
 // GenerationFactoryBuilder constructs the reusable factory for one immutable
-// artifact snapshot. The coordinator retains a successful factory until its
-// snapshot is fully applied, including across failed Start or Rotate calls.
+// artifact snapshot. The coordinator retains pending factories across failed
+// attempts and keeps the applied factory for a later artifact reversion.
 type GenerationFactoryBuilder func(ArtifactSnapshot) (FixedBindingGenerationFactory, error)
 
 // GenerationCoordinatorConfig contains the externally owned artifact cache and
@@ -35,8 +35,8 @@ type GenerationCoordinatorConfig struct {
 }
 
 // Validate rejects invalid dependencies and supervisors that already own a
-// generation. One coordinator must be the sole Start and Rotate caller for its
-// supervisor.
+// generation. One coordinator must be the sole generation-application owner
+// for its supervisor.
 func (c GenerationCoordinatorConfig) Validate() error {
 	if c.Cache == nil || c.Cache.state == nil {
 		return fmt.Errorf("%w: nil artifact cache", ErrInvalidGenerationCoordinator)
@@ -102,8 +102,9 @@ type generationCoordinatorState struct {
 	started      bool
 	closing      bool
 	applied      *ArtifactSnapshot
+	appliedBuild *generationFactoryPlan
 	pending      *ArtifactSnapshot
-	pendingBuild FixedBindingGenerationFactory
+	pendingBuild *generationFactoryPlan
 	lastAttempt  time.Time
 	lastSuccess  time.Time
 	refreshOK    uint64
@@ -276,58 +277,70 @@ func (s *generationCoordinatorState) reconcile(ctx context.Context) error {
 		return cause
 	}
 
-	if s.hasPending() {
-		return s.applyPending(ctx)
-	}
-	if snapshot, ok := s.cache.Snapshot(); ok && s.needsSnapshot(snapshot) {
-		s.setPending(snapshot)
-		return s.applyPending(ctx)
-	}
-	if !s.cache.RefreshDue(s.now()) {
-		return nil
-	}
-	if err := s.cache.Refresh(ctx); err != nil {
-		if s.isClosing() {
-			return ErrGenerationCoordinatorClosed
+	// A failed candidate must not prevent discovery of its replacement. A
+	// failed fetch still leaves the last validated pending factory usable.
+	var refreshErr error
+	refreshed := false
+	if s.cache.RefreshDue(s.now()) {
+		if err := s.cache.Refresh(ctx); err != nil {
+			if s.isClosing() {
+				return ErrGenerationCoordinatorClosed
+			}
+			refreshErr = s.recordRefreshFailure(err)
+		} else {
+			refreshed = true
 		}
-		return s.recordRefreshFailure(err)
 	}
-	s.mu.Lock()
-	s.refreshOK++
-	s.mu.Unlock()
 	snapshot, ok := s.cache.Snapshot()
-	if !ok {
+	if refreshed && !ok {
 		return s.recordRefreshFailure(errors.New("artifact refresh published no snapshot"))
 	}
-	if !s.needsSnapshot(snapshot) {
+	if refreshed {
 		s.mu.Lock()
-		if s.applied != nil {
-			s.applied = new(snapshot.clone())
-		}
+		s.refreshOK++
+		s.mu.Unlock()
+	}
+	if ok {
+		s.selectSnapshot(snapshot)
+	}
+	applyErr := s.applyPending(ctx)
+	if refreshErr != nil {
+		// Applying a retained candidate can succeed during a fetch outage.
+		// Keep that success without hiding the independent refresh failure.
+		combined := errors.Join(refreshErr, applyErr)
+		s.mu.Lock()
+		s.lastErr = combined
+		s.mu.Unlock()
+		return combined
+	}
+	if applyErr == nil && refreshed {
+		s.mu.Lock()
 		s.lastSuccess = s.now()
 		s.lastErr = nil
 		s.mu.Unlock()
-		return nil
 	}
-	s.setPending(snapshot)
-	return s.applyPending(ctx)
+	return applyErr
 }
 
-func (s *generationCoordinatorState) hasPending() bool {
+func (s *generationCoordinatorState) selectSnapshot(snapshot ArtifactSnapshot) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.pending != nil
-}
-
-func (s *generationCoordinatorState) needsSnapshot(snapshot ArtifactSnapshot) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.applied == nil || !sameArtifactContent(*s.applied, snapshot)
-}
-
-func (s *generationCoordinatorState) setPending(snapshot ArtifactSnapshot) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.applied != nil && sameArtifactContent(*s.applied, snapshot) {
+		if s.pending == nil {
+			s.applied = new(snapshot.clone())
+			return
+		}
+		// A failed newer plan may already be the supervisor's recovery
+		// source. Restore the applied plan through the transition boundary,
+		// even when its still-active manager requires no replacement.
+		s.pending = new(snapshot.clone())
+		s.pendingBuild = s.appliedBuild
+		return
+	}
+	if s.pending != nil && sameArtifactContent(*s.pending, snapshot) {
+		s.pending = new(snapshot.clone())
+		return
+	}
 	s.pending = new(snapshot.clone())
 	s.pendingBuild = nil
 }
@@ -339,32 +352,27 @@ func (s *generationCoordinatorState) applyPending(ctx context.Context) error {
 		return nil
 	}
 	snapshot := s.pending.clone()
-	factory := s.pendingBuild
-	hasApplied := s.applied != nil
+	plan := s.pendingBuild
+	previouslyApplied := s.applied != nil && sameArtifactContent(*s.applied, snapshot)
 	s.mu.Unlock()
 
-	if factory == nil {
-		var err error
-		factory, err = s.buildFactory(snapshot)
+	if plan == nil {
+		factory, err := s.buildFactory(snapshot)
 		if err != nil {
 			return s.recordGenerationFailure(fmt.Errorf("build Middle-End generation factory: %w", err))
 		}
 		if factory == nil {
 			return s.recordGenerationFailure(errors.New("build Middle-End generation factory: nil factory"))
 		}
+		plan = &generationFactoryPlan{build: factory}
 		s.mu.Lock()
 		if s.pending != nil && sameArtifactContent(*s.pending, snapshot) {
-			s.pendingBuild = factory
+			s.pendingBuild = plan
 		}
 		s.mu.Unlock()
 	}
 
-	var err error
-	if hasApplied {
-		err = s.supervisor.Rotate(ctx, factory)
-	} else {
-		err = s.supervisor.Start(ctx, factory)
-	}
+	published, err := s.supervisor.applyFactory(ctx, plan)
 	if err != nil {
 		if s.isClosing() {
 			return ErrGenerationCoordinatorClosed
@@ -374,9 +382,14 @@ func (s *generationCoordinatorState) applyPending(ctx context.Context) error {
 
 	s.mu.Lock()
 	s.applied = new(snapshot.clone())
+	s.appliedBuild = plan
 	s.pending = nil
 	s.pendingBuild = nil
-	s.applyOK++
+	// Count new content adopted after background recovery, but not a no-op
+	// reversion that only restores the existing manager's recovery source.
+	if published || !previouslyApplied {
+		s.applyOK++
+	}
 	s.lastSuccess = s.now()
 	s.lastErr = nil
 	s.mu.Unlock()

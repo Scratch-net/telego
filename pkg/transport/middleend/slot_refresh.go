@@ -10,12 +10,12 @@ import (
 )
 
 const (
-	maxRefreshCandidatesPerManager = 8
-	slotRefreshInterval            = time.Second
-	slotRefreshMinimumUnused       = 45 * time.Second
-	slotRefreshPreparationTimeout  = 10 * time.Second
-	slotRefreshRetryInitial        = time.Second
-	slotRefreshRetryMaximum        = 10 * time.Second
+	maxRefreshCandidatesPerManager    = 8
+	slotRefreshInterval               = time.Second
+	slotRefreshMinimumUnused          = 45 * time.Second
+	slotReplacementPreparationTimeout = 10 * time.Second
+	slotRefreshRetryInitial           = time.Second
+	slotRefreshRetryMaximum           = 10 * time.Second
 )
 
 // A reservation includes construction, validation, and disposal. The old
@@ -83,6 +83,29 @@ func unusedSlotLocked(slot *fixedBindingSlot) bool {
 		slot.outHead == nil && slot.outTail == nil && slot.probe == nil
 }
 
+// retireUnusedSlot disposes of one empty old physical link. The per-ordinal
+// maintenance worker owns this join, so it cannot delay a sibling's probes.
+func (m *fixedBindingManager) retireUnusedSlot(slot *fixedBindingSlot) bool {
+	m.mu.Lock()
+	if m.state != fixedBindingManagerReady || m.accepting || slices.Index(m.order, slot) < 0 ||
+		!unusedSlotLocked(slot) || slot.refreshing || channelClosed(slot.link.Done()) || !refreshLinkIdle(slot.link.Snapshot()) {
+		m.mu.Unlock()
+		return false
+	}
+	slot.retired = true
+	events := slot.events
+	m.operations.Add(1)
+	m.mu.Unlock()
+	defer m.operations.Done()
+	_ = slot.link.Close()
+	<-slot.consumerDone
+	// A peer terminal state can win between the idle check and orderly Close.
+	if cause := slot.link.Err(); cause != nil {
+		m.recordSlotFailure(slot, events, cause, FixedBindingSlotFailureLinkTerminal, true)
+	}
+	return true
+}
+
 // refreshUnusedSlots only claims bounded work. A slow candidate does not stop
 // another DC's maintenance, and this scheduler never waits for liveness probes.
 func (m *fixedBindingManager) refreshUnusedSlots(ctx context.Context, now time.Time) {
@@ -108,7 +131,7 @@ func (m *fixedBindingManager) refreshUnusedSlots(ctx context.Context, now time.T
 }
 
 func (m *fixedBindingManager) refreshSlot(parent context.Context, attempt *slotRefreshAttempt) {
-	ctx, cancel := context.WithTimeout(parent, slotRefreshPreparationTimeout)
+	ctx, cancel := context.WithTimeout(parent, slotReplacementPreparationTimeout)
 	stopManagerCancel := context.AfterFunc(m.refreshContext, cancel)
 	success, canceled := false, false
 	defer func() {
@@ -154,7 +177,7 @@ func (m *fixedBindingManager) refreshSlot(parent context.Context, attempt *slotR
 	if err := link.Start(ctx); err != nil {
 		return
 	}
-	if err := m.probeRefreshCandidate(ctx, link, events, capacity); err != nil {
+	if err := m.probeReplacementCandidate(ctx, link, events, capacity); err != nil {
 		return
 	}
 	// No application work can enter the candidate before publication.
@@ -179,6 +202,7 @@ func (m *fixedBindingManager) refreshSlot(parent context.Context, attempt *slotR
 		return
 	}
 	current := &fixedBindingSlot{
+		ordinal: old.ordinal, incarnation: old.incarnation + 1,
 		dcID: old.dcID, sourceIP: replacement.SourceIP, link: link, events: events, capacity: capacity,
 		requestWake: make(chan struct{}, 1), bindings: make(map[*clientBinding]struct{}), consumerDone: make(chan struct{}),
 	}
@@ -249,7 +273,7 @@ func closeRefreshCandidate(link ClientLink, events <-chan LinkEvent) {
 	}
 }
 
-func (m *fixedBindingManager) probeRefreshCandidate(ctx context.Context, link ClientLink, events <-chan LinkEvent, capacity <-chan struct{}) error {
+func (m *fixedBindingManager) probeReplacementCandidate(ctx context.Context, link ClientLink, events <-chan LinkEvent, capacity <-chan struct{}) error {
 	m.mu.Lock()
 	pingID, err := m.allocateProbeIDLocked()
 	m.mu.Unlock()
@@ -291,7 +315,7 @@ func (m *fixedBindingManager) probeRefreshCandidate(ctx context.Context, link Cl
 			keepalive := event.Kind == LinkEventPing || event.Kind == LinkEventPong
 			clearLinkEventPacket(&event)
 			if err != nil || !keepalive {
-				return fmt.Errorf("%w: unexpected refresh probe event", ErrFixedBindingProtocol)
+				return fmt.Errorf("%w: unexpected replacement probe event", ErrFixedBindingProtocol)
 			}
 			if matched {
 				return nil

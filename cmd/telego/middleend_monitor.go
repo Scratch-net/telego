@@ -19,36 +19,35 @@ type middleEndMonitor struct {
 	stopper  sync.Once
 	workers  sync.WaitGroup
 
-	previous middleEndMonitorCounters
-	pressure map[string]middleEndPressureState
+	previous                 middleEndMonitorCounters
+	pressure                 map[string]middleEndPressureState
+	diagnosticRecordsDropped uint64
 }
 
 type middleEndMonitorCounters struct {
-	initialized                 bool
-	admitting                   bool
-	repairing                   bool
-	refreshFailures             uint64
-	generationFailures          uint64
-	natIPv4Successes            uint64
-	natIPv4Failures             uint64
-	natIPv6Successes            uint64
-	natIPv6Failures             uint64
-	slotFailures                uint64
-	slotFailureAffectedBindings uint64
-	slotRepairSuccesses         uint64
-	slotRepairFailures          uint64
-	slotRefreshSuccesses        uint64
-	slotRefreshFailures         uint64
-	slotRefreshCanceled         uint64
-	zeroReadyTransitions        map[middleend.DCID]uint64
-	responseBackpressure        uint64
-	controlBackpressure         uint64
-	frontendInputPressure       uint64
-	frontendOutputPressure      uint64
-	frontendOutputEvictions     uint64
-	middleEndBindingsTotal      uint64
-	directFallbacksActive       int64
-	directFallbacksTotal        uint64
+	initialized             bool
+	admitting               bool
+	repairing               bool
+	refreshFailures         uint64
+	generationFailures      uint64
+	natIPv4Successes        uint64
+	natIPv4Failures         uint64
+	natIPv6Successes        uint64
+	natIPv6Failures         uint64
+	slotRepairSuccesses     uint64
+	slotRepairFailures      uint64
+	slotRefreshSuccesses    uint64
+	slotRefreshFailures     uint64
+	slotRefreshCanceled     uint64
+	zeroReadyTransitions    map[middleend.DCID]uint64
+	responseBackpressure    uint64
+	controlBackpressure     uint64
+	frontendInputPressure   uint64
+	frontendOutputPressure  uint64
+	frontendOutputEvictions uint64
+	middleEndBindingsTotal  uint64
+	directFallbacksActive   int64
+	directFallbacksTotal    uint64
 }
 
 type middleEndPressureState struct {
@@ -99,6 +98,7 @@ func (m *middleEndMonitor) run() {
 }
 
 func (m *middleEndMonitor) observe() {
+	m.diagnosticRecordsDropped = observeMiddleEndDiagnostics(m.service, middleEndApplicationLogger{}, m.diagnosticRecordsDropped)
 	snapshot := m.service.Snapshot()
 	var frontend gproxy.MiddleEndFrontendStats
 	if m.frontend != nil {
@@ -107,31 +107,29 @@ func (m *middleEndMonitor) observe() {
 	responseBackpressure, controlBackpressure := middleEndBackpressureTotals(snapshot.Supervisor)
 	refreshSuccesses, refreshFailures, refreshCanceled := middleEndSlotRefreshTotals(snapshot.Supervisor)
 	current := middleEndMonitorCounters{
-		initialized:                 true,
-		admitting:                   snapshot.Supervisor.Admitting,
-		repairing:                   snapshot.Supervisor.Repairing,
-		refreshFailures:             snapshot.Coordinator.RefreshFailures,
-		generationFailures:          snapshot.Coordinator.GenerationFailures,
-		natIPv4Successes:            snapshot.NAT.IPv4.Successes,
-		natIPv4Failures:             snapshot.NAT.IPv4.Failures,
-		natIPv6Successes:            snapshot.NAT.IPv6.Successes,
-		natIPv6Failures:             snapshot.NAT.IPv6.Failures,
-		slotFailures:                snapshot.Supervisor.SlotFailures,
-		slotFailureAffectedBindings: snapshot.Supervisor.SlotFailureAffectedBindings,
-		slotRepairSuccesses:         snapshot.Supervisor.SlotRepairSuccesses,
-		slotRepairFailures:          snapshot.Supervisor.SlotRepairFailures,
-		slotRefreshSuccesses:        refreshSuccesses,
-		slotRefreshFailures:         refreshFailures,
-		slotRefreshCanceled:         refreshCanceled,
-		zeroReadyTransitions:        make(map[middleend.DCID]uint64, len(snapshot.Supervisor.DCs)),
-		responseBackpressure:        responseBackpressure,
-		controlBackpressure:         controlBackpressure,
-		frontendInputPressure:       frontend.InputBackpressureEvents,
-		frontendOutputPressure:      frontend.OutputBackpressureEvents,
-		frontendOutputEvictions:     frontend.OutputEvictions,
-		middleEndBindingsTotal:      frontend.MiddleEndBindingsTotal,
-		directFallbacksActive:       frontend.DirectFallbacksActive,
-		directFallbacksTotal:        frontend.DirectFallbacksTotal,
+		initialized:             true,
+		admitting:               snapshot.Supervisor.Admitting,
+		repairing:               snapshot.Supervisor.Repairing,
+		refreshFailures:         snapshot.Coordinator.RefreshFailures,
+		generationFailures:      snapshot.Coordinator.GenerationFailures,
+		natIPv4Successes:        snapshot.NAT.IPv4.Successes,
+		natIPv4Failures:         snapshot.NAT.IPv4.Failures,
+		natIPv6Successes:        snapshot.NAT.IPv6.Successes,
+		natIPv6Failures:         snapshot.NAT.IPv6.Failures,
+		slotRepairSuccesses:     snapshot.Supervisor.SlotRepairSuccesses,
+		slotRepairFailures:      snapshot.Supervisor.SlotRepairFailures,
+		slotRefreshSuccesses:    refreshSuccesses,
+		slotRefreshFailures:     refreshFailures,
+		slotRefreshCanceled:     refreshCanceled,
+		zeroReadyTransitions:    make(map[middleend.DCID]uint64, len(snapshot.Supervisor.DCs)),
+		responseBackpressure:    responseBackpressure,
+		controlBackpressure:     controlBackpressure,
+		frontendInputPressure:   frontend.InputBackpressureEvents,
+		frontendOutputPressure:  frontend.OutputBackpressureEvents,
+		frontendOutputEvictions: frontend.OutputEvictions,
+		middleEndBindingsTotal:  frontend.MiddleEndBindingsTotal,
+		directFallbacksActive:   frontend.DirectFallbacksActive,
+		directFallbacksTotal:    frontend.DirectFallbacksTotal,
 	}
 	previous := m.previous
 	if !previous.initialized && snapshot.NAT.Static {
@@ -219,30 +217,6 @@ func (m *middleEndMonitor) observe() {
 			Int("repairing_slots", middleEndRepairingSlots(snapshot.Supervisor)).
 			Err(snapshot.Supervisor.LastError).
 			Msg("Middle-End physical-link replacement failed; recovery will retry while unaffected DC pools remain available")
-	}
-	if current.slotFailures > previous.slotFailures {
-		failure := snapshot.Supervisor.LastSlotFailure
-		affectedBindings := middleEndCounterIncrease(
-			current.slotFailureAffectedBindings,
-			previous.slotFailureAffectedBindings,
-		)
-		event := log.Debug()
-		message := "Middle-End physical links closed; replacement started"
-		if middleEndSlotFailureHasClientImpact(affectedBindings) {
-			event = log.Warn()
-			message = "Middle-End physical links failed; affected client bindings closed before replacement"
-		}
-		event.
-			Uint64("new_failures", current.slotFailures-previous.slotFailures).
-			Uint64("failures_total", current.slotFailures).
-			Uint64("affected_bindings", affectedBindings).
-			Uint64("affected_bindings_total", current.slotFailureAffectedBindings).
-			Int("last_dc", int(failure.DCID)).
-			Str("last_reason", string(failure.Reason)).
-			Bool("last_peer_eof", failure.PeerEOF).
-			Bool("last_used", failure.Used).
-			Int64("last_age_ms", max(0, failure.Age.Milliseconds())).
-			Msg(message)
 	}
 	if current.slotRepairSuccesses > previous.slotRepairSuccesses {
 		log.Debug().

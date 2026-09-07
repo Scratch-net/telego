@@ -57,7 +57,7 @@ func TestMiddleEndRuntimeDefaultsAreDerivedAndValid(t *testing.T) {
 	if service.Runtime.EventLoops != 2 || service.LinksPerDC != 4 || service.DialConcurrency != 8 {
 		t.Fatalf("runtime topology = loops %d links %d dialers %d", service.Runtime.EventLoops, service.LinksPerDC, service.DialConcurrency)
 	}
-	if service.Supervisor.ProbeInterval != 5*time.Second || service.Supervisor.ProbeFailureTimeout != 100*time.Second || service.Supervisor.DrainTimeout != 90*time.Second {
+	if service.Supervisor.ProbeInterval != 5*time.Second || service.Supervisor.ProbeFailureTimeout != 100*time.Second {
 		t.Fatalf("supervisor durations = %+v", service.Supervisor)
 	}
 	if service.LinkLimits.MaxPendingSubmissions != 4096 || service.LinkLimits.MaxPendingSubmissionBytes != 2<<20 ||

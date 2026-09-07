@@ -259,6 +259,21 @@ func (s *Service) Snapshot() ServiceSnapshot {
 	}
 }
 
+// DiagnosticSnapshot reads retained causal records without consuming them.
+func (s *Service) DiagnosticSnapshot() GenerationDiagnosticSnapshot {
+	if s == nil || s.state == nil {
+		return GenerationDiagnosticSnapshot{}
+	}
+	return s.state.supervisor.DiagnosticSnapshot()
+}
+
+// AcknowledgeDiagnostics releases the boundary emitted by the primary monitor.
+func (s *Service) AcknowledgeDiagnostics(through uint64) {
+	if s != nil && s.state != nil {
+		s.state.supervisor.AcknowledgeDiagnostics(through)
+	}
+}
+
 // Done closes after the full ordered shutdown completes.
 func (s *Service) Done() <-chan struct{} {
 	if s == nil || s.state == nil {

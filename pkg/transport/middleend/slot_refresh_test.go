@@ -186,7 +186,7 @@ func TestSlotRefreshPreparationFailuresKeepIncumbentAndBackOff(t *testing.T) {
 					candidate.peerClose(io.EOF)
 				}
 				if mode == "wrong_pong" || mode == "timeout" {
-					time.Sleep(slotRefreshPreparationTimeout)
+					time.Sleep(slotReplacementPreparationTimeout)
 				}
 				synctest.Wait()
 				if channelClosed(old.Done()) || manager.state.slots[2].link != old {
@@ -365,6 +365,8 @@ func TestSlotRefreshAndFailedRepairShareCandidateOwnership(t *testing.T) {
 					candidate.emit(LinkEvent{Kind: LinkEventPong, KeepaliveID: candidatePing(t, candidate).ID})
 				} else {
 					close(gate)
+					synctest.Wait()
+					candidate.emit(LinkEvent{Kind: LinkEventPong, KeepaliveID: candidatePing(t, candidate).ID})
 					if err := <-repairDone; err != nil {
 						t.Fatal(err)
 					}
@@ -381,6 +383,7 @@ func TestSlotRefreshAndFailedRepairShareCandidateOwnership(t *testing.T) {
 func TestSlotRefreshLosesToFailedIncumbentRepair(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		old, candidate, repaired := newFixedBindingFakeLink(), newFixedBindingFakeLink(), newFixedBindingFakeLink()
+		respondToFixedBindingPings(repaired)
 		var repair atomic.Bool
 		manager := newSlotRefreshTestManager(t, []FixedBindingSlot{{DCID: 2, Link: old}}, func(ctx context.Context, dcID DCID) (FixedBindingSlot, error) {
 			if repair.Load() {
@@ -547,6 +550,7 @@ func TestSlotRefreshCompletedProbeDeadlineDoesNotFailLink(t *testing.T) {
 func TestSlotRefreshFailureCleanupCannotCloseConcurrentRepair(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		old, repaired := newFixedBindingFakeLink(), newFixedBindingFakeLink()
+		respondToFixedBindingPings(repaired)
 		manager := newSlotRefreshTestManager(t, []FixedBindingSlot{{DCID: 2, Link: old}}, refreshCandidateFactory(repaired))
 		observerEntered, observerRelease := make(chan struct{}), make(chan struct{})
 		var observeOnce sync.Once
@@ -579,6 +583,7 @@ func TestSlotRefreshFailureCleanupCannotCloseConcurrentRepair(t *testing.T) {
 func TestSlotRefreshOldFailedProbeDeadlineCannotFailRepair(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		old, repaired := newFixedBindingFakeLink(), newFixedBindingFakeLink()
+		respondToFixedBindingPings(repaired)
 		manager := newSlotRefreshTestManager(t, []FixedBindingSlot{{DCID: 2, Link: old}}, refreshCandidateFactory(repaired))
 		probeResult := make(chan error, 1)
 		ctx, cancel := context.WithCancel(t.Context())

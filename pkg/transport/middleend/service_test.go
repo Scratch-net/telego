@@ -26,7 +26,6 @@ func serviceTestConfig(t *testing.T, source ArtifactSource) ServiceConfig {
 			PreparationTimeout:   time.Second,
 			ProbeInterval:        5 * time.Millisecond,
 			ProbeFailureTimeout:  30 * time.Millisecond,
-			DrainTimeout:         time.Second,
 			RepairBackoffInitial: time.Millisecond,
 			RepairBackoffMaximum: 5 * time.Millisecond,
 		},
