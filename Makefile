@@ -1,4 +1,4 @@
-.PHONY: build install uninstall clean test test-gnet bench run
+.PHONY: build install uninstall clean test test-limited test-gnet bench run
 .DEFAULT_GOAL := build
 
 # Build tags for gnet optimizations:
@@ -69,10 +69,19 @@ uninstall:
 # Race-test gc_opt with gnet's portable poller. gnet's poll_opt uses unsafe
 # poll attachments that are incompatible with the race build's checkptr.
 test: test-gnet
-	go test -tags="gc_opt" -race ./...
-	go test -tags="$(TAGS)" ./...
+	sh dist/test-go.sh -race ./...
+	sh dist/test-go.sh -race -tags=gc_opt ./...
+	sh dist/test-go.sh -tags="$(TAGS)" ./...
 
-# The local dependency is a separate module, outside the root ./... pattern.
+# Linux cgroup v2 gate: preserve the caller's environment and cap the full tree.
+test-limited:
+	@test -f /sys/fs/cgroup/cgroup.controllers || { echo "test-limited requires Linux cgroup v2 and a systemd user manager." >&2; exit 1; }
+	systemd-run --user --scope --collect \
+		--property=MemoryMax=2G --property=MemorySwapMax=0 \
+		--property=TasksMax=512 --property=CPUQuota=200% \
+		$(MAKE) --no-print-directory -j1 test
+
+# Only local patch regressions run in the separate gnet module.
 test-gnet:
 	sh dist/test-gnet.sh
 

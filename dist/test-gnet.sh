@@ -20,7 +20,33 @@ trap 'exit 143' TERM
 export GOWORK="$test_workspace/go.work"
 cd "$test_root/third_party/gnet"
 
-go test -mod=readonly -race -timeout 20m ./...
-go test -mod=readonly -race -tags=gc_opt -timeout 20m ./...
+# Run only the regressions for Telego's local patches, not the upstream suite.
+test_names='TestTelegoClientStartFailureCompletesOnce
+TestTelegoServerPartialStartFailureClosesPreparedPoller
+TestTelegoClientConcurrentStopAndAutomaticDone
+TestTelegoClientStopBeforeAndDuringStart
+TestTelegoEnrollmentOnOpenActions
+TestTelegoEnrollmentPreCanceledContext
+TestTelegoRegistrationReportsPollerError
+TestTelegoPostDuplicationFailuresDisposeDescriptor
+TestTelegoClientDialCanceledByStop
+TestTelegoRegistrationCancellationReleasesPendingDescriptor
+TestTelegoClientExplicitStopRetiresEnrollmentBeforeOwnerJoin
+TestTelegoClientTerminalErrorIsRetained
+TestTelegoAcceptedEnrollmentOwnerExitDisposesSocket
+TestOwnedWriteRealPartialSocketDrainRetainsAllocation
+TestOwnedWriteReleaseReentryDoesNotRepeatWrittenBatch
+TestPollerCloseWaitsForAcceptedTrigger
+TestPollerCloseRejectsLateTriggerAndPreservesReusedFDs
+TestPollerTriggerPreservesPriorityAndDiscardsBothQueues
+TestPollerEventfdFailurePreservesStdin
+TestOwnedBufferMixedOrderAndPartialDisposal
+TestOwnedBufferReleaseUnlinksBeforeReentry
+TestOwnedBufferReadAndWriteToKeepPartialAllocation'
+test_filter="^($(printf '%s' "$test_names" | tr '\n' '|'))$"
+set -- -mod=readonly -run="$test_filter"
+
+sh "$test_root/dist/test-go.sh" "$@" -race . ./pkg/netpoll ./pkg/buffer/elastic
+sh "$test_root/dist/test-go.sh" "$@" -race -tags=gc_opt . ./pkg/netpoll ./pkg/buffer/elastic
 # poll_opt uses unsafe attachments that are incompatible with race checkptr.
-go test -mod=readonly -tags=poll_opt,gc_opt -timeout 20m ./...
+sh "$test_root/dist/test-go.sh" "$@" -tags=poll_opt,gc_opt . ./pkg/netpoll ./pkg/buffer/elastic

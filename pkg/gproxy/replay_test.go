@@ -3,7 +3,9 @@ package gproxy
 import (
 	"crypto/rand"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -74,34 +76,31 @@ func TestReplayCache_DifferentIDs(t *testing.T) {
 
 // TestReplayCache_Expiry tests that entries expire after TTL.
 func TestReplayCache_Expiry(t *testing.T) {
-	// Use very short TTL for testing
-	ttl := 100 * time.Millisecond
-	cache := NewReplayCache(1000, ttl)
-
-	sessionID := make([]byte, 32)
-	rand.Read(sessionID)
-
-	// First call
-	seen := cache.Seen(sessionID)
-	if seen {
-		t.Error("first call should return false")
+	for _, ttl := range []time.Duration{time.Nanosecond, time.Minute} {
+		t.Run(ttl.String(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				cache := NewReplayCache(1000, ttl)
+				sessionID := []byte("session")
+				if cache.Seen(sessionID) {
+					t.Fatal("first session was already seen")
+				}
+				time.Sleep(ttl - time.Nanosecond)
+				if !cache.Seen(sessionID) {
+					t.Fatal("session expired before its deadline")
+				}
+				time.Sleep(time.Nanosecond)
+				if got := cache.Len(); got != 0 {
+					t.Fatalf("expired entries = %d, want 0", got)
+				}
+				if cache.Seen(sessionID) {
+					t.Fatal("replay hit extended the original deadline")
+				}
+				if !cache.Seen(sessionID) {
+					t.Fatal("expired session was not reinserted")
+				}
+			})
+		})
 	}
-
-	// Second call should show as seen
-	seen = cache.Seen(sessionID)
-	if !seen {
-		t.Error("should be seen immediately after")
-	}
-
-	// Wait for TTL + cleanup interval (TTL/2)
-	time.Sleep(ttl + ttl/2 + 50*time.Millisecond)
-
-	// After expiry, should be treated as new
-	// Note: cleanup runs on interval, may need to wait
-	seen = cache.Seen(sessionID)
-	// After cleanup, this becomes new again
-	// The cache might not have cleaned up yet, so we just verify the mechanism works
-	t.Logf("After TTL, seen=%v (depends on cleanup timing)", seen)
 }
 
 // TestReplayCache_MaxSize tests cleanup when size is exceeded.
@@ -116,23 +115,76 @@ func TestReplayCache_MaxSize(t *testing.T) {
 		cache.Seen(id)
 	}
 
-	// The cache should handle this without panicking
-	// With LRU eviction, size should stay around maxSize
 	totalSize := cache.Len()
+	if capacity := cache.maxPerShard * numShards; totalSize > capacity {
+		t.Errorf("cache size = %d, exceeds shard capacity %d", totalSize, capacity)
+	}
+}
 
-	// LRU should keep size around maxSize (may be slightly over due to per-shard limits)
-	t.Logf("Cache size after %d inserts: %d (max: %d)", maxSize*2, totalSize, maxSize)
-	if totalSize > maxSize*2 {
-		t.Errorf("Cache grew too large: %d > %d", totalSize, maxSize*2)
+func TestReplayCache_ReplayDoesNotRefreshEvictionOrder(t *testing.T) {
+	cache := NewReplayCache(2*numShards, time.Minute)
+	ids := [][]byte{{0}, {64}, {128}}
+	for _, id := range ids[1:] {
+		if cache.getShardIdx(string(id)) != cache.getShardIdx(string(ids[0])) {
+			t.Fatal("test IDs must share a shard")
+		}
+	}
+	cache.Seen(ids[0])
+	cache.Seen(ids[1])
+	if !cache.Seen(ids[0]) {
+		t.Fatal("first session was not retained")
+	}
+	cache.Seen(ids[2])
+	if !cache.Seen(ids[1]) || !cache.Seen(ids[2]) {
+		t.Fatal("newer sessions were evicted")
+	}
+	if cache.Seen(ids[0]) {
+		t.Fatal("replay hit changed capacity eviction order")
+	}
+}
+
+func TestReplayCache_ConcurrentSameSession(t *testing.T) {
+	cache := NewReplayCache(numShards, time.Minute)
+	var accepted atomic.Int64
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for range 32 {
+		wg.Go(func() {
+			<-start
+			if !cache.Seen([]byte("same-session")) {
+				accepted.Add(1)
+			}
+		})
+	}
+	close(start)
+	wg.Wait()
+	if got := accepted.Load(); got != 1 {
+		t.Fatalf("first admissions = %d, want 1", got)
+	}
+}
+
+func TestReplayCache_NonpositiveTTL(t *testing.T) {
+	for _, ttl := range []time.Duration{0, -time.Second} {
+		t.Run(ttl.String(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				cache := NewReplayCache(numShards, ttl)
+				cache.Seen([]byte("session"))
+				time.Sleep(20 * 365 * 24 * time.Hour)
+				if !cache.Seen([]byte("session")) || cache.Len() != 1 {
+					t.Fatal("nonpositive TTL must disable expiration")
+				}
+			})
+		})
 	}
 }
 
 // TestReplayCache_Concurrent tests thread-safety under parallel access.
 func TestReplayCache_Concurrent(t *testing.T) {
-	cache := NewReplayCache(10000, time.Minute)
-
 	const numGoroutines = 100
 	const opsPerGoroutine = 100
+	// Even if every ID shares one shard, capacity eviction cannot interfere
+	// with the check-and-add assertion in this concurrency test.
+	cache := NewReplayCache(numGoroutines*opsPerGoroutine*numShards, time.Minute)
 
 	var wg sync.WaitGroup
 
@@ -140,8 +192,7 @@ func TestReplayCache_Concurrent(t *testing.T) {
 		id := i
 		wg.Go(func() {
 			for j := range opsPerGoroutine {
-				sessionID := make([]byte, 32)
-				rand.Read(sessionID)
+				sessionID := []byte{byte(id), byte(j)}
 
 				// First call
 				cache.Seen(sessionID)

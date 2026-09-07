@@ -28,16 +28,16 @@ jobs:
         run: go build -v ./...
 
       - name: Run tests with race detector
-        run: go test -race -timeout 120s ./...
+        run: sh dist/test-go.sh -race ./...
 
       - name: Run gc_opt tests with race detector
-        run: go test -race -tags=gc_opt -timeout 120s ./...
+        run: sh dist/test-go.sh -race -tags=gc_opt ./...
 
       - name: Run production-tag tests
-        run: go test -tags=poll_opt,gc_opt -timeout 120s ./...
+        run: sh dist/test-go.sh -tags=poll_opt,gc_opt ./...
 
       - name: Run tests with coverage
-        run: go test -coverprofile=coverage.out -covermode=atomic ./pkg/...
+        run: sh dist/test-go.sh -coverprofile=coverage.out -covermode=atomic ./pkg/...
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7
@@ -47,7 +47,7 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
 
   test-gnet:
-    name: Local gnet dependency
+    name: Local gnet patch regressions
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -60,7 +60,7 @@ jobs:
             go.sum
             third_party/gnet/go.sum
 
-      - name: Test the local gnet module
+      - name: Run local gnet patch regressions
         run: make test-gnet
 
   docker:

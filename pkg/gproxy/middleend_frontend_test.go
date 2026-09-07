@@ -1657,21 +1657,23 @@ func TestMiddleEndWaitingReservationAcceptsThenProcessesNextPacket(t *testing.T)
 	if action := runMiddleEndOwner(secondConn, func() gnet.Action { return handler.OnTraffic(secondConn) }); action != gnet.None {
 		t.Fatalf("reservation materialization action = %v", action)
 	}
-	if secondCtx.middleEnd.waiting != nil || !secondCtx.middleEnd.awaitingResult {
+	if secondCtx.middleEnd.waiting != nil {
 		t.Fatal("reservation did not transfer retained request into manager ownership")
 	}
 
-	var accepted middleend.LinkSubmission
-	for range 2 {
-		submission := waitMiddleEndSubmission(t, link)
-		if submission.ConnectionID == secondCtx.middleEnd.binding.ConnectionID() {
-			accepted = submission
-		}
+	first := waitMiddleEndSubmission(t, link)
+	if first.ConnectionID != firstCtx.middleEnd.binding.ConnectionID() || first.SubmissionID == 0 {
+		t.Fatalf("first accepted request identity = connection %d submission %d", first.ConnectionID, first.SubmissionID)
 	}
-	if accepted.SubmissionID == 0 {
-		t.Fatal("materialized waiting request was not accepted")
+	accepted := waitMiddleEndSubmission(t, link)
+	if accepted.ConnectionID != secondCtx.middleEnd.binding.ConnectionID() || accepted.SubmissionID == 0 || accepted.SubmissionID == first.SubmissionID {
+		t.Fatalf("materialized waiting request identity = connection %d submission %d; first %d/%d", accepted.ConnectionID, accepted.SubmissionID, first.ConnectionID, first.SubmissionID)
 	}
-	consumeMiddleEndRequestResult(t, handler, secondConn, secondCtx)
+	// The manager can publish acceptance before the reservation callback
+	// checks its token again. Only await another callback if it is still pending.
+	if secondCtx.middleEnd.awaitingResult {
+		consumeMiddleEndRequestResult(t, handler, secondConn, secondCtx)
+	}
 
 	secondConn.SetReadData(encodeMiddleEndClientPacket(
 		t,

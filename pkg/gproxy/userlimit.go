@@ -7,7 +7,6 @@ import (
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
-	"github.com/hashicorp/golang-lru/v2/expirable"
 )
 
 const (
@@ -44,8 +43,9 @@ type userIPState struct {
 	// Active IPs with connection count (LRU)
 	activeIPs *lru.Cache[string, *int64]
 
-	// Blocked IPs (expirable LRU with TTL) - nil when limiting disabled
-	blockedIPs *expirable.LRU[string, struct{}]
+	// Blocked IPs with TTL, protected by the user shard lock.
+	// Nil when limiting is disabled.
+	blockedIPs *ttlSet
 
 	// Traffic counters (read via atomic, updated in hot path)
 	bytesIn  atomic.Int64
@@ -62,8 +62,8 @@ type userIPState struct {
 // UserIPStats contains statistics for a single user.
 type UserIPStats struct {
 	SecretName    string
-	TrackedIPs    int      // Unique IPs in LRU cache (may include disconnected)
-	ActiveIPs     int      // IPs with active connections right now
+	TrackedIPs    int // Unique IPs in LRU cache (may include disconnected)
+	ActiveIPs     int // IPs with active connections right now
 	BlockedIPs    int
 	TrackedIPList []string // List of tracked IP addresses
 	BlockedIPList []string // List of currently blocked IP addresses
@@ -75,6 +75,7 @@ type UserIPStats struct {
 
 // NewUserIPLimiter creates a new user IP limiter/stats tracker.
 // If maxIPsPerUser <= 0, limiting is disabled but stats are still tracked.
+// Nonpositive blockTimeout keeps blocked IPs until capacity eviction or Close.
 func NewUserIPLimiter(maxIPsPerUser int, blockTimeout time.Duration) *UserIPLimiter {
 	l := &UserIPLimiter{
 		maxIPsPerUser:   maxIPsPerUser,
@@ -127,16 +128,14 @@ func (l *UserIPLimiter) getOrCreateUserState(shard *userLimiterShard, secretKey 
 			// IPs that had legitimately disconnected (count=0) should not be blocked -
 			// they're just being removed to make room for new IPs.
 			if state.blockedIPs != nil && atomic.LoadInt64(countPtr) > 0 {
-				state.blockedIPs.Add(ip, struct{}{})
+				state.blockedIPs.add(ip)
 				state.blockedTotal.Add(1)
 			}
 		})
 		state.activeIPs = activeIPs
 
-		// Create blocked IPs expirable LRU
-		state.blockedIPs = expirable.NewLRU[string, struct{}](
+		state.blockedIPs = newTTLSet(
 			l.maxIPsPerUser*10, // Allow tracking more blocked IPs
-			nil,
 			l.blockTimeout,
 		)
 	} else {
@@ -174,9 +173,9 @@ func (l *UserIPLimiter) TryAcquire(ip net.IP, secret []byte, secretName string) 
 
 	// Check if IP is blocked (only when limiting is enabled)
 	if state.limitingEnabled && state.blockedIPs != nil {
-		if _, blocked := state.blockedIPs.Peek(ipStr); blocked {
+		if state.blockedIPs.contains(ipStr) {
 			// Refresh TTL by re-adding
-			state.blockedIPs.Add(ipStr, struct{}{})
+			state.blockedIPs.add(ipStr)
 			return "", false
 		}
 	}
@@ -282,7 +281,7 @@ func (l *UserIPLimiter) Stats() []UserIPStats {
 
 			var blockedKeys []string
 			if state.blockedIPs != nil {
-				blockedKeys = state.blockedIPs.Keys()
+				blockedKeys = state.blockedIPs.keys()
 			}
 
 			stats = append(stats, UserIPStats{
@@ -305,10 +304,8 @@ func (l *UserIPLimiter) Stats() []UserIPStats {
 	return stats
 }
 
-// Close stops any background goroutines.
+// Close clears blocked IPs. The limiter owns no background workers.
 func (l *UserIPLimiter) Close() {
-	// expirable.LRU runs its own cleanup goroutine
-	// Purge all to stop cleanup timers
 	if l == nil {
 		return
 	}
@@ -318,7 +315,7 @@ func (l *UserIPLimiter) Close() {
 		shard.mu.Lock()
 		for _, state := range shard.users {
 			if state.blockedIPs != nil {
-				state.blockedIPs.Purge()
+				state.blockedIPs.purge()
 			}
 		}
 		shard.mu.Unlock()

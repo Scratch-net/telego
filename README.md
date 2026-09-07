@@ -691,6 +691,8 @@ Responses have an 8 MiB limit and a 20-second request timeout. HTTP 413 indicate
 Client cancellation or server shutdown stops CPU profiling. The runtime completes an active leak-detection GC before it can return.
 The response limit does not bound internal runtime memory or GC duration. A fresh leak profile runs GC and adds temporary load.
 
+The leak profile detects permanently blocked goroutines. A zero count does not exclude live timer workers or other resource leaks.
+
 For a local leak snapshot, run:
 
 ```sh
@@ -768,10 +770,19 @@ Unauthenticated FakeTLS probes ─────────────▶ mask h
 
 ## Contributing
 
-PRs are welcome! Please ensure:
+Before a pull request, run `make test`.
+This command runs the local gnet patch regressions and the Telego tests in the three supported build modes.
+It does not run the upstream gnet test suite.
 
-1. Tests pass: `go test -race ./...`
-2. Benchmarks don't regress: `go test -bench=. ./...`
+The test runner sets `GOMAXPROCS=2`, one package at a time, two parallel tests, and a 120-second timeout per package.
+`GOMEMLIMIT=512MiB` is a soft Go runtime limit. It does not prevent an operating-system OOM.
+
+On Linux with cgroup v2 and a systemd user manager, run `make test-limited` for local verification.
+This command caps the complete test process tree at 2 GiB of memory, no swap, 512 tasks, and two CPUs.
+It runs the gates in sequence and preserves the caller's environment.
+Other platforms can run `make test`, but this command has no hard memory limit.
+
+For performance changes, compare the relevant benchmarks before and after the change.
 
 ---
 

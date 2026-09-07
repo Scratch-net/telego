@@ -3,8 +3,10 @@ package gproxy
 import (
 	"fmt"
 	"net"
+	"slices"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -182,65 +184,104 @@ func TestUserIPLimiter_StatsOnlyMode(t *testing.T) {
 }
 
 func TestUserIPLimiter_BlockExpires(t *testing.T) {
-	// Use short timeout for testing
-	l := NewUserIPLimiter(2, 100*time.Millisecond)
-	defer l.Close()
-
-	secret := []byte("0123456789abcdef")
-	ip1 := net.ParseIP("192.168.1.1")
-	ip2 := net.ParseIP("192.168.1.2")
-	ip3 := net.ParseIP("192.168.1.3")
-
-	// Fill up and evict ip1
-	l.TryAcquire(ip1, secret, "test")
-	l.TryAcquire(ip2, secret, "test")
-	l.TryAcquire(ip3, secret, "test") // Evicts ip1
-
-	// ip1 should be blocked
-	_, ok := l.TryAcquire(ip1, secret, "test")
-	if ok {
-		t.Fatal("IP1 should be blocked")
-	}
-
-	// Wait for block to expire
-	time.Sleep(150 * time.Millisecond)
-
-	// ip1 should now be allowed (will evict ip2)
-	_, ok = l.TryAcquire(ip1, secret, "test")
-	if !ok {
-		t.Fatal("IP1 should be allowed after block expires")
-	}
+	synctest.Test(t, func(t *testing.T) {
+		const timeout = time.Minute
+		l := NewUserIPLimiter(2, timeout)
+		defer l.Close()
+		secret := []byte("0123456789abcdef")
+		ip1 := net.ParseIP("192.168.1.1")
+		l.TryAcquire(ip1, secret, "test")
+		l.TryAcquire(net.ParseIP("192.168.1.2"), secret, "test")
+		l.TryAcquire(net.ParseIP("192.168.1.3"), secret, "test")
+		if _, ok := l.TryAcquire(ip1, secret, "test"); ok {
+			t.Fatal("evicted active IP was not blocked")
+		}
+		time.Sleep(timeout - time.Nanosecond)
+		if got := l.Stats()[0].BlockedIPs; got != 1 {
+			t.Fatalf("blocked IPs before deadline = %d, want 1", got)
+		}
+		time.Sleep(time.Nanosecond)
+		if stats := l.Stats()[0]; stats.BlockedIPs != 0 || len(stats.BlockedIPList) != 0 {
+			t.Fatal("stats retained an expired block")
+		}
+		if _, ok := l.TryAcquire(ip1, secret, "test"); !ok {
+			t.Fatal("IP was rejected at its block deadline")
+		}
+	})
 }
 
 func TestUserIPLimiter_BlockTimeoutRefresh(t *testing.T) {
-	const (
-		blockTimeout    = 2 * time.Second
-		refreshInterval = 750 * time.Millisecond
-	)
-	l := NewUserIPLimiter(2, blockTimeout)
+	synctest.Test(t, func(t *testing.T) {
+		const timeout = time.Minute
+		l := NewUserIPLimiter(1, timeout)
+		defer l.Close()
+		secret := []byte("0123456789abcdef")
+		ip1 := net.ParseIP("192.168.1.1")
+		l.TryAcquire(ip1, secret, "test")
+		l.TryAcquire(net.ParseIP("192.168.1.2"), secret, "test")
+		time.Sleep(timeout / 2)
+		if _, ok := l.TryAcquire(ip1, secret, "test"); ok {
+			t.Fatal("blocked retry was accepted")
+		}
+		time.Sleep(timeout / 2)
+		if stats := l.Stats()[0]; stats.BlockedIPs != 1 || stats.BlockedTotal != 1 {
+			t.Fatal("retry did not refresh the block or changed the eviction count")
+		}
+		time.Sleep(timeout/2 - time.Nanosecond)
+		if got := l.Stats()[0].BlockedIPs; got != 1 {
+			t.Fatalf("block expired before refreshed deadline: %d", got)
+		}
+		time.Sleep(time.Nanosecond)
+		if _, ok := l.TryAcquire(ip1, secret, "test"); !ok {
+			t.Fatal("block did not expire at its refreshed deadline")
+		}
+	})
+}
+
+func TestUserIPLimiter_BlockedCapacityAndRefreshOrder(t *testing.T) {
+	l := NewUserIPLimiter(1, time.Hour)
 	defer l.Close()
-
 	secret := []byte("0123456789abcdef")
-	ip1 := net.ParseIP("192.168.1.1")
-	ip2 := net.ParseIP("192.168.1.2")
-	ip3 := net.ParseIP("192.168.1.3")
-
-	// Fill up and evict ip1
-	l.TryAcquire(ip1, secret, "test")
-	l.TryAcquire(ip2, secret, "test")
-	l.TryAcquire(ip3, secret, "test")
-
-	// Keep refreshing block by attempting connection
-	for i := range 3 {
-		time.Sleep(refreshInterval)
-		_, ok := l.TryAcquire(ip1, secret, "test")
-		if ok {
-			t.Fatalf("IP1 should still be blocked at iteration %d", i)
+	for i := 1; i <= 12; i++ {
+		if _, ok := l.TryAcquire(net.IPv4(192, 0, 2, byte(i)), secret, "test"); !ok {
+			t.Fatal("new IP was rejected")
 		}
 	}
+	if stats := l.Stats()[0]; stats.BlockedIPs != 10 || stats.BlockedIPList[0] != "192.0.2.2" {
+		t.Fatalf("blocked capacity eviction is incorrect: %v", stats.BlockedIPList)
+	}
+	if _, ok := l.TryAcquire(net.ParseIP("192.0.2.2"), secret, "test"); ok {
+		t.Fatal("oldest retained block was not enforced")
+	}
+	l.TryAcquire(net.ParseIP("192.0.2.13"), secret, "test")
+	want := []string{"192.0.2.4", "192.0.2.5", "192.0.2.6", "192.0.2.7", "192.0.2.8", "192.0.2.9", "192.0.2.10", "192.0.2.11", "192.0.2.2", "192.0.2.12"}
+	if got := l.Stats()[0].BlockedIPList; !slices.Equal(got, want) {
+		t.Fatalf("blocked order after refresh and eviction = %v, want %v", got, want)
+	}
+}
 
-	// The attempts span 2.25 seconds, longer than the original TTL. Each
-	// successful refresh leaves 1.25 seconds of scheduler margin.
+func TestUserIPLimiter_NonpositiveTTLAndClose(t *testing.T) {
+	for _, ttl := range []time.Duration{0, -time.Second} {
+		t.Run(ttl.String(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				l := NewUserIPLimiter(1, ttl)
+				secret := []byte("0123456789abcdef")
+				ip1 := net.ParseIP("192.0.2.1")
+				l.TryAcquire(ip1, secret, "test")
+				l.TryAcquire(net.ParseIP("192.0.2.2"), secret, "test")
+				time.Sleep(20 * 365 * 24 * time.Hour)
+				if _, ok := l.TryAcquire(ip1, secret, "test"); ok {
+					t.Fatal("nonpositive TTL must disable block expiration")
+				}
+				l.Close()
+				l.Close()
+				stats := l.Stats()[0]
+				if stats.BlockedIPs != 0 || stats.TrackedIPs != 1 || stats.BlockedTotal != 1 {
+					t.Fatal("Close must clear only blocked entries")
+				}
+			})
+		})
+	}
 }
 
 func TestUserIPLimiter_ConcurrentAccess(t *testing.T) {

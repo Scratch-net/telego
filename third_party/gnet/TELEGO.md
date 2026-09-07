@@ -35,7 +35,9 @@ The release targets are Linux amd64, arm64, and arm/v7.
 ## Verification
 
 Root `go test ./...` does not include this nested module.
-`make test-gnet` runs its complete test suite with default race, `gc_opt` race, and `poll_opt,gc_opt` production builds.
+`make test-gnet` runs only the named regressions for Telego's local patches, not the upstream test suite.
+The three builds use default race, `gc_opt` race, and `poll_opt,gc_opt` production tags.
+The script limits package parallelism to one, test parallelism to two, and each package to 120 seconds.
 The test script creates a temporary workspace that uses the root dependency versions. Neither module file changes.
 `make test` runs the dependency gates and the Telego gates.
 
