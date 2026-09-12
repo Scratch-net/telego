@@ -317,9 +317,10 @@ type fixedBindingManager struct {
 	slotFailureAffectedBindings uint64
 	lastSlotFailure             FixedBindingSlotFailureSnapshot
 	slotFailureObserver         func(FixedBindingSlotFailureSnapshot)
+	slotSocketObserver          func(GenerationDiagnosticRecord)
 	slotRepairSuccesses         uint64
 	slotRepairFailures          uint64
-	slotRepairObserver          func(bool)
+	slotRepairObserver          func(bool, GenerationDiagnosticRecord)
 	repairLink                  fixedBindingSlotRepair
 	repairContext               context.Context
 	cancelRepairs               context.CancelCauseFunc
@@ -1404,6 +1405,8 @@ func (m *fixedBindingManager) repairFailedSlots(ctx context.Context) error {
 }
 
 func (m *fixedBindingManager) repairSlot(ctx context.Context, slot *fixedBindingSlot) (result error) {
+	started := time.Now()
+	stage := GenerationSlotRepairWaitConsumer
 	repairContext, cancelRepair := context.WithCancelCause(ctx)
 	ctx, cancel := context.WithTimeout(repairContext, slotReplacementPreparationTimeout)
 	stopManagerCancel := context.AfterFunc(m.repairContext, func() {
@@ -1415,9 +1418,33 @@ func (m *fixedBindingManager) repairSlot(ctx context.Context, slot *fixedBinding
 		cancelRepair(nil)
 	}()
 	repaired := false
+	var candidate ClientLink
+	var candidateEvents <-chan LinkEvent
+	var diagnosticCause error
 	defer func() {
+		var record GenerationDiagnosticRecord
 		if !repaired {
-			m.finishSlotRepairFailure(slot)
+			if diagnosticCause == nil {
+				diagnosticCause = result
+			}
+			record = m.slotRepairFailureDiagnostic(ctx, slot, stage, started, diagnosticCause)
+		}
+		if candidate != nil {
+			if !repaired {
+				if record.Kind != "" {
+					record.Transport = candidate.Snapshot().Transport
+				}
+				closeRefreshCandidate(candidate, candidateEvents)
+				if record.Kind != "" {
+					record.Transport.Socket = candidate.Snapshot().Transport.Socket
+				}
+			}
+			m.mu.Lock()
+			delete(m.repairCandidates, slot)
+			m.mu.Unlock()
+		}
+		if !repaired {
+			m.finishSlotRepairFailure(slot, record)
 		}
 	}()
 
@@ -1427,6 +1454,7 @@ func (m *fixedBindingManager) repairSlot(ctx context.Context, slot *fixedBinding
 		return fmt.Errorf("%w: DC %d wait for failed consumer: %w", ErrFixedBindingSlotRepair, slot.dcID, context.Cause(ctx))
 	}
 
+	stage = GenerationSlotRepairConstruct
 	replacement, err := m.repairLink(ctx, slot.dcID)
 	link := replacement.Link
 	if nilClientLink(link) {
@@ -1444,19 +1472,14 @@ func (m *fixedBindingManager) repairSlot(ctx context.Context, slot *fixedBinding
 	}
 	m.mu.Unlock()
 	if alias {
+		stage = GenerationSlotRepairValidate
 		return fmt.Errorf("%w: DC %d replacement reused an owned notification channel", ErrFixedBindingSlotRepair, slot.dcID)
 	}
-	defer func() {
-		if !repaired {
-			closeRefreshCandidate(link, events)
-		}
-		m.mu.Lock()
-		delete(m.repairCandidates, slot)
-		m.mu.Unlock()
-	}()
+	candidate, candidateEvents = link, events
 	if err != nil {
 		return fmt.Errorf("%w: DC %d construct replacement: %w", ErrFixedBindingSlotRepair, slot.dcID, err)
 	}
+	stage = GenerationSlotRepairValidate
 	if replacement.DCID != slot.dcID {
 		return fmt.Errorf("%w: DC %d replacement returned signed DC %d", ErrFixedBindingSlotRepair, slot.dcID, replacement.DCID)
 	}
@@ -1467,12 +1490,15 @@ func (m *fixedBindingManager) repairSlot(ctx context.Context, slot *fixedBinding
 	if events == nil || capacity == nil {
 		return fmt.Errorf("%w: DC %d replacement has a nil notification channel", ErrFixedBindingSlotRepair, slot.dcID)
 	}
+	stage = GenerationSlotRepairStart
 	if err := link.Start(ctx); err != nil {
 		return fmt.Errorf("%w: DC %d start replacement: %w", ErrFixedBindingSlotRepair, slot.dcID, err)
 	}
+	stage = GenerationSlotRepairProbe
 	if err := m.probeReplacementCandidate(ctx, link, events, capacity); err != nil {
 		return fmt.Errorf("%w: DC %d probe replacement: %w", ErrFixedBindingSlotRepair, slot.dcID, err)
 	}
+	stage = GenerationSlotRepairPublish
 	select {
 	case <-link.Done():
 		err := link.Err()
@@ -1484,8 +1510,10 @@ func (m *fixedBindingManager) repairSlot(ctx context.Context, slot *fixedBinding
 	}
 
 	m.mu.Lock()
-	if context.Cause(ctx) != nil || m.state != fixedBindingManagerReady || !m.accepting || !slot.failed || !slot.repairing ||
+	publicationCause := context.Cause(ctx)
+	if publicationCause != nil || m.state != fixedBindingManagerReady || !m.accepting || !slot.failed || !slot.repairing ||
 		channelClosed(link.Done()) || !refreshLinkIdle(link.Snapshot()) {
+		diagnosticCause = publicationCause
 		m.mu.Unlock()
 		return fmt.Errorf("%w: DC %d manager changed during replacement", ErrFixedBindingSlotRepair, slot.dcID)
 	}
@@ -1512,24 +1540,50 @@ func (m *fixedBindingManager) repairSlot(ctx context.Context, slot *fixedBinding
 	m.mu.Unlock()
 	repaired = true
 	if observer != nil {
-		observer(true)
+		observer(true, GenerationDiagnosticRecord{})
 	}
 	return nil
 }
 
-func (m *fixedBindingManager) finishSlotRepairFailure(slot *fixedBindingSlot) {
+// Capture the rejected attempt before cleanup. Candidate disposal can block,
+// and a later deadline or retirement must not replace its cause or identity.
+func (m *fixedBindingManager) slotRepairFailureDiagnostic(ctx context.Context, slot *fixedBindingSlot, stage GenerationSlotRepairStage, started time.Time, cause error) GenerationDiagnosticRecord {
 	m.mu.Lock()
-	var observer func(bool)
+	var record GenerationDiagnosticRecord
+	// Retirement, shutdown and caller cancellation are intentional stops.
+	// Preparation deadlines remain failed attempts, including parent deadlines.
+	if slot.failed && slot.repairing && m.state == fixedBindingManagerReady && m.accepting &&
+		m.repairContext.Err() == nil && !errors.Is(ctx.Err(), context.Canceled) {
+		now := time.Now()
+		record = GenerationDiagnosticRecord{
+			Kind: GenerationDiagnosticSlotRepairFailure, At: now,
+			GenerationID: m.generationID, Role: m.generationRole,
+			DCID: slot.dcID, Slot: slot.ordinal, Incarnation: slot.incarnation,
+			RepairStage: stage, RepairDuration: max(0, now.Sub(started)),
+		}
+	}
+	m.mu.Unlock()
+	if record.Kind != "" {
+		safeError := classifyGenerationDiagnosticError(cause)
+		record.ErrorCode, record.ErrorText = safeError.code, safeError.text
+		record.NetworkOperation, record.Errno = safeError.operation, safeError.errno
+	}
+	return record
+}
+
+func (m *fixedBindingManager) finishSlotRepairFailure(slot *fixedBindingSlot, record GenerationDiagnosticRecord) {
+	m.mu.Lock()
+	var observer func(bool, GenerationDiagnosticRecord)
 	if slot.failed && slot.repairing {
 		slot.repairing = false
-		if m.state == fixedBindingManagerReady && m.accepting {
+		if record.Kind != "" {
 			m.slotRepairFailures++
 			observer = m.slotRepairObserver
 		}
 	}
 	m.mu.Unlock()
 	if observer != nil {
-		observer(false)
+		observer(false, record)
 	}
 }
 
@@ -3263,6 +3317,7 @@ func (m *fixedBindingManager) recordSlotFailureForProbe(
 		RequestItems: slot.requestItems, RequestBytes: slot.requestBytes,
 		ControlItems: slot.controlItems, ControlBytes: slot.controlBytes,
 		ResponseItems: slot.pending, ResponseBytes: slot.bytes,
+		Transport: slot.link.Snapshot().Transport,
 	}
 	slot.failed = true
 	slot.err = wrapped
@@ -3311,6 +3366,7 @@ func (m *fixedBindingManager) recordSlotFailureForProbe(
 	failedLink := slot.link
 	m.lastSlotFailure = failure
 	observer := m.slotFailureObserver
+	socketObserver := m.slotSocketObserver
 	m.mu.Unlock()
 	safeError := classifyGenerationDiagnosticError(cause)
 	failure.diagnostic.ErrorCode = safeError.code
@@ -3329,6 +3385,19 @@ func (m *fixedBindingManager) recordSlotFailureForProbe(
 	}
 	if !retiredTerminal {
 		_ = failedLink.Close()
+		// This Close already waits for the engine's terminal publication. Never
+		// re-read slot.link: repair can publish a different physical incarnation.
+		if socketObserver != nil && diagnostic.Transport.Socket.At.IsZero() {
+			transport := failedLink.Snapshot().Transport
+			if !transport.Socket.At.IsZero() {
+				socketObserver(GenerationDiagnosticRecord{
+					Kind: GenerationDiagnosticSlotSocket, At: transport.Socket.At,
+					GenerationID: diagnostic.GenerationID, Role: diagnostic.Role, DCID: diagnostic.DCID,
+					Slot: diagnostic.Slot, Incarnation: diagnostic.Incarnation,
+					FailureObservedAt: diagnostic.At, Transport: transport,
+				})
+			}
+		}
 	}
 }
 

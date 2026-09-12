@@ -22,23 +22,46 @@ const (
 type GenerationDiagnosticKind string
 
 const (
-	GenerationDiagnosticSlotFailure      GenerationDiagnosticKind = "slot_failure"
-	GenerationDiagnosticForcedRetirement GenerationDiagnosticKind = "forced_retirement"
+	GenerationDiagnosticSlotFailure       GenerationDiagnosticKind = "slot_failure"
+	GenerationDiagnosticSlotRepairFailure GenerationDiagnosticKind = "slot_repair_failure"
+	GenerationDiagnosticSlotSocket        GenerationDiagnosticKind = "slot_socket"
+	GenerationDiagnosticForcedRetirement  GenerationDiagnosticKind = "forced_retirement"
+)
+
+// GenerationSlotRepairStage identifies the operation which rejected a replacement.
+type GenerationSlotRepairStage string
+
+const (
+	GenerationSlotRepairWaitConsumer GenerationSlotRepairStage = "wait_consumer"
+	GenerationSlotRepairConstruct    GenerationSlotRepairStage = "construct"
+	GenerationSlotRepairValidate     GenerationSlotRepairStage = "validate"
+	GenerationSlotRepairStart        GenerationSlotRepairStage = "start"
+	GenerationSlotRepairProbe        GenerationSlotRepairStage = "probe"
+	GenerationSlotRepairPublish      GenerationSlotRepairStage = "publish"
 )
 
 // GenerationDiagnosticRecord contains values only: no raw errors, endpoints,
 // client identities, packets, or callbacks. Slot is a zero-based logical ordinal.
 // At records local observation time; Sequence records supervisor arrival order.
 type GenerationDiagnosticRecord struct {
-	Sequence         uint64
-	FailureSequence  uint64
-	Kind             GenerationDiagnosticKind
-	At               time.Time
-	GenerationID     uint64
-	Role             GenerationRole
-	DCID             DCID
-	Slot             int
-	Incarnation      uint64
+	Sequence        uint64
+	FailureSequence uint64
+	Kind            GenerationDiagnosticKind
+	At              time.Time
+	GenerationID    uint64
+	Role            GenerationRole
+	DCID            DCID
+	Slot            int
+	Incarnation     uint64
+	// Socket follow-ups correlate by the original physical identity and claim
+	// time, not FailureSequence, which only the supervisor can assign globally.
+	FailureObservedAt time.Time
+	// Repair records describe the rejected candidate's transport. Other records
+	// describe the failed incumbent. Socket.At can follow the failure claim.
+	Transport LinkTransportSnapshot
+	// Repair failures identify the failed incumbent, not an unpublished candidate.
+	RepairStage      GenerationSlotRepairStage
+	RepairDuration   time.Duration
 	Reason           FixedBindingSlotFailureReason
 	RetirementReason GenerationRetirementReason
 	AffectedBindings int
@@ -218,6 +241,7 @@ func classifyGenerationDiagnosticError(cause error) generationDiagnosticError {
 		{ErrFixedBindingManagerClosed, "manager_closed", "manager is closed"},
 		{ErrFixedBindingManagerQuiesced, "manager_quiesced", "manager is not admitting bindings"},
 		{ErrFixedBindingSlotFailed, "slot_failed", "physical link failed"},
+		{ErrFixedBindingSlotRepair, "slot_repair", "physical link replacement failed"},
 	} {
 		if errors.Is(cause, entry.cause) {
 			result.code, result.text = entry.code, entry.text

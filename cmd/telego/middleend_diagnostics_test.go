@@ -258,6 +258,30 @@ func TestMiddleEndDiagnosticsUnknownSafeCause(t *testing.T) {
 	}
 }
 
+func TestMiddleEndDiagnosticsSeparateRepairAttempt(t *testing.T) {
+	record := middleend.GenerationDiagnosticRecord{
+		Kind: middleend.GenerationDiagnosticSlotRepairFailure, Sequence: 4,
+		At:           time.Date(2026, time.September, 12, 12, 0, 0, 0, time.UTC),
+		GenerationID: 7, Role: middleend.GenerationRoleActive, DCID: -2, Slot: 3, Incarnation: 5,
+		RepairStage: middleend.GenerationSlotRepairStart, RepairDuration: 25 * time.Millisecond,
+		ErrorCode: "eof", ErrorText: "peer closed the stream", NetworkOperation: "read",
+	}
+	var output bytes.Buffer
+	logger := zerolog.New(&output).Level(zerolog.InfoLevel)
+	emitMiddleEndDiagnostic(&logger, record)
+	decoded := readDiagnosticJSON(t, output.String())[0]
+	if decoded["message"] != middleEndSlotRepairFailureMessage || decoded["diagnostic_kind"] != "slot_repair_failure" ||
+		decoded["repair_stage"] != "start" || decoded["repair_duration_ms"] != float64(25) || decoded["error_code"] != "eof" ||
+		decoded["level"] != "info" || decoded["dc"] != float64(-2) || decoded["incarnation"] != float64(5) {
+		t.Fatalf("repair record = %v", decoded)
+	}
+	for _, field := range []string{"failure_sequence", "reason", "retirement_reason", "probe_id", "age_ms", "error"} {
+		if _, exists := decoded[field]; exists {
+			t.Errorf("repair record included unrelated field %s", field)
+		}
+	}
+}
+
 func TestMiddleEndDiagnosticsZeroImpactCapacityRetirementUsesInfo(t *testing.T) {
 	record := diagnosticMonitorRecords()[2]
 	record.RetirementReason = middleend.GenerationRetirementRecoveryCapacity

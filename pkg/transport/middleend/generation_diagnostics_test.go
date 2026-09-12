@@ -297,7 +297,7 @@ func TestGenerationDiagnosticsRepairPreservesClaimedIncarnation(t *testing.T) {
 		respondToFixedBindingPings(replacement)
 		manager := newSlotRefreshTestManager(t, []FixedBindingSlot{{DCID: -2, Link: old}}, refreshCandidateFactory(replacement))
 		supervisor := newGenerationTestSupervisor(t, generationTestConfig())
-		diagnosticTestObserver(manager, supervisor)
+		repairDiagnosticTestObserver(manager, supervisor)
 		entered, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
 		var once sync.Once
 		manager.state.mu.Lock()
@@ -319,6 +319,9 @@ func TestGenerationDiagnosticsRepairPreservesClaimedIncarnation(t *testing.T) {
 		}
 		close(release)
 		<-done
+		if snapshot := supervisor.Snapshot(); snapshot.SlotRepairSuccesses != 1 || snapshot.SlotRepairFailures != 0 || len(supervisor.DiagnosticSnapshot().Records) != 1 {
+			t.Fatal("successful repair emitted a repair failure")
+		}
 		if slot.ordinal != 0 || slot.incarnation != 2 || slot.lastProbe.id != 0 || !slot.lastProbe.lastPongAt.IsZero() {
 			t.Fatalf("repair identity/summary = ordinal %d incarnation %d probe %+v", slot.ordinal, slot.incarnation, slot.lastProbe)
 		}
@@ -358,8 +361,11 @@ func TestGenerationDiagnosticsRefreshRetainsOldIdentity(t *testing.T) {
 func TestGenerationDiagnosticsPublicationAndCapacityLifetime(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		old := newPooledGenerationTestManager(t, 2, true, true)
-		old.manager.state.repairLink = func(context.Context, DCID) (FixedBindingSlot, error) {
-			return FixedBindingSlot{}, errGenerationTestFactoryExhausted
+		// This test isolates generation lifetime events. Any repair started
+		// before rotation waits for retirement instead of racing an extra failure.
+		old.manager.state.repairLink = func(ctx context.Context, _ DCID) (FixedBindingSlot, error) {
+			<-ctx.Done()
+			return FixedBindingSlot{}, context.Cause(ctx)
 		}
 		current := newGenerationTestManager(t, []DCID{2}, true)
 		supervisor := newGenerationTestSupervisor(t, generationTestConfig())

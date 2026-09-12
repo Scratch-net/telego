@@ -242,6 +242,7 @@ type LinkSnapshot struct {
 	PendingEventBytes        int
 	EventHighWater           int
 	EventBytesHighWater      int
+	Transport                LinkTransportSnapshot
 }
 
 // ClientLink is the common contract for one already-selected Middle-End

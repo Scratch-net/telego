@@ -441,15 +441,10 @@ func (s *generationSupervisorState) prepareGeneration(parent context.Context, fa
 		return nil, fmt.Errorf("%w: factory returned a manager that was already started", ErrInvalidGenerationSupervisor)
 	}
 	manager.state.slotFailureObserver = s.recordSlotFailure
+	manager.state.slotSocketObserver = s.recordSlotSocket
 	manager.state.generationID = generationID
 	manager.state.generationRole = GenerationRoleCandidate
-	manager.state.slotRepairObserver = func(success bool) {
-		if success {
-			s.slotRepairSuccesses.Add(1)
-		} else {
-			s.slotRepairFailures.Add(1)
-		}
-	}
+	manager.state.slotRepairObserver = s.recordSlotRepair
 	manager.state.dcObserver = s.recordDCChange
 	// Bootstrap and initial admission failures are real link failures, but
 	// they are not losses of coverage from an admitted generation.
@@ -481,6 +476,23 @@ func (s *generationSupervisorState) recordSlotFailure(failure FixedBindingSlotFa
 	record.Kind = GenerationDiagnosticSlotFailure
 	record.FailureSequence = failure.Sequence
 	record.AffectedBindings = failure.AffectedBindings
+	s.diagnostics.append(record)
+	s.mu.Unlock()
+}
+
+func (s *generationSupervisorState) recordSlotRepair(success bool, record GenerationDiagnosticRecord) {
+	if success {
+		s.slotRepairSuccesses.Add(1)
+		return
+	}
+	s.mu.Lock()
+	s.slotRepairFailures.Add(1)
+	s.diagnostics.append(record)
+	s.mu.Unlock()
+}
+
+func (s *generationSupervisorState) recordSlotSocket(record GenerationDiagnosticRecord) {
+	s.mu.Lock()
 	s.diagnostics.append(record)
 	s.mu.Unlock()
 }

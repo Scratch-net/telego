@@ -175,6 +175,7 @@ func (r *GnetClientRuntime) NewClientLink(conn *net.TCPConn, bootstrap *ClientBo
 		maxControlItems:  maxControlItems,
 		maxControlBytes:  maxControlBytes,
 		state:            LinkStateCreated,
+		transport:        LinkTransportSnapshot{IO: LinkIOSnapshot{Available: true}, Socket: LinkSocketSnapshot{Status: LinkSocketNotCaptured}},
 		events:           make(chan LinkEvent, limits.MaxPendingEvents),
 		submissionReady:  make(chan struct{}, 1),
 		done:             make(chan struct{}),
@@ -339,6 +340,8 @@ type GnetClientLink struct {
 	startResult               error
 	terminalClaimed           bool
 	terminalErr               error
+	transport                 LinkTransportSnapshot
+	transportFrozen           bool
 	finalized                 bool
 	closeScheduled            bool
 	drainScheduled            bool
@@ -540,6 +543,7 @@ func (l *GnetClientLink) Snapshot() LinkSnapshot {
 		PendingEventBytes:        l.pendingEventBytes,
 		EventHighWater:           l.eventHighWater,
 		EventBytesHighWater:      l.eventBytesHighWater,
+		Transport:                l.transport,
 	}
 }
 
@@ -610,6 +614,7 @@ func (l *GnetClientLink) onOpen(conn gnet.Conn) ([]byte, gnet.Action) {
 		l.claimOwnerFailure(err)
 		return nil, gnet.Close
 	}
+	l.observeWriteAttempt(len(initial))
 	return initial, gnet.None
 }
 
@@ -632,6 +637,7 @@ func (l *GnetClientLink) onTraffic(conn gnet.Conn) gnet.Action {
 		l.claimOwnerFailure(fmt.Errorf("read Middle-End gnet inbound buffer: %w", err))
 		return gnet.Close
 	}
+	l.observeReadBytes(len(data))
 
 	remaining := data
 	for len(remaining) != 0 {
@@ -646,7 +652,9 @@ func (l *GnetClientLink) onTraffic(conn gnet.Conn) gnet.Action {
 		}
 		remaining = remaining[consumed:]
 		if len(update.Outbound) != 0 {
+			l.beginOwnerWrite(len(update.Outbound))
 			written, err := conn.Write(update.Outbound)
+			l.endOwnerWrite()
 			if err != nil || written != len(update.Outbound) {
 				l.claimOwnerFailure(writeResultError("bootstrap", written, len(update.Outbound), err))
 				return gnet.Close
@@ -675,7 +683,8 @@ func (l *GnetClientLink) onTraffic(conn gnet.Conn) gnet.Action {
 	return gnet.None
 }
 
-func (l *GnetClientLink) onClose(_ gnet.Conn, closeErr error) {
+func (l *GnetClientLink) onClose(conn gnet.Conn, closeErr error) {
+	l.captureOwnerDiagnostics(conn)
 	if !l.isTerminalClaimed() {
 		terminalErr := closeErr
 		if terminalErr == nil {
@@ -928,7 +937,9 @@ func (l *GnetClientLink) writeOwnerBatch(conn gnet.Conn, wires [][]byte, charges
 	// link-owned ciphertext immediately after the synchronous call returns.
 	// Ciphertext is public wire data; unlike plaintext and keys, wiping it adds
 	// no secrecy and would zero every transmitted byte on the owner-loop path.
+	l.beginOwnerWrite(total)
 	written, err := conn.Writev(slices.Clone(wires))
+	l.endOwnerWrite()
 	for index := range wires {
 		charges[index].wireBytes = len(wires[index])
 		wires[index] = nil
@@ -966,6 +977,7 @@ func (l *GnetClientLink) observeOwnerOutbound(conn gnet.Conn, afterWrite bool) e
 		return fmt.Errorf("%w: %d exceeds %d", ErrGnetOutboundBackpressure, outbound, l.maxOutboundBytes)
 	}
 	consumed := l.ownerWireTotal - uint64(outbound)
+	l.observeOutboundProgress(outbound, consumed)
 	releasedItems := 0
 	releasedBytes := 0
 	releasedControlItems := 0
@@ -1184,6 +1196,10 @@ func (l *GnetClientLink) finalizeAfterStreamClose() {
 	if l.finalized {
 		l.mu.Unlock()
 		return
+	}
+	if !l.transportFrozen {
+		l.transportFrozen = true
+		l.transport.Socket = LinkSocketSnapshot{Status: LinkSocketUnavailable, At: time.Now()}
 	}
 	if !l.terminalClaimed {
 		l.terminalClaimed = true

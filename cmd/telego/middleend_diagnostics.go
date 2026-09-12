@@ -11,6 +11,8 @@ import (
 
 const (
 	middleEndSlotFailureMessage        = "Middle-End physical link failed"
+	middleEndSlotRepairFailureMessage  = "Middle-End physical-link replacement attempt failed"
+	middleEndSlotSocketMessage         = "Middle-End physical-link close evidence"
 	middleEndForcedRetirementMessage   = "Middle-End capacity retirement closed a generation"
 	middleEndDiagnosticsDroppedMessage = "Middle-End diagnostic journal dropped records"
 )
@@ -62,16 +64,43 @@ func emitMiddleEndDiagnostic(logger middleEndDiagnosticLogger, record middleend.
 		Uint64("diagnostic_sequence", record.Sequence).
 		Str("observed_at", record.At.UTC().Format(time.RFC3339Nano)).
 		Uint64("generation_id", record.GenerationID).
-		Str("role", string(record.Role)).
-		Int("affected_bindings", record.AffectedBindings)
+		Str("role", string(record.Role))
+	if record.Kind == middleend.GenerationDiagnosticSlotSocket {
+		emitMiddleEndTransport(event, record.Transport)
+		event.
+			Int("dc", int(record.DCID)).
+			Int("slot", record.Slot).
+			Uint64("incarnation", record.Incarnation).
+			Str("failure_observed_at", record.FailureObservedAt.UTC().Format(time.RFC3339Nano)).
+			Msg(middleEndSlotSocketMessage)
+		return
+	}
+	event.Int("affected_bindings", record.AffectedBindings)
 	if record.Kind == middleend.GenerationDiagnosticForcedRetirement {
 		event.
 			Str("retirement_reason", string(record.RetirementReason)).
 			Msg(middleEndForcedRetirementMessage)
 		return
 	}
+	if record.Kind == middleend.GenerationDiagnosticSlotRepairFailure {
+		emitMiddleEndTransport(event, record.Transport)
+		event.
+			Str("transport_subject", "replacement_candidate").
+			Int("dc", int(record.DCID)).
+			Int("slot", record.Slot).
+			Uint64("incarnation", record.Incarnation).
+			Str("repair_stage", string(record.RepairStage)).
+			Int64("repair_duration_ms", max(0, record.RepairDuration.Milliseconds())).
+			Str("error_code", record.ErrorCode).
+			Str("error_text", record.ErrorText).
+			Str("network_operation", record.NetworkOperation).
+			Uint64("errno", record.Errno).
+			Msg(middleEndSlotRepairFailureMessage)
+		return
+	}
 	// The source classifies errors before journal retention. No raw error or
 	// operational snapshot enters this path. Accepted means local queue acceptance.
+	emitMiddleEndTransport(event, record.Transport)
 	event.
 		Uint64("failure_sequence", record.FailureSequence).
 		Int("dc", int(record.DCID)).

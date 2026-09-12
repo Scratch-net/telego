@@ -215,7 +215,6 @@ func (m *middleEndMonitor) observe() {
 			Uint64("new_failures", current.slotRepairFailures-previous.slotRepairFailures).
 			Uint64("failures_total", current.slotRepairFailures).
 			Int("repairing_slots", middleEndRepairingSlots(snapshot.Supervisor)).
-			Err(snapshot.Supervisor.LastError).
 			Msg("Middle-End physical-link replacement failed; recovery will retry while unaffected DC pools remain available")
 	}
 	if current.slotRepairSuccesses > previous.slotRepairSuccesses {

@@ -256,7 +256,7 @@ Telego logs route fallback, artifact failure, generation failure, failed physica
 
 ### Failure diagnostics
 
-Telego keeps a service-wide journal for physical-link failures and capacity retirements. The journal retains the first 256 unacknowledged records.
+Telego keeps a service-wide journal for physical-link failures, failed repair attempts, socket follow-ups, and capacity retirements. The journal retains the first 256 unacknowledged records across these event classes.
 
 If the journal is full, Telego rejects new records and increases the dropped-record counter. Failure totals and the last-failure summary still advance.
 
@@ -264,11 +264,21 @@ The monitor emits at most 256 records per observation, with a normal interval of
 
 Records with client impact and increases in dropped records use WARN. Successful link replacements still use DEBUG.
 
-Each record identifies the generation and its role at the event, not at log emission. Physical-link records also identify the signed DC, slot ordinal, and incarnation.
+Each record identifies the generation and its role at the original failure or retirement, not at log emission. Socket follow-ups retain this role even if it changes before close. Physical-link failures, failed repairs, and socket follow-ups also identify the signed DC, slot ordinal, and incarnation.
 
 The slot ordinal starts at zero and stays fixed within its manager. The incarnation increases after a successful repair or refresh.
 
-Physical-link records contain the failure reason, affected-binding count, safe error classification, link age, peer EOF status, and previous client use.
+Failed repairs use `diagnostic_kind=slot_repair_failure`, separate from `slot_failure` and `forced_retirement`. Their slot identity describes the failed incumbent, not the unpublished replacement candidate.
+
+Each failed repair records `repair_stage` and `repair_duration_ms`. The stages are `wait_consumer`, `construct`, `validate`, `start`, `probe`, and `publish`.
+
+Telego captures the cause, identity, observation time, and duration before candidate cleanup. The duration excludes cleanup. A later deadline or retirement does not change this evidence.
+
+Intentional cancellation by the caller, retirement, or shutdown does not count as a failed repair. A preparation deadline still counts as a failed repair. Repair failures do not increase physical-link failure totals or affected-binding totals.
+
+Each retained repair failure uses INFO and contains its own safe error classification. If the repair-failure count increases, the monitor also emits a WARN summary. This summary does not assign the shared latest error to individual attempts.
+
+Records with `diagnostic_kind=slot_failure` contain the failure reason, affected-binding count, safe error classification, link age, peer EOF status, and previous client use.
 
 The manager starts the age clock at initialization of the ready link. This age does not measure the full TCP connection lifetime.
 
@@ -276,13 +286,33 @@ The probe history includes local queue acceptance, link submission acceptance, t
 
 Queue counts and byte counts describe the manager slot before failure cleanup. They do not describe the engine queues before failure.
 
+gnet snapshots include received wire-byte totals, write-attempt totals, and the last observed read and write-attempt times. Write attempts measure bytes offered to gnet, not kernel acceptance or peer delivery.
+
+gnet outbound progress counts encoded frame bytes that leave its user-space buffer. It excludes bootstrap writes and does not prove TCP acknowledgment.
+
+If gnet closes inside a write call, `wire_write_in_flight=true` and `gnet_outbound_progress_incomplete=true` describe that close-time observation. The progress value and its timestamp retain the last exact observation. The buffered-byte count still describes the buffer at close.
+
+On Linux, the owner callback samples `TCP_INFO` before gnet flushes residual bytes and closes the socket. The fields include TCP state, unacknowledged packets, loss and retransmission counters, RTT, RTT variation, and the send congestion window.
+
+The `tcp_info_status` field distinguishes `available`, `not_captured`, `unavailable`, `unsupported`, and `error`. Unavailable evidence does not appear as zero-valued TCP measurements. Sockets that never enter gnet can report `unavailable`. The reference engine reports unsupported transport diagnostics.
+
+These TCP measurements describe the connected socket. With SOCKS5, they describe the connection to the proxy, not the remote Telegram connection.
+
+A local failure can precede the close callback. A later `diagnostic_kind=slot_socket` record preserves the original generation, role, signed DC, slot, and incarnation. Its `failure_observed_at` identifies the original failure observation. This INFO follow-up does not increase failure or affected-binding totals.
+
+For failed repairs, `transport_subject=replacement_candidate` identifies whose transport evidence appears. The slot identity still describes the failed incumbent. The record combines I/O evidence before candidate cleanup with socket evidence from the close callback.
+
+Journal reads use cached values and never access socket descriptors. Closed transport snapshots stay fixed, even if a write call returns after the close callback.
+
 Record timestamps describe local observations, not exact remote failure times. Sequence numbers describe arrival order at the supervisor.
 
-Diagnostic records exclude raw errors, addresses, credentials, client identities, and packet contents. Unknown errors use a fixed redacted description.
+Diagnostic records exclude raw errors, socket descriptors, addresses, credentials, client identities, and packet contents. Unknown errors use a fixed redacted description.
 
 The monitor acknowledges the copied journal boundary after log emission. Records that arrive during emission remain available for the next observation.
 
 Independent journal reads do not remove records. Acknowledgement does not prove durable log storage, and process failure can lose unacknowledged records.
+
+Failed-repair records reach the journal after candidate cleanup. A process failure during cleanup can also lose the captured record.
 
 The journal and its counters survive generation changes. A service restart resets them.
 

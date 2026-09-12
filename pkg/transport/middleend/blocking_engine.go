@@ -284,6 +284,8 @@ func (l *BlockingClientLinkEngine) Snapshot() LinkSnapshot {
 		PendingEventBytes:        l.pendingEventBytes,
 		EventHighWater:           l.eventHighWater,
 		EventBytesHighWater:      l.eventBytesHighWater,
+		// The reference engine does not collect gnet transport observations.
+		Transport: LinkTransportSnapshot{Socket: LinkSocketSnapshot{Status: LinkSocketUnsupported}},
 	}
 }
 

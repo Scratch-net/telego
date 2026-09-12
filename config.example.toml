@@ -188,8 +188,20 @@ enabled = false
 # Use the `telego_middleend_*` metrics to compare queue use with configured capacity.
 # Refresh outcomes and zero-ready transitions record replacement results and losses of per-DC availability.
 # Capacity-retirement counters distinguish intentional interruptions from physical-link failures.
-# The diagnostic journal retains the first 256 unseen failures or capacity retirements. Overflow increases the dropped-record counter.
+# Physical-link failures, failed repair attempts, socket follow-ups, and capacity retirements share a journal of the first 256 unseen records.
+# Overflow increases the dropped-record counter.
 # The monitor emits each retained record at INFO, or WARN for client impact. Log emission does not guarantee durable storage.
+# Failed repairs use slot_repair_failure and identify the failed incumbent, not the unpublished replacement candidate.
+# Telego captures the repair stage, duration, and safe cause before candidate cleanup. The duration excludes cleanup.
+# Repair records reach the journal after cleanup. A process failure can lose records before log emission.
+# Intentional cancellation does not count as a failed repair. Repair failures do not increase physical-link failure or affected-binding totals.
+# Each retained repair failure uses INFO. An increase in failed repairs also produces an aggregate WARN summary.
+# gnet I/O evidence includes wire-byte totals and read/write-attempt times. Write attempts do not prove kernel acceptance or peer delivery.
+# Outbound progress excludes bootstrap writes and does not prove TCP acknowledgment. A close during a write marks the progress as incomplete.
+# On Linux, TCP_INFO comes from the owner close callback before residual flush. Explicit availability states distinguish missing evidence from zero measurements.
+# Socket follow-ups preserve the original physical identity and failure time without another failure count.
+# Failed-repair transport evidence describes the replacement candidate. The slot identity still describes the failed incumbent.
+# The reference engine reports unsupported transport diagnostics. Diagnostic records contain no addresses, socket descriptors, credentials, or packet contents.
 # Telego also logs admission, repair, refresh, queue pressure, and binding eviction events.
 # Telego logs the process descriptor limit and the direct-fallback minimum at startup.
 # The active-ready log reports live and two-generation payload-capacity ceilings.
