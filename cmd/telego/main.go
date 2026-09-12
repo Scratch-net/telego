@@ -481,7 +481,7 @@ func (c *VersionCmd) Run() error {
 			"Native Telegram WEB protocol",
 			"Splice mode for probe resistance",
 			"FakeTLS (ee) and raw (dd) protocol support",
-			"Multiple secrets per user",
+			"Named secrets with per-user tracking",
 		}).
 		Msg("telego")
 	return nil

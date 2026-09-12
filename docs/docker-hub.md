@@ -12,9 +12,9 @@ The image uses `telego` as its entry point. It contains a static binary and no s
 
 ## Supported image tags
 
-Release `v0.6.1` publishes these tags:
+Release `v0.6.4` publishes these tags:
 
-- `scratchnet/telego:v0.6.1` — fixed release
+- `scratchnet/telego:v0.6.4` — fixed release
 - `scratchnet/telego:v0.6` — latest `v0.6.x` release
 - `scratchnet/telego:v0` — latest `v0.x` release
 - `scratchnet/telego:latest` — moving image from a release or a successful `main` build
@@ -28,18 +28,20 @@ For repeatable deployments, use a fixed release tag. The `latest` tag can contai
 Replace `www.google.com` with the FakeTLS mask hostname:
 
 ```bash
-docker run --rm scratchnet/telego:v0.6.1 \
+docker run --rm scratchnet/telego:v0.6.4 \
   generate www.google.com
 ```
 
 To also print Telegram WEB proxy links, add the public WEB hostname:
 
 ```bash
-docker run --rm scratchnet/telego:v0.6.1 \
+docker run --rm scratchnet/telego:v0.6.4 \
   generate www.google.com --web-host proxy.example.com
 ```
 
 The command prints one base secret. Store the 32-character hexadecimal value in the configuration without the `ee` or `dd` prefix.
+
+Each name in `[secrets]` has one base key. Telego uses that name for per-user tracking. The `ee`, `dd`, and WEB links use forms of the same base key.
 
 ## Run MTProxy
 
@@ -64,7 +66,7 @@ docker run -d \
   --restart unless-stopped \
   -p 443:443 \
   -v "$PWD/config.toml:/config.toml:ro" \
-  scratchnet/telego:v0.6.1 \
+  scratchnet/telego:v0.6.4 \
   run -c /config.toml -l
 ```
 
@@ -79,7 +81,7 @@ docker logs telego
 ```yaml
 services:
   telego:
-    image: scratchnet/telego:v0.6.1
+    image: scratchnet/telego:v0.6.4
     restart: unless-stopped
     ports:
       - "443:443"
@@ -141,7 +143,7 @@ Replace `proxy.example.com` in these files:
 Generate the secret and WEB links:
 
 ```bash
-docker run --rm scratchnet/telego:v0.6.1 \
+docker run --rm scratchnet/telego:v0.6.4 \
   generate proxy.example.com --web-host proxy.example.com
 ```
 
