@@ -252,16 +252,33 @@ function release(bytes,items,lane){queuedBytes-=bytes;queuedItems-=items;if(lane
 	return document, nil
 }
 
-const webSocketBridgeFunctions = `function openWebSocket(){
+const webSocketBridgeFunctions = `function waitForWebSocketOpen(socket){
  return new Promise((resolve,reject)=>{
-  const socket=new WebSocket(webSocketTarget,'tproxy-v1.'+sessionToken);webSocket=socket;socket.binaryType='arraybuffer';
-  socket.onopen=()=>resolve();
-  socket.onmessage=event=>{
-   if(!(event.data instanceof ArrayBuffer)||!event.data.byteLength){fail();return}
-   port.postMessage({t:'traffic',up:0,down:event.data.byteLength});port.postMessage(event.data,[event.data]);status('connected');
+  let settled=false;const deadline=Date.now()+requestTimeoutMs;
+  const finish=error=>{
+   if(settled)return;settled=true;clearTimeout(timer);
+   socket.removeEventListener('open',opened);socket.removeEventListener('error',failed);socket.removeEventListener('close',failed);
+   lifecycleController.signal.removeEventListener('abort',aborted);
+   if(error){try{socket.close()}catch(closeError){}reject(error)}else resolve();
   };
-  socket.onerror=()=>reject(new Error('websocket failed'));socket.onclose=()=>{if(!closed)fail()};
+  const failed=()=>finish(new Error('websocket failed'));
+  const aborted=()=>finish(new DOMException('carrier closed','AbortError'));
+  const opened=()=>{if(closed||lifecycleController.signal.aborted){aborted();return}finish(Date.now()>=deadline?new Error('websocket opening deadline reached'):null)};
+  const timer=setTimeout(()=>finish(new Error('websocket opening deadline reached')),requestTimeoutMs);
+  socket.addEventListener('open',opened);socket.addEventListener('error',failed);socket.addEventListener('close',failed);
+  lifecycleController.signal.addEventListener('abort',aborted,{once:true});
+  if(closed||lifecycleController.signal.aborted)aborted();
  });
+}
+async function openWebSocket(){
+ const socket=new WebSocket(webSocketTarget,'tproxy-v1.'+sessionToken);webSocket=socket;socket.binaryType='arraybuffer';let opened=false;
+ socket.onmessage=event=>{
+  if(closed||!opened||webSocket!==socket)return;
+  if(!(event.data instanceof ArrayBuffer)||!event.data.byteLength){fail();return}
+  port.postMessage({t:'traffic',up:0,down:event.data.byteLength});port.postMessage(event.data,[event.data]);status('connected');
+ };
+ socket.onclose=()=>{if(!closed)fail()};
+ await waitForWebSocketOpen(socket);ensureOpen();opened=true;
 }
 function queueWebSocket(data){
  if(!reserve(data)){fail();return}upPending.push(data);runWebSocketUp();
@@ -296,8 +313,8 @@ function finishWebSocketLane(lane,notify){
 function openWebSocketLane(lane){
  const socket=new WebSocket(webSocketTarget,'tproxy-lane-v1.'+sessionToken+'.'+lane.id);
  lane.socket=socket;socket.binaryType='arraybuffer';
- socket.onopen=()=>{if(closed||lane.finished){socket.close();return}lane.opened=true;status('connected');runWebSocketLaneUp(lane)};
  socket.onmessage=event=>{
+  if(closed||lane.finished||!lane.opened||lanes.get(lane.id)!==lane||lane.socket!==socket)return;
   if(!(event.data instanceof ArrayBuffer)||!event.data.byteLength){fail();return}
   let frames;try{frames=splitFrames(event.data)}catch(error){fail();return}
   if(frames.some(frame=>frame.id!==lane.id)){fail();return}if(frames.some(frame=>frame.type===3))lane.remoteClosed=true;
@@ -308,6 +325,10 @@ function openWebSocketLane(lane){
   if(closed||lane.finished)return;if(!lane.opened){fail();return}
   finishWebSocketLane(lane,!lane.localClosed&&!lane.remoteClosed);
  };
+ waitForWebSocketOpen(socket).then(()=>{
+  if(closed||lane.finished||lanes.get(lane.id)!==lane||lane.socket!==socket){socket.close();return}
+  lane.opened=true;status('connected');runWebSocketLaneUp(lane);
+ },()=>{if(!closed&&!lane.finished&&lanes.get(lane.id)===lane)fail()});
 }
 function queueWebSocketLane(frame){
  let lane=lanes.get(frame.id);
@@ -352,6 +373,7 @@ const relayOrigin=__ORIGIN__,bootstrap=__BOOTSTRAP__,carrier=__CARRIER__,batchLi
 const match=/^#android=([A-Za-z0-9_-]{43})$/.exec(location.hash),androidNonce=match?match[1]:'';
 history.replaceState(null,'',location.pathname);
 const queueByteLimit=33554432,queueItemLimit=16384,maxFrames=4096,maxPayload=1048576,closedLaneLimit=4096;
+const requestTimeoutMs=90000;
 let initialized=false,closed=false,port=null,sessionToken='',createStarted=false;
 let queuedBytes=0,queuedItems=0,upSequence=1,downCursor='0',upRunning=false,pollController=null;
 const lifecycleController=new AbortController();
@@ -418,19 +440,62 @@ function retryAfterMs(response){
  const seconds=Number(value);if(Number.isFinite(seconds)&&seconds>=0)return Math.min(seconds*1000,30000);
  const when=Date.parse(value);return Number.isFinite(when)&&when>Date.now()?Math.min(when-Date.now(),30000):0;
 }
-async function request(path,makeOptions){
- let delay=250,attempt=0;const deadline=Date.now()+90000;
+function cancelResponse(response){
+ if(response&&response.body)try{response.body.cancel().catch(()=>{})}catch(error){}
+}
+async function readResponse(response,limit,exact,signal,deadline){
+ let declared=null;const length=response.headers.get('Content-Length'),encoding=response.headers.get('Content-Encoding');
+ // Fetch exposes decoded bytes. An encoded Content-Length is not their size.
+ if(length!==null&&(!encoding||encoding.toLowerCase()==='identity')){
+  if(!/^[0-9]+$/.test(length))throw new Error('invalid response length');
+  declared=Number(length);
+  if(!Number.isSafeInteger(declared)||declared>limit||(exact&&declared!==limit))throw new Error('response body exceeds its limit');
+ }
+ if(!response.body)throw new Error('missing response body');
+ const reader=response.body.getReader();let buffer=new Uint8Array(declared||0),total=0;
+ const cancel=()=>{try{reader.cancel().catch(()=>{})}catch(error){}};
+ signal.addEventListener('abort',cancel,{once:true});
+ try{
+  while(true){
+   ensureOpen(signal);if(Date.now()>=deadline)throw new Error('response deadline reached');
+   const part=await reader.read();
+   ensureOpen(signal);if(Date.now()>=deadline)throw new Error('response deadline reached');
+   if(part.done)break;
+   if(!(part.value instanceof Uint8Array)||part.value.byteLength>limit-total||
+      (declared!==null&&part.value.byteLength>declared-total))throw new Error('response body exceeds its limit');
+   const next=total+part.value.byteLength;
+   if(next>buffer.length){const grown=new Uint8Array(Math.min(limit,Math.max(next,buffer.length*2,16384)));grown.set(buffer);buffer=grown}
+   buffer.set(part.value,total);total=next;
+  }
+  if((exact&&total!==limit)||(declared!==null&&total!==declared))throw new Error('invalid response length');
+  return total===buffer.length?buffer.buffer:buffer.buffer.slice(0,total);
+ }catch(error){cancel();throw error}
+ finally{signal.removeEventListener('abort',cancel);reader.releaseLock()}
+}
+async function request(path,makeOptions,onHeaders){
+ let delay=250,attempt=0;const deadline=Date.now()+requestTimeoutMs;
  while(true){
   ensureOpen();const requestOptions=makeOptions(),controller=new AbortController(),external=requestOptions.signal;
   ensureOpen(external);const remaining=deadline-Date.now();if(remaining<=0)throw new Error('carrier retry deadline reached');
   const abort=()=>controller.abort();lifecycleController.signal.addEventListener('abort',abort,{once:true});if(external)external.addEventListener('abort',abort,{once:true});requestOptions.signal=controller.signal;
   ensureOpen(external);
-  const timer=setTimeout(abort,remaining);let retry=0,unavailable=false;
+  const timer=setTimeout(abort,remaining);let retry=0,unavailable=false,response=null;
   try{
-   const response=await fetch(relayOrigin+path,requestOptions);
-   if(response.status!==503)return response;
-   unavailable=true;retry=retryAfterMs(response);await response.arrayBuffer();
-  }catch(error){ensureOpen(external);if(++attempt===9)throw new Error('carrier retry limit reached')}
+   response=await fetch(relayOrigin+path,requestOptions);
+   if(response.status!==503){
+    if(onHeaders)onHeaders(response);
+    ensureOpen(controller.signal);
+    if(Date.now()>=deadline)throw new Error('response deadline reached');
+    let body=new ArrayBuffer(0);
+    if(response.status===200&&(path==='/api/v1/session'||path==='/api/v1/down')){
+     // The server can send one whole frame above the configured batch target.
+     body=await readResponse(response,path==='/api/v1/session'?8:Math.max(batchLimit,maxPayload+8),path==='/api/v1/session',controller.signal,deadline);
+     if(path==='/api/v1/down'&&body.byteLength>batchLimit&&splitFrames(body).length!==1)throw new Error('response batch exceeds its limit');
+    }else cancelResponse(response);
+    return {status:response.status,headers:response.headers,body};
+   }
+   unavailable=true;retry=retryAfterMs(response);cancelResponse(response);
+  }catch(error){controller.abort();cancelResponse(response);ensureOpen(external);if(response)throw error;if(++attempt===9)throw new Error('carrier retry limit reached')}
   finally{clearTimeout(timer);lifecycleController.signal.removeEventListener('abort',abort);if(external)external.removeEventListener('abort',abort)}
   ensureOpen(external);const backoffRemaining=deadline-Date.now();if(backoffRemaining<=0)throw new Error('carrier retry deadline reached');
   status('reconnecting');const backoff=Math.min(retry||(delay+Math.floor(Math.random()*Math.max(1,delay/4))),backoffRemaining);await pause(backoff,external);if(!unavailable)delay=Math.min(delay*2,5000);
@@ -440,10 +505,13 @@ function fail(){if(closed)return;status('failed');if(port)port.postMessage({t:'c
 async function createSession(first){
  try{
   status('connecting');
-  const response=await request('/api/v1/session',()=>options('POST',bootstrap,first));
-  if(response.status!==200||response.headers.get('X-Carrier-Mode')!==carrier)throw new Error('session creation rejected');
-  sessionToken=response.headers.get('X-Session-Token')||'';downCursor=response.headers.get('X-Down-Cursor')||'0';
-  const welcome=await response.arrayBuffer();
+  const response=await request('/api/v1/session',()=>options('POST',bootstrap,first),response=>{
+   if(response.status!==200||response.headers.get('X-Carrier-Mode')!==carrier)throw new Error('session creation rejected');
+   // Retain the cleanup token even if the body stalls or the page closes.
+   sessionToken=response.headers.get('X-Session-Token')||'';downCursor=response.headers.get('X-Down-Cursor')||'0';
+   if(closed)deleteSession();
+  });
+  const welcome=response.body;
   if(!sessionToken||welcome.byteLength!==8||new DataView(welcome).getUint8(0)!==17)throw new Error('invalid session creation');
   if(closed){deleteSession();return}port.postMessage(welcome,[welcome]);status('connected');
   if(carrier==='https-lanes')ensureLane(0);
@@ -476,7 +544,7 @@ async function poll(){
    const response=await request('/api/v1/down',()=>options('POST',sessionToken,null,{'X-Down-Cursor':downCursor},pollController.signal));
    if(response.status===204){status('connected');continue}
    if(response.status!==200)throw new Error('downlink rejected');
-   const next=response.headers.get('X-Down-Cursor')||'',data=await response.arrayBuffer(),frames=splitFrames(data);
+   const next=response.headers.get('X-Down-Cursor')||'',data=response.body,frames=splitFrames(data);
    if(!next||!frames.length)throw new Error('invalid downlink response');
    if(closed)return;port.postMessage({t:'traffic',up:0,down:data.byteLength});port.postMessage(data,[data]);downCursor=next;status('connected');
   }catch(error){if(!closed)fail();return}
@@ -526,14 +594,14 @@ async function pollLane(lane){
    const response=await request('/api/v1/down',()=>options('POST',sessionToken,null,{'X-Down-Cursor':lane.cursor,'X-Lane-ID':laneID},controller.signal));
    if(response.status===204){if(response.headers.get('X-Lane-Closed')==='1'){finishLane(lane);return}status('connected');continue}
    if(response.status!==200)throw new Error('lane downlink rejected');
-   const next=response.headers.get('X-Down-Cursor')||'',data=await response.arrayBuffer(),frames=splitFrames(data);
+   const next=response.headers.get('X-Down-Cursor')||'',data=response.body,frames=splitFrames(data);
    if(!next||!frames.length)throw new Error('invalid lane downlink response');
    for(const frame of frames)if(frame.id!==lane.id)throw new Error('cross-lane frame');
    if(closed)return;port.postMessage({t:'traffic',up:0,down:data.byteLength});port.postMessage(data,[data]);lane.cursor=next;status('connected');
   }
  }catch(error){if(!closed)fail()}finally{lane.polling=false;lane.controller=null}
 }
-function deleteSession(){if(sessionToken)fetch(relayOrigin+'/api/v1/session',options('DELETE',sessionToken,null,null,undefined,true)).catch(()=>{})}
+function deleteSession(){if(sessionToken)fetch(relayOrigin+'/api/v1/session',options('DELETE',sessionToken,null,null,undefined,true)).then(cancelResponse).catch(()=>{})}
 function close(notifyServer){
  if(closed)return;closed=true;lifecycleController.abort();if(pollController)pollController.abort();
  for(const lane of lanes.values())if(lane.controller)lane.controller.abort();

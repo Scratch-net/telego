@@ -240,6 +240,13 @@ The WebSocket target is `wss://<WEB host>/api/v1/ws`. The bridge sends the beare
 
 In `https` mode, the carrier uses serialized fetch requests and long polls. In `https-lanes` mode, it uses independent fetch and long-poll lanes.
 
+Session creation, uplink, and downlink requests each have a 90-second budget for retries, headers, and the complete response body.
+The bridge limits response bytes during the read. Session creation requires exactly eight bytes.
+Downlink batches use the configured byte target, with an exception for one whole protocol frame that exceeds this target.
+
+Each WebSocket has a 90-second deadline to open. This deadline ends when the connection opens and does not limit its lifetime.
+Page closure cancels pending body reads and WebSocket establishment.
+
 Without `backend`, WEB streams use the shared MTProxy session core directly. This path uses trusted client metadata and bounded queues inside Telego.
 
 If a deployment requires a local socket connection, set `backend` explicitly:

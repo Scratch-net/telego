@@ -774,6 +774,11 @@ Before a pull request, run `make test`.
 This command runs the local gnet patch regressions and the Telego tests in the three supported build modes.
 It does not run the upstream gnet test suite.
 
+Install Node.js 24 to include the WEB bridge behavior tests.
+These tests run the rendered JavaScript with simulated clocks and sockets. They require no npm packages.
+CI installs Node explicitly. If Node is absent, local Go tests skip the JavaScript tests.
+Node is not required to build or run Telego.
+
 The test runner sets `GOMAXPROCS=2`, one package at a time, two parallel tests, and a 120-second timeout per package.
 `GOMEMLIMIT=512MiB` is a soft Go runtime limit. It does not prevent an operating-system OOM.
 

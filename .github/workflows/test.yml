@@ -24,6 +24,12 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
+      - name: Set up Node for bridge behavior tests
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
       - name: Build
         run: go build -v ./...
 
