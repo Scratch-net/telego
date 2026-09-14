@@ -364,10 +364,16 @@ type middleEndClient struct {
 	retryDelay time.Duration
 	closed     bool
 
-	outputStallDeadline time.Time
-	inputAccounted      int64
-	outputAccounted     atomic.Int64
-	outputEvicting      atomic.Bool
+	outputStallDeadline          time.Time
+	responseLastWriteAt          time.Time
+	responseLastBufferDecreaseAt time.Time
+	responseWriteBytes           uint64
+	responseWriteEvents          uint64
+	responseOutputWait           middleend.ResponseOutputWait
+	responseOutputWaitSince      time.Time
+	inputAccounted               int64
+	outputAccounted              atomic.Int64
+	outputEvicting               atomic.Bool
 }
 
 func (h *ProxyHandler) commitAuthenticatedRoute(c clientEndpoint, ctx *ConnContext) gnet.Action {
@@ -601,11 +607,16 @@ func middleEndAddrPort(
 	return netip.AddrPortFrom(addr, addrPort.Port()), nil
 }
 
-func (h *ProxyHandler) handleMiddleEnd(c clientEndpoint, ctx *ConnContext) gnet.Action {
+func (h *ProxyHandler) handleMiddleEnd(c clientEndpoint, ctx *ConnContext) (result gnet.Action) {
 	client := ctx.middleEnd
 	if client == nil || client.binding == nil {
 		return gnet.Close
 	}
+	defer func() {
+		if result == gnet.Close {
+			client.reportResponsePressureOutput(c, h.maxWriteBuffer, false)
+		}
+	}()
 	if !client.reconcileInput(c) {
 		h.logger.Debug("[%s] Middle-End aggregate client input limit reached", ctx.LogPrefix())
 		return gnet.Close
@@ -710,6 +721,7 @@ func (h *ProxyHandler) handleMiddleEndToken(
 	}
 
 	if !client.outputHeadroom(c, h.maxWriteBuffer) {
+		client.observeResponseOutputWait(middleend.ResponseOutputClientBuffer)
 		if processedReason {
 			if err := client.finishToken(token); err != nil {
 				return false, gnet.Close
@@ -719,6 +731,7 @@ func (h *ProxyHandler) handleMiddleEndToken(
 		return true, gnet.None
 	}
 	if !client.frontend.reserveOutput() {
+		client.observeResponseOutputWait(middleend.ResponseOutputSharedBudget)
 		if processedReason {
 			if err := client.finishToken(token); err != nil {
 				return false, gnet.Close
@@ -734,11 +747,13 @@ func (h *ProxyHandler) handleMiddleEndToken(
 	outputReservation := int64(middleEndMaxEncodedResponse)
 	releaseOutput, prepared := prepareClientOutput(c, middleEndMaxEncodedResponse)
 	if !prepared {
+		client.observeResponseOutputWait(middleend.ResponseOutputCarrierBudget)
 		client.frontend.outputBudget.release(outputReservation)
 		client.armOutputRetry(c, client.frontend.stallTimeout)
 		return true, gnet.None
 	}
 	defer releaseOutput()
+	client.observeResponseOutputWait(middleend.ResponseOutputNotWaiting)
 
 	event, ok, err := token.TryNextEvent()
 	if err != nil {
@@ -822,6 +837,9 @@ func (c *middleEndClient) waitForOutput(connection clientEndpoint) bool {
 
 func (c *middleEndClient) refreshOutput(connection clientEndpoint, reservation int64) bool {
 	current, previous := c.reconcileOutput(connection, reservation)
+	if current < previous {
+		c.responseLastBufferDecreaseAt = time.Now()
+	}
 	if current == 0 {
 		c.resetOutputProgress()
 		return true
@@ -959,6 +977,9 @@ func (h *ProxyHandler) writeMiddleEndEvent(
 		h.logger.Debug("[%s] write Middle-End response: %v", ctx.LogPrefix(), err)
 		return gnet.Close
 	}
+	client.responseLastWriteAt = time.Now()
+	client.responseWriteBytes += uint64(len(wire))
+	client.responseWriteEvents++
 	if counter := ctx.TrafficOut(); counter != nil {
 		counter.Add(int64(payloadSize))
 	}
@@ -1133,6 +1154,7 @@ func (h *ProxyHandler) closeMiddleEnd(client *middleEndClient) {
 	// from being leased into the gap.
 	_ = client.binding.BeginClose()
 	frontend.mu.Unlock()
+	client.reportResponsePressureOutput(client.route.conn, h.maxWriteBuffer, true)
 	client.clearOwnerState()
 }
 

@@ -256,7 +256,8 @@ Telego logs route fallback, artifact failure, generation failure, failed physica
 
 ### Failure diagnostics
 
-Telego keeps a service-wide journal for physical-link failures, failed repair attempts, socket follow-ups, and capacity retirements. The journal retains the first 256 unacknowledged records across these event classes.
+Telego keeps a service-wide journal for physical-link failures, failed repair attempts, socket follow-ups, capacity retirements, and response-pressure evictions.
+The journal retains the first 256 unacknowledged records across these event classes.
 
 If the journal is full, Telego rejects new records and increases the dropped-record counter. Failure totals and the last-failure summary still advance.
 
@@ -279,6 +280,50 @@ Intentional cancellation by the caller, retirement, or shutdown does not count a
 Each retained repair failure uses INFO and contains its own safe error classification. If the repair-failure count increases, the monitor also emits a WARN summary. This summary does not assign the shared latest error to individual attempts.
 
 Records with `diagnostic_kind=slot_failure` contain the failure reason, affected-binding count, safe error classification, link age, peer EOF status, and previous client use.
+
+#### Response-pressure diagnostics
+
+Response pressure occurs when an incoming response exceeds a queue limit.
+Telego closes a selected client binding and discards its queued responses. The shared ME link stays active.
+These evictions do not increase physical-link failure or affected-binding counters.
+
+Each `diagnostic_kind=response_pressure` WARN record captures queue state before cleanup:
+
+- `pressure_limit` identifies the first failed check: `binding_items`, `binding_bytes`, `slot_items`, `slot_bytes`, `manager_items`, or `manager_bytes`.
+- `incoming_event_bytes` gives the size of the rejected response, including its ME event overhead.
+- The `incoming`, `victim`, `slot`, and `manager` response fields give queue occupancy and limits in items and bytes.
+- `dc`, `slot`, and `incarnation` identify the victim's physical link. The `incoming_*` fields identify the incoming response's link.
+- `victim_is_incoming` distinguishes an incoming binding from another buffered binding selected to release shared capacity.
+- `victim_queue_nonempty_since`, `victim_last_dequeue_at`, and dequeue totals describe queue consumption before eviction.
+- `victim_ready_queued` and `victim_ready_leased` show whether a readiness token waits for dispatch or belongs to a consumer.
+
+The frontend emits one `diagnostic_kind=response_pressure_output` INFO follow-up when it observes the eviction or closes the client.
+The tuple `generation_id`, `eviction_sequence`, and `eviction_observed_at` connects both records without a client identifier.
+Observer scheduling can place the follow-up before the eviction record in the journal.
+`observed_at` describes each observation separately. The follow-up does not describe client output at the earlier eviction time.
+
+The follow-up contains client and shared output accounting, the last successful response write, and the last observed buffer decrease.
+`client_output_wait` gives the last observed deferral reason: `none`, `client_buffer`, `shared_budget`, or `carrier_budget`.
+It also contains the deferral start time, retry state, stall deadline, and native-versus-WEB transport flag.
+Response write totals count encoded bytes accepted by the local write helper. They do not prove TCP acknowledgment or client delivery.
+`none` does not prove that the client consumed responses promptly.
+
+During terminal handling, `client_buffered_available=true` enables the live `client_output_buffered_bytes` field.
+During the close callback, this field is unavailable because transport cleanup can precede the callback. Cached accounting remains available.
+An absent follow-up does not prove an empty client buffer. Process termination or journal overflow can prevent its retention.
+
+Two counters retain totals across generation changes, including events rejected by a full diagnostic journal:
+
+| Metric | Meaning |
+|---|---|
+| `telego_middleend_response_pressure_evictions_total{limit}` | Client bindings closed by each response limit |
+| `telego_middleend_response_pressure_discarded_bytes_total{limit}` | Queued response bytes discarded from those bindings |
+
+Discarded bytes exclude the rejected incoming response and any data already queued in the frontend.
+The `limit` label has the six values above plus `unknown`. Metrics contain no client, generation, slot, or eviction identifiers.
+The existing `telego_middleend_manager_backpressure_events` gauge describes only current managers. Its value can decrease after generation retirement.
+
+#### Physical-link transport evidence
 
 The manager starts the age clock at initialization of the ready link. This age does not measure the full TCP connection lifetime.
 

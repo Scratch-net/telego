@@ -22,10 +22,12 @@ const (
 type GenerationDiagnosticKind string
 
 const (
-	GenerationDiagnosticSlotFailure       GenerationDiagnosticKind = "slot_failure"
-	GenerationDiagnosticSlotRepairFailure GenerationDiagnosticKind = "slot_repair_failure"
-	GenerationDiagnosticSlotSocket        GenerationDiagnosticKind = "slot_socket"
-	GenerationDiagnosticForcedRetirement  GenerationDiagnosticKind = "forced_retirement"
+	GenerationDiagnosticSlotFailure            GenerationDiagnosticKind = "slot_failure"
+	GenerationDiagnosticSlotRepairFailure      GenerationDiagnosticKind = "slot_repair_failure"
+	GenerationDiagnosticSlotSocket             GenerationDiagnosticKind = "slot_socket"
+	GenerationDiagnosticForcedRetirement       GenerationDiagnosticKind = "forced_retirement"
+	GenerationDiagnosticResponsePressure       GenerationDiagnosticKind = "response_pressure"
+	GenerationDiagnosticResponsePressureOutput GenerationDiagnosticKind = "response_pressure_output"
 )
 
 // GenerationSlotRepairStage identifies the operation which rejected a replacement.
@@ -44,6 +46,8 @@ const (
 // client identities, packets, or callbacks. Slot is a zero-based logical ordinal.
 // At records local observation time; Sequence records supervisor arrival order.
 type GenerationDiagnosticRecord struct {
+	Pressure        ResponsePressureDiagnostic
+	PressureOutput  ResponsePressureOutput
 	Sequence        uint64
 	FailureSequence uint64
 	Kind            GenerationDiagnosticKind

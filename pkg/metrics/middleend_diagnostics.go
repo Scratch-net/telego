@@ -10,6 +10,7 @@ import (
 )
 
 func registerMiddleEndDiagnosticMetrics(meter metric.Meter, provider MiddleEndStatsProvider) {
+	registerMiddleEndResponsePressureMetrics(meter, provider)
 	meter.Int64ObservableCounter("telego_middleend_diagnostic_records_dropped_total",
 		metric.WithDescription("ME diagnostic records rejected by the full journal during the service lifetime"),
 		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {

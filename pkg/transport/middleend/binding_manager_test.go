@@ -2939,6 +2939,13 @@ func TestFixedBindingManagerResponseSaturationFailsOnlyOffendingBinding(t *testi
 			if err != nil {
 				t.Fatal(err)
 			}
+			diagnostics := make(chan GenerationDiagnosticRecord, 3)
+			manager.state.generationID = 42
+			manager.state.generationRole = GenerationRoleActive
+			manager.state.responsePressureObserver = func(record GenerationDiagnosticRecord) {
+				_ = manager.Snapshot() // The observer must run outside the manager lock.
+				diagnostics <- record
+			}
 			if err := manager.Start(t.Context()); err != nil {
 				t.Fatal(err)
 			}
@@ -2990,6 +2997,43 @@ func TestFixedBindingManagerResponseSaturationFailsOnlyOffendingBinding(t *testi
 			defer cancel()
 			if _, nextErr := offendingBinding.NextEvent(ctx); !errors.Is(nextErr, ErrFixedBindingResponseBackpressure) {
 				t.Fatalf("NextEvent = %v", nextErr)
+			}
+			var record GenerationDiagnosticRecord
+			select {
+			case record = <-diagnostics:
+			case <-ctx.Done():
+				t.Fatal("missing eviction diagnostic")
+			}
+			wantLimit := map[string]ResponsePressureLimit{
+				"per binding items": ResponsePressureBindingItems, "per binding bytes": ResponsePressureBindingBytes,
+				"per slot items": ResponsePressureSlotItems, "per slot bytes": ResponsePressureSlotBytes,
+				"global items": ResponsePressureManagerItems, "global bytes": ResponsePressureManagerBytes,
+			}[test.name]
+			if record.Kind != GenerationDiagnosticResponsePressure || record.Pressure.Limit != wantLimit ||
+				record.GenerationID != 42 || record.Role != GenerationRoleActive || record.AffectedBindings != 1 ||
+				record.Pressure.EvictionSequence != 1 || record.Pressure.VictimIsIncoming == test.preserveIncoming {
+				t.Fatalf("eviction identity or classification = %+v", record)
+			}
+			if test.secondKind != 0 && (record.Pressure.Victim.Items != 1 || record.Pressure.QueueNonemptySince.IsZero()) {
+				t.Fatalf("eviction lost pre-cleanup victim queue: %+v", record.Pressure)
+			}
+			if test.secondSlot && (record.DCID != 1 || record.Pressure.IncomingDCID != 2) {
+				t.Fatalf("cross-slot eviction identity = %+v", record)
+			}
+			output := ResponsePressureOutput{At: time.Now(), BufferedAvailable: true, BufferedBytes: 123}
+			offendingBinding.ReportResponsePressureOutput(output)
+			offendingBinding.ReportResponsePressureOutput(output)
+			select {
+			case followup := <-diagnostics:
+				if followup.Kind != GenerationDiagnosticResponsePressureOutput || followup.Pressure != record.Pressure ||
+					followup.PressureOutput != output || followup.AffectedBindings != 0 {
+					t.Fatalf("output follow-up lost eviction evidence: %+v", followup)
+				}
+			case <-ctx.Done():
+				t.Fatal("missing output follow-up")
+			}
+			if len(diagnostics) != 0 {
+				t.Fatal("duplicate output follow-up")
 			}
 			if test.preserveIncoming {
 				event, nextErr := healthyBinding.NextEvent(ctx)

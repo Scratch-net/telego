@@ -727,6 +727,8 @@ To disable diagnostics, set `diagnostics = false`. Then restart Telego.
 | `telego_middleend_links` | Gauge | ME links by generation role, signed DC, and state |
 | `telego_middleend_slot_failure_total` | Counter | Physical-link failures |
 | `telego_middleend_slot_failure_affected_bindings_total` | Counter | Bindings terminated by physical-link failures |
+| `telego_middleend_response_pressure_evictions_total` | Counter | Bindings evicted by response queue limits, by `limit`, across generations |
+| `telego_middleend_response_pressure_discarded_bytes_total` | Counter | Queued response bytes discarded from evicted bindings, by `limit` |
 | `telego_middleend_forced_retirement_total` | Counter | Capacity retirements by `reason`: `artifact_capacity` or `recovery_capacity` |
 | `telego_middleend_forced_retirement_affected_bindings_total` | Counter | Bindings interrupted by capacity retirement, by `reason` |
 | `telego_middleend_diagnostic_records_dropped_total` | Counter | Diagnostic records rejected by the full journal. This metric has no labels. |

@@ -312,6 +312,8 @@ type fixedBindingManager struct {
 	responseBytesHighWater int
 
 	responseBackpressureEvents  uint64
+	responseEvictionSequence    uint64
+	responsePressureObserver    func(GenerationDiagnosticRecord)
 	controlBackpressureEvents   uint64
 	slotFailures                uint64
 	slotFailureAffectedBindings uint64
@@ -359,13 +361,18 @@ type clientBinding struct {
 	sourceIP     netip.Addr
 	connectionID int64
 
-	nextMu sync.Mutex
-	queue  []LinkEvent
-	head   int
-	items  int
-	bytes  int
-	notify chan struct{}
-	ops    sync.WaitGroup
+	nextMu                sync.Mutex
+	queue                 []LinkEvent
+	head                  int
+	items                 int
+	bytes                 int
+	responseNonemptySince time.Time
+	responseLastDequeueAt time.Time
+	responseDequeuedItems uint64
+	responseDequeuedBytes uint64
+	responsePressure      *GenerationDiagnosticRecord
+	notify                chan struct{}
+	ops                   sync.WaitGroup
 
 	request *preparedRequest
 	result  *ClientRequestResult
@@ -2473,6 +2480,9 @@ func (m *fixedBindingManager) popBindingEventLocked(binding *clientBinding) (Lin
 	binding.head = (binding.head + 1) % len(binding.queue)
 	size := event.ByteSize()
 	binding.items--
+	binding.responseLastDequeueAt = time.Now()
+	binding.responseDequeuedItems++
+	binding.responseDequeuedBytes += uint64(size)
 	binding.bytes -= size
 	binding.slot.pending--
 	binding.slot.bytes -= size
@@ -2480,6 +2490,7 @@ func (m *fixedBindingManager) popBindingEventLocked(binding *clientBinding) (Lin
 	m.pendingBytes -= size
 	if binding.items == 0 {
 		binding.head = 0
+		binding.responseNonemptySince = time.Time{}
 	}
 	m.releaseTerminalBindingLocked(binding)
 	return event, true
@@ -3043,7 +3054,10 @@ func (m *fixedBindingManager) routeEvent(slot *fixedBindingSlot, event LinkEvent
 	}
 	if err := m.enqueueEventLocked(binding, event); err != nil {
 		if errors.Is(err, ErrFixedBindingResponseBackpressure) {
+			var records [2]GenerationDiagnosticRecord
+			count := 1
 			victim := m.responsePressureVictimLocked(binding, event.ByteSize())
+			records[0] = m.responsePressureDiagnosticLocked(binding, victim, event.ByteSize())
 			m.evictBackpressuredBindingLocked(victim, err)
 			controlErr := m.queueControlLocked(victim.slot, nil, victim.connectionID)
 			if victim != binding {
@@ -3051,13 +3065,21 @@ func (m *fixedBindingManager) routeEvent(slot *fixedBindingSlot, event LinkEvent
 				// client. Its released charge is sufficient for this exact event,
 				// so preserve the incoming healthy response.
 				if retryErr := m.enqueueEventLocked(binding, event); retryErr != nil {
+					records[1] = m.responsePressureDiagnosticLocked(binding, binding, event.ByteSize())
+					count++
 					m.evictBackpressuredBindingLocked(binding, retryErr)
 					clearLinkEventPacket(&event)
 				}
 			} else {
 				clearLinkEventPacket(&event)
 			}
+			observer := m.responsePressureObserver
 			m.mu.Unlock()
+			if observer != nil {
+				for _, record := range records[:count] {
+					observer(record)
+				}
+			}
 			if errors.Is(controlErr, ErrFixedBindingSubmissionIDExhausted) {
 				m.exhaustSubmissionIDs()
 			}
@@ -3225,6 +3247,9 @@ func (m *fixedBindingManager) enqueueEventLocked(binding *clientBinding, event L
 	}
 	index := (binding.head + binding.items) % len(binding.queue)
 	binding.queue[index] = event
+	if binding.items == 0 {
+		binding.responseNonemptySince = time.Now()
+	}
 	binding.items++
 	binding.bytes += size
 	binding.slot.pending++
@@ -3461,6 +3486,7 @@ func (m *fixedBindingManager) clearBindingQueueLocked(binding *clientBinding) {
 	binding.head = 0
 	binding.items = 0
 	binding.bytes = 0
+	binding.responseNonemptySince = time.Time{}
 }
 
 func (m *fixedBindingManager) publishBindingTerminalLocked(binding *clientBinding, err error) {

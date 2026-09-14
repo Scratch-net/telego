@@ -104,7 +104,11 @@ func (m *middleEndMonitor) observe() {
 	if m.frontend != nil {
 		frontend = m.frontend.MiddleEndFrontendStats()
 	}
-	responseBackpressure, controlBackpressure := middleEndBackpressureTotals(snapshot.Supervisor)
+	_, controlBackpressure := middleEndBackpressureTotals(snapshot.Supervisor)
+	var responseBackpressure uint64
+	for _, evictions := range snapshot.Supervisor.ResponsePressureEvictions {
+		responseBackpressure += evictions
+	}
 	refreshSuccesses, refreshFailures, refreshCanceled := middleEndSlotRefreshTotals(snapshot.Supervisor)
 	current := middleEndMonitorCounters{
 		initialized:             true,

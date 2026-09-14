@@ -98,22 +98,24 @@ type GenerationForcedRetirementCounter struct {
 // slices are defensive sorted copies. Admitting is true only for a healthy
 // active generation.
 type GenerationSupervisorSnapshot struct {
-	Admitting                   bool
-	ActiveDCIDs                 []DCID
-	RetiringDCIDs               []DCID
-	Active                      *FixedBindingManagerSnapshot
-	Retiring                    *FixedBindingManagerSnapshot
-	Repairing                   bool
-	SlotFailures                uint64
-	SlotFailureAffectedBindings uint64
-	LastSlotFailure             FixedBindingSlotFailureSnapshot
-	SlotRepairSuccesses         uint64
-	SlotRepairFailures          uint64
-	DCs                         []FixedBindingDCSnapshot
-	LastError                   error
-	ForcedRetirements           []GenerationForcedRetirementCounter
-	LastForcedRetirement        GenerationForcedRetirementSnapshot
-	DiagnosticRecordsDropped    uint64
+	Admitting                      bool
+	ActiveDCIDs                    []DCID
+	RetiringDCIDs                  []DCID
+	Active                         *FixedBindingManagerSnapshot
+	Retiring                       *FixedBindingManagerSnapshot
+	Repairing                      bool
+	SlotFailures                   uint64
+	SlotFailureAffectedBindings    uint64
+	LastSlotFailure                FixedBindingSlotFailureSnapshot
+	SlotRepairSuccesses            uint64
+	SlotRepairFailures             uint64
+	DCs                            []FixedBindingDCSnapshot
+	LastError                      error
+	ForcedRetirements              []GenerationForcedRetirementCounter
+	LastForcedRetirement           GenerationForcedRetirementSnapshot
+	DiagnosticRecordsDropped       uint64
+	ResponsePressureEvictions      [ResponsePressureLimitCount]uint64
+	ResponsePressureDiscardedBytes [ResponsePressureLimitCount]uint64
 }
 
 // FixedBindingGenerationSupervisor owns one active and at most one retiring
@@ -132,23 +134,25 @@ type generationSupervisorState struct {
 	rootContext context.Context
 	cancelRoot  context.CancelFunc
 
-	mu                          sync.Mutex
-	active                      *supervisedGeneration
-	retiring                    *supervisedGeneration
-	sources                     []*supervisedGeneration
-	lastPlan                    *generationFactoryPlan
-	lastErr                     error
-	lastSlotFailure             FixedBindingSlotFailureSnapshot
-	slotFailures                uint64
-	slotFailureAffectedBindings uint64
-	repairing                   bool
-	closing                     bool
-	closeResult                 error
-	dcCounters                  map[DCID]FixedBindingDCSnapshot
-	forcedRetirements           [2]GenerationForcedRetirementCounter
-	lastForcedRetirement        GenerationForcedRetirementSnapshot
-	diagnostics                 generationDiagnosticJournal
-	nextGenerationID            uint64
+	mu                             sync.Mutex
+	active                         *supervisedGeneration
+	retiring                       *supervisedGeneration
+	sources                        []*supervisedGeneration
+	lastPlan                       *generationFactoryPlan
+	lastErr                        error
+	lastSlotFailure                FixedBindingSlotFailureSnapshot
+	slotFailures                   uint64
+	slotFailureAffectedBindings    uint64
+	repairing                      bool
+	closing                        bool
+	closeResult                    error
+	dcCounters                     map[DCID]FixedBindingDCSnapshot
+	forcedRetirements              [2]GenerationForcedRetirementCounter
+	lastForcedRetirement           GenerationForcedRetirementSnapshot
+	diagnostics                    generationDiagnosticJournal
+	responsePressureEvictions      [ResponsePressureLimitCount]uint64
+	responsePressureDiscardedBytes [ResponsePressureLimitCount]uint64
+	nextGenerationID               uint64
 
 	ready               chan struct{}
 	done                chan struct{}
@@ -442,6 +446,7 @@ func (s *generationSupervisorState) prepareGeneration(parent context.Context, fa
 	}
 	manager.state.slotFailureObserver = s.recordSlotFailure
 	manager.state.slotSocketObserver = s.recordSlotSocket
+	manager.state.responsePressureObserver = s.recordResponsePressure
 	manager.state.generationID = generationID
 	manager.state.generationRole = GenerationRoleCandidate
 	manager.state.slotRepairObserver = s.recordSlotRepair
@@ -1055,17 +1060,19 @@ func (s *FixedBindingGenerationSupervisor) Snapshot() GenerationSupervisorSnapsh
 	state := s.state
 	state.mu.Lock()
 	result := GenerationSupervisorSnapshot{
-		Admitting:                   healthyGeneration(state.active),
-		Repairing:                   state.repairing,
-		SlotFailures:                state.slotFailures,
-		SlotFailureAffectedBindings: state.slotFailureAffectedBindings,
-		LastSlotFailure:             state.lastSlotFailure,
-		SlotRepairSuccesses:         state.slotRepairSuccesses.Load(),
-		SlotRepairFailures:          state.slotRepairFailures.Load(),
-		LastError:                   state.lastErr,
-		ForcedRetirements:           slices.Clone(state.forcedRetirements[:]),
-		LastForcedRetirement:        state.lastForcedRetirement,
-		DiagnosticRecordsDropped:    state.diagnostics.dropped,
+		Admitting:                      healthyGeneration(state.active),
+		Repairing:                      state.repairing,
+		SlotFailures:                   state.slotFailures,
+		SlotFailureAffectedBindings:    state.slotFailureAffectedBindings,
+		LastSlotFailure:                state.lastSlotFailure,
+		SlotRepairSuccesses:            state.slotRepairSuccesses.Load(),
+		SlotRepairFailures:             state.slotRepairFailures.Load(),
+		LastError:                      state.lastErr,
+		ForcedRetirements:              slices.Clone(state.forcedRetirements[:]),
+		LastForcedRetirement:           state.lastForcedRetirement,
+		DiagnosticRecordsDropped:       state.diagnostics.dropped,
+		ResponsePressureEvictions:      state.responsePressureEvictions,
+		ResponsePressureDiscardedBytes: state.responsePressureDiscardedBytes,
 	}
 	var activeManager, retiringManager *FixedBindingManager
 	counters := make(map[DCID]FixedBindingDCSnapshot, len(state.dcCounters))

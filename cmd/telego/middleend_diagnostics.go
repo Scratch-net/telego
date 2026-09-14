@@ -76,6 +76,10 @@ func emitMiddleEndDiagnostic(logger middleEndDiagnosticLogger, record middleend.
 		return
 	}
 	event.Int("affected_bindings", record.AffectedBindings)
+	if record.Kind == middleend.GenerationDiagnosticResponsePressure || record.Kind == middleend.GenerationDiagnosticResponsePressureOutput {
+		emitMiddleEndResponsePressure(event, record)
+		return
+	}
 	if record.Kind == middleend.GenerationDiagnosticForcedRetirement {
 		event.
 			Str("retirement_reason", string(record.RetirementReason)).
