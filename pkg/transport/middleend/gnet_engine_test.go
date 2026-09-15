@@ -1039,6 +1039,9 @@ func TestGnetIndividualCloseRemovesRegistrationAndResources(t *testing.T) {
 			t.Fatalf("NewClientLink: %v", err)
 		}
 		link := clientLink.(*GnetClientLink)
+		if got := gnetRuntime.registeredLinkCount(); got != 1 {
+			t.Fatalf("created link count = %d", got)
+		}
 		if err := link.Start(newHarnessContext(t)); err != nil {
 			t.Fatalf("Start: %v", err)
 		}
@@ -1053,6 +1056,9 @@ func TestGnetIndividualCloseRemovesRegistrationAndResources(t *testing.T) {
 		gnetRuntime.mu.Unlock()
 		if registered {
 			t.Fatal("Done closed before runtime registration removal")
+		}
+		if got := gnetRuntime.registeredLinkCount(); got != 0 {
+			t.Fatalf("closed link count = %d", got)
 		}
 		if err := waitFakePeer(t, peer); err != nil {
 			t.Fatalf("fake peer: %v", err)

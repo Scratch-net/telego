@@ -1,0 +1,534 @@
+{
+  "format_version": 1,
+  "dashboards": {
+    "telego": {
+      "uid": "telego-dashboard",
+      "panels": [
+        {
+          "title": "ME response pool occupancy",
+          "description": "One service pool across all generations and frontend output. Includes reserved processing capacity. This is not RSS.",
+          "type": "stat",
+          "gridPos": {
+            "h": 5,
+            "w": 8,
+            "x": 0,
+            "y": 0
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "min": 0,
+              "noValue": "Metric unavailable"
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "label_replace(label_replace(telego_middleend_response_memory_used_bytes{job=\"telego\",instance=~\"$instance\"} / telego_middleend_response_memory_limit_bytes{job=\"telego\",instance=~\"$instance\"}, \"server\", \"VPS\", \"instance\", \"127[.]0[.]0[.]1:9090\"), \"server\", \"NAS\", \"instance\", \"nas\")",
+              "refId": "A",
+              "legendFormat": "{{server}} / retained / limit",
+              "instant": true
+            }
+          ],
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "value",
+            "graphMode": "none",
+            "textMode": "value_and_name"
+          }
+        },
+        {
+          "title": "ME response waits active",
+          "description": "Current admission wait intervals across client buffer, legacy shared output, WEB carrier, and processing reserve reasons.",
+          "type": "stat",
+          "gridPos": {
+            "h": 5,
+            "w": 8,
+            "x": 8,
+            "y": 0
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "min": 0,
+              "noValue": "Metric unavailable"
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "label_replace(label_replace(sum by (instance) (telego_middleend_response_admission_waits_active{job=\"telego\",instance=~\"$instance\"}), \"server\", \"VPS\", \"instance\", \"127[.]0[.]0[.]1:9090\"), \"server\", \"NAS\", \"instance\", \"nas\")",
+              "refId": "A",
+              "legendFormat": "{{server}} / active waits",
+              "instant": true
+            }
+          ],
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "value",
+            "graphMode": "none",
+            "textMode": "value_and_name"
+          }
+        },
+        {
+          "title": "ME output stall closures in selected period",
+          "description": "Closures after the output no-progress timeout. Shared memory pressure can close a binding earlier and has separate counters.",
+          "type": "stat",
+          "gridPos": {
+            "h": 5,
+            "w": 8,
+            "x": 16,
+            "y": 0
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "min": 0,
+              "noValue": "Metric unavailable"
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "label_replace(label_replace(sum by (instance) (increase(telego_middleend_response_output_stall_closures_total{job=\"telego\",instance=~\"$instance\"}[$__range])), \"server\", \"VPS\", \"instance\", \"127[.]0[.]0[.]1:9090\"), \"server\", \"NAS\", \"instance\", \"nas\")",
+              "refId": "A",
+              "legendFormat": "{{server}} / stall closures",
+              "instant": true
+            }
+          ],
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "value",
+            "graphMode": "none",
+            "textMode": "value_and_name"
+          }
+        }
+      ]
+    },
+    "telego-health": {
+      "uid": "telego-health",
+      "panels": [
+        {
+          "title": "ME shared response pool",
+          "description": "Charged retained capacity across generations and frontend output. Limit includes processing reserve. RSS remains in its separate panel.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 0
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "min": 0,
+              "noValue": "Metric unavailable"
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "label_replace(label_replace(telego_middleend_response_memory_used_bytes{job=\"telego\",instance=~\"$instance\"}, \"server\", \"VPS\", \"instance\", \"127[.]0[.]0[.]1:9090\"), \"server\", \"NAS\", \"instance\", \"nas\")",
+              "refId": "A",
+              "legendFormat": "{{server}} / retained",
+              "instant": false
+            },
+            {
+              "expr": "label_replace(label_replace(telego_middleend_response_memory_limit_bytes{job=\"telego\",instance=~\"$instance\"}, \"server\", \"VPS\", \"instance\", \"127[.]0[.]0[.]1:9090\"), \"server\", \"NAS\", \"instance\", \"nas\")",
+              "refId": "B",
+              "legendFormat": "{{server}} / limit",
+              "instant": false
+            },
+            {
+              "expr": "label_replace(label_replace(telego_middleend_response_memory_high_water_bytes{job=\"telego\",instance=~\"$instance\"}, \"server\", \"VPS\", \"instance\", \"127[.]0[.]0[.]1:9090\"), \"server\", \"NAS\", \"instance\", \"nas\")",
+              "refId": "C",
+              "legendFormat": "{{server}} / lifetime peak",
+              "instant": false
+            }
+          ],
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true,
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "title": "ME response memory classes",
+          "description": "Ordinary queues and output cannot consume the protected processing reserve. A zero control limit is valid because ordered CloseExternal uses an inline marker.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 0
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "min": 0,
+              "noValue": "Metric unavailable"
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "label_replace(label_replace(telego_middleend_response_memory_class_bytes{job=\"telego\",instance=~\"$instance\"}, \"server\", \"VPS\", \"instance\", \"127[.]0[.]0[.]1:9090\"), \"server\", \"NAS\", \"instance\", \"nas\")",
+              "refId": "A",
+              "legendFormat": "{{server}} / {{class}} used",
+              "instant": false
+            },
+            {
+              "expr": "label_replace(label_replace(telego_middleend_response_memory_class_limit_bytes{job=\"telego\",instance=~\"$instance\"}, \"server\", \"VPS\", \"instance\", \"127[.]0[.]0[.]1:9090\"), \"server\", \"NAS\", \"instance\", \"nas\")",
+              "refId": "B",
+              "legendFormat": "{{server}} / {{class}} limit",
+              "instant": false
+            }
+          ],
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true,
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "title": "ME retained response charge by stage",
+          "description": "Allocation charges include payload capacity, reservation headroom, and metadata. Persistent ME decoder buffers have a separate bound outside this pool.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "min": 0,
+              "noValue": "Metric unavailable"
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "label_replace(label_replace(telego_middleend_response_memory_stage_bytes{job=\"telego\",instance=~\"$instance\"}, \"server\", \"VPS\", \"instance\", \"127[.]0[.]0[.]1:9090\"), \"server\", \"NAS\", \"instance\", \"nas\")",
+              "refId": "A",
+              "legendFormat": "{{server}} / {{stage}}",
+              "instant": false
+            }
+          ],
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true,
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "title": "ME response admission waits active",
+          "description": "Unfinished wait intervals. Shared mode normally waits for processing_reserve; shared_budget identifies the legacy aggregate output allowance.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "min": 0,
+              "noValue": "Metric unavailable"
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "label_replace(label_replace(sum by (instance, reason) (telego_middleend_response_admission_waits_active{job=\"telego\",instance=~\"$instance\"}), \"server\", \"VPS\", \"instance\", \"127[.]0[.]0[.]1:9090\"), \"server\", \"NAS\", \"instance\", \"nas\")",
+              "refId": "A",
+              "legendFormat": "{{server}} / {{reason}}",
+              "instant": false
+            }
+          ],
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true,
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "title": "ME response wait entries and completions",
+          "description": "Each reason transition ends its prior interval. Client cleanup also completes an active interval.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 16
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "min": 0,
+              "noValue": "Metric unavailable"
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "label_replace(label_replace(sum by (instance, reason) (rate(telego_middleend_response_admission_waits_total{job=\"telego\",instance=~\"$instance\"}[$__rate_interval])), \"server\", \"VPS\", \"instance\", \"127[.]0[.]0[.]1:9090\"), \"server\", \"NAS\", \"instance\", \"nas\")",
+              "refId": "A",
+              "legendFormat": "{{server}} / {{reason}} started",
+              "instant": false
+            },
+            {
+              "expr": "label_replace(label_replace(sum by (instance, reason) (rate(telego_middleend_response_admission_waits_completed_total{job=\"telego\",instance=~\"$instance\"}[$__rate_interval])), \"server\", \"VPS\", \"instance\", \"127[.]0[.]0[.]1:9090\"), \"server\", \"NAS\", \"instance\", \"nas\")",
+              "refId": "B",
+              "legendFormat": "{{server}} / {{reason}} completed",
+              "instant": false
+            }
+          ],
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true,
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "title": "ME mean completed response wait",
+          "description": "Duration sum divided by completed interval count over the same rate window. No value means no completed waits or unavailable metrics. Active waits are separate.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 16
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "min": 0,
+              "noValue": "Metric unavailable"
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "label_replace(label_replace(sum by (instance, reason) (rate(telego_middleend_response_admission_wait_seconds_total{job=\"telego\",instance=~\"$instance\"}[$__rate_interval])) / (sum by (instance, reason) (rate(telego_middleend_response_admission_waits_completed_total{job=\"telego\",instance=~\"$instance\"}[$__rate_interval])) > 0), \"server\", \"VPS\", \"instance\", \"127[.]0[.]0[.]1:9090\"), \"server\", \"NAS\", \"instance\", \"nas\")",
+              "refId": "A",
+              "legendFormat": "{{server}} / {{reason}}",
+              "instant": false
+            }
+          ],
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true,
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "title": "ME pressure closures by selection rule (last hour)",
+          "description": "Shared pressure closure rule: stalled, above_fair_share, largest_backlog, or incoming_fallback. A soft share is not a fixed binding limit. Historical limit panels remain unchanged.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 24
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "min": 0,
+              "noValue": "Metric unavailable"
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "label_replace(label_replace(sum by (instance, rule) (increase(telego_middleend_response_pressure_selections_total{job=\"telego\",instance=~\"$instance\"}[1h])), \"server\", \"VPS\", \"instance\", \"127[.]0[.]0[.]1:9090\"), \"server\", \"NAS\", \"instance\", \"nas\")",
+              "refId": "A",
+              "legendFormat": "{{server}} / {{rule}}",
+              "instant": false
+            }
+          ],
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true,
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "title": "ME response budget charge reclaimed immediately (last hour)",
+          "description": "Charged bytes released synchronously by pressure closure, including reservation headroom and metadata. Deferred queue cleanup and later output release only change pool gauges. This is not physical memory returned to the OS.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 24
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "min": 0,
+              "noValue": "Metric unavailable"
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "label_replace(label_replace(sum by (instance, limit) (increase(telego_middleend_response_pressure_reclaimed_bytes_total{job=\"telego\",instance=~\"$instance\"}[1h])), \"server\", \"VPS\", \"instance\", \"127[.]0[.]0[.]1:9090\"), \"server\", \"NAS\", \"instance\", \"nas\")",
+              "refId": "A",
+              "legendFormat": "{{server}} / {{limit}}",
+              "instant": false
+            }
+          ],
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true,
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "title": "ME output stall closures (last hour)",
+          "description": "Output no-progress timeout closures, separate from earlier shared-pressure closures.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 32
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "min": 0,
+              "noValue": "Metric unavailable"
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "label_replace(label_replace(sum by (instance) (increase(telego_middleend_response_output_stall_closures_total{job=\"telego\",instance=~\"$instance\"}[1h])), \"server\", \"VPS\", \"instance\", \"127[.]0[.]0[.]1:9090\"), \"server\", \"NAS\", \"instance\", \"nas\")",
+              "refId": "A",
+              "legendFormat": "{{server}} / stall closures",
+              "instant": false
+            }
+          ],
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true,
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

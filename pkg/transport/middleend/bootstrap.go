@@ -170,6 +170,26 @@ func (b *ClientBootstrap) Start() ([]byte, error) {
 // fragmentation and returns partial consumption at the plaintext-to-encrypted
 // transition so the caller can immediately write Outbound before resuming.
 func (b *ClientBootstrap) Feed(data []byte) (int, BootstrapUpdate, error) {
+	return b.feed(data, nil, nil)
+}
+
+const maxBootstrapBorrowedFeedSize = 64 * 1024
+
+// feedFrames delivers borrowed post-handshake payloads synchronously. The
+// callbacks must not retain payloads, recursively feed, or directly fail or
+// retire the bootstrap. They may call Encode to reply, but must immediately
+// return any Encode error without accessing the now-invalid borrowed payload.
+// becameReady runs after checksum negotiation, before any frame callback.
+// Callback errors permanently fail the bootstrap. This path caps the CBC
+// plaintext allocation and does not build a retained post-handshake batch.
+func (b *ClientBootstrap) feedFrames(data []byte, becameReady func() error, frame func(Frame) error) (int, BootstrapUpdate, error) {
+	if frame == nil {
+		return 0, BootstrapUpdate{}, fmt.Errorf("%w: nil frame callback", ErrBootstrapState)
+	}
+	return b.feed(data[:min(len(data), maxBootstrapBorrowedFeedSize)], becameReady, frame)
+}
+
+func (b *ClientBootstrap) feed(data []byte, becameReady func() error, frame func(Frame) error) (int, BootstrapUpdate, error) {
 	var update BootstrapUpdate
 	if b == nil {
 		return 0, update, fmt.Errorf("%w: nil bootstrap", ErrBootstrapState)
@@ -183,7 +203,7 @@ func (b *ClientBootstrap) Feed(data []byte) (int, BootstrapUpdate, error) {
 	case clientBootstrapNonceSent:
 		return b.feedServerNonce(data)
 	case clientBootstrapHandshakeSent, clientBootstrapReady:
-		return b.feedEncrypted(data)
+		return b.feedEncrypted(data, becameReady, frame)
 	default:
 		return 0, update, b.fail(fmt.Errorf("%w: stage %d", ErrBootstrapState, b.stage))
 	}
@@ -269,9 +289,10 @@ func (b *ClientBootstrap) feedServerNonce(data []byte) (int, BootstrapUpdate, er
 	return consumed, update, nil
 }
 
-func (b *ClientBootstrap) feedEncrypted(data []byte) (int, BootstrapUpdate, error) {
+func (b *ClientBootstrap) feedEncrypted(data []byte, becameReady func() error, visit func(Frame) error) (int, BootstrapUpdate, error) {
 	var update BootstrapUpdate
 	consumed, plaintext := b.decrypter.Feed(data)
+	defer clear(plaintext)
 	for len(plaintext) != 0 {
 		fed, err := b.decoder.Feed(plaintext)
 		if err != nil {
@@ -281,7 +302,7 @@ func (b *ClientBootstrap) feedEncrypted(data []byte) (int, BootstrapUpdate, erro
 
 		progress := false
 		for {
-			frame, ok, err := b.decoder.Next()
+			frame, ok, err := b.decoder.nextBorrowed()
 			if err != nil {
 				return consumed, BootstrapUpdate{}, b.fail(err)
 			}
@@ -306,9 +327,21 @@ func (b *ClientBootstrap) feedEncrypted(data []byte) (int, BootstrapUpdate, erro
 				b.remoteProcessID = peer.Sender
 				b.stage = clientBootstrapReady
 				update.BecameReady = true
+				if becameReady != nil {
+					if err := becameReady(); err != nil {
+						return consumed, BootstrapUpdate{}, b.fail(err)
+					}
+				}
 				continue
 			}
-			update.Frames = append(update.Frames, frame)
+			if visit != nil {
+				if err := visit(frame); err != nil {
+					return consumed, BootstrapUpdate{}, b.fail(err)
+				}
+			} else {
+				frame.Payload = slices.Clone(frame.Payload)
+				update.Frames = append(update.Frames, frame)
+			}
 		}
 		if fed == 0 && !progress {
 			return consumed, BootstrapUpdate{}, b.fail(io.ErrNoProgress)

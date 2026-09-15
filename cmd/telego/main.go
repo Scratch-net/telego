@@ -158,7 +158,7 @@ func (c *RunCmd) Run() error {
 		shutdown, handler, errCh, err = gproxy.RunWithMiddleEnd(
 			&cfg,
 			logger,
-			middleEndRuntimeConfig.Frontend(middleEndService.Source()),
+			middleEndRuntimeConfig.FrontendForService(middleEndService),
 		)
 		if err != nil {
 			middleEndStatusMonitor.Stop()

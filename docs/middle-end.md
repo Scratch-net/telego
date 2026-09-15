@@ -184,12 +184,12 @@ Telego derives the operational limits below. Most installations do not need an o
 | Replacement preparation deadline | 10s | Bounds repair and refresh preparation, including the handshake and matching pong |
 | Public connections | 10,000 | `max-connections` can only reduce this value |
 | Link request queue | 4,096 items and 2MiB | Fixed for each physical link |
-| Link response queue | 4,096 items and 2MiB | Fixed for each physical link |
+| Standalone link event channel | 4,096 items and 2MiB | Production responses use the manager sink instead |
 | Manager request budget | 32MiB plus 16KiB | `queue-budget-mb` can reduce this budget |
-| Manager response budget | 32MiB plus 16KiB | `queue-budget-mb` can reduce this budget |
 | Frontend input budget | 32MiB plus 16KiB | Uses the same derived value |
-| Frontend output budget | 32MiB plus 16KiB | Uses the same derived value |
-| Response items for each binding | 768 | Fixed from the telemt route limit |
+| Shared response budget | 69,231,118 bytes on the current 64-bit build | `2Q` ordinary capacity plus a derived processing reserve, shared across generations and frontend output |
+| Response queue storage | 16 events per chunk | Each chunk and ownership record consumes shared capacity |
+| Client output stall timeout | 100s | Exhaustion of shared response capacity can require an earlier closure |
 | Endpoint dial timeout | 3s | Fixed from the official implementation |
 | NAT probe timeout | 5s | One shared STUN batch for private direct sockets |
 | NAT result cache | 10 minutes | Matches the public telemt cache period |
@@ -198,7 +198,8 @@ Telego derives the operational limits below. Most installations do not need an o
 | Live generation managers | 2 | Includes an unpublished candidate and managers with unfinished cleanup |
 | Retiring generation deadline | None | Healthy bindings remain until natural closure, failure, capacity retirement, or shutdown |
 
-The byte budgets are independent ceilings. Do not add them together as one shared queue.
+The response budget combines manager responses and frontend output in one service-wide pool.
+Request and frontend input budgets remain separate.
 
 The reported payload capacity includes the link queues for eight extra candidates per manager. Rotation reserves capacity for at most two managers.
 
@@ -211,6 +212,43 @@ For enrolled ME sockets, gnet can retain one descriptor per ME event loop after 
 This allowance covers only that close-completion interval. Bootstrap and enrollment can temporarily duplicate descriptors and require separate capacity.
 
 The `queue-budget-mb` range is 2 through 32. A value of `0` selects the default and its extra 16KiB permit.
+Call this derived queue value `Q`. With zero or omitted `queue-budget-mb`, ordinary response capacity is `2Q`: 67,141,632 bytes.
+The pool adds the reserve from `MiddleEndResponseProcessingBytes()`. The current 64-bit reserve is 2,089,486 bytes, for a total of 69,231,118 bytes.
+An explicit nonzero `queue-budget-mb` keeps a total response pool of `2Q`, including the reserve.
+For example, `queue-budget-mb: 8` supplies a 16MiB response pool. It preserves the separate 8MiB request and input budgets.
+The [memory-cap measurements](investigations/middleend-response-implementation-2026-09-15.md#separate-process-native-memory-caps) support this default. Local acceptance checks passed. Deployment remains pending.
+
+### Response admission and memory ownership
+
+Each binding borrows available response capacity. Production response admission has no fixed 2MiB or 768-event cutoff for a binding.
+The same pool covers active and retiring generations, replacement candidates, and frontend output.
+A temporary client pause can recover while its retained responses fit this pool.
+
+Admission reserves the response envelope, ownership handle, participant record, and queue chunk before allocation.
+The envelope includes the maximum output expansion for that response and its output metadata.
+The processing reserve admits one complete maximum-size encode, including plaintext and encrypted output at the same time.
+Smaller responses reserve their own size bounds. Native output and logical WEB output retain their charges until their allocations end.
+
+A partial output drain counts as progress. It does not release the full backing allocation charge.
+An accepted write does not prove client receipt or output drain.
+When a binding closes, its remaining output and detached queue storage stay charged until their owners release them.
+Each manager has one cleanup worker. Manager shutdown waits for that worker to finish.
+
+An inline `CloseExternal` marker follows all accepted responses without another response allocation.
+Client output caps defer response processing. They preserve response order and the existing no-progress timeout.
+Request and outbound control limits retain their previous behavior.
+
+### Bounds outside the response pool
+
+The decoder capacity is separate from the response pool. Let `M = MaxMEFrameSize`, currently 1,044,576 bytes.
+Each physical link retains at most `M` bytes of decoder storage.
+Each concurrently active ME owner can temporarily retain another `M` bytes during decoder growth and 64KiB of CBC plaintext.
+This bound includes active, retiring, and candidate links. The decoder releases its retained storage when the bootstrap retires.
+
+WEB has a separate 512MiB global carrier allowance by default. WEB handoff can retain carrier storage after logical output releases its response allocation.
+Requests, frontend input, protocol state, runtime overhead, and kernel socket buffers also remain outside the response pool.
+The response limit is not a process RSS limit or an absolute guarantee against OOM.
+The [implementation report](investigations/middleend-response-implementation-2026-09-15.md) separates tested allocation bounds from the remaining load and memory validation.
 
 ## Metrics and logs
 
@@ -222,6 +260,7 @@ Enable the Prometheus listener to inspect ME state. Start with these metrics:
 | `telego_middleend_frontend_routes_active` | Current `middleend` and `direct_fallback` public routes |
 | `telego_middleend_frontend_route_commits_total` | Lifetime route selections |
 | `telego_middleend_links` | Physical links by generation role, signed DC, and state |
+| `telego_middleend_runtime_links` | Registered runtime links, including unpublished generation and refresh candidates |
 | `telego_middleend_slot_failure_total` | Physical-link failures during the service lifetime |
 | `telego_middleend_slot_failure_affected_bindings_total` | Bindings that physical-link failures terminated |
 | `telego_middleend_forced_retirement_total` | Capacity retirements by `reason`: `artifact_capacity` or `recovery_capacity` |
@@ -235,8 +274,31 @@ Enable the Prometheus listener to inspect ME state. Start with these metrics:
 | `telego_middleend_artifact_state` | Applied and pending artifact state |
 | `telego_middleend_artifact_refresh_total` | Artifact refresh results |
 | `telego_middleend_generation_apply_total` | Coordinator results for generation application, including adoption after background recovery |
+| `telego_middleend_response_memory_used_bytes` | Current response budget charge in the one service pool |
+| `telego_middleend_response_memory_limit_bytes` | Combined response limit, including protected reserves |
+| `telego_middleend_response_memory_high_water_bytes` | Lifetime maximum response budget charge |
+| `telego_middleend_response_memory_class_bytes{class}` | Current ordinary, processing, or control charge |
+| `telego_middleend_response_memory_class_limit_bytes{class}` | Capacity for each memory class |
+| `telego_middleend_response_memory_stage_bytes{stage}` | Retained charge for queues, decoding, encoding, output, in-flight data, or participant metadata |
+| `telego_middleend_response_admission_waits_total{reason}` | Entries into each admission wait reason |
+| `telego_middleend_response_admission_waits_completed_total{reason}` | Completed wait intervals, including intervals that end during client cleanup |
+| `telego_middleend_response_admission_wait_seconds_total{reason}` | Duration of completed wait intervals |
+| `telego_middleend_response_admission_waits_active{reason}` | Wait intervals that remain open |
+| `telego_middleend_response_output_stall_closures_total` | Client closures after the output no-progress timeout |
+| `telego_middleend_response_pressure_selections_total{rule}` | Closures by the shared selection rule, including incoming fallback |
+| `telego_middleend_response_pressure_reclaimed_bytes_total{limit}` | Charged bytes released synchronously by pressure closure |
 
-The queue metrics report current use, capacity, and lifetime high-water values. Telego logs thresholds at 80%, 95%, and 100%.
+The queue metrics report current use, capacity, and lifetime high-water values.
+For shared responses, Telego logs the service pool high-water thresholds at 80%, 95%, and 100%.
+It does not compare shared manager responses against the removed local response limits.
+Shared response gauges contain no generation or role labels. Rotation does not multiply the response pool.
+The generic `decode` stage does not include persistent production decoder storage. That storage has the separate per-link bound above.
+The `reason` labels are `client_buffer`, `shared_budget`, `carrier_budget`, and `processing_reserve`.
+`shared_budget` describes the legacy aggregate output allowance. Shared response encoding normally waits for `processing_reserve` instead.
+Average completed wait duration uses the duration counter divided by the completed interval counter over the same interval.
+Active waits remain separate because their final durations are not yet known.
+The reclaimed counter includes released reservation headroom and metadata. It does not measure physical memory returned to the operating system.
+Deferred queue cleanup and later output release change the pool gauges. They do not increase the synchronous reclaimed counter.
 
 The ready-link metric counts the current link during candidate preparation. Candidate reservations appear separately in `telego_middleend_slot_refreshes_active`.
 
@@ -283,19 +345,48 @@ Records with `diagnostic_kind=slot_failure` contain the failure reason, affected
 
 #### Response-pressure diagnostics
 
-Response pressure occurs when an incoming response exceeds a queue limit.
+Response pressure occurs when an incoming response cannot reserve shared ordinary capacity.
+The selector checks current free capacity under the pool lock before it selects a victim.
+If another owner already released sufficient capacity, admission retries without an eviction.
 Telego closes a selected client binding and discards its queued responses. The shared ME link stays active.
 These evictions do not increase physical-link failure or affected-binding counters.
 
+The selector first prefers queued backlog that can cover the required release.
+Queued backlog also ranks before output-only backlog.
+Fresh output observations then rank stalled consumers before consumers above their soft fair share.
+Retained size and a stable connection order resolve the remaining ties. A fair share is a preference, not a binding limit.
+An empty healthy binding or an owner with only an encode in flight cannot supply a pressure victim.
+The selector considers backlog across generations and makes at most four global selection attempts for one incoming response.
+
+Before closure, the manager checks that the selected binding still has backlog.
+After closure, admission checks actual free capacity and the incoming binding state again.
+An asynchronous output close supplies no immediate capacity credit.
+If bounded attempts cannot admit the incoming response, Telego closes its binding instead of silently losing bytes on an open connection.
+
 Each `diagnostic_kind=response_pressure` WARN record captures queue state before cleanup:
 
-- `pressure_limit` identifies the first failed check: `binding_items`, `binding_bytes`, `slot_items`, `slot_bytes`, `manager_items`, or `manager_bytes`.
+- `pressure_limit=shared_budget` identifies exhaustion of shared ordinary response capacity.
+- The legacy values `binding_items`, `binding_bytes`, `slot_items`, `slot_bytes`, `manager_items`, and `manager_bytes` remain available for historical metrics and standalone managers.
 - `incoming_event_bytes` gives the size of the rejected response, including its ME event overhead.
-- The `incoming`, `victim`, `slot`, and `manager` response fields give queue occupancy and limits in items and bytes.
+- The `incoming`, `victim`, `slot`, and `manager` response fields give logical queue occupancy in items and bytes.
+- Legacy records also include local queue limits. Shared-budget records omit these unenforced limits.
 - `dc`, `slot`, and `incarnation` identify the victim's physical link. The `incoming_*` fields identify the incoming response's link.
 - `victim_is_incoming` distinguishes an incoming binding from another buffered binding selected to release shared capacity.
 - `victim_queue_nonempty_since`, `victim_last_dequeue_at`, and dequeue totals describe queue consumption before eviction.
 - `victim_ready_queued` and `victim_ready_leased` show whether a readiness token waits for dispatch or belongs to a consumer.
+
+Shared-budget records also contain allocation evidence from the selection:
+
+- `selection_rule` gives `stalled`, `above_fair_share`, `largest_backlog`, or `incoming_fallback`.
+- `selection_observed_at`, `response_pool_*`, and `response_ordinary_*` describe the selected pool snapshot.
+- `required_additional_bytes` gives the new ordinary charge. `required_reclaim_bytes` gives its shortage at selection.
+- `soft_fair_share_bytes` and `scanned_participants` describe the selection work.
+- `victim_*_retained_bytes` and `victim_retained_bytes` describe charged allocation capacity. They include reservation headroom and metadata.
+- `victim_output_unread_bytes` and `victim_output_wait` describe the latest owner observation.
+- `victim_observation_available` and `victim_progress_available` identify known timestamps. Their corresponding age fields appear only when those timestamps exist.
+- `reclaimed_retained_bytes` counts charged bytes released synchronously by this closure. It excludes deferred cleanup and later output release.
+
+Selection evidence and frontend follow-up evidence describe different times. Neither converts a scheduled close into immediate capacity credit.
 
 The frontend emits one `diagnostic_kind=response_pressure_output` INFO follow-up when it observes the eviction or closes the client.
 The tuple `generation_id`, `eviction_sequence`, and `eviction_observed_at` connects both records without a client identifier.
@@ -303,7 +394,7 @@ Observer scheduling can place the follow-up before the eviction record in the jo
 `observed_at` describes each observation separately. The follow-up does not describe client output at the earlier eviction time.
 
 The follow-up contains client and shared output accounting, the last successful response write, and the last observed buffer decrease.
-`client_output_wait` gives the last observed deferral reason: `none`, `client_buffer`, `shared_budget`, or `carrier_budget`.
+`client_output_wait` gives the last observed deferral reason: `none`, `client_buffer`, `shared_budget`, `carrier_budget`, or `processing_reserve`.
 It also contains the deferral start time, retry state, stall deadline, and native-versus-WEB transport flag.
 Response write totals count encoded bytes accepted by the local write helper. They do not prove TCP acknowledgment or client delivery.
 `none` does not prove that the client consumed responses promptly.
@@ -316,11 +407,12 @@ Two counters retain totals across generation changes, including events rejected 
 
 | Metric | Meaning |
 |---|---|
-| `telego_middleend_response_pressure_evictions_total{limit}` | Client bindings closed by each response limit |
+| `telego_middleend_response_pressure_evictions_total{limit}` | Client bindings closed by shared pressure or a legacy response limit |
 | `telego_middleend_response_pressure_discarded_bytes_total{limit}` | Queued response bytes discarded from those bindings |
 
 Discarded bytes exclude the rejected incoming response and any data already queued in the frontend.
-The `limit` label has the six values above plus `unknown`. Metrics contain no client, generation, slot, or eviction identifiers.
+The `limit` label contains `shared_budget`, the six legacy values, and `unknown`.
+Metrics contain no client, generation, slot, or eviction identifiers.
 The existing `telego_middleend_manager_backpressure_events` gauge describes only current managers. Its value can decrease after generation retirement.
 
 #### Physical-link transport evidence

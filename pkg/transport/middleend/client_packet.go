@@ -316,11 +316,8 @@ func newClientPacketEncoder(
 // responses receive zero to three fresh random bytes, matching
 // tcp_rpc_write_packet_compact in Telegram's net/net-tcp-rpc-common.c.
 func (e *ClientPacketEncoder) Encode(packet []byte) ([]byte, error) {
-	if len(packet) < 4 || len(packet)%4 != 0 {
-		return nil, fmt.Errorf("%w: response packet length %d", ErrInvalidClientPacket, len(packet))
-	}
-	if len(packet) > e.maxPacketSize {
-		return nil, fmt.Errorf("%w: %d > %d", ErrClientPacketTooLarge, len(packet), e.maxPacketSize)
+	if _, err := e.EncodedSizeBound(len(packet)); err != nil {
+		return nil, err
 	}
 
 	switch e.connectionType {
@@ -335,6 +332,32 @@ func (e *ClientPacketEncoder) Encode(packet []byte) ([]byte, error) {
 		return e.encodePaddedIntermediatePacket(packet)
 	default:
 		return nil, fmt.Errorf("%w: 0x%08x", ErrUnsupportedClientFraming, uint32(e.connectionType))
+	}
+}
+
+// EncodedSizeBound plans one response without consuming padding randomness.
+func (e *ClientPacketEncoder) EncodedSizeBound(packetBytes int) (int, error) {
+	if packetBytes < 4 || packetBytes%4 != 0 {
+		return 0, fmt.Errorf("%w: response packet length %d", ErrInvalidClientPacket, packetBytes)
+	}
+	if packetBytes > e.maxPacketSize {
+		return 0, fmt.Errorf("%w: %d > %d", ErrClientPacketTooLarge, packetBytes, e.maxPacketSize)
+	}
+	switch e.connectionType {
+	case obfuscated2.ConnectionTypeAbridged:
+		if packetBytes/4 > 0xffffff {
+			return 0, fmt.Errorf("%w: abridged word count %d", ErrClientPacketTooLarge, packetBytes/4)
+		}
+		if packetBytes/4 <= 0x7e {
+			return packetBytes + 1, nil
+		}
+		return packetBytes + maxClientPacketHeaderSize, nil
+	case obfuscated2.ConnectionTypeIntermediate:
+		return packetBytes + maxClientPacketHeaderSize, nil
+	case obfuscated2.ConnectionTypePaddedIntermediate:
+		return packetBytes + maxClientPacketHeaderSize + 3, nil
+	default:
+		return 0, fmt.Errorf("%w: 0x%08x", ErrUnsupportedClientFraming, uint32(e.connectionType))
 	}
 }
 

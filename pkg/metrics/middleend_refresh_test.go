@@ -99,7 +99,11 @@ func newMiddleEndRefreshScraper(t *testing.T, source MiddleEndStatsProvider) fun
 			t.Errorf("shutdown metrics: %v", err)
 		}
 	})
-	registerMiddleEndMetrics(provider.Meter("telego-refresh-test"), source)
+	meter := provider.Meter("telego-refresh-test")
+	registerMiddleEndMetrics(meter, source)
+	if frontend, ok := source.(middleEndFrontendStatsProvider); ok {
+		registerMiddleEndFrontendMetrics(meter, frontend)
+	}
 	handler := promhttp.HandlerFor(registry, promhttp.HandlerOpts{})
 	return func() string {
 		response := httptest.NewRecorder()

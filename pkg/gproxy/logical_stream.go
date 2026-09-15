@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/panjf2000/gnet/v2"
 )
@@ -22,6 +23,16 @@ type LogicalQueueBudget struct {
 	Reserve func(bytes, items int) bool
 	Release func(bytes, items int)
 }
+
+// Each node retains one complete allocation until its last byte is read.
+// The ME response envelope also charges this metadata before enqueueing it.
+type logicalOutputEntry struct {
+	data    []byte
+	next    *logicalOutputEntry
+	release func(error)
+}
+
+const logicalOwnedOutputMetadataBytes = int64(unsafe.Sizeof(logicalOutputEntry{}))
 
 // LogicalStreamOptions supplies trusted process-local ingress metadata. The
 // owner remains fixed across HTTP requests, carrier lanes, and reconnects.
@@ -83,7 +94,8 @@ type LogicalStream struct {
 	// Output reservations can originate on the direct DC loop. Queue reads
 	// and writes remain on the client owner; counters cover both stages.
 	outputMu       sync.Mutex
-	output         [][]byte
+	output         *logicalOutputEntry
+	outputLast     *logicalOutputEntry
 	outputOffset   int
 	outputBytes    int
 	outputCapacity int
@@ -291,11 +303,18 @@ func (s *LogicalStream) finish(err error) {
 		s.input = nil
 	}
 	s.outputMu.Lock()
-	bytes, items := s.outputCapacity, s.outputItems
-	s.output, s.outputBytes, s.outputCapacity, s.outputItems = nil, 0, 0, 0
+	output := s.output
+	s.output, s.outputLast = nil, nil
+	s.outputOffset, s.outputBytes, s.outputCapacity, s.outputItems = 0, 0, 0, 0
 	s.outputMu.Unlock()
-	if bytes != 0 || items != 0 {
-		s.options.OutputBudget.Release(bytes, items)
+	for output != nil {
+		next := output.next
+		s.releaseOutputEntry(output, err)
+		output = next
+	}
+	if s.preparedOutput != 0 {
+		s.releaseOutput(s.preparedOutput, 1)
+		s.preparedOutput = 0
 	}
 	s.notifyOpened(err)
 	s.options.Notify()
@@ -436,26 +455,27 @@ func (s *LogicalStream) TryRead(dst []byte) (int, error) {
 		return 0, net.ErrClosed
 	}
 	s.outputMu.Lock()
-	if len(s.output) == 0 || len(dst) == 0 {
+	if s.output == nil || len(dst) == 0 {
 		s.outputMu.Unlock()
 		return 0, nil
 	}
-	data := s.output[0]
-	n := copy(dst[:min(len(dst), 64*1024)], data[s.outputOffset:])
+	entry := s.output
+	n := copy(dst[:min(len(dst), 64*1024)], entry.data[s.outputOffset:])
 	s.outputOffset += n
 	s.outputBytes -= n
-	released := 0
-	if s.outputOffset == len(data) {
-		released = cap(data)
-		s.output[0] = nil
-		s.output = s.output[1:]
+	drained := s.outputOffset == len(entry.data)
+	if drained {
+		s.output = entry.next
+		if s.output == nil {
+			s.outputLast = nil
+		}
 		s.outputOffset = 0
-		s.outputCapacity -= released
+		s.outputCapacity -= cap(entry.data)
 		s.outputItems--
 	}
 	s.outputMu.Unlock()
-	if released > 0 {
-		s.options.OutputBudget.Release(released, 1)
+	if drained {
+		s.releaseOutputEntry(entry, nil)
 	}
 	_ = s.schedule()
 	return n, nil
@@ -535,27 +555,89 @@ func (s *LogicalStream) releaseOutput(bytes, items int) {
 }
 
 func (s *LogicalStream) writeReserved(data []byte) error {
+	return s.writeReservedOutput(data, false, nil)
+}
+
+func (s *LogicalStream) writeReservedOutput(data []byte, owned bool, release func(error)) error {
+	capacity := len(data)
+	if owned {
+		capacity = cap(data)
+	}
 	s.outputMu.Lock()
 	if s.requestedClose.Load() {
 		s.outputMu.Unlock()
-		s.releaseOutput(len(data), 1)
+		s.releaseOutput(capacity, 1)
 		return net.ErrClosed
 	}
-	if len(data) > s.reservedBytes || s.reservedItems == 0 {
+	if capacity > s.reservedBytes || s.reservedItems == 0 {
 		s.outputMu.Unlock()
 		return io.ErrShortBuffer
 	}
-	buffer := make([]byte, len(data))
-	copy(buffer, data)
-	s.reservedBytes -= len(data)
+	buffer := data
+	if !owned {
+		buffer = make([]byte, len(data))
+		copy(buffer, data)
+	}
+	entry := &logicalOutputEntry{data: buffer, release: release}
+	s.reservedBytes -= capacity
 	s.reservedItems--
-	s.output = append(s.output, buffer)
+	if s.outputLast == nil {
+		s.output = entry
+	} else {
+		s.outputLast.next = entry
+	}
+	s.outputLast = entry
 	s.outputBytes += len(data)
-	s.outputCapacity += len(data)
+	s.outputCapacity += capacity
 	s.outputItems++
 	s.outputMu.Unlock()
 	s.options.Notify()
 	return nil
+}
+
+// releaseOutputEntry runs outside outputMu, after detaching the entry. Its
+// private ME callback may only clear data and release budgets or atomic
+// counters. It must not call stream methods because ownerMu can be held.
+func (s *LogicalStream) releaseOutputEntry(entry *logicalOutputEntry, err error) {
+	capacity, release := cap(entry.data), entry.release
+	*entry = logicalOutputEntry{}
+	s.options.OutputBudget.Release(capacity, 1)
+	if release != nil {
+		release(err)
+	}
+}
+
+// writeMiddleEndOwned transfers ciphertext ownership without copying. Call
+// it only on the stream owner. The release callback runs exactly once, even
+// on rejection, after the stream has stopped retaining the allocation.
+// The callback follows the restrictions documented by releaseOutputEntry.
+func (s *LogicalStream) writeMiddleEndOwned(data []byte, release func(error)) (n int, err error) {
+	defer func() {
+		if (err != nil || len(data) == 0) && release != nil {
+			release(err)
+		}
+	}()
+	if s.finished || s.requestedClose.Load() {
+		return 0, net.ErrClosed
+	}
+	if len(data) == 0 {
+		return 0, nil
+	}
+	capacity := cap(data)
+	reservation := s.preparedOutput
+	if reservation != 0 {
+		if capacity > reservation {
+			return 0, io.ErrShortBuffer
+		}
+		s.preparedOutput = 0
+		s.releaseOutput(reservation-capacity, 0)
+	} else if s.reserveOutput(capacity, capacity) == 0 {
+		return 0, io.ErrShortBuffer
+	}
+	if err := s.writeReservedOutput(data, true, release); err != nil {
+		return 0, err
+	}
+	return len(data), nil
 }
 
 func (s *LogicalStream) Write(data []byte) (int, error) {

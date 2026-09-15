@@ -23,6 +23,12 @@ Telego charges each complete allocation until its release callback runs. Partial
 Buffer operations unlink the complete processed batch before release callbacks run. These callbacks can reenter the connection without duplicate writes.
 Ordinary `Write` and `AsyncWrite` retain their existing copy semantics.
 
+Unix write and close operations collect at most 1,024 descriptors before each system call.
+Each event loop has one fixed descriptor array: 24KiB on 64-bit systems and 12KiB on 32-bit systems.
+The owner clears its descriptor references before release callbacks run, so reentrant writes reuse the array safely.
+Public buffer `Peek` methods retain their existing behavior.
+Close still disposes all remaining output nodes synchronously. This change bounds descriptor collection, not total close work.
+
 `ExecuteHighPriority` submits owned writes through the Unix high-priority FIFO queue.
 Unsupported owners, including the Windows owner, return an error instead of an unordered fallback.
 

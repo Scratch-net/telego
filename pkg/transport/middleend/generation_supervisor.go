@@ -116,6 +116,8 @@ type GenerationSupervisorSnapshot struct {
 	DiagnosticRecordsDropped       uint64
 	ResponsePressureEvictions      [ResponsePressureLimitCount]uint64
 	ResponsePressureDiscardedBytes [ResponsePressureLimitCount]uint64
+	ResponsePressureReclaimedBytes [ResponsePressureLimitCount]uint64
+	ResponsePressureSelections     [ResponsePressureSelectionReasonCount]uint64
 }
 
 // FixedBindingGenerationSupervisor owns one active and at most one retiring
@@ -152,6 +154,8 @@ type generationSupervisorState struct {
 	diagnostics                    generationDiagnosticJournal
 	responsePressureEvictions      [ResponsePressureLimitCount]uint64
 	responsePressureDiscardedBytes [ResponsePressureLimitCount]uint64
+	responsePressureReclaimedBytes [ResponsePressureLimitCount]uint64
+	responsePressureSelections     [ResponsePressureSelectionReasonCount]uint64
 	nextGenerationID               uint64
 
 	ready               chan struct{}
@@ -1073,6 +1077,8 @@ func (s *FixedBindingGenerationSupervisor) Snapshot() GenerationSupervisorSnapsh
 		DiagnosticRecordsDropped:       state.diagnostics.dropped,
 		ResponsePressureEvictions:      state.responsePressureEvictions,
 		ResponsePressureDiscardedBytes: state.responsePressureDiscardedBytes,
+		ResponsePressureReclaimedBytes: state.responsePressureReclaimedBytes,
+		ResponsePressureSelections:     state.responsePressureSelections,
 	}
 	var activeManager, retiringManager *FixedBindingManager
 	counters := make(map[DCID]FixedBindingDCSnapshot, len(state.dcCounters))

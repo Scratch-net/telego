@@ -194,8 +194,8 @@ func (m *fixedBindingManager) refreshSlot(parent context.Context, attempt *slotR
 	}
 	// Hold the manager lock across the incumbent snapshot: otherwise a stale
 	// response can enqueue and submit a close between the link and queue checks.
-	// GnetClientLink.Snapshot only takes its link lock; the link publishes events
-	// through a channel and never calls back into this manager while locked.
+	// GnetClientLink.Snapshot only takes its link lock. Response delivery calls
+	// the manager only after releasing that lock.
 	if !refreshLinkIdle(attempt.oldLink.Snapshot()) {
 		m.mu.Unlock()
 		canceled = true
@@ -205,6 +205,10 @@ func (m *fixedBindingManager) refreshSlot(parent context.Context, attempt *slotR
 		ordinal: old.ordinal, incarnation: old.incarnation + 1,
 		dcID: old.dcID, sourceIP: replacement.SourceIP, link: link, events: events, capacity: capacity,
 		requestWake: make(chan struct{}, 1), bindings: make(map[*clientBinding]struct{}), consumerDone: make(chan struct{}),
+	}
+	if err := m.installResponseSinkLocked(current, link, events); err != nil {
+		m.mu.Unlock()
+		return
 	}
 	m.initializeSlotRefreshLocked(current, index, time.Now())
 	m.order[index] = current

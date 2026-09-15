@@ -229,6 +229,12 @@ func (a ProxyAnswer) MarshalBinary() ([]byte, error) {
 
 // ParseProxyAnswer decodes a strict RPC_PROXY_ANS payload.
 func ParseProxyAnswer(wire []byte) (ProxyAnswer, error) {
+	return parseProxyAnswer(wire, true)
+}
+
+// parseProxyAnswer can borrow the packet from its validated RPC payload.
+// A borrowed packet must be consumed before its source frame is reused.
+func parseProxyAnswer(wire []byte, clonePacket bool) (ProxyAnswer, error) {
 	var answer ProxyAnswer
 	if err := validateRPCPayload(wire, ProxyAnswerHeaderSize); err != nil {
 		return answer, err
@@ -241,9 +247,12 @@ func ParseProxyAnswer(wire []byte) (ProxyAnswer, error) {
 		return ProxyAnswer{}, err
 	}
 	answer.ConnectionID = int64(binary.LittleEndian.Uint64(wire[8:16]))
-	answer.Packet = slices.Clone(wire[ProxyAnswerHeaderSize:])
+	answer.Packet = wire[ProxyAnswerHeaderSize:len(wire):len(wire)]
 	if len(answer.Packet) > MaxClientPacketSize {
 		return ProxyAnswer{}, fmt.Errorf("%w: proxy answer packet %d exceeds %d", ErrClientPacketTooLarge, len(answer.Packet), MaxClientPacketSize)
+	}
+	if clonePacket {
+		answer.Packet = slices.Clone(answer.Packet)
 	}
 	return answer, nil
 }

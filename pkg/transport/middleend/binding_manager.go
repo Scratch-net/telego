@@ -282,6 +282,12 @@ type fixedBindingManager struct {
 	generationID   uint64
 	generationRole GenerationRole
 	limits         FixedBindingLimits
+	responseBudget *ResponseBudget
+	reclaimHead    *responseQueueChunk
+	reclaimTail    *responseQueueChunk
+	reclaimReady   chan struct{}
+	reclaimDone    chan struct{}
+	reclaimClosing bool
 	state          fixedBindingManagerState
 	// slots retains the first configured slot for focused diagnostics and
 	// compatibility with single-link generations. slotGroups owns the complete
@@ -363,6 +369,11 @@ type clientBinding struct {
 
 	nextMu                sync.Mutex
 	queue                 []LinkEvent
+	queueAllocation       *ResponseAllocation
+	responseQueueHead     *responseQueueChunk
+	responseQueueTail     *responseQueueChunk
+	responseParticipant   *ResponseParticipant
+	responseHeadEpoch     uint64
 	head                  int
 	items                 int
 	bytes                 int
@@ -377,24 +388,25 @@ type clientBinding struct {
 	request *preparedRequest
 	result  *ClientRequestResult
 
-	readyPrev        *clientBinding
-	readyNext        *clientBinding
-	readyQueued      bool
-	readyLeased      bool
-	readyEpoch       uint64
-	reservationEpoch uint64
-	consumerMode     fixedBindingConsumerMode
-	terminalObserved bool
-	resident         bool
-	active           bool
-	localClosing     bool
-	remoteClosed     bool
-	terminal         bool
-	terminalErr      error
-	closeStarted     bool
-	closeDone        chan struct{}
-	closeResult      error
-	closeSet         bool
+	readyPrev          *clientBinding
+	readyNext          *clientBinding
+	readyQueued        bool
+	readyLeased        bool
+	readyEpoch         uint64
+	reservationEpoch   uint64
+	consumerMode       fixedBindingConsumerMode
+	terminalObserved   bool
+	resident           bool
+	active             bool
+	localClosing       bool
+	remoteClosed       bool
+	remoteClosePending bool
+	terminal           bool
+	terminalErr        error
+	closeStarted       bool
+	closeDone          chan struct{}
+	closeResult        error
+	closeSet           bool
 }
 
 type fixedBindingConsumerMode uint8
@@ -669,10 +681,26 @@ func NewFixedBindingManager(slots []FixedBindingSlot, limits FixedBindingLimits)
 	return newFixedBindingManager(slots, limits, nil)
 }
 
+// NewFixedBindingManagerWithResponseBudget shares response ownership with other
+// generations and frontend output. Consumers must release every dequeued event.
+// A nil budget preserves the standalone constructor's legacy behavior.
+func NewFixedBindingManagerWithResponseBudget(slots []FixedBindingSlot, limits FixedBindingLimits, budget *ResponseBudget) (*FixedBindingManager, error) {
+	return newFixedBindingManagerWithResponseBudget(slots, limits, nil, budget)
+}
+
 func newFixedBindingManager(
 	slots []FixedBindingSlot,
 	limits FixedBindingLimits,
 	repairLink fixedBindingSlotRepair,
+) (*FixedBindingManager, error) {
+	return newFixedBindingManagerWithResponseBudget(slots, limits, repairLink, nil)
+}
+
+func newFixedBindingManagerWithResponseBudget(
+	slots []FixedBindingSlot,
+	limits FixedBindingLimits,
+	repairLink fixedBindingSlotRepair,
+	budget *ResponseBudget,
 ) (*FixedBindingManager, error) {
 	if err := limits.Validate(); err != nil {
 		return nil, err
@@ -697,6 +725,9 @@ func newFixedBindingManager(
 
 	manager := &fixedBindingManager{
 		limits:           limits,
+		responseBudget:   budget,
+		reclaimReady:     make(chan struct{}, 1),
+		reclaimDone:      make(chan struct{}),
 		state:            fixedBindingManagerCreated,
 		accepting:        true,
 		coverageEnabled:  true,
@@ -859,7 +890,21 @@ func (m *fixedBindingManager) startFirst(ctx context.Context) error {
 	m.ensureConsumers()
 	m.mu.Lock()
 	starting := m.state == fixedBindingManagerStarting
+	var sinkErr error
+	if starting {
+		for _, slot := range m.order {
+			if err := m.installResponseSinkLocked(slot, slot.link, slot.events); err != nil {
+				sinkErr = fmt.Errorf("%w: DC %d response sink: %w", ErrFixedBindingInitialFailure, slot.dcID, err)
+				break
+			}
+		}
+	}
 	m.mu.Unlock()
+	if sinkErr != nil {
+		m.beginTerminal(sinkErr)
+		<-m.done
+		return m.waitStartResult()
+	}
 	if !starting {
 		<-m.done
 		return m.waitStartResult()
@@ -918,6 +963,9 @@ func (m *fixedBindingManager) publishStartLocked(result error) {
 
 func (m *fixedBindingManager) ensureConsumers() {
 	m.consumersOnce.Do(func() {
+		if m.responseBudget != nil {
+			go m.reclaimResponses()
+		}
 		for _, slot := range m.order {
 			m.consumers.Go(func() {
 				m.consumeSlot(slot)
@@ -1528,6 +1576,10 @@ func (m *fixedBindingManager) repairSlot(ctx context.Context, slot *fixedBinding
 		slot.controlItems != 0 || slot.controlBytes != 0 || slot.probe != nil {
 		m.mu.Unlock()
 		return fmt.Errorf("%w: DC %d failed slot retained outbound work", ErrFixedBindingSlotRepair, slot.dcID)
+	}
+	if err := m.installResponseSinkLocked(slot, link, events); err != nil {
+		m.mu.Unlock()
+		return fmt.Errorf("%w: DC %d install replacement response sink: %w", ErrFixedBindingSlotRepair, slot.dcID, err)
 	}
 	slot.link = link
 	slot.sourceIP = replacement.SourceIP
@@ -2287,7 +2339,68 @@ func (t *ClientReadyToken) TryTakeRequestResult() (ClientRequestResult, bool, er
 	return result, true, nil
 }
 
+// ClientResponseHead describes one queue head without exposing packet storage.
+// Its private identity is valid only for its originating readiness lease.
+type ClientResponseHead struct {
+	Kind        LinkEventKind
+	PacketBytes int
+	token       *clientReadyToken
+	epoch       uint64
+}
+
+// TryPeekResponse allows size admission before taking packet ownership.
+func (t *ClientReadyToken) TryPeekResponse() (ClientResponseHead, bool, error) {
+	if t == nil || t.state == nil || t.state.manager == nil {
+		return ClientResponseHead{}, false, ErrFixedBindingReadyToken
+	}
+	m := t.state.manager
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, binding, err := t.validateLocked()
+	if err != nil {
+		return ClientResponseHead{}, false, err
+	}
+	if binding.consumerMode == fixedBindingConsumerBlocking {
+		return ClientResponseHead{}, false, ErrFixedBindingConsumerMode
+	}
+	event, available := binding.responseHeadLocked()
+	if !available {
+		return ClientResponseHead{}, false, nil
+	}
+	return ClientResponseHead{Kind: event.Kind, PacketBytes: len(event.Packet), token: t.state, epoch: binding.responseHeadEpoch}, true, nil
+}
+
+// TryTakeResponse takes only the previously inspected queue head. Concurrent
+// cancellation returns unavailable; it never substitutes another response.
+func (t *ClientReadyToken) TryTakeResponse(head ClientResponseHead) (LinkEvent, bool, error) {
+	if t == nil || t.state == nil || t.state.manager == nil || head.token != t.state {
+		return LinkEvent{}, false, ErrFixedBindingReadyToken
+	}
+	m := t.state.manager
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, binding, err := t.validateLocked()
+	if err != nil {
+		return LinkEvent{}, false, err
+	}
+	if binding.consumerMode == fixedBindingConsumerBlocking {
+		return LinkEvent{}, false, ErrFixedBindingConsumerMode
+	}
+	event, available := binding.responseHeadLocked()
+	if !available || binding.responseHeadEpoch != head.epoch {
+		return LinkEvent{}, false, nil
+	}
+	if head.Kind != event.Kind || head.PacketBytes != len(event.Packet) {
+		return LinkEvent{}, false, ErrFixedBindingReadyToken
+	}
+	binding.consumerMode = fixedBindingConsumerToken
+	event, ok := m.popBindingEventLocked(binding)
+	return event, ok, nil
+}
+
 // TryNextEvent takes at most one retained response without blocking.
+// Queue counters release immediately. Allocation ownership transfers to the
+// caller, which must call event.Release after it stops retaining the packet.
 func (t *ClientReadyToken) TryNextEvent() (LinkEvent, bool, error) {
 	if t == nil || t.state == nil || t.state.manager == nil {
 		return LinkEvent{}, false, ErrFixedBindingReadyToken
@@ -2326,7 +2439,7 @@ func (t *ClientReadyToken) TryTerminal() (error, bool, error) {
 		m.mu.Unlock()
 		return nil, false, nil
 	}
-	if binding.items != 0 || binding.result != nil || binding.request != nil {
+	if binding.hasResponseLocked() || binding.result != nil || binding.request != nil {
 		m.mu.Unlock()
 		return nil, false, nil
 	}
@@ -2360,7 +2473,7 @@ func (t *ClientReadyToken) Ack() error {
 }
 
 func (m *fixedBindingManager) bindingHasReadyReasonLocked(binding *clientBinding) bool {
-	tokenEvents := binding.consumerMode != fixedBindingConsumerBlocking && binding.items > 0
+	tokenEvents := binding.consumerMode != fixedBindingConsumerBlocking && binding.hasResponseLocked()
 	tokenTerminal := binding.consumerMode != fixedBindingConsumerBlocking && binding.terminal && !binding.terminalObserved
 	return tokenEvents || tokenTerminal || binding.result != nil ||
 		(binding.request != nil && binding.request.phase == preparedRequestReserved && !binding.request.handed)
@@ -2417,8 +2530,10 @@ func (m *fixedBindingManager) unlinkReadyLocked(binding *clientBinding) {
 	}
 }
 
-// NextEvent returns the next retained response in order and releases its exact
-// item and ByteSize charge. It returns io.EOF after an orderly local, remote,
+// NextEvent returns the next retained response in order and releases its queued
+// item and ByteSize counters. Allocation ownership transfers to the caller,
+// which must call event.Release after it stops retaining the packet.
+// It returns io.EOF after an orderly local, remote,
 // or manager close once the response queue is empty. Slot failures are sticky.
 // One goroutine may call NextEvent for a binding.
 func (b *ClientBinding) NextEvent(ctx context.Context) (LinkEvent, error) {
@@ -2471,15 +2586,42 @@ func (b *clientBinding) nextEvent(ctx context.Context) (LinkEvent, error) {
 	}
 }
 
+func (binding *clientBinding) hasResponseLocked() bool {
+	return binding.items != 0 || binding.remoteClosePending
+}
+
+func (binding *clientBinding) responseHeadLocked() (LinkEvent, bool) {
+	if binding.items != 0 {
+		if binding.responseQueueHead != nil {
+			chunk := binding.responseQueueHead
+			return chunk.events[chunk.head], true
+		}
+		return binding.queue[binding.head], true
+	}
+	if binding.remoteClosePending {
+		return LinkEvent{Kind: LinkEventCloseExternal, ConnectionID: binding.connectionID}, true
+	}
+	return LinkEvent{}, false
+}
+
 func (m *fixedBindingManager) popBindingEventLocked(binding *clientBinding) (LinkEvent, bool) {
-	if binding.items == 0 {
+	event, available := binding.responseHeadLocked()
+	if !available {
 		return LinkEvent{}, false
 	}
-	event := binding.queue[binding.head]
-	binding.queue[binding.head] = LinkEvent{}
-	binding.head = (binding.head + 1) % len(binding.queue)
+	if binding.items != 0 {
+		if binding.responseQueueHead != nil {
+			binding.popSharedResponseLocked()
+		} else {
+			binding.queue[binding.head] = LinkEvent{}
+			binding.head = (binding.head + 1) % len(binding.queue)
+		}
+		binding.items--
+	} else {
+		binding.remoteClosePending = false
+	}
+	binding.responseHeadEpoch++
 	size := event.ByteSize()
-	binding.items--
 	binding.responseLastDequeueAt = time.Now()
 	binding.responseDequeuedItems++
 	binding.responseDequeuedBytes += uint64(size)
@@ -2490,7 +2632,16 @@ func (m *fixedBindingManager) popBindingEventLocked(binding *clientBinding) (Lin
 	m.pendingBytes -= size
 	if binding.items == 0 {
 		binding.head = 0
-		binding.responseNonemptySince = time.Time{}
+		if !binding.remoteClosePending {
+			binding.responseNonemptySince = time.Time{}
+		}
+		m.releaseBindingQueueAllocationLocked(binding)
+	}
+	if event.ResponseAllocation != nil {
+		_ = event.ResponseAllocation.TryMove(ResponseMemoryOrdinary, ResponseMemoryInflight)
+	}
+	if binding.terminal && !binding.hasResponseLocked() {
+		binding.detachResponseParticipantLocked()
 	}
 	m.releaseTerminalBindingLocked(binding)
 	return event, true
@@ -2551,6 +2702,7 @@ func (b *clientBinding) beginClose() {
 	}
 	b.closeStarted = true
 	b.localClosing = true
+	b.detachResponseParticipantLocked()
 	m.detachActiveBindingLocked(b)
 	m.clearBindingQueueLocked(b)
 	b.result = nil
@@ -2758,6 +2910,13 @@ func (m *fixedBindingManager) closeAll() {
 	m.requestBytes = 0
 	m.controlItems = 0
 	m.controlBytes = 0
+	if m.responseBudget != nil {
+		m.reclaimClosing = true
+		m.signalReclaimLocked()
+		m.mu.Unlock()
+		<-m.reclaimDone
+		m.mu.Lock()
+	}
 	m.closeResult = errors.Join(closeErrors...)
 	m.state = fixedBindingManagerClosed
 	close(m.done)
@@ -2969,8 +3128,14 @@ func (m *fixedBindingManager) signalSlotLocked(slot *fixedBindingSlot) {
 }
 
 func (m *fixedBindingManager) routeEvent(slot *fixedBindingSlot, event LinkEvent) error {
+	return m.routeEventIncarnation(slot, nil, event)
+}
+
+// Event-channel identity guards the physical incarnation at every routing
+// mutation. Repair reuses slot pointers, while refresh replaces them.
+func (m *fixedBindingManager) routeEventIncarnation(slot *fixedBindingSlot, events <-chan LinkEvent, event LinkEvent) error {
 	m.mu.Lock()
-	retired := slot.retired
+	retired := slot.retired || events != nil && slot.events != events
 	m.mu.Unlock()
 	if retired {
 		clearLinkEventPacket(&event)
@@ -2982,10 +3147,11 @@ func (m *fixedBindingManager) routeEvent(slot *fixedBindingSlot, event LinkEvent
 	}
 	switch event.Kind {
 	case LinkEventPing:
+		clearLinkEventPacket(&event)
 		return nil
 	case LinkEventPong:
 		m.mu.Lock()
-		if m.state != fixedBindingManagerClosing && m.state != fixedBindingManagerClosed && !slot.failed && !slot.retired {
+		if m.state != fixedBindingManagerClosing && m.state != fixedBindingManagerClosed && !slot.failed && !slot.retired && (events == nil || slot.events == events) {
 			probe := slot.probe
 			if probe != nil && probe.submitted && probe.id == event.KeepaliveID {
 				slot.lastProbe.lastPongAt = time.Now()
@@ -2993,13 +3159,14 @@ func (m *fixedBindingManager) routeEvent(slot *fixedBindingSlot, event LinkEvent
 			}
 		}
 		m.mu.Unlock()
+		clearLinkEventPacket(&event)
 		return nil
 	case LinkEventProxyAnswer, LinkEventSimpleAck, LinkEventCloseExternal:
 	default:
 		return fmt.Errorf("%w: DC %d emitted event kind %d", ErrFixedBindingProtocol, slot.dcID, event.Kind)
 	}
 	m.mu.Lock()
-	if m.state == fixedBindingManagerClosing || m.state == fixedBindingManagerClosed || slot.failed || slot.retired {
+	if m.state == fixedBindingManagerClosing || m.state == fixedBindingManagerClosed || slot.failed || slot.retired || events != nil && slot.events != events {
 		m.mu.Unlock()
 		clearLinkEventPacket(&event)
 		return nil
@@ -3052,7 +3219,30 @@ func (m *fixedBindingManager) routeEvent(slot *fixedBindingSlot, event LinkEvent
 		m.mu.Unlock()
 		return nil
 	}
+	if m.responseBudget != nil && event.Kind == LinkEventCloseExternal {
+		// The inline marker is part of the already bounded resident binding.
+		// It requires no queue growth and remains ordered after all payloads.
+		binding.remoteClosePending = true
+		binding.remoteClosed = true
+		if binding.items == 0 {
+			binding.responseNonemptySince = time.Now()
+		}
+		binding.bytes += ClosePayloadSize
+		binding.slot.pending++
+		binding.slot.bytes += ClosePayloadSize
+		m.pending++
+		m.pendingBytes += ClosePayloadSize
+		m.recordResponseHighWaterLocked(binding.slot)
+		m.detachActiveBindingLocked(binding)
+		m.publishBindingTerminalLocked(binding, nil)
+		m.mu.Unlock()
+		event.Release()
+		return nil
+	}
 	if err := m.enqueueEventLocked(binding, event); err != nil {
+		if errors.Is(err, ErrFixedBindingResponseBackpressure) && m.responseBudget != nil {
+			return m.retrySharedResponseLocked(slot, events, binding, event)
+		}
 		if errors.Is(err, ErrFixedBindingResponseBackpressure) {
 			var records [2]GenerationDiagnosticRecord
 			count := 1
@@ -3102,9 +3292,9 @@ func (m *fixedBindingManager) routeEvent(slot *fixedBindingSlot, event LinkEvent
 	return nil
 }
 
-func (m *fixedBindingManager) evictBackpressuredBindingLocked(binding *clientBinding, cause error) {
+func (m *fixedBindingManager) evictBackpressuredBindingLocked(binding *clientBinding, cause error) int {
 	m.detachActiveBindingLocked(binding)
-	m.clearBindingQueueLocked(binding)
+	released := m.clearBindingQueueLocked(binding)
 	binding.result = nil
 	m.invalidateReadyLocked(binding)
 	if binding.request != nil {
@@ -3112,6 +3302,7 @@ func (m *fixedBindingManager) evictBackpressuredBindingLocked(binding *clientBin
 	}
 	m.publishBindingTerminalLocked(binding, cause)
 	m.releaseTerminalBindingLocked(binding)
+	return released
 }
 
 func (m *fixedBindingManager) responsePressureVictimLocked(incoming *clientBinding, incomingBytes int) *clientBinding {
@@ -3219,34 +3410,105 @@ func (m *fixedBindingManager) enqueueEventLocked(binding *clientBinding, event L
 	if size <= 0 {
 		return fmt.Errorf("%w: invalid event size", ErrFixedBindingProtocol)
 	}
-	if binding.items >= m.limits.MaxPendingResponseItemsPerBinding ||
-		size > m.limits.MaxPendingResponseBytesPerBinding-binding.bytes {
+	if m.responseBudget == nil && (binding.items >= m.limits.MaxPendingResponseItemsPerBinding ||
+		size > m.limits.MaxPendingResponseBytesPerBinding-binding.bytes) {
 		m.responseBackpressureEvents++
 		return fmt.Errorf("%w: binding %d", ErrFixedBindingResponseBackpressure, binding.connectionID)
 	}
-	if binding.slot.pending >= m.limits.MaxPendingResponseItemsPerSlot ||
-		size > m.limits.MaxPendingResponseBytesPerSlot-binding.slot.bytes {
+	if m.responseBudget == nil && (binding.slot.pending >= m.limits.MaxPendingResponseItemsPerSlot ||
+		size > m.limits.MaxPendingResponseBytesPerSlot-binding.slot.bytes) {
 		m.responseBackpressureEvents++
 		return fmt.Errorf("%w: DC %d", ErrFixedBindingResponseBackpressure, binding.slot.dcID)
 	}
-	if m.pending >= m.limits.MaxPendingResponseItems ||
-		size > m.limits.MaxPendingResponseBytes-m.pendingBytes {
+	if m.responseBudget == nil && (m.pending >= m.limits.MaxPendingResponseItems ||
+		size > m.limits.MaxPendingResponseBytes-m.pendingBytes) {
 		m.responseBackpressureEvents++
 		return fmt.Errorf("%w: global", ErrFixedBindingResponseBackpressure)
 	}
+	allocation := event.ResponseAllocation
+	adopt := m.responseBudget != nil && allocation != nil && allocation.budget == m.responseBudget
+	if adopt {
+		// Reject malformed ownership before any capacity failure can trigger
+		// global selection. The caller exclusively owns this incoming handle.
+		m.responseBudget.mu.Lock()
+		valid := !allocation.released && allocation.bytes >= ResponseAllocationCharge(cap(event.Packet)) &&
+			(allocation.owner == nil || allocation.owner == binding.responseParticipant)
+		m.responseBudget.mu.Unlock()
+		if !valid {
+			return fmt.Errorf("%w: invalid response allocation ownership", ErrFixedBindingProtocol)
+		}
+	}
+	if m.responseBudget != nil && binding.responseParticipant == nil {
+		participant, ok := m.responseBudget.registerParticipant(binding.connectionID, binding)
+		if !ok {
+			m.responseBackpressureEvents++
+			return fmt.Errorf("%w: response participant metadata", ErrFixedBindingResponseBackpressure)
+		}
+		binding.responseParticipant = participant
+	}
+	capacity := len(event.Packet)
+	if m.responseBudget != nil {
+		var err error
+		descriptor := event
+		if !adopt {
+			descriptor.Packet = descriptor.Packet[:len(descriptor.Packet):len(descriptor.Packet)]
+		}
+		capacity, err = responseEventAllocationCapacity(descriptor)
+		if err != nil {
+			return err
+		}
+	}
+	if adopt {
+		if !allocation.AssignOwner(binding.responseParticipant) {
+			return fmt.Errorf("%w: foreign response allocation owner", ErrFixedBindingProtocol)
+		}
+		if allocation.Bytes() < ResponseAllocationCharge(cap(event.Packet)) {
+			return fmt.Errorf("%w: undersized response allocation", ErrFixedBindingProtocol)
+		}
+		if !allocation.TryMoveAtLeast(capacity, ResponseMemoryOrdinary, ResponseMemoryInflight) {
+			m.responseBackpressureEvents++
+			return fmt.Errorf("%w: response allocation transfer", ErrFixedBindingResponseBackpressure)
+		}
+	} else {
+		allocation = nil
+		if capacity > 0 {
+			var ok bool
+			allocation, ok = m.responseBudget.TryReserveFor(binding.responseParticipant, capacity, ResponseMemoryOrdinary, ResponseMemoryInflight)
+			if !ok {
+				m.responseBackpressureEvents++
+				return fmt.Errorf("%w: response allocation capacity", ErrFixedBindingResponseBackpressure)
+			}
+		}
+	}
 	if err := m.growBindingQueueLocked(binding); err != nil {
+		if !adopt {
+			allocation.Release()
+		}
 		return err
 	}
-	if event.Kind == LinkEventProxyAnswer && event.Packet != nil {
+	if !adopt && event.Kind == LinkEventProxyAnswer && event.Packet != nil {
 		// ByteSize charges len(Packet). Detach from any oversized backing array
 		// before retention so the manager-owned capacity has the same bound.
 		packet := make([]byte, len(event.Packet))
 		copy(packet, event.Packet)
-		clear(event.Packet)
+		event.Release()
 		event.Packet = packet
+		event.ResponseAllocation = allocation
+	} else if !adopt {
+		// ACKs retain their promotion envelope even without packet storage.
+		// The former delivery owner ends at successful enqueue.
+		event.Release()
+		event.ResponseAllocation = allocation
 	}
-	index := (binding.head + binding.items) % len(binding.queue)
-	binding.queue[index] = event
+	if m.responseBudget != nil {
+		chunk := binding.responseQueueTail
+		chunk.events[chunk.tail] = event
+		chunk.tail++
+		_ = allocation.TryMove(ResponseMemoryOrdinary, ResponseMemoryQueuePayload)
+	} else {
+		index := (binding.head + binding.items) % len(binding.queue)
+		binding.queue[index] = event
+	}
 	if binding.items == 0 {
 		binding.responseNonemptySince = time.Now()
 	}
@@ -3262,6 +3524,9 @@ func (m *fixedBindingManager) enqueueEventLocked(binding *clientBinding, event L
 }
 
 func (m *fixedBindingManager) growBindingQueueLocked(binding *clientBinding) error {
+	if m.responseBudget != nil {
+		return m.growSharedResponseQueueLocked(binding)
+	}
 	if binding.items < len(binding.queue) {
 		return nil
 	}
@@ -3270,14 +3535,36 @@ func (m *fixedBindingManager) growBindingQueueLocked(binding *clientBinding) err
 		return fmt.Errorf("%w: binding %d", ErrFixedBindingResponseBackpressure, binding.connectionID)
 	}
 	newLength := min(limit, max(1, len(binding.queue)*2))
+	if newLength > math.MaxInt/ResponseQueueEntryBytes {
+		return fmt.Errorf("%w: response metadata capacity overflow", ErrFixedBindingResponseBackpressure)
+	}
+	allocation, ok := m.responseBudget.TryReserve(newLength*ResponseQueueEntryBytes, ResponseMemoryOrdinary, ResponseMemoryQueueMetadata)
+	if !ok {
+		m.responseBackpressureEvents++
+		return fmt.Errorf("%w: response metadata capacity", ErrFixedBindingResponseBackpressure)
+	}
 	queue := make([]LinkEvent, newLength)
 	for index := range binding.items {
 		queue[index] = binding.queue[(binding.head+index)%len(binding.queue)]
 	}
 	clear(binding.queue)
 	binding.queue = queue
+	previous := binding.queueAllocation
+	binding.queueAllocation = allocation
+	previous.Release()
 	binding.head = 0
 	return nil
+}
+
+// The caller has removed every entry. Legacy managers keep their empty rings.
+func (m *fixedBindingManager) releaseBindingQueueAllocationLocked(binding *clientBinding) {
+	if m.responseBudget == nil {
+		return
+	}
+	binding.queue = nil
+	allocation := binding.queueAllocation
+	binding.queueAllocation = nil
+	allocation.Release()
 }
 
 func (m *fixedBindingManager) failSlot(
@@ -3473,23 +3760,39 @@ func (m *fixedBindingManager) detachActiveBindingLocked(binding *clientBinding) 
 	binding.active = false
 }
 
-func (m *fixedBindingManager) clearBindingQueueLocked(binding *clientBinding) {
-	for index := range binding.items {
-		queueIndex := (binding.head + index) % len(binding.queue)
-		clearLinkEventPacket(&binding.queue[queueIndex])
-		binding.queue[queueIndex] = LinkEvent{}
+func (m *fixedBindingManager) clearBindingQueueLocked(binding *clientBinding) int {
+	binding.responseHeadEpoch++
+	released := 0
+	if m.responseBudget != nil {
+		released = m.clearSharedResponseQueueLocked(binding)
+	} else {
+		for index := range binding.items {
+			queueIndex := (binding.head + index) % len(binding.queue)
+			clearLinkEventPacket(&binding.queue[queueIndex])
+			binding.queue[queueIndex] = LinkEvent{}
+		}
 	}
-	binding.slot.pending -= binding.items
+	items := binding.items
+	if binding.remoteClosePending {
+		items++
+		binding.remoteClosePending = false
+	}
+	binding.slot.pending -= items
 	binding.slot.bytes -= binding.bytes
-	m.pending -= binding.items
+	m.pending -= items
 	m.pendingBytes -= binding.bytes
 	binding.head = 0
 	binding.items = 0
 	binding.bytes = 0
 	binding.responseNonemptySince = time.Time{}
+	m.releaseBindingQueueAllocationLocked(binding)
+	return released
 }
 
 func (m *fixedBindingManager) publishBindingTerminalLocked(binding *clientBinding, err error) {
+	if !binding.hasResponseLocked() {
+		binding.detachResponseParticipantLocked()
+	}
 	if binding.terminal {
 		if binding.terminalErr == nil && err != nil {
 			binding.terminalErr = err
@@ -3512,7 +3815,7 @@ func (m *fixedBindingManager) publishBindingCloseLocked(binding *clientBinding, 
 }
 
 func (m *fixedBindingManager) releaseTerminalBindingLocked(binding *clientBinding) {
-	if !binding.resident || !binding.terminal || binding.items != 0 || binding.request != nil || binding.result != nil ||
+	if !binding.resident || !binding.terminal || binding.hasResponseLocked() || binding.request != nil || binding.result != nil ||
 		binding.readyQueued || binding.readyLeased || (!binding.terminalObserved && !binding.closeSet) {
 		return
 	}
@@ -3531,6 +3834,7 @@ func (m *fixedBindingManager) releaseBindingResidentLocked(binding *clientBindin
 	if !binding.resident {
 		return
 	}
+	binding.detachResponseParticipantLocked()
 	delete(m.byID, binding.connectionID)
 	delete(binding.slot.bindings, binding)
 	binding.resident = false
@@ -3567,11 +3871,7 @@ func (m *fixedBindingManager) invalidateReadyLocked(binding *clientBinding) {
 }
 
 func clearLinkEventPacket(event *LinkEvent) {
-	if event == nil {
-		return
-	}
-	clear(event.Packet)
-	event.Packet = nil
+	event.Release()
 }
 
 func allocateFixedBindingConnectionID() (int64, error) {

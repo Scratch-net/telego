@@ -53,7 +53,7 @@ func TestMiddleEndOutputReservationTransfersToObservedGnetBytes(t *testing.T) {
 	frontend := &middleEndFrontend{outputBudget: newMiddleEndByteBudget(middleEndMaxEncodedResponse + 100)}
 	client := &middleEndClient{frontend: frontend}
 	conn := newMiddleEndOwnerConn()
-	if !frontend.reserveOutput() {
+	if !frontend.reserveOutput(middleEndMaxEncodedResponse) {
 		t.Fatal("output reservation was rejected")
 	}
 	conn.SetOutboundBuffered(100)

@@ -154,6 +154,10 @@ func encodeFrame(sequence int32, payload []byte, mode ChecksumMode, maxFrameSize
 // explicitly checksummed full TCP RPC frame. Stream implementations must use
 // FrameDecoder so checksum mode cannot drift between calls.
 func DecodeFrame(wire []byte, expectedSequence int32, mode ChecksumMode, maxFrameSize int) (Frame, error) {
+	return decodeFrame(wire, expectedSequence, mode, maxFrameSize, true)
+}
+
+func decodeFrame(wire []byte, expectedSequence int32, mode ChecksumMode, maxFrameSize int, clonePayload bool) (Frame, error) {
 	var frame Frame
 	if err := validateSequence(expectedSequence); err != nil {
 		return frame, err
@@ -188,7 +192,10 @@ func DecodeFrame(wire []byte, expectedSequence int32, mode ChecksumMode, maxFram
 	}
 
 	frame.Sequence = sequence
-	frame.Payload = slices.Clone(wire[8 : len(wire)-4])
+	frame.Payload = wire[8 : len(wire)-4 : len(wire)-4]
+	if clonePayload {
+		frame.Payload = slices.Clone(frame.Payload)
+	}
 	return frame, nil
 }
 
@@ -246,6 +253,16 @@ func (d *FrameDecoder) Feed(data []byte) (int, error) {
 		d.buffer = d.buffer[:buffered]
 		d.head = 0
 	}
+	needed := buffered + consumed
+	if needed > cap(d.buffer) {
+		// Avoid append's allocator-dependent excess capacity. Each decoder
+		// retains at most maxFrameSize, with one old allocation during growth.
+		capacity := min(d.maxFrameSize, max(needed, 2*cap(d.buffer)))
+		grown := make([]byte, buffered, capacity)
+		copy(grown, d.buffer)
+		clear(d.buffer[:cap(d.buffer)])
+		d.buffer = grown
+	}
 	d.buffer = append(d.buffer, data[:consumed]...)
 	return consumed, nil
 }
@@ -253,6 +270,16 @@ func (d *FrameDecoder) Feed(data []byte) (int, error) {
 // Next returns the next complete frame. The boolean is false when more bytes
 // are required. On a protocol error, the decoder remains permanently failed.
 func (d *FrameDecoder) Next() (Frame, bool, error) {
+	return d.next(true)
+}
+
+// nextBorrowed returns decoder-owned payload storage. Consume it before any
+// subsequent decoder operation. In particular, Feed and retire invalidate it.
+func (d *FrameDecoder) nextBorrowed() (Frame, bool, error) {
+	return d.next(false)
+}
+
+func (d *FrameDecoder) next(clonePayload bool) (Frame, bool, error) {
 	var frame Frame
 	if d.err != nil {
 		return frame, false, d.err
@@ -290,7 +317,7 @@ func (d *FrameDecoder) Next() (Frame, bool, error) {
 			return frame, false, nil
 		}
 
-		decoded, err := DecodeFrame(buffer[:declaredSize], d.nextSequence, d.mode, d.maxFrameSize)
+		decoded, err := decodeFrame(buffer[:declaredSize], d.nextSequence, d.mode, d.maxFrameSize, clonePayload)
 		if err != nil {
 			d.err = err
 			return frame, false, err

@@ -272,6 +272,17 @@ func (r *GnetClientRuntime) removeLink(link *GnetClientLink) {
 	r.mu.Unlock()
 }
 
+// registeredLinkCount includes created links and unpublished generation or
+// refresh candidates. It does not expose link identities or protocol state.
+func (r *GnetClientRuntime) registeredLinkCount() int {
+	if r == nil {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.links)
+}
+
 type gnetClientEventHandler struct {
 	gnet.BuiltinEventEngine
 	runtime *GnetClientRuntime
@@ -352,6 +363,7 @@ type GnetClientLink struct {
 	gconn                     gnet.Conn
 	submissions               []LinkSubmission
 	eventCharges              []int
+	responseSink              func(LinkEvent) error
 	pendingSubmissions        int
 	pendingSubmissionBytes    int
 	submissionHighWater       int
@@ -641,7 +653,17 @@ func (l *GnetClientLink) onTraffic(conn gnet.Conn) gnet.Action {
 
 	remaining := data
 	for len(remaining) != 0 {
-		consumed, update, err := l.bootstrap.Feed(remaining)
+		consumed, update, err := l.bootstrap.feedFrames(remaining[:min(len(remaining), gnetClientReadBufferCap)], func() error {
+			if outbound := conn.OutboundBuffered(); outbound != 0 {
+				return fmt.Errorf("Middle-End bootstrap became ready with %d gnet outbound bytes", outbound)
+			}
+			if !l.publishReady() {
+				return ErrLinkClosed
+			}
+			return nil
+		}, func(frame Frame) error {
+			return l.handleOwnerBorrowedFrame(conn, frame)
+		})
 		if err != nil {
 			l.claimOwnerFailure(err)
 			return gnet.Close
@@ -659,19 +681,6 @@ func (l *GnetClientLink) onTraffic(conn gnet.Conn) gnet.Action {
 				l.claimOwnerFailure(writeResultError("bootstrap", written, len(update.Outbound), err))
 				return gnet.Close
 			}
-		}
-		if update.BecameReady {
-			if outbound := conn.OutboundBuffered(); outbound != 0 {
-				l.claimOwnerFailure(fmt.Errorf("Middle-End bootstrap became ready with %d gnet outbound bytes", outbound))
-				return gnet.Close
-			}
-			if !l.publishReady() {
-				return gnet.Close
-			}
-		}
-		if err := l.processOwnerFrames(conn, update.Frames); err != nil {
-			l.claimOwnerFailure(err)
-			return gnet.Close
 		}
 	}
 	if l.bootstrap.Ready() {
@@ -721,7 +730,15 @@ func (l *GnetClientLink) publishReady() bool {
 }
 
 func (l *GnetClientLink) handleOwnerFrame(conn gnet.Conn, frame Frame) error {
-	event, err := parseLinkEvent(frame.Payload)
+	return l.handleOwnerFramePacket(conn, frame, false)
+}
+
+func (l *GnetClientLink) handleOwnerBorrowedFrame(conn gnet.Conn, frame Frame) error {
+	return l.handleOwnerFramePacket(conn, frame, true)
+}
+
+func (l *GnetClientLink) handleOwnerFramePacket(conn gnet.Conn, frame Frame, borrowed bool) error {
+	event, err := parseLinkEventPacket(frame.Payload, !borrowed)
 	if err != nil {
 		return err
 	}
@@ -734,15 +751,11 @@ func (l *GnetClientLink) handleOwnerFrame(conn gnet.Conn, frame Frame) error {
 			return err
 		}
 	}
-	return l.enqueueOwnerEvent(event)
+	return l.deliverOwnerEvent(event, borrowed)
 }
 
 func (l *GnetClientLink) enqueueOwnerEvent(event LinkEvent) error {
-	if err := l.enqueueEvent(event); err != nil {
-		clear(event.Packet)
-		return err
-	}
-	return nil
+	return l.deliverOwnerEvent(event, false)
 }
 
 func (l *GnetClientLink) processOwnerFrames(conn gnet.Conn, frames []Frame) error {
@@ -758,17 +771,33 @@ func (l *GnetClientLink) processOwnerFrames(conn gnet.Conn, frames []Frame) erro
 	return nil
 }
 
-func (l *GnetClientLink) enqueueEvent(event LinkEvent) error {
+// deliverOwnerEvent consumes event on every return. Borrowed packet views remain
+// valid only through this call. Channel delivery allocates after admission;
+// response sinks reserve their retained copy before returning.
+func (l *GnetClientLink) deliverOwnerEvent(event LinkEvent, borrowed bool) error {
 	charge := event.ByteSize()
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	if l.terminalClaimed || l.finalized {
+		l.mu.Unlock()
+		event.Release()
 		return ErrLinkClosed
+	}
+	if sink := l.responseSink; sink != nil && responseSinkEvent(event.Kind) {
+		l.mu.Unlock()
+		return sink(event)
 	}
 	l.reconcileEventsLocked()
 	if l.pendingEvents >= l.limits.MaxPendingEvents ||
 		charge > l.limits.MaxPendingEventBytes-l.pendingEventBytes {
+		l.mu.Unlock()
+		event.Release()
 		return ErrLinkEventBackpressure
+	}
+	if borrowed && event.Packet != nil {
+		packet := make([]byte, len(event.Packet))
+		copy(packet, event.Packet)
+		event.Release()
+		event.Packet = packet
 	}
 	l.events <- event
 	l.eventCharges = append(l.eventCharges, charge)
@@ -776,6 +805,7 @@ func (l *GnetClientLink) enqueueEvent(event LinkEvent) error {
 	l.pendingEventBytes += charge
 	l.eventHighWater = max(l.eventHighWater, l.pendingEvents)
 	l.eventBytesHighWater = max(l.eventBytesHighWater, l.pendingEventBytes)
+	l.mu.Unlock()
 	return nil
 }
 
@@ -1238,6 +1268,7 @@ func (l *GnetClientLink) finalizeAfterStreamClose() {
 	l.eventCharges = nil
 	l.pendingEvents = 0
 	l.pendingEventBytes = 0
+	l.responseSink = nil
 	close(l.events)
 	l.state = LinkStateClosed
 	l.finalized = true

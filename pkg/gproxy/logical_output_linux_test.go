@@ -1,7 +1,6 @@
 package gproxy
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"testing"
@@ -71,7 +70,7 @@ func TestLogicalOutputFIFOAcrossPollerPriorityQueues(t *testing.T) {
 	if !errors.Is(err, errorx.ErrEngineShutdown) {
 		t.Fatalf("poller exit: %v", err)
 	}
-	if got := bytes.Join(stream.output, nil); string(got) != "AB" {
+	if got := logicalOutputBytes(stream); string(got) != "AB" {
 		t.Fatalf("logical downlink delivered %q, want submission order AB", got)
 	}
 }
@@ -96,7 +95,7 @@ func TestLogicalOutputEOFBarrierAcrossPollerPriorityQueues(t *testing.T) {
 		if err := owner.Execute(t.Context(), gnet.RunnableFunc(func(context.Context) error {
 			if index == 0 {
 				return executeAfterClientOutput(stream, gnet.RunnableFunc(func(context.Context) error {
-					beforeEOF = string(bytes.Join(stream.output, nil))
+					beforeEOF = string(logicalOutputBytes(stream))
 					return errorx.ErrEngineShutdown
 				}))
 			}

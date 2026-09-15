@@ -36,13 +36,15 @@ TestTelegoClientTerminalErrorIsRetained
 TestTelegoAcceptedEnrollmentOwnerExitDisposesSocket
 TestOwnedWriteRealPartialSocketDrainRetainsAllocation
 TestOwnedWriteReleaseReentryDoesNotRepeatWrittenBatch
+TestOwnedWriteBoundedDescriptorsPreserveReentry
 TestPollerCloseWaitsForAcceptedTrigger
 TestPollerCloseRejectsLateTriggerAndPreservesReusedFDs
 TestPollerTriggerPreservesPriorityAndDiscardsBothQueues
 TestPollerEventfdFailurePreservesStdin
 TestOwnedBufferMixedOrderAndPartialDisposal
 TestOwnedBufferReleaseUnlinksBeforeReentry
-TestOwnedBufferReadAndWriteToKeepPartialAllocation'
+TestOwnedBufferReadAndWriteToKeepPartialAllocation
+TestOwnedBufferPeekIntoBoundsTinyBacklog'
 test_filter="^($(printf '%s' "$test_names" | tr '\n' '|'))$"
 set -- -mod=readonly -run="$test_filter"
 

@@ -99,6 +99,23 @@ func prepareClientOutput(c clientEndpoint, maximum int) (func(), bool) {
 	}, true
 }
 
+func supportsMiddleEndOwnedOutput(c clientEndpoint) bool {
+	if _, ok := c.(*LogicalStream); ok {
+		return true
+	}
+	_, ok := c.(gnet.OwnedWriter)
+	return ok
+}
+
+// The logical callback only clears payload and releases budget ownership. It
+// never reenters the stream. Native gnet can call it synchronously or on close.
+func writeMiddleEndOwnedOutput(c clientEndpoint, data []byte, release func(error)) (int, error) {
+	if stream, ok := c.(*LogicalStream); ok {
+		return stream.writeMiddleEndOwned(data, release)
+	}
+	return c.(gnet.OwnedWriter).WriteOwned(data, release)
+}
+
 // gnet invokes OnClose before freeing its outbound buffer. The next upstream
 // owner task is the release barrier for logical input charges and OnClosed.
 func (h *ProxyHandler) completeUpstreamClose(conn gnet.Conn, client clientEndpoint, output *relayOutput, done func()) {

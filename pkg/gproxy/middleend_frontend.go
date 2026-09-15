@@ -88,9 +88,12 @@ type MiddleEndFrontendConfig struct {
 	MaxPendingClientBytes      int
 	MaxPendingClientBytesTotal int
 	MaxPendingOutputBytesTotal int
-	OutputRetryInitial         time.Duration
-	OutputRetryMax             time.Duration
-	OutputStallTimeout         time.Duration
+	// ResponseBudget must be the same pool used by Source. Nil keeps legacy
+	// output accounting. Processing reserve must fit one complete encode.
+	ResponseBudget     *middleend.ResponseBudget
+	OutputRetryInitial time.Duration
+	OutputRetryMax     time.Duration
+	OutputStallTimeout time.Duration
 }
 
 // String redacts the binding source and optional process-wide proxy tag.
@@ -167,6 +170,9 @@ func (c MiddleEndFrontendConfig) validate() error {
 	if c.OutputStallTimeout <= 0 {
 		return fmt.Errorf("%w: OutputStallTimeout must be positive", ErrInvalidMiddleEndFrontend)
 	}
+	if c.ResponseBudget != nil && c.ResponseBudget.Snapshot().ProcessingReserveBytes < MiddleEndResponseProcessingBytes() {
+		return fmt.Errorf("%w: response processing reserve must be at least %d bytes", ErrInvalidMiddleEndFrontend, MiddleEndResponseProcessingBytes())
+	}
 	return nil
 }
 
@@ -184,19 +190,22 @@ func nilMiddleEndBindingSource(source MiddleEndBindingSource) bool {
 }
 
 type middleEndFrontend struct {
-	source           MiddleEndBindingSource
-	precommitFailure MiddleEndPrecommitAction
-	tag              middleend.ProxyTag
-	hasTag           bool
-	maxPendingClient int
-	retryInitial     time.Duration
-	retryMax         time.Duration
-	stallTimeout     time.Duration
-	inputBudget      middleEndByteBudget
-	outputBudget     middleEndByteBudget
-	outputEvictions  atomic.Uint64
-	middleEndCommits atomic.Uint64
-	fallbackCommits  atomic.Uint64
+	source                MiddleEndBindingSource
+	precommitFailure      MiddleEndPrecommitAction
+	tag                   middleend.ProxyTag
+	hasTag                bool
+	maxPendingClient      int
+	retryInitial          time.Duration
+	retryMax              time.Duration
+	stallTimeout          time.Duration
+	inputBudget           middleEndByteBudget
+	outputBudget          middleEndByteBudget
+	responseBudget        *middleend.ResponseBudget
+	outputEvictions       atomic.Uint64
+	responseWaits         [middleend.ResponseOutputWaitCount]middleEndResponseWaitStats
+	responseStallClosures atomic.Uint64
+	middleEndCommits      atomic.Uint64
+	fallbackCommits       atomic.Uint64
 
 	mu              sync.Mutex
 	routes          map[int64]*middleEndRoute
@@ -218,6 +227,7 @@ func newMiddleEndFrontend(config MiddleEndFrontendConfig) *middleEndFrontend {
 		stallTimeout:     config.OutputStallTimeout,
 		inputBudget:      newMiddleEndByteBudget(config.MaxPendingClientBytesTotal),
 		outputBudget:     newMiddleEndByteBudget(config.MaxPendingOutputBytesTotal),
+		responseBudget:   config.ResponseBudget,
 		routes:           make(map[int64]*middleEndRoute),
 		directFallbacks:  make(map[uint64]struct{}),
 		stopCh:           make(chan struct{}),
@@ -371,6 +381,7 @@ type middleEndClient struct {
 	responseWriteEvents          uint64
 	responseOutputWait           middleend.ResponseOutputWait
 	responseOutputWaitSince      time.Time
+	responseStallClosed          bool
 	inputAccounted               int64
 	outputAccounted              atomic.Int64
 	outputEvicting               atomic.Bool
@@ -720,7 +731,36 @@ func (h *ProxyHandler) handleMiddleEndToken(
 		return false, gnet.Close
 	}
 
-	if !client.outputHeadroom(c, h.maxWriteBuffer) {
+	head, hasResponse, err := token.TryPeekResponse()
+	if err != nil {
+		return false, gnet.Close
+	}
+	if !hasResponse {
+		if err := client.finishToken(token); err != nil {
+			return false, gnet.Close
+		}
+		return false, gnet.None
+	}
+	if head.Kind == middleend.LinkEventCloseExternal {
+		event, ok, err := token.TryTakeResponse(head)
+		if err != nil {
+			return false, gnet.Close
+		}
+		action := gnet.None
+		if ok {
+			event.Release()
+			action = client.beginOrderlyClose(c)
+		}
+		if err := client.finishToken(token); err != nil {
+			return false, gnet.Close
+		}
+		return false, action
+	}
+	plainBound, outputBound, err := client.responseOutputBounds(head)
+	if err != nil {
+		return false, gnet.Close
+	}
+	if !client.outputHeadroom(c, h.maxWriteBuffer, outputBound) {
 		client.observeResponseOutputWait(middleend.ResponseOutputClientBuffer)
 		if processedReason {
 			if err := client.finishToken(token); err != nil {
@@ -730,7 +770,8 @@ func (h *ProxyHandler) handleMiddleEndToken(
 		}
 		return true, gnet.None
 	}
-	if !client.frontend.reserveOutput() {
+	outputReservation := int64(0)
+	if client.frontend.responseBudget == nil && !client.frontend.reserveOutput(outputBound) {
 		client.observeResponseOutputWait(middleend.ResponseOutputSharedBudget)
 		if processedReason {
 			if err := client.finishToken(token); err != nil {
@@ -744,8 +785,10 @@ func (h *ProxyHandler) handleMiddleEndToken(
 		client.armOutputRetry(c, client.frontend.stallTimeout)
 		return true, gnet.None
 	}
-	outputReservation := int64(middleEndMaxEncodedResponse)
-	releaseOutput, prepared := prepareClientOutput(c, middleEndMaxEncodedResponse)
+	if client.frontend.responseBudget == nil {
+		outputReservation = int64(outputBound)
+	}
+	releaseOutput, prepared := prepareClientOutput(c, outputBound)
 	if !prepared {
 		client.observeResponseOutputWait(middleend.ResponseOutputCarrierBudget)
 		client.frontend.outputBudget.release(outputReservation)
@@ -753,15 +796,34 @@ func (h *ProxyHandler) handleMiddleEndToken(
 		return true, gnet.None
 	}
 	defer releaseOutput()
+	var work middleEndResponseWork
+	if client.frontend.responseBudget != nil {
+		if !supportsMiddleEndOwnedOutput(c) {
+			return false, gnet.Close
+		}
+		var admitted bool
+		work, admitted = reserveMiddleEndResponseWork(client.frontend.responseBudget, plainBound, outputBound)
+		if !admitted {
+			client.observeResponseOutputWait(middleend.ResponseOutputProcessingReserve)
+			client.armOutputRetry(c, client.frontend.stallTimeout)
+			return true, gnet.None
+		}
+		defer work.release()
+	}
 	client.observeResponseOutputWait(middleend.ResponseOutputNotWaiting)
 
-	event, ok, err := token.TryNextEvent()
+	event, ok, err := token.TryTakeResponse(head)
 	if err != nil {
 		client.frontend.outputBudget.release(outputReservation)
 		return false, gnet.Close
 	}
 	if ok {
-		action := h.writeMiddleEndEvent(c, ctx, client, event)
+		var action gnet.Action
+		if client.frontend.responseBudget == nil {
+			action = h.writeMiddleEndEvent(c, ctx, client, event)
+		} else {
+			action = h.writeMiddleEndOwnedEvent(c, ctx, client, event, &work)
+		}
 		if !client.refreshOutput(c, outputReservation) {
 			action = gnet.Close
 		}
@@ -803,8 +865,8 @@ func (c *middleEndClient) finishToken(token *middleend.ClientReadyToken) error {
 	return token.Ack()
 }
 
-func (c *middleEndClient) outputHeadroom(connection clientEndpoint, maximum int) bool {
-	return connection.OutboundBuffered() <= maximum-middleEndMaxEncodedResponse
+func (c *middleEndClient) outputHeadroom(connection clientEndpoint, maximum, required int) bool {
+	return required >= 0 && required <= maximum && connection.OutboundBuffered() <= maximum-required
 }
 
 func (c *middleEndClient) beginOrderlyClose(connection clientEndpoint) gnet.Action {
@@ -829,6 +891,7 @@ func (c *middleEndClient) waitForOutput(connection clientEndpoint) bool {
 		c.outputStallDeadline = now.Add(c.frontend.stallTimeout)
 	}
 	if !now.Before(c.outputStallDeadline) {
+		c.recordResponseStallClosure()
 		return false
 	}
 	c.armOutputRetry(connection, time.Until(c.outputStallDeadline))
@@ -837,14 +900,15 @@ func (c *middleEndClient) waitForOutput(connection clientEndpoint) bool {
 
 func (c *middleEndClient) refreshOutput(connection clientEndpoint, reservation int64) bool {
 	current, previous := c.reconcileOutput(connection, reservation)
+	now := time.Now()
 	if current < previous {
-		c.responseLastBufferDecreaseAt = time.Now()
+		c.responseLastBufferDecreaseAt = now
 	}
+	c.reportResponseProgress(now, current)
 	if current == 0 {
 		c.resetOutputProgress()
 		return true
 	}
-	now := time.Now()
 	if c.outputStallDeadline.IsZero() || current < previous {
 		c.outputStallDeadline = now.Add(c.frontend.stallTimeout)
 		c.retryMu.Lock()
@@ -852,10 +916,17 @@ func (c *middleEndClient) refreshOutput(connection clientEndpoint, reservation i
 		c.retryMu.Unlock()
 	}
 	if !now.Before(c.outputStallDeadline) {
+		c.recordResponseStallClosure()
 		return false
 	}
 	c.armOutputRetry(connection, time.Until(c.outputStallDeadline))
 	return true
+}
+
+func (c *middleEndClient) reportResponseProgress(observedAt time.Time, unreadBytes int) {
+	if c.frontend != nil && c.frontend.responseBudget != nil && c.binding != nil {
+		c.binding.ReportResponseProgress(observedAt, c.responseLastBufferDecreaseAt, unreadBytes, c.responseOutputWait)
+	}
 }
 
 func (c *middleEndClient) armOutputRetry(connection clientEndpoint, remaining time.Duration) {
@@ -949,7 +1020,12 @@ func (h *ProxyHandler) writeMiddleEndEvent(
 	client *middleEndClient,
 	event middleend.LinkEvent,
 ) gnet.Action {
-	defer clear(event.Packet)
+	defer event.Release()
+	if event.ResponseAllocation != nil {
+		// An owned source requires the matching frontend pool. Keep custom
+		// source misconfiguration from advancing the cipher without ownership.
+		return gnet.Close
+	}
 	var (
 		wire        []byte
 		payloadSize int
@@ -988,19 +1064,26 @@ func (h *ProxyHandler) writeMiddleEndEvent(
 }
 
 func (c *middleEndClient) writeWire(connection clientEndpoint, wire []byte) error {
-	if c.mode == ModeDD {
-		out := make([]byte, len(wire))
-		defer clear(out)
-		c.encryptor.XORKeyStream(out, wire)
-		return writeAllOwner(connection, out)
+	encodedSize := len(wire)
+	if c.mode != ModeDD {
+		encodedSize = c.drs.PlanSize(len(wire))
 	}
-
-	encodedSize := c.drs.PlanSize(len(wire))
 	if encodedSize > middleEndMaxEncodedResponse {
 		return fmt.Errorf("%w: encoded response %d exceeds %d", ErrMiddleEndClientProtocol, encodedSize, middleEndMaxEncodedResponse)
 	}
 	out := make([]byte, encodedSize)
 	defer clear(out)
+	if err := c.encryptResponse(out, wire); err != nil {
+		return err
+	}
+	return writeAllOwner(connection, out)
+}
+
+func (c *middleEndClient) encryptResponse(out, wire []byte) error {
+	if c.mode == ModeDD {
+		c.encryptor.XORKeyStream(out, wire)
+		return nil
+	}
 	sourceOffset := 0
 	destinationOffset := 0
 	for sourceOffset < len(wire) {
@@ -1024,7 +1107,7 @@ func (c *middleEndClient) writeWire(connection clientEndpoint, wire []byte) erro
 	if destinationOffset != len(out) {
 		return fmt.Errorf("%w: DRS planned %d bytes and wrote %d", ErrMiddleEndClientProtocol, len(out), destinationOffset)
 	}
-	return writeAllOwner(connection, out)
+	return nil
 }
 
 func writeAllOwner(connection clientEndpoint, wire []byte) error {

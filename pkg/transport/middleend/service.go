@@ -37,6 +37,9 @@ type ServiceConfig struct {
 	LinksPerDC             int
 	LinkLimits             LinkLimits
 	BindingLimits          FixedBindingLimits
+	// ResponseBudget enables allocation ownership. Nil preserves legacy callers.
+	// Frontend consumers must honor LinkEvent.Release before enabling this pool.
+	ResponseBudget *ResponseBudgetConfig
 }
 
 // String redacts transports, credentials, and all retained capacity policy.
@@ -49,6 +52,11 @@ func (c ServiceConfig) GoString() string { return c.String() }
 
 // Validate rejects configuration defects before the gnet runtime starts.
 func (c ServiceConfig) Validate() error {
+	if c.ResponseBudget != nil {
+		if err := c.ResponseBudget.Validate(); err != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidServiceConfig, err)
+		}
+	}
 	if nilArtifactSource(c.ArtifactSource) {
 		return fmt.Errorf("%w: nil artifact source", ErrInvalidServiceConfig)
 	}
@@ -83,10 +91,12 @@ func (c ServiceConfig) Validate() error {
 // ServiceSnapshot combines the two redacted operational state machines owned
 // by Service. It contains no artifact body, endpoint, tag, or credential.
 type ServiceSnapshot struct {
-	Coordinator GenerationCoordinatorSnapshot
-	Supervisor  GenerationSupervisorSnapshot
-	NAT         NATResolverSnapshot
-	Capacity    ServiceCapacitySnapshot
+	Coordinator    GenerationCoordinatorSnapshot
+	Supervisor     GenerationSupervisorSnapshot
+	NAT            NATResolverSnapshot
+	Capacity       ServiceCapacitySnapshot
+	ResponseBudget ResponseBudgetSnapshot
+	RuntimeLinks   int
 }
 
 // ServiceCapacitySnapshot contains only non-secret production bounds needed
@@ -94,6 +104,10 @@ type ServiceSnapshot struct {
 type ServiceCapacitySnapshot struct {
 	MaxRefreshCandidatesPerManager int
 	EventLoops                     int
+	ResponseBudgetBytes            int
+	DecoderBytesPerLink            int
+	DecoderGrowthBytesPerOwner     int
+	DecodePlaintextBytesPerOwner   int
 	LinksPerDC                     int
 	MaxResidentBindings            int
 	LinkSubmissionItems            int
@@ -119,12 +133,13 @@ type Service struct {
 }
 
 type serviceState struct {
-	cache       *ArtifactCache
-	runtime     *GnetClientRuntime
-	supervisor  *FixedBindingGenerationSupervisor
-	coordinator *GenerationCoordinator
-	nat         *NATResolver
-	capacity    ServiceCapacitySnapshot
+	cache          *ArtifactCache
+	runtime        *GnetClientRuntime
+	supervisor     *FixedBindingGenerationSupervisor
+	coordinator    *GenerationCoordinator
+	nat            *NATResolver
+	capacity       ServiceCapacitySnapshot
+	responseBudget *ResponseBudget
 
 	closeOnce sync.Once
 	done      chan struct{}
@@ -140,6 +155,14 @@ type serviceState struct {
 func NewService(config ServiceConfig) (*Service, error) {
 	if err := config.Validate(); err != nil {
 		return nil, err
+	}
+	var responseBudget *ResponseBudget
+	if config.ResponseBudget != nil {
+		var err error
+		responseBudget, err = NewResponseBudget(*config.ResponseBudget)
+		if err != nil {
+			return nil, err
+		}
 	}
 	cache, err := NewArtifactCache(config.ArtifactSource, config.ArtifactRefreshTimeout)
 	if err != nil {
@@ -167,6 +190,7 @@ func NewService(config ServiceConfig) (*Service, error) {
 			LinksPerDC:          config.LinksPerDC,
 			LinkLimits:          config.LinkLimits,
 			BindingLimits:       config.BindingLimits,
+			ResponseBudget:      responseBudget,
 		})
 		if err != nil {
 			return nil, err
@@ -186,14 +210,19 @@ func NewService(config ServiceConfig) (*Service, error) {
 		return nil, fmt.Errorf("initialize Middle-End generation coordinator: %w", err)
 	}
 	return &Service{state: &serviceState{
-		cache:       cache,
-		runtime:     runtime,
-		supervisor:  supervisor,
-		coordinator: coordinator,
-		nat:         config.NATResolver,
+		cache:          cache,
+		runtime:        runtime,
+		supervisor:     supervisor,
+		coordinator:    coordinator,
+		nat:            config.NATResolver,
+		responseBudget: responseBudget,
 		capacity: ServiceCapacitySnapshot{
 			MaxRefreshCandidatesPerManager: maxRefreshCandidatesPerManager,
 			EventLoops:                     config.Runtime.EventLoops,
+			ResponseBudgetBytes:            responseBudget.Snapshot().LimitBytes,
+			DecoderBytesPerLink:            MaxMEFrameSize,
+			DecoderGrowthBytesPerOwner:     MaxMEFrameSize,
+			DecodePlaintextBytesPerOwner:   maxBootstrapBorrowedFeedSize,
 			LinksPerDC:                     config.LinksPerDC,
 			MaxResidentBindings:            config.BindingLimits.MaxResidentBindings,
 			LinkSubmissionItems:            config.LinkLimits.MaxPendingSubmissions,
@@ -246,16 +275,27 @@ func (s *Service) Source() *FixedBindingGenerationSupervisor {
 	return s.state.supervisor
 }
 
+// ResponseBudget returns the same allocation pool used by every generation.
+// Pass it to the frontend before accepting allocation-owned response events.
+func (s *Service) ResponseBudget() *ResponseBudget {
+	if s == nil || s.state == nil {
+		return nil
+	}
+	return s.state.responseBudget
+}
+
 // Snapshot returns redacted coordinator and topology state.
 func (s *Service) Snapshot() ServiceSnapshot {
 	if s == nil || s.state == nil {
 		return ServiceSnapshot{}
 	}
 	return ServiceSnapshot{
-		Coordinator: s.state.coordinator.Snapshot(),
-		Supervisor:  s.state.supervisor.Snapshot(),
-		NAT:         s.state.nat.Snapshot(),
-		Capacity:    s.state.capacity,
+		Coordinator:    s.state.coordinator.Snapshot(),
+		Supervisor:     s.state.supervisor.Snapshot(),
+		NAT:            s.state.nat.Snapshot(),
+		Capacity:       s.state.capacity,
+		ResponseBudget: s.state.responseBudget.Snapshot(),
+		RuntimeLinks:   s.state.runtime.registeredLinkCount(),
 	}
 }
 

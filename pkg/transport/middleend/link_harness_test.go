@@ -45,6 +45,10 @@ type fakePeerConfig struct {
 	holdBootstrap   bool
 	discardRecords  bool
 	recordCounter   *atomic.Uint64
+	// Test-only request generation runs synchronously on the peer protocol
+	// owner. send emits one RPC frame before returning; nil preserves echo.
+	respond       func(ProxyRequest, func([]byte) error) (bool, error)
+	maxOperations uint64 // zero preserves the existing recorder policy
 }
 
 type fakePeerRecord struct {
@@ -275,6 +279,18 @@ func (p *fakeMiddleEndPeer) handleFrame(server *runtimeTestServer, frame Frame) 
 			}
 			return nil
 		}
+		if p.config.respond != nil {
+			handled, err := p.config.respond(request, func(payload []byte) error {
+				wire, err := server.encodePayloadRuntime(payload)
+				if err != nil {
+					return err
+				}
+				return writeFragments(p.conn, wire, p.config.fragmentPattern)
+			})
+			if handled || err != nil {
+				return err
+			}
+		}
 		answer, err := (ProxyAnswer{
 			Flags:        ProxyAnswerFlagFlush,
 			ConnectionID: request.ConnectionID,
@@ -348,7 +364,10 @@ func waitFakePeerSignal(signal <-chan struct{}, operation string) error {
 }
 
 func (p *fakeMiddleEndPeer) record(record fakePeerRecord) error {
-	p.recordCount.Add(1)
+	count := p.recordCount.Add(1)
+	if p.config.maxOperations != 0 && count > p.config.maxOperations {
+		return fmt.Errorf("%w: processed maximum %d", errFakePeerRecordLimit, p.config.maxOperations)
+	}
 	if p.config.recordCounter != nil {
 		p.config.recordCounter.Add(1)
 	}

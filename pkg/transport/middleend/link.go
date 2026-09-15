@@ -37,8 +37,8 @@ const (
 	// MaxLinkQueueItems is the local memory-safety ceiling for either queue on
 	// one Middle-End link. It is not a Telegram protocol limit. The 4,096-item
 	// cap matches the web-proxy bridge frame cap. With the current amd64 engine
-	// layouts, it limits eager per-link queue metadata to 360,480 bytes for the
-	// blocking engine and 229,376 bytes for the gnet engine.
+	// layouts, it limits eager per-link queue metadata to 393,248 bytes for the
+	// blocking engine and 262,144 bytes for the gnet engine.
 	MaxLinkQueueItems = 4096
 	// MaxLinkQueueBytes is the local payload-memory ceiling for either queue on
 	// one Middle-End link. It follows the existing 512 MiB global pending-byte
@@ -187,6 +187,22 @@ type LinkEvent struct {
 	ConfirmKey   uint32
 	KeepaliveID  uint64
 	Packet       []byte
+	// ResponseAllocation follows Packet across queue and frontend ownership.
+	// A non-nil value requires Release when this event is no longer retained.
+	ResponseAllocation *ResponseAllocation
+}
+
+// Release clears the owned packet and returns its retained-allocation charge.
+// Copying a LinkEvent does not duplicate ownership of its packet or charge.
+func (e *LinkEvent) Release() {
+	if e == nil {
+		return
+	}
+	clear(e.Packet)
+	e.Packet = nil
+	allocation := e.ResponseAllocation
+	e.ResponseAllocation = nil
+	allocation.Release()
 }
 
 // String reports routing metadata without disclosing the answer packet.
@@ -268,7 +284,12 @@ type LinkSnapshot struct {
 // exceeds MaxPendingSubmissionBytes. They return ErrLinkBackpressure without
 // accepting an item when the current pending item or byte charge would exceed
 // a limit. If an accepted response cannot fit in the event queue, they must
-// fail the entire link with ErrLinkEventBackpressure. Any bootstrap, protocol,
+// fail the entire link with ErrLinkEventBackpressure. Production gnet managers
+// can install an internal response sink that replaces response-channel admission
+// with manager admission. In that mode Events retains keepalives and terminal
+// closure, while rejected client responses close their binding. Standalone
+// channel consumers retain the bounded event-queue contract above.
+// Any bootstrap, protocol,
 // transport, or owner-loop failure must close the stream, stop accepting
 // submissions, close every link-owned queue, and preserve the first terminal
 // error for Err. They must never retry, migrate a connection, or drop an
@@ -323,13 +344,17 @@ func signalSubmissionReady(ready chan<- struct{}) {
 }
 
 func parseLinkEvent(payload []byte) (LinkEvent, error) {
+	return parseLinkEventPacket(payload, true)
+}
+
+func parseLinkEventPacket(payload []byte, clonePacket bool) (LinkEvent, error) {
 	operation, err := ParseRPCOperation(payload)
 	if err != nil {
 		return LinkEvent{}, err
 	}
 	switch operation {
 	case OperationProxyAnswer:
-		answer, err := ParseProxyAnswer(payload)
+		answer, err := parseProxyAnswer(payload, clonePacket)
 		if err != nil {
 			return LinkEvent{}, err
 		}

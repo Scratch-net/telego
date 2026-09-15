@@ -4,6 +4,8 @@
 package gnet
 
 import (
+	"bytes"
+	"encoding/binary"
 	"testing"
 
 	"github.com/panjf2000/gnet/v2/pkg/netpoll"
@@ -44,6 +46,75 @@ func ownedReentryConn(t *testing.T) (*conn, int) {
 		t.Fatal(err)
 	}
 	return c, fds[1]
+}
+
+func TestOwnedWriteBoundedDescriptorsPreserveReentry(t *testing.T) {
+	for _, operation := range []string{"flush", "close"} {
+		t.Run(operation, func(t *testing.T) {
+			c, peer := ownedReentryConn(t)
+			const count = 3*iovMax + 17
+			released := make([]int, count)
+			expected := make([]byte, 1+4*count)
+			expected[0] = 'P'
+			_, _ = c.outboundBuffer.Write(expected[:1])
+			for index := 0; index < count; index++ {
+				index := index
+				data := make([]byte, 4)
+				binary.LittleEndian.PutUint32(data, uint32(index))
+				copy(expected[1+4*index:], data)
+				if _, err := c.WriteOwned(data, func(err error) {
+					released[index]++
+					if err != nil {
+						t.Errorf("release %d: %v", index, err)
+					}
+					for _, retained := range c.loop.writeBuffers {
+						if retained != nil {
+							t.Fatal("owner scratch retained output during release callback")
+						}
+					}
+					if index == 0 {
+						if operation == "close" {
+							err = c.loop.Close(c)
+						} else {
+							err = c.Flush()
+						}
+						if err != nil {
+							t.Errorf("reentrant %s: %v", operation, err)
+						}
+					}
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for c.opened && c.OutboundBuffered() != 0 {
+				if err := c.Flush(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got := make([]byte, len(expected))
+			offset := 0
+			for offset < len(got) {
+				n, err := unix.Read(peer, got[offset:])
+				if err != nil || n <= 0 {
+					t.Fatalf("socket drain at %d: %d, %v", offset, n, err)
+				}
+				offset += n
+			}
+			if !bytes.Equal(got, expected) {
+				t.Fatal("bounded writev changed or repeated response bytes")
+			}
+			for index, calls := range released {
+				if calls != 1 {
+					t.Fatalf("release %d ran %d times", index, calls)
+				}
+			}
+			for _, retained := range c.loop.writeBuffers {
+				if retained != nil {
+					t.Fatal("owner retained descriptor after drain")
+				}
+			}
+		})
+	}
 }
 
 func TestOwnedWriteReleaseReentryDoesNotRepeatWrittenBatch(t *testing.T) {

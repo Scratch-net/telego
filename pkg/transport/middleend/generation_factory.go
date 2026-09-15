@@ -35,6 +35,7 @@ type GnetGenerationFactoryConfig struct {
 	LinksPerDC          int
 	LinkLimits          LinkLimits
 	BindingLimits       FixedBindingLimits
+	ResponseBudget      *ResponseBudget
 }
 
 // String redacts the artifact secret, SOCKS credentials, runtime, and limits.
@@ -62,6 +63,7 @@ type gnetGenerationFactoryState struct {
 	linksPerDC          int
 	linkLimits          LinkLimits
 	bindingLimits       FixedBindingLimits
+	responseBudget      *ResponseBudget
 	processID           int
 	processStartedAt    time.Time
 	now                 func() time.Time
@@ -183,6 +185,7 @@ func newGnetGenerationFactory(
 		linksPerDC:          config.LinksPerDC,
 		linkLimits:          config.LinkLimits,
 		bindingLimits:       config.BindingLimits,
+		responseBudget:      config.ResponseBudget,
 		processID:           processID,
 		processStartedAt:    processStartedAt,
 		now:                 now,
@@ -278,7 +281,7 @@ func (f *GnetGenerationFactory) Build(ctx context.Context) (*FixedBindingManager
 	for index, result := range results {
 		slots[index] = result.slot
 	}
-	manager, err := newFixedBindingManager(slots, state.bindingLimits, state.buildReplacementLink)
+	manager, err := newFixedBindingManagerWithResponseBudget(slots, state.bindingLimits, state.buildReplacementLink, state.responseBudget)
 	if err != nil {
 		closeGenerationSlots(results)
 		return nil, fmt.Errorf("construct Middle-End generation manager: %w", err)

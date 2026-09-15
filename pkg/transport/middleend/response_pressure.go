@@ -12,6 +12,7 @@ const (
 	ResponsePressureSlotBytes
 	ResponsePressureManagerItems
 	ResponsePressureManagerBytes
+	ResponsePressureSharedBudget
 	ResponsePressureUnknown
 	ResponsePressureLimitCount
 )
@@ -30,6 +31,8 @@ func (limit ResponsePressureLimit) String() string {
 		return "manager_items"
 	case ResponsePressureManagerBytes:
 		return "manager_bytes"
+	case ResponsePressureSharedBudget:
+		return "shared_budget"
 	default:
 		return "unknown"
 	}
@@ -62,6 +65,26 @@ type ResponsePressureDiagnostic struct {
 	DequeuedBytes       uint64
 	ReadyQueued         bool
 	ReadyLeased         bool
+	// Shared values are immutable selection evidence. ReclaimedBytes counts
+	// only the synchronous cleanup performed by this eviction.
+	Budget                     ResponseBudgetSnapshot
+	SelectionAt                time.Time
+	SelectionReason            ResponsePressureSelectionReason
+	RequiredAdditionalBytes    int
+	RequiredReclaimBytes       int
+	FairShareBytes             int
+	ScannedParticipants        int
+	VictimRetainedBytes        int
+	VictimQueuedBytes          int
+	VictimInflightBytes        int
+	VictimOutputBytes          int
+	VictimUnreadBytes          int
+	VictimWait                 ResponseOutputWait
+	VictimObservationAvailable bool
+	VictimObservationAge       time.Duration
+	VictimProgressAvailable    bool
+	VictimProgressAge          time.Duration
+	ReclaimedBytes             int
 }
 
 // ResponsePressureOutput is sampled by the client owner after eviction. It is
@@ -85,6 +108,48 @@ type ResponsePressureOutput struct {
 	WaitSince            time.Time
 	RetryPending         bool
 	StallDeadline        time.Time
+	SharedResponseBudget bool
+	ResponseBudget       ResponseBudgetSnapshot
+}
+
+// These values cross manager locks without retaining another manager or client.
+type responsePressureIncoming struct {
+	connectionID                   int64
+	bytes                          int
+	dcID                           DCID
+	slot                           int
+	incarnation                    uint64
+	queue, slotQueue, managerQueue ResponseQueueDiagnostic
+}
+
+type responsePressureEvidence struct {
+	incoming                                                responsePressureIncoming
+	budget                                                  ResponseBudgetSnapshot
+	selectedAt                                              time.Time
+	reason                                                  ResponsePressureSelectionReason
+	requiredAdditional, requiredReclaim, fairShare, scanned int
+	victim                                                  ResponseParticipantSnapshot
+}
+
+func (e responsePressureEvidence) apply(p *ResponsePressureDiagnostic, victimID int64) {
+	p.IncomingBytes, p.IncomingDCID = e.incoming.bytes, e.incoming.dcID
+	p.IncomingSlot, p.IncomingIncarnation = e.incoming.slot, e.incoming.incarnation
+	p.VictimIsIncoming = e.incoming.connectionID == victimID
+	p.Incoming, p.Slot, p.Manager = e.incoming.queue, e.incoming.slotQueue, e.incoming.managerQueue
+	p.Budget, p.SelectionAt, p.SelectionReason = e.budget, e.selectedAt, e.reason
+	p.RequiredAdditionalBytes, p.RequiredReclaimBytes = e.requiredAdditional, e.requiredReclaim
+	p.FairShareBytes, p.ScannedParticipants = e.fairShare, e.scanned
+	p.VictimRetainedBytes, p.VictimQueuedBytes = e.victim.RetainedBytes, e.victim.QueuedBytes
+	p.VictimInflightBytes, p.VictimOutputBytes = e.victim.InflightBytes, e.victim.OutputBytes
+	p.VictimUnreadBytes, p.VictimWait = e.victim.UnreadBytes, e.victim.Wait
+	p.VictimObservationAvailable = !e.victim.ObservedAt.IsZero() && !e.victim.ObservedAt.After(e.selectedAt)
+	if p.VictimObservationAvailable {
+		p.VictimObservationAge = e.selectedAt.Sub(e.victim.ObservedAt)
+	}
+	p.VictimProgressAvailable = !e.victim.LastProgressAt.IsZero() && !e.victim.LastProgressAt.After(e.selectedAt)
+	if p.VictimProgressAvailable {
+		p.VictimProgressAge = e.selectedAt.Sub(e.victim.LastProgressAt)
+	}
 }
 
 // ResponseOutputWait describes the last owner-observed reason for deferral.
@@ -95,6 +160,8 @@ const (
 	ResponseOutputClientBuffer
 	ResponseOutputSharedBudget
 	ResponseOutputCarrierBudget
+	ResponseOutputProcessingReserve
+	ResponseOutputWaitCount
 )
 
 func (wait ResponseOutputWait) String() string {
@@ -107,6 +174,8 @@ func (wait ResponseOutputWait) String() string {
 		return "shared_budget"
 	case ResponseOutputCarrierBudget:
 		return "carrier_budget"
+	case ResponseOutputProcessingReserve:
+		return "processing_reserve"
 	default:
 		return "unknown"
 	}
@@ -117,6 +186,8 @@ func (m *fixedBindingManager) responsePressureDiagnosticLocked(incoming, victim 
 	limit := ResponsePressureUnknown
 	// Match enqueueEventLocked's order, including item checks before byte checks.
 	switch {
+	case m.responseBudget != nil:
+		limit = ResponsePressureSharedBudget
 	case incoming.items >= m.limits.MaxPendingResponseItemsPerBinding:
 		limit = ResponsePressureBindingItems
 	case size > m.limits.MaxPendingResponseBytesPerBinding-incoming.bytes:
@@ -149,6 +220,11 @@ func (m *fixedBindingManager) responsePressureDiagnosticLocked(incoming, victim 
 			DequeuedItems: victim.responseDequeuedItems, DequeuedBytes: victim.responseDequeuedBytes,
 			ReadyQueued: victim.readyQueued, ReadyLeased: victim.readyLeased,
 		},
+	}
+	if m.responseBudget != nil {
+		for _, queue := range []*ResponseQueueDiagnostic{&record.Pressure.Incoming, &record.Pressure.Victim, &record.Pressure.Slot, &record.Pressure.Manager} {
+			queue.ItemLimit, queue.ByteLimit = 0, 0
+		}
 	}
 	if m.responsePressureObserver != nil {
 		victim.responsePressure = new(record)
@@ -187,6 +263,10 @@ func (s *generationSupervisorState) recordResponsePressure(record GenerationDiag
 		limit := min(record.Pressure.Limit, ResponsePressureUnknown)
 		s.responsePressureEvictions[limit]++
 		s.responsePressureDiscardedBytes[limit] += uint64(max(0, record.Pressure.Victim.Bytes))
+		s.responsePressureReclaimedBytes[limit] += uint64(max(0, record.Pressure.ReclaimedBytes))
+		if limit == ResponsePressureSharedBudget && record.Pressure.SelectionReason < ResponsePressureSelectionReasonCount {
+			s.responsePressureSelections[record.Pressure.SelectionReason]++
+		}
 	}
 	s.diagnostics.append(record)
 }

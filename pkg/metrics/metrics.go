@@ -123,28 +123,45 @@ func NewServer(cfg Config, limiter StatsProvider) (*Server, error) {
 }
 
 func registerMiddleEndMetrics(meter metric.Meter, provider MiddleEndStatsProvider) {
+	meter.Int64ObservableGauge("telego_middleend_runtime_links",
+		metric.WithDescription("Currently registered physical ME links, including unpublished generation and refresh candidates until link finalization"),
+		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
+			observer.Observe(int64(provider.Snapshot().RuntimeLinks))
+			return nil
+		}),
+	)
 	meter.Int64ObservableGauge("telego_middleend_capacity",
 		metric.WithDescription("Configured Middle-End topology and bounded-queue capacities"),
 		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
 			capacity := provider.Snapshot().Capacity
 			for resource, value := range map[string]int{
-				"refresh_candidates_per_manager": capacity.MaxRefreshCandidatesPerManager,
-				"event_loops":                    capacity.EventLoops,
-				"links_per_dc":                   capacity.LinksPerDC,
-				"resident_bindings":              capacity.MaxResidentBindings,
-				"link_submission_items":          capacity.LinkSubmissionItems,
-				"link_submission_bytes":          capacity.LinkSubmissionBytes,
-				"link_event_items":               capacity.LinkEventItems,
-				"link_event_bytes":               capacity.LinkEventBytes,
-				"manager_request_items":          capacity.ManagerRequestItems,
-				"manager_request_bytes":          capacity.ManagerRequestBytes,
-				"manager_control_items":          capacity.ManagerControlItems,
-				"manager_control_bytes":          capacity.ManagerControlBytes,
-				"manager_response_items":         capacity.ManagerResponseItems,
-				"manager_response_bytes":         capacity.ManagerResponseBytes,
-				"binding_response_items":         capacity.BindingResponseItems,
-				"binding_response_bytes":         capacity.BindingResponseBytes,
+				"refresh_candidates_per_manager":   capacity.MaxRefreshCandidatesPerManager,
+				"event_loops":                      capacity.EventLoops,
+				"links_per_dc":                     capacity.LinksPerDC,
+				"resident_bindings":                capacity.MaxResidentBindings,
+				"link_submission_items":            capacity.LinkSubmissionItems,
+				"link_submission_bytes":            capacity.LinkSubmissionBytes,
+				"link_event_items":                 capacity.LinkEventItems,
+				"link_event_bytes":                 capacity.LinkEventBytes,
+				"manager_request_items":            capacity.ManagerRequestItems,
+				"manager_request_bytes":            capacity.ManagerRequestBytes,
+				"manager_control_items":            capacity.ManagerControlItems,
+				"manager_control_bytes":            capacity.ManagerControlBytes,
+				"manager_response_items":           capacity.ManagerResponseItems,
+				"manager_response_bytes":           capacity.ManagerResponseBytes,
+				"binding_response_items":           capacity.BindingResponseItems,
+				"binding_response_bytes":           capacity.BindingResponseBytes,
+				"response_budget_bytes":            capacity.ResponseBudgetBytes,
+				"decoder_bytes_per_link":           capacity.DecoderBytesPerLink,
+				"decoder_growth_bytes_per_owner":   capacity.DecoderGrowthBytesPerOwner,
+				"decode_plaintext_bytes_per_owner": capacity.DecodePlaintextBytesPerOwner,
 			} {
+				if capacity.ResponseBudgetBytes > 0 {
+					switch resource {
+					case "manager_response_items", "manager_response_bytes", "binding_response_items", "binding_response_bytes":
+						continue
+					}
+				}
 				observer.Observe(int64(value), metric.WithAttributes(attribute.String("resource", resource)))
 			}
 			return nil
@@ -265,6 +282,7 @@ func registerMiddleEndMetrics(meter metric.Meter, provider MiddleEndStatsProvide
 	registerMiddleEndLinkQueueMetrics(meter, provider)
 	registerMiddleEndRefreshMetrics(meter, provider)
 	registerMiddleEndDiagnosticMetrics(meter, provider)
+	registerMiddleEndResponseMemoryMetrics(meter, provider)
 }
 
 type middleEndLinkMetricKey struct {
@@ -311,9 +329,9 @@ func forEachMiddleEndRole(snapshot middleend.GenerationSupervisorSnapshot, visit
 
 func registerMiddleEndManagerQueueMetrics(meter metric.Meter, provider MiddleEndStatsProvider) {
 	registerMiddleEndManagerQueueMetric(meter, provider, "telego_middleend_manager_queue_items", "Items retained by ME generation-manager queues", false, false)
-	registerMiddleEndManagerQueueMetric(meter, provider, "telego_middleend_manager_queue_bytes", "Bytes retained by ME generation-manager queues", true, false)
+	registerMiddleEndManagerQueueMetric(meter, provider, "telego_middleend_manager_queue_bytes", "Logical bytes queued by ME generation managers; response bytes exclude reserved headroom and allocation metadata", true, false)
 	registerMiddleEndManagerQueueMetric(meter, provider, "telego_middleend_manager_queue_high_water_items", "Lifetime high-water items retained by ME generation-manager queues", false, true)
-	registerMiddleEndManagerQueueMetric(meter, provider, "telego_middleend_manager_queue_high_water_bytes", "Lifetime high-water bytes retained by ME generation-manager queues", true, true)
+	registerMiddleEndManagerQueueMetric(meter, provider, "telego_middleend_manager_queue_high_water_bytes", "Generation high-water logical queue bytes; response bytes exclude reserved headroom and allocation metadata", true, true)
 	meter.Int64ObservableGauge("telego_middleend_manager_backpressure_events",
 		metric.WithDescription("Lifetime bounded-queue rejections in the current ME generation manager"),
 		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
@@ -504,6 +522,7 @@ func registerProxyMetrics(meter metric.Meter, provider ProxyStatsProvider) {
 }
 
 func registerMiddleEndFrontendMetrics(meter metric.Meter, provider middleEndFrontendStatsProvider) {
+	registerMiddleEndResponseWaitMetrics(meter, provider)
 	meter.Int64ObservableGauge("telego_middleend_frontend_routes_active",
 		metric.WithDescription("Active public connections committed to ME or direct fallback"),
 		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
@@ -529,7 +548,7 @@ func registerMiddleEndFrontendMetrics(meter metric.Meter, provider middleEndFron
 	}{
 		{
 			name:        "telego_middleend_frontend_buffer_bytes",
-			description: "Bytes retained between public gnet connections and the ME binding manager",
+			description: "Retained client input or owner-observed unread client output; output excludes retained backing capacity and reserved headroom",
 			value: func(stats gproxy.MiddleEndFrontendStats, direction string) int64 {
 				if direction == "input" {
 					return stats.InputBytes
@@ -539,7 +558,7 @@ func registerMiddleEndFrontendMetrics(meter metric.Meter, provider middleEndFron
 		},
 		{
 			name:        "telego_middleend_frontend_buffer_high_water_bytes",
-			description: "Lifetime high-water bytes retained by the ME public frontend",
+			description: "Lifetime high-water retained input or owner-observed unread output bytes in the ME frontend",
 			value: func(stats gproxy.MiddleEndFrontendStats, direction string) int64 {
 				if direction == "input" {
 					return stats.InputBytesHighWater
@@ -564,6 +583,9 @@ func registerMiddleEndFrontendMetrics(meter metric.Meter, provider middleEndFron
 			metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
 				stats := provider.MiddleEndFrontendStats()
 				for _, direction := range []string{"input", "output"} {
+					if stats.SharedResponseBudget && direction == "output" && instrument.name == "telego_middleend_frontend_buffer_capacity_bytes" {
+						continue
+					}
 					observer.Observe(instrument.value(stats, direction), metric.WithAttributes(attribute.String("direction", direction)))
 				}
 				return nil

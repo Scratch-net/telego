@@ -125,14 +125,14 @@ func TestBlockingClientLinkEngineEagerMetadataBudget(t *testing.T) {
 	perEvent := unsafe.Sizeof(LinkEvent{}) +
 		unsafe.Sizeof((*blockingWriteJob)(nil)) +
 		unsafe.Sizeof(blockingWriteResult{})
-	if perEvent != 88 {
-		t.Fatalf("blocking eager metadata = %d bytes/item, documentation assumes 88", perEvent)
+	if perEvent != 96 {
+		t.Fatalf("blocking eager metadata = %d bytes/item, documentation assumes 96", perEvent)
 	}
 	total := unsafe.Sizeof(LinkEvent{})*MaxLinkQueueItems +
 		unsafe.Sizeof((*blockingWriteJob)(nil))*(MaxLinkQueueItems+1) +
 		unsafe.Sizeof(blockingWriteResult{})*(MaxLinkQueueItems+1)
-	if total != 360480 {
-		t.Fatalf("blocking eager channel element cap = %d, want 360480", total)
+	if total != 393248 {
+		t.Fatalf("blocking eager channel element cap = %d, want 393248", total)
 	}
 }
 

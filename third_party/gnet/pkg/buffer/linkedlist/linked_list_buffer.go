@@ -20,6 +20,7 @@ package linkedlist
 import (
 	"io"
 	"math"
+	"unsafe"
 
 	bsPool "github.com/panjf2000/gnet/v2/pkg/pool/byteslice"
 )
@@ -29,6 +30,10 @@ type node struct {
 	next    *node
 	release func(error)
 }
+
+// OwnedNodeBytes is the explicit metadata retained for one owned output slice.
+// It excludes the slice allocation and runtime allocator overhead.
+const OwnedNodeBytes = int(unsafe.Sizeof(node{}))
 
 // dispose runs only after the node is unlinked and byte counts are updated.
 func (b *node) dispose(err error) {
@@ -201,6 +206,17 @@ func (llb *Buffer) Peek(maxBytes int) ([][]byte, error) {
 		}
 	}
 	return bs, nil
+}
+
+// PeekInto fills at most len(dst) descriptors in order without allocation.
+// It borrows the listed slices until the next buffer mutation.
+func (llb *Buffer) PeekInto(dst [][]byte) int {
+	n := 0
+	for iter := llb.head; iter != nil && n < len(dst); iter = iter.next {
+		dst[n] = iter.buf
+		n++
+	}
+	return n
 }
 
 // PeekWithBytes is like Peek but accepts [][]byte and puts them onto head.

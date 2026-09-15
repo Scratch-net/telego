@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net/http"
 	"net/netip"
@@ -73,6 +74,99 @@ func TestMiddleEndRuntimeDefaultsAreDerivedAndValid(t *testing.T) {
 	}
 	if err := service.Validate(); err != nil {
 		t.Fatalf("derived service config = %v", err)
+	}
+}
+
+func TestMiddleEndResponseBudgetCoversMaximumOperation(t *testing.T) {
+	for _, queueMB := range []int{0, 2, 8, 32} {
+		t.Run(fmt.Sprint(queueMB), func(t *testing.T) {
+			config := &Config{
+				Performance: PerformanceConfig{NumEventLoops: 1},
+				MiddleEnd:   MiddleEndConfig{Enabled: true, QueueBudgetMB: queueMB},
+			}
+			runtimeConfig, err := config.ToMiddleEndRuntimeConfig()
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(runtimeConfig.CloseIdleConnections)
+			queueBytes := middleEndDefaultManagerQueueBytes
+			if queueMB != 0 {
+				queueBytes = queueMB << 20
+			}
+			expectedTotal := 2 * queueBytes
+			if queueMB == 0 {
+				expectedTotal += gproxy.MiddleEndResponseProcessingBytes()
+			}
+			derived := runtimeConfig.Service.ResponseBudget
+			if derived == nil || derived.LimitBytes != expectedTotal ||
+				derived.ProcessingReserveBytes != gproxy.MiddleEndResponseProcessingBytes() || derived.ControlReserveBytes != 0 {
+				t.Fatalf("derived response budget = %+v", derived)
+			}
+			pool, err := middleend.NewResponseBudget(*derived)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Reserve a complete maximum response with its first queue chunk and
+			// owner record while the encode reserve is fully occupied.
+			processing, ok := pool.TryReserve(derived.ProcessingReserveBytes-middleend.ResponseAllocationCharge(0),
+				middleend.ResponseMemoryProcessing, middleend.ResponseMemoryEncode)
+			if !ok {
+				t.Fatal("maximum encode does not fit its reserve")
+			}
+			defer processing.Release()
+			ordinary, ok := pool.TryReserve(middleend.MinimumResponseOrdinaryBytes()-middleend.ResponseAllocationCharge(0),
+				middleend.ResponseMemoryOrdinary, middleend.ResponseMemoryQueuePayload)
+			if !ok {
+				t.Fatal("maximum queued response does not fit beside its encode reserve")
+			}
+			ordinary.Release()
+			if queueMB == 0 {
+				retained, ok := pool.TryReserve(2*queueBytes-middleend.ResponseAllocationCharge(0),
+					middleend.ResponseMemoryOrdinary, middleend.ResponseMemoryOutput)
+				if !ok {
+					t.Fatal("default retained responses cannot use the full 2Q beside occupied processing reserve")
+				}
+				retained.Release()
+			}
+			processing.Release()
+			if pool.Snapshot().UsedBytes != 0 {
+				t.Fatal("operation reservations leaked")
+			}
+			if runtimeConfig.Service.BindingLimits.MaxPendingRequestBytes != queueBytes ||
+				runtimeConfig.Frontend((*middleend.FixedBindingManager)(nil)).MaxPendingClientBytesTotal != queueBytes {
+				t.Fatal("response pool changed request or input capacity")
+			}
+		})
+	}
+}
+
+func TestMiddleEndFrontendUsesServiceResponseBudget(t *testing.T) {
+	config := &Config{
+		Performance: PerformanceConfig{NumEventLoops: 1},
+		MiddleEnd:   MiddleEndConfig{Enabled: true, QueueBudgetMB: 2},
+	}
+	runtimeConfig, err := config.ToMiddleEndRuntimeConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(runtimeConfig.CloseIdleConnections)
+	service, err := middleend.NewService(runtimeConfig.Service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := service.Close(ctx); err != nil {
+			t.Error(err)
+		}
+	})
+	frontend := runtimeConfig.FrontendForService(service)
+	if frontend.Source != service.Source() || frontend.ResponseBudget == nil || frontend.ResponseBudget != service.ResponseBudget() {
+		t.Fatal("frontend and generation source do not share the service response pool")
+	}
+	if frontend.ResponseBudget.Snapshot().LimitBytes != 4<<20 || frontend.MaxPendingClientBytesTotal != 2<<20 {
+		t.Fatal("minimum queue budget did not map to a 4 MiB response pool and 2 MiB input limit")
 	}
 }
 

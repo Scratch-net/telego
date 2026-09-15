@@ -1140,7 +1140,9 @@ func TestMiddleEndOutputStallTimeoutDoesNotPopEvent(t *testing.T) {
 
 func TestMiddleEndOutputHeadroomBoundariesAndSingleEncryption(t *testing.T) {
 	handler, link, conn, ctx, responseDecryptor := establishMiddleEndDD(t, nil)
-	threshold := handler.maxWriteBuffer - middleEndMaxEncodedResponse
+	answer := append(validMiddleEndPacket(), 9, 10, 11, 12)
+	required := len(answer) + 4
+	threshold := handler.maxWriteBuffer - required
 	for _, test := range []struct {
 		name string
 		used int
@@ -1154,7 +1156,7 @@ func TestMiddleEndOutputHeadroomBoundariesAndSingleEncryption(t *testing.T) {
 			conn.SetOutboundBuffered(test.used)
 			got := false
 			runMiddleEndOwner(conn, func() gnet.Action {
-				got = ctx.middleEnd.outputHeadroom(conn, handler.maxWriteBuffer)
+				got = ctx.middleEnd.outputHeadroom(conn, handler.maxWriteBuffer, required)
 				return gnet.None
 			})
 			if got != test.want {
@@ -1163,7 +1165,6 @@ func TestMiddleEndOutputHeadroomBoundariesAndSingleEncryption(t *testing.T) {
 		})
 	}
 
-	answer := append(validMiddleEndPacket(), 9, 10, 11, 12)
 	conn.SetOutboundBuffered(threshold + 1)
 	link.emit(middleend.LinkEvent{
 		Kind:         middleend.LinkEventProxyAnswer,

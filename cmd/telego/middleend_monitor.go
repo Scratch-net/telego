@@ -156,15 +156,25 @@ func (m *middleEndMonitor) observe() {
 		if current.admitting {
 			livePayloadCapacity, rotationPayloadCapacity := middleEndPayloadCapacity(snapshot, frontend)
 			liveLinkCapacity, rotationLinkCapacity := middleEndLinkCapacity(snapshot)
+			liveLinkCapacity = max(liveLinkCapacity, snapshot.RuntimeLinks)
+			rotationLinkCapacity = max(rotationLinkCapacity, snapshot.RuntimeLinks)
+			liveDecoderCapacity, rotationDecoderCapacity, decoderGrowthCapacity, decoderPlaintextCapacity := middleEndDecoderCapacity(snapshot)
 			log.Info().
 				Int("active_links", middleEndManagerLinks(snapshot.Supervisor.Active)).
+				Int("registered_me_links", snapshot.RuntimeLinks).
 				Int("refresh_candidates_per_manager", snapshot.Capacity.MaxRefreshCandidatesPerManager).
 				Int("live_me_link_capacity", liveLinkCapacity).
 				Int("rotation_me_link_capacity", rotationLinkCapacity).
 				Int64("active_middleend_bindings", frontend.MiddleEndBindingsActive).
 				Int64("active_direct_fallbacks", frontend.DirectFallbacksActive).
-				Int64("live_payload_capacity_bytes", livePayloadCapacity).
-				Int64("rotation_payload_capacity_bytes", rotationPayloadCapacity).
+				Int64("live_queue_and_response_capacity_bytes", livePayloadCapacity).
+				Int64("rotation_queue_and_response_capacity_bytes", rotationPayloadCapacity).
+				Int("response_budget_bytes", snapshot.Capacity.ResponseBudgetBytes).
+				Int64("registered_link_decoder_capacity_bytes", liveDecoderCapacity).
+				Int64("projected_rotation_decoder_capacity_bytes", rotationDecoderCapacity).
+				Int64("decoder_growth_capacity_bytes", decoderGrowthCapacity).
+				Int64("decoder_plaintext_capacity_bytes", decoderPlaintextCapacity).
+				Str("memory_scope", "configured bounds; excludes WEB carrier, runtime, and kernel memory").
 				Msg("Middle-End active generation ready; new clients use gnet ME links")
 		} else if previous.initialized {
 			log.Warn().Msg("Middle-End admission unavailable; new clients use direct fallback")
@@ -280,8 +290,7 @@ func (m *middleEndMonitor) observe() {
 			Uint64("new_evictions", current.frontendOutputEvictions-previous.frontendOutputEvictions).
 			Msg("Middle-End aggregate output pressure evicted the largest buffered clients")
 	}
-	m.observePressure("frontend", "input", "bytes", int(frontend.InputBytesHighWater), int(frontend.InputBytesLimit))
-	m.observePressure("frontend", "output", "bytes", int(frontend.OutputBytesHighWater), int(frontend.OutputBytesLimit))
+	m.observeFrontendPressure(frontend, snapshot.ResponseBudget)
 	m.observeManagerPressure("active", snapshot.Supervisor.Active, snapshot.Capacity)
 	m.observeManagerPressure("retiring", snapshot.Supervisor.Retiring, snapshot.Capacity)
 	m.observeLinkPressure("active", snapshot.Supervisor.Active, snapshot.Capacity)
@@ -345,20 +354,24 @@ func logMiddleEndNATProbeChanges(
 	}
 }
 
-// middleEndPayloadCapacity returns conservative logical payload-retention
-// ceilings. Queue budgets are independent, so each is counted once. Per-slot
-// and per-binding manager limits are subsets of the manager-wide limits and
-// are not counted again. Rotation permits at most two whole generations.
+// middleEndPayloadCapacity counts configured queue and response-allocation
+// allowances, not process memory. Shared response charges include headroom and
+// metadata, and count once across generations. Decoder storage is separate.
 func middleEndPayloadCapacity(snapshot middleend.ServiceSnapshot, frontend gproxy.MiddleEndFrontendStats) (live, rotation int64) {
-	frontendCapacity := frontend.InputBytesLimit + frontend.OutputBytesLimit
 	capacity := snapshot.Capacity
+	shared := capacity.ResponseBudgetBytes > 0
+	frontendCapacity := frontend.InputBytesLimit + int64(capacity.ResponseBudgetBytes)
+	if !shared {
+		frontendCapacity += frontend.OutputBytesLimit
+	}
 	generationCapacity := func(manager *middleend.FixedBindingManagerSnapshot) int64 {
 		if manager == nil {
 			return 0
 		}
-		managerCapacity := int64(capacity.ManagerRequestBytes) +
-			int64(capacity.ManagerControlBytes) +
-			int64(capacity.ManagerResponseBytes)
+		managerCapacity := int64(capacity.ManagerRequestBytes) + int64(capacity.ManagerControlBytes)
+		if !shared {
+			managerCapacity += int64(capacity.ManagerResponseBytes)
+		}
 		linkCapacity := int64(len(manager.Slots)+capacity.MaxRefreshCandidatesPerManager) *
 			(int64(capacity.LinkSubmissionBytes) + int64(capacity.LinkEventBytes))
 		return managerCapacity + linkCapacity
@@ -366,9 +379,33 @@ func middleEndPayloadCapacity(snapshot middleend.ServiceSnapshot, frontend gprox
 
 	activeCapacity := generationCapacity(snapshot.Supervisor.Active)
 	retiringCapacity := generationCapacity(snapshot.Supervisor.Retiring)
-	live = frontendCapacity + activeCapacity + retiringCapacity
-	rotation = frontendCapacity + 2*max(activeCapacity, retiringCapacity)
+	liveLinks, rotationLinks := middleEndLinkCapacity(snapshot)
+	perLinkCapacity := int64(capacity.LinkSubmissionBytes) + int64(capacity.LinkEventBytes)
+	live = frontendCapacity + activeCapacity + retiringCapacity + int64(max(0, snapshot.RuntimeLinks-liveLinks))*perLinkCapacity
+	rotation = frontendCapacity + 2*max(activeCapacity, retiringCapacity) + int64(max(0, snapshot.RuntimeLinks-rotationLinks))*perLinkCapacity
 	return live, rotation
+}
+
+// Persistent decoder storage follows all registered links, including unpublished
+// candidates. Rotation projects the observed topology and cannot fall below the
+// current count. Shared event loops bound growth and CBC concurrency separately.
+func middleEndDecoderCapacity(snapshot middleend.ServiceSnapshot) (live, rotation, growth, plaintext int64) {
+	_, rotationLinks := middleEndLinkCapacity(snapshot)
+	capacity := snapshot.Capacity
+	live = int64(snapshot.RuntimeLinks) * int64(capacity.DecoderBytesPerLink)
+	rotation = int64(max(rotationLinks, snapshot.RuntimeLinks)) * int64(capacity.DecoderBytesPerLink)
+	growth = int64(capacity.EventLoops) * int64(capacity.DecoderGrowthBytesPerOwner)
+	plaintext = int64(capacity.EventLoops) * int64(capacity.DecodePlaintextBytesPerOwner)
+	return live, rotation, growth, plaintext
+}
+
+func (m *middleEndMonitor) observeFrontendPressure(frontend gproxy.MiddleEndFrontendStats, pool middleend.ResponseBudgetSnapshot) {
+	m.observePressure("frontend", "input", "bytes", int(frontend.InputBytesHighWater), int(frontend.InputBytesLimit))
+	if pool.LimitBytes > 0 {
+		m.observePressure("service", "response_memory", "charged_bytes", pool.HighWaterBytes, pool.LimitBytes)
+	} else {
+		m.observePressure("frontend", "output", "bytes", int(frontend.OutputBytesHighWater), int(frontend.OutputBytesLimit))
+	}
 }
 
 func middleEndSlotRefreshTotals(snapshot middleend.GenerationSupervisorSnapshot) (successes, failures, canceled uint64) {
@@ -427,6 +464,9 @@ func (m *middleEndMonitor) observeManagerPressure(
 		{name: "control", items: manager.ControlItemsHighWater, itemLimit: capacity.ManagerControlItems, bytes: manager.ControlBytesHighWater, byteLimit: capacity.ManagerControlBytes},
 		{name: "response", items: manager.ResponseItemsHighWater, itemLimit: capacity.ManagerResponseItems, bytes: manager.ResponseBytesHighWater, byteLimit: capacity.ManagerResponseBytes},
 	} {
+		if capacity.ResponseBudgetBytes > 0 && queue.name == "response" {
+			continue
+		}
 		m.observePressure(role, queue.name, "items", queue.items, queue.itemLimit)
 		m.observePressure(role, queue.name, "bytes", queue.bytes, queue.byteLimit)
 	}
@@ -487,7 +527,7 @@ func (m *middleEndMonitor) observePressure(role, queue, dimension string, value,
 			Int("high_water", value).
 			Int("limit", limit).
 			Int("percent", percentage).
-			Msg("Middle-End queue high-water threshold crossed")
+			Msg("Middle-End queue or allocation-budget high-water threshold crossed")
 	}
 	m.pressure[key] = middleEndPressureState{value: value, stage: stage}
 }

@@ -68,6 +68,25 @@ func (mb *Buffer) Peek(n int) ([][]byte, error) {
 	return mb.listBuffer.PeekWithBytes(n, head, tail)
 }
 
+// PeekInto fills at most len(dst) descriptors without allocation or scanning
+// later list nodes. Ring segments precede list entries, as with Peek.
+func (mb *Buffer) PeekInto(dst [][]byte) int {
+	if len(dst) == 0 {
+		return 0
+	}
+	n := 0
+	head, tail := mb.ringBuffer.Peek(-1)
+	if len(head) != 0 {
+		dst[n] = head
+		n++
+	}
+	if len(tail) != 0 && n < len(dst) {
+		dst[n] = tail
+		n++
+	}
+	return n + mb.listBuffer.PeekInto(dst[n:])
+}
+
 // Discard discards n bytes in this buffer.
 func (mb *Buffer) Discard(n int) (discarded int, err error) {
 	discarded, err = mb.ringBuffer.Discard(n)

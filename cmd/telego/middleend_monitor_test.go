@@ -47,6 +47,84 @@ func TestMiddleEndPayloadCapacityHandlesMissingGenerations(t *testing.T) {
 	}
 }
 
+func TestMiddleEndSharedCapacityCountsPoolOnceAndSeparatesDecoder(t *testing.T) {
+	snapshot := middleend.ServiceSnapshot{
+		RuntimeLinks: 5,
+		Capacity: middleend.ServiceCapacitySnapshot{
+			MaxRefreshCandidatesPerManager: 8,
+			LinkSubmissionBytes:            11, LinkEventBytes: 13,
+			ManagerRequestBytes: 17, ManagerControlBytes: 19,
+			ManagerResponseBytes: 23, BindingResponseBytes: 1000,
+			ResponseBudgetBytes: 101, EventLoops: 3,
+			DecoderBytesPerLink: 1024, DecoderGrowthBytesPerOwner: 1024, DecodePlaintextBytesPerOwner: 64,
+		},
+		Supervisor: middleend.GenerationSupervisorSnapshot{
+			Active:   &middleend.FixedBindingManagerSnapshot{Slots: make([]middleend.FixedBindingSlotSnapshot, 2)},
+			Retiring: &middleend.FixedBindingManagerSnapshot{Slots: make([]middleend.FixedBindingSlotSnapshot, 1)},
+		},
+	}
+	frontend := gproxy.MiddleEndFrontendStats{InputBytesLimit: 29, OutputBytesLimit: 31, SharedResponseBudget: true}
+	live, rotation := middleEndPayloadCapacity(snapshot, frontend)
+	const managerCapacity = 17 + 19
+	const perLinkCapacity = 11 + 13
+	wantLive := int64(29 + 101 + 2*managerCapacity + (3+2*8)*perLinkCapacity)
+	wantRotation := int64(29 + 101 + 2*(managerCapacity+(2+8)*perLinkCapacity))
+	if live != wantLive || rotation != wantRotation {
+		t.Fatalf("shared capacities = %d/%d, want %d/%d", live, rotation, wantLive, wantRotation)
+	}
+	decoderLive, decoderRotation, growth, plaintext := middleEndDecoderCapacity(snapshot)
+	if decoderLive != 5*1024 || decoderRotation != 2*(2+8)*1024 || growth != 3*1024 || plaintext != 3*64 {
+		t.Fatalf("separate decoder capacities = %d/%d, growth %d, plaintext %d", decoderLive, decoderRotation, growth, plaintext)
+	}
+	snapshot.Supervisor.Active, snapshot.Supervisor.Retiring = nil, nil
+	snapshot.RuntimeLinks = 0
+	live, rotation = middleEndPayloadCapacity(snapshot, frontend)
+	if live != 29+101 || rotation != 29+101 {
+		t.Fatal("missing generations lost the service-wide response pool or added legacy output capacity")
+	}
+	// An unpublished generation has registered links before it appears in the
+	// supervisor's published manager snapshots.
+	snapshot.RuntimeLinks = 4
+	live, rotation = middleEndPayloadCapacity(snapshot, frontend)
+	decoderLive, decoderRotation, _, _ = middleEndDecoderCapacity(snapshot)
+	if live != 29+101+4*perLinkCapacity || rotation != live || decoderLive != 4*1024 || decoderRotation != decoderLive {
+		t.Fatal("unpublished registered links were omitted from current or projected storage")
+	}
+}
+
+func TestMiddleEndSharedPressureSkipsObsoleteQueueLimits(t *testing.T) {
+	monitor := &middleEndMonitor{pressure: make(map[string]middleEndPressureState)}
+	frontend := gproxy.MiddleEndFrontendStats{
+		InputBytesHighWater: 90, InputBytesLimit: 100,
+		OutputBytesHighWater: 999, OutputBytesLimit: 100,
+	}
+	monitor.observeFrontendPressure(frontend, middleend.ResponseBudgetSnapshot{LimitBytes: 100, HighWaterBytes: 80})
+	if _, exists := monitor.pressure["frontend/output/bytes"]; exists {
+		t.Fatal("shared output was compared with the old frontend limit")
+	}
+	if monitor.pressure["service/response_memory/charged_bytes"].value != 80 || monitor.pressure["frontend/input/bytes"].value != 90 {
+		t.Fatal("shared pool or independent input pressure was omitted")
+	}
+	manager := &middleend.FixedBindingManagerSnapshot{RequestBytesHighWater: 90, ResponseBytesHighWater: 999, ResponseItemsHighWater: 900}
+	capacity := middleend.ServiceCapacitySnapshot{ResponseBudgetBytes: 100, ManagerRequestBytes: 100, ManagerResponseBytes: 100, ManagerResponseItems: 768}
+	monitor.observeManagerPressure("active", manager, capacity)
+	if _, exists := monitor.pressure["active/response/bytes"]; exists {
+		t.Fatal("shared response queue was compared with the old manager byte limit")
+	}
+	if _, exists := monitor.pressure["active/response/items"]; exists {
+		t.Fatal("shared response queue was compared with the old manager item limit")
+	}
+	if monitor.pressure["active/request/bytes"].value != 90 {
+		t.Fatal("independent manager request pressure was omitted")
+	}
+	capacity.ResponseBudgetBytes = 0
+	monitor.observeManagerPressure("active", manager, capacity)
+	monitor.observeFrontendPressure(frontend, middleend.ResponseBudgetSnapshot{})
+	if monitor.pressure["active/response/bytes"].value != 999 || monitor.pressure["frontend/output/bytes"].value != 999 {
+		t.Fatal("legacy response pressure thresholds changed")
+	}
+}
+
 func TestMiddleEndMonitorRefreshTotalsUseServiceLifetimeCounters(t *testing.T) {
 	snapshot := middleend.GenerationSupervisorSnapshot{
 		DCs: []middleend.FixedBindingDCSnapshot{

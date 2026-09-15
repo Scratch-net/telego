@@ -90,8 +90,8 @@ func (MiddleEndRuntimeConfig) String() string {
 
 func (c MiddleEndRuntimeConfig) GoString() string { return c.String() }
 
-// Frontend derives the fixed production frontend policy for an already-owned
-// service source.
+// Frontend derives policy for a binding source. Use FrontendForService when
+// the source belongs to a service with a shared response pool.
 func (c MiddleEndRuntimeConfig) Frontend(source gproxy.MiddleEndBindingSource) gproxy.MiddleEndFrontendConfig {
 	var tag *middleend.ProxyTag
 	if c.ProxyTag != nil {
@@ -108,6 +108,14 @@ func (c MiddleEndRuntimeConfig) Frontend(source gproxy.MiddleEndBindingSource) g
 		OutputRetryMax:             middleEndOutputRetryMaximum,
 		OutputStallTimeout:         middleEndOutputStallTimeout,
 	}
+}
+
+// FrontendForService shares the service's response pool with every frontend
+// output owner, including output retained after a generation retires.
+func (c MiddleEndRuntimeConfig) FrontendForService(service *middleend.Service) gproxy.MiddleEndFrontendConfig {
+	frontend := c.Frontend(service.Source())
+	frontend.ResponseBudget = service.ResponseBudget()
+	return frontend
 }
 
 // CloseIdleConnections releases artifact-fetch keepalive sockets after the ME
@@ -134,6 +142,21 @@ func (c *Config) ToMiddleEndRuntimeConfig() (MiddleEndRuntimeConfig, error) {
 	managerQueueBytes, err := middleEndManagerQueueBytes(c.MiddleEnd.QueueBudgetMB)
 	if err != nil {
 		return MiddleEndRuntimeConfig{}, err
+	}
+	responseBudget := middleend.ResponseBudgetConfig{
+		LimitBytes:             2 * managerQueueBytes,
+		ProcessingReserveBytes: gproxy.MiddleEndResponseProcessingBytes(),
+	}
+	if c.MiddleEnd.QueueBudgetMB == 0 {
+		// The default keeps the full 2Q available for retained responses.
+		// Explicit queue budgets retain their total-budget interpretation.
+		responseBudget.LimitBytes += responseBudget.ProcessingReserveBytes
+	}
+	// CloseExternal uses an inline terminal marker. Its admission requires no
+	// response allocation; outbound close commands keep their control budget.
+	ordinaryBytes := responseBudget.LimitBytes - responseBudget.ProcessingReserveBytes - responseBudget.ControlReserveBytes
+	if minimum := middleend.MinimumResponseOrdinaryBytes(); ordinaryBytes < minimum {
+		return MiddleEndRuntimeConfig{}, fmt.Errorf("derived Middle-End response budget leaves %d ordinary bytes; need at least %d", ordinaryBytes, minimum)
 	}
 	eventLoops := c.Performance.NumEventLoops
 	if eventLoops == 0 {
@@ -174,6 +197,7 @@ func (c *Config) ToMiddleEndRuntimeConfig() (MiddleEndRuntimeConfig, error) {
 	serviceConfig := middleend.ServiceConfig{
 		ArtifactSource:         artifactSource,
 		ArtifactRefreshTimeout: middleEndArtifactRefreshTimeout,
+		ResponseBudget:         new(responseBudget),
 		Runtime: middleend.GnetClientRuntimeConfig{
 			EventLoops: eventLoops,
 		},

@@ -1,7 +1,6 @@
 package gproxy
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"net"
@@ -40,6 +39,14 @@ func runQueuedLogicalOutput(t *testing.T, owner *queuedIdleOwner) {
 	}
 }
 
+func logicalOutputBytes(stream *LogicalStream) []byte {
+	var output []byte
+	for entry := stream.output; entry != nil; entry = entry.next {
+		output = append(output, entry.data...)
+	}
+	return output
+}
+
 func TestLogicalOutputFIFOCoalescesConcurrentProducers(t *testing.T) {
 	stream, owner, budget, closed := newQueuedLogicalOutput(t)
 	const producers, blocks = 8, 32
@@ -68,7 +75,8 @@ func TestLogicalOutputFIFOCoalescesConcurrentProducers(t *testing.T) {
 	}
 	runQueuedLogicalOutput(t, owner)
 	wantSequence := make([]byte, producers)
-	for _, block := range stream.output {
+	for entry := stream.output; entry != nil; entry = entry.next {
+		block := entry.data
 		if len(block) != 2 || block[1] != wantSequence[block[0]] {
 			t.Fatalf("producer order changed: block %v, next sequences %v", block, wantSequence)
 		}
@@ -111,7 +119,7 @@ func TestLogicalOutputReentrantEnqueueFollowsCurrentBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	runQueuedLogicalOutput(t, owner)
-	if got := bytes.Join(stream.output, nil); string(got) != "ABC" {
+	if got := logicalOutputBytes(stream); string(got) != "ABC" {
 		t.Fatalf("reentrant output = %q, want ABC", got)
 	}
 	_ = stream.Close()

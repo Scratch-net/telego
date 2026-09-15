@@ -2,10 +2,12 @@ package gproxy
 
 import (
 	"sync/atomic"
+
+	"github.com/scratch-net/telego/pkg/transport/middleend"
 )
 
-// MiddleEndFrontendStats is a redacted snapshot of bytes retained between the
-// public gnet connections and the fixed-binding manager.
+// MiddleEndFrontendStats reports frontend observations. OutputBytes counts
+// unread bytes; the shared response pool separately charges retained capacity.
 type MiddleEndFrontendStats struct {
 	MiddleEndBindingsActive int64
 	MiddleEndBindingsTotal  uint64
@@ -17,11 +19,26 @@ type MiddleEndFrontendStats struct {
 	InputBytesLimit         int64
 	InputBackpressureEvents uint64
 
-	OutputBytes              int64
-	OutputBytesHighWater     int64
-	OutputBytesLimit         int64
-	OutputBackpressureEvents uint64
-	OutputEvictions          uint64
+	OutputBytes                 int64
+	OutputBytesHighWater        int64
+	OutputBytesLimit            int64
+	OutputBackpressureEvents    uint64
+	OutputEvictions             uint64
+	SharedResponseBudget        bool
+	ResponseWaitsTotal          [middleend.ResponseOutputWaitCount]uint64
+	ResponseWaitsCompletedTotal [middleend.ResponseOutputWaitCount]uint64
+	// Completed durations use microseconds to avoid nanosecond counter wrap
+	// after 21 days with 10,000 concurrent waits. Resolution is one microsecond.
+	ResponseWaitDurationMicroseconds [middleend.ResponseOutputWaitCount]uint64
+	ResponseWaitsActive              [middleend.ResponseOutputWaitCount]int64
+	ResponseStallClosures            uint64
+}
+
+type middleEndResponseWaitStats struct {
+	entered   atomic.Uint64
+	completed atomic.Uint64
+	duration  atomic.Uint64
+	active    atomic.Int64
 }
 
 type middleEndByteBudget struct {
@@ -84,7 +101,7 @@ func (f *middleEndFrontend) stats() MiddleEndFrontendStats {
 	middleEndBindingsActive := int64(len(f.routes))
 	directFallbacksActive := int64(len(f.directFallbacks))
 	f.mu.Unlock()
-	return MiddleEndFrontendStats{
+	result := MiddleEndFrontendStats{
 		MiddleEndBindingsActive:  middleEndBindingsActive,
 		MiddleEndBindingsTotal:   f.middleEndCommits.Load(),
 		DirectFallbacksActive:    directFallbacksActive,
@@ -98,7 +115,17 @@ func (f *middleEndFrontend) stats() MiddleEndFrontendStats {
 		OutputBytesLimit:         outputLimit,
 		OutputBackpressureEvents: outputBackpressure,
 		OutputEvictions:          f.outputEvictions.Load(),
+		SharedResponseBudget:     f.responseBudget != nil,
+		ResponseStallClosures:    f.responseStallClosures.Load(),
 	}
+	for reason := range middleend.ResponseOutputWaitCount {
+		wait := &f.responseWaits[reason]
+		result.ResponseWaitsTotal[reason] = wait.entered.Load()
+		result.ResponseWaitsCompletedTotal[reason] = wait.completed.Load()
+		result.ResponseWaitDurationMicroseconds[reason] = wait.duration.Load()
+		result.ResponseWaitsActive[reason] = wait.active.Load()
+	}
+	return result
 }
 
 func (c *middleEndClient) retainedInputBytes(connection clientEndpoint) int64 {
@@ -135,13 +162,14 @@ func (c *middleEndClient) reconcileOutput(connection clientEndpoint, reservation
 }
 
 func (c *middleEndClient) releaseBudgets() {
+	c.observeResponseOutputWait(middleend.ResponseOutputNotWaiting)
 	c.frontend.inputBudget.release(c.inputAccounted)
 	c.inputAccounted = 0
 	c.frontend.outputBudget.release(c.outputAccounted.Swap(0))
 }
 
-func (f *middleEndFrontend) reserveOutput() bool {
-	return f.outputBudget.tryReserve(int64(middleEndMaxEncodedResponse))
+func (f *middleEndFrontend) reserveOutput(size int) bool {
+	return f.outputBudget.tryReserve(int64(size))
 }
 
 func (f *middleEndFrontend) evictOutputPressureVictim(current *middleEndClient) bool {
