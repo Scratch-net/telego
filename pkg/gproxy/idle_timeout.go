@@ -3,7 +3,6 @@ package gproxy
 import (
 	"context"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/panjf2000/gnet/v2"
@@ -130,7 +129,7 @@ func (h *ProxyHandler) startHandshakeTimer(conn clientEndpoint, ctx *ConnContext
 			}
 			h.recordHandshakeFailure(ctx, handshakeStageForState(state))
 			h.logger.Info("[#%d] handshake timeout from %s in state %s (active: %d)",
-				ctx.id, conn.RemoteAddr(), state, atomic.LoadInt64(&h.activeConns))
+				ctx.id, conn.RemoteAddr(), state, h.activeConns.Load())
 			return conn.Close()
 		})); err != nil {
 			_ = conn.Close()

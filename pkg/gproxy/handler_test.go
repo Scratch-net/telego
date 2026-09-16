@@ -337,15 +337,15 @@ func TestProxyHandlerGlobalConnectionLimit(t *testing.T) {
 	if _, action := handler.OnOpen(second); action != gnet.Close {
 		t.Fatalf("saturated OnOpen action = %v, want close", action)
 	}
-	if got := atomic.LoadInt64(&handler.activeConns); got != 2 {
+	if got := handler.activeConns.Load(); got != 2 {
 		t.Fatalf("active before rejected OnClose = %d", got)
 	}
 	handler.OnClose(second, nil)
-	if got := atomic.LoadInt64(&handler.activeConns); got != 1 {
+	if got := handler.activeConns.Load(); got != 1 {
 		t.Fatalf("active after rejected OnClose = %d", got)
 	}
 	handler.OnClose(first, nil)
-	if got := atomic.LoadInt64(&handler.activeConns); got != 0 {
+	if got := handler.activeConns.Load(); got != 0 {
 		t.Fatalf("active after all closes = %d", got)
 	}
 }
@@ -657,16 +657,16 @@ func TestProxyHandler_ActiveConnections(t *testing.T) {
 	}
 
 	// Check active count
-	if handler.activeConns != 5 {
-		t.Errorf("activeConns: got %d, want 5", handler.activeConns)
+	if handler.activeConns.Load() != 5 {
+		t.Errorf("activeConns: got %d, want 5", handler.activeConns.Load())
 	}
 
 	// Close some
 	handler.OnClose(conns[0], nil)
 	handler.OnClose(conns[1], nil)
 
-	if handler.activeConns != 3 {
-		t.Errorf("activeConns after close: got %d, want 3", handler.activeConns)
+	if handler.activeConns.Load() != 3 {
+		t.Errorf("activeConns after close: got %d, want 3", handler.activeConns.Load())
 	}
 
 	// Close rest
@@ -674,8 +674,8 @@ func TestProxyHandler_ActiveConnections(t *testing.T) {
 		handler.OnClose(conns[i], nil)
 	}
 
-	if handler.activeConns != 0 {
-		t.Errorf("activeConns after all closed: got %d, want 0", handler.activeConns)
+	if handler.activeConns.Load() != 0 {
+		t.Errorf("activeConns after all closed: got %d, want 0", handler.activeConns.Load())
 	}
 }
 

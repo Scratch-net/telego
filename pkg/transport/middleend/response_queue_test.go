@@ -58,6 +58,59 @@ func TestSharedResponseQueueMaximumTinyEventsHasBoundedReclamation(t *testing.T)
 	t.Logf("64 MiB admits %d ACKs; fill=%s bounded clear=%s released=%d B chunk=%d B participant=%d B", count, fillDuration, clearDuration, freed, ResponseAllocationCharge(responseQueueChunkBytes), ResponseParticipantBytes)
 }
 
+func TestSharedResponseQueueAdmitsMaximumBeforeCleanupWorkerRuns(t *testing.T) {
+	budget := responseBudgetForTest(t, ResponseBudgetConfig{LimitBytes: 2 << 20})
+	manager, err := NewFixedBindingManagerWithResponseBudget(
+		[]FixedBindingSlot{{DCID: 2, Link: newFixedBindingFakeLink()}}, fixedBindingTestLimits(), budget,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := manager.state
+	// Defer starting consumers to model the valid schedule where the cleanup
+	// worker has not run before the incoming response retries admission.
+	m.state = fixedBindingManagerReady
+	t.Cleanup(func() {
+		m.ensureConsumers()
+		if err := manager.Close(); err != nil {
+			t.Error(err)
+		}
+		if snapshot := budget.Snapshot(); snapshot.UsedBytes != 0 || snapshot.Allocations != 0 {
+			t.Errorf("cleanup retained response ownership: %+v", snapshot)
+		}
+	})
+	slow, err := manager.Bind(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	incoming, err := manager.Bind(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	for {
+		err = m.enqueueEventLocked(slow.state, LinkEvent{Kind: LinkEventSimpleAck, ConnectionID: slow.ConnectionID()})
+		if err != nil {
+			break
+		}
+	}
+	m.mu.Unlock()
+	if !errors.Is(err, ErrFixedBindingResponseBackpressure) {
+		t.Fatal(err)
+	}
+	if err := m.routeEvent(incoming.state.slot, LinkEvent{
+		Kind: LinkEventProxyAnswer, ConnectionID: incoming.ConnectionID(), Packet: make([]byte, MaxClientPacketSize),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if incoming.state.terminal || incoming.state.items != 1 {
+		t.Fatalf("maximum incoming response rejected before cleanup ran: terminal=%v items=%d", incoming.state.terminalErr, incoming.state.items)
+	}
+	if !errors.Is(slow.state.terminalErr, ErrFixedBindingResponseBackpressure) || m.reclaimHead == nil {
+		t.Fatal("pressure did not detach the slow binding's remaining queue")
+	}
+}
+
 func TestSharedResponseQueueThousandBindingMetadata(t *testing.T) {
 	budget := responseBudgetForTest(t, ResponseBudgetConfig{LimitBytes: 8 << 20})
 	limits := fixedBindingTestLimits()

@@ -506,8 +506,8 @@ func TestLogicalStreamCloseBeforeOpenNotifiesExactlyOnce(t *testing.T) {
 	}
 	runIdleExpiry(t, owner)
 	runIdleExpiry(t, owner)
-	if fmt.Sprint(events) != "[opened closed]" || atomic.LoadInt64(&handler.activeConns) != 0 {
-		t.Fatalf("canceled lifecycle = %v, active %d", events, handler.activeConns)
+	if fmt.Sprint(events) != "[opened closed]" || handler.activeConns.Load() != 0 {
+		t.Fatalf("canceled lifecycle = %v, active %d", events, handler.activeConns.Load())
 	}
 	budget.assertEmpty(t)
 }

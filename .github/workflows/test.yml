@@ -42,6 +42,9 @@ jobs:
       - name: Run production-tag tests
         run: sh dist/test-go.sh -tags=poll_opt,gc_opt ./...
 
+      - name: Run 32-bit production-tag tests
+        run: make test-32
+
       - name: Run tests with coverage
         run: sh dist/test-go.sh -coverprofile=coverage.out -covermode=atomic ./pkg/...
 

@@ -573,7 +573,7 @@ func closeMiddleEndTestClient(handler *ProxyHandler, conn *middleEndOwnerConn, c
 	if ctx.State() == StateClosed {
 		return
 	}
-	atomic.AddInt64(&handler.activeConns, 1)
+	handler.activeConns.Add(1)
 	runMiddleEndOwner(conn, func() gnet.Action { return handler.OnClose(conn, nil) })
 }
 

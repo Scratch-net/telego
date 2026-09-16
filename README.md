@@ -776,6 +776,10 @@ Before a pull request, run `make test`.
 This command runs the local gnet patch regressions and the Telego tests in the three supported build modes.
 It does not run the upstream gnet test suite.
 
+On Linux with 32-bit executable support, also run `make test-32`.
+This command runs the Telego tests with production tags on `linux/386` to detect alignment and allocation-size errors.
+The test and release workflows require this gate. Cross-builds alone do not detect these runtime errors.
+
 Install Node.js 24 to include the WEB bridge behavior tests.
 These tests run the rendered JavaScript with simulated clocks and sockets. They require no npm packages.
 CI installs Node explicitly. If Node is absent, local Go tests skip the JavaScript tests.

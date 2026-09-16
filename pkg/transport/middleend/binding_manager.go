@@ -1546,6 +1546,9 @@ func (m *fixedBindingManager) repairSlot(ctx context.Context, slot *fixedBinding
 		return fmt.Errorf("%w: DC %d replacement has a nil notification channel", ErrFixedBindingSlotRepair, slot.dcID)
 	}
 	stage = GenerationSlotRepairStart
+	if err := prepareReplacementResponseSink(link); err != nil {
+		return fmt.Errorf("%w: DC %d prepare replacement response sink: %w", ErrFixedBindingSlotRepair, slot.dcID, err)
+	}
 	if err := link.Start(ctx); err != nil {
 		return fmt.Errorf("%w: DC %d start replacement: %w", ErrFixedBindingSlotRepair, slot.dcID, err)
 	}

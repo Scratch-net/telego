@@ -303,7 +303,7 @@ func TestSpliceGnetClientCloseCancelsDial(t *testing.T) {
 		t.Fatal("client cancellation did not stop splice dial")
 	}
 	awaitSpliceCondition(t, "splice admission release", func() bool {
-		return atomic.LoadInt64(&server.handler.activeConns) == 0
+		return server.handler.activeConns.Load() == 0
 	})
 }
 

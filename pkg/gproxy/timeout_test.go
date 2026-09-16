@@ -66,7 +66,7 @@ func TestHandshakeTimeout_SilentConnection(t *testing.T) {
 	// Give gnet event loop time to process
 	time.Sleep(100 * time.Millisecond)
 
-	active := atomic.LoadInt64(&handler.activeConns)
+	active := handler.activeConns.Load()
 	if active != 1 {
 		t.Fatalf("expected 1 active conn, got %d", active)
 	}
@@ -74,7 +74,7 @@ func TestHandshakeTimeout_SilentConnection(t *testing.T) {
 	// Wait for handshake timeout (2s + 1s buffer)
 	time.Sleep(3 * time.Second)
 
-	active = atomic.LoadInt64(&handler.activeConns)
+	active = handler.activeConns.Load()
 	if active != 0 {
 		t.Fatalf("expected 0 active conns after timeout, got %d (leak!)", active)
 	}

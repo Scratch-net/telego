@@ -28,6 +28,15 @@ jobs:
       - name: Run local gnet patch regressions
         run: make test-gnet
 
+      - name: Set up Node for bridge behavior tests
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Run 32-bit production-tag tests
+        run: make test-32
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
         with:

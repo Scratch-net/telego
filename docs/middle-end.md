@@ -216,12 +216,13 @@ Call this derived queue value `Q`. With zero or omitted `queue-budget-mb`, ordin
 The pool adds the reserve from `MiddleEndResponseProcessingBytes()`. The current 64-bit reserve is 2,089,486 bytes, for a total of 69,231,118 bytes.
 An explicit nonzero `queue-budget-mb` keeps a total response pool of `2Q`, including the reserve.
 For example, `queue-budget-mb: 8` supplies a 16MiB response pool. It preserves the separate 8MiB request and input budgets.
-The [memory-cap measurements](investigations/middleend-response-implementation-2026-09-15.md#separate-process-native-memory-caps) support this default. Local acceptance checks passed. Deployment remains pending.
+The [memory-cap measurements](investigations/middleend-response-implementation-2026-09-15.md#separate-process-native-memory-caps) support this default.
 
 ### Response admission and memory ownership
 
 Each binding borrows available response capacity. Production response admission has no fixed 2MiB or 768-event cutoff for a binding.
 The same pool covers active and retiring generations, replacement candidates, and frontend output.
+Before publication, replacement candidates reject application responses before allocating a retained packet copy. Ping and Pong remain available for probes.
 A temporary client pause can recover while its retained responses fit this pool.
 
 Admission reserves the response envelope, ownership handle, participant record, and queue chunk before allocation.
@@ -233,6 +234,7 @@ A partial output drain counts as progress. It does not release the full backing 
 An accepted write does not prove client receipt or output drain.
 When a binding closes, its remaining output and detached queue storage stay charged until their owners release them.
 Each manager has one cleanup worker. Manager shutdown waits for that worker to finish.
+Synchronous cleanup targets one maximum admission. Its event limit derives from allocation charges for the target architecture.
 
 An inline `CloseExternal` marker follows all accepted responses without another response allocation.
 Client output caps defer response processing. They preserve response order and the existing no-progress timeout.

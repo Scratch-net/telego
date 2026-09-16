@@ -174,6 +174,9 @@ func (m *fixedBindingManager) refreshSlot(parent context.Context, attempt *slotR
 	if validatePublicEndpoint("refresh source", netip.AddrPortFrom(replacement.SourceIP, 1)) != nil {
 		return
 	}
+	if err := prepareReplacementResponseSink(link); err != nil {
+		return
+	}
 	if err := link.Start(ctx); err != nil {
 		return
 	}

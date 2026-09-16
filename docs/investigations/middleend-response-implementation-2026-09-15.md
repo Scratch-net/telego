@@ -1,5 +1,8 @@
 # Middle-End response implementation: 2026-09-15
 
+This report records the September 15 checkpoint.
+The [September 16 release audit](middleend-release-audit-2026-09-16.md) records subsequent corrections to candidate preparation and the cleanup limit.
+
 Phases 1 through 5 of the [accepted plan](middleend-response-pressure-plan-2026-09-15.md) passed implementation and independent audit gates.
 Phase 5 includes telemetry, capacity reporting, documentation, and dashboard preparation.
 Local Phase 6 acceptance checks passed. Memory-cap measurements support the selected final default. Deployment and production validation remain pending.

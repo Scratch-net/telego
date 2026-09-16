@@ -7,7 +7,6 @@ import (
 
 const responseQueueChunkItems = 16
 const responseQueueChunkBytes = int(unsafe.Sizeof(responseQueueChunk{}))
-const responseReclaimTurnItems = 8192
 
 // Fixed chunks bound allocation and copying on the physical ME owner. The
 // detached job link lives in already charged storage, so scheduling cleanup
@@ -65,7 +64,14 @@ func (m *fixedBindingManager) clearSharedResponseQueueLocked(binding *clientBind
 	if head == nil {
 		return 0
 	}
-	remaining, freed := releaseResponseChunks(head, MinimumResponseOrdinaryBytes(), responseReclaimTurnItems)
+	byteBudget := MinimumResponseOrdinaryBytes()
+	// ACKs have the smallest queued envelope; close markers live inline.
+	// Ignore chunk reclamation when deriving the finite entry bound so it
+	// still covers byteBudget on architectures with smaller allocation charges.
+	minimumOutput, _ := ClientResponseOutputBound(LinkEventSimpleAck, 0)
+	minimumCharge := ResponseAllocationCharge(minimumOutput + ResponseOutputMetadataBytes)
+	itemBudget := 1 + (byteBudget-1)/minimumCharge
+	remaining, freed := releaseResponseChunks(head, byteBudget, itemBudget)
 	if remaining == nil {
 		return freed
 	}

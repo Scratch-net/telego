@@ -364,6 +364,7 @@ type GnetClientLink struct {
 	submissions               []LinkSubmission
 	eventCharges              []int
 	responseSink              func(LinkEvent) error
+	responsePreparation       responseSinkPreparation
 	pendingSubmissions        int
 	pendingSubmissionBytes    int
 	submissionHighWater       int
@@ -785,6 +786,12 @@ func (l *GnetClientLink) deliverOwnerEvent(event LinkEvent, borrowed bool) error
 	if sink := l.responseSink; sink != nil && responseSinkEvent(event.Kind) {
 		l.mu.Unlock()
 		return sink(event)
+	}
+	if l.responsePreparation != responseSinkUnprepared && responseSinkEvent(event.Kind) {
+		l.responsePreparation = responseSinkRejected
+		l.mu.Unlock()
+		event.Release()
+		return errCandidateResponse
 	}
 	l.reconcileEventsLocked()
 	if l.pendingEvents >= l.limits.MaxPendingEvents ||

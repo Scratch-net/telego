@@ -1,4 +1,4 @@
-.PHONY: build install uninstall clean test test-limited test-gnet bench run
+.PHONY: build install uninstall clean test test-limited test-gnet test-32 bench run
 .DEFAULT_GOAL := build
 
 # Build tags for gnet optimizations:
@@ -84,6 +84,11 @@ test-limited:
 # Only local patch regressions run in the separate gnet module.
 test-gnet:
 	sh dist/test-gnet.sh
+
+# Run on a Linux host with 32-bit executable support. This catches alignment
+# and allocation-size regressions which release cross-builds cannot detect.
+test-32:
+	GOOS=linux GOARCH=386 CGO_ENABLED=0 sh dist/test-go.sh -tags="$(TAGS)" ./...
 
 .PHONY: test-rpm
 test-rpm:

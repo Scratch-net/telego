@@ -298,12 +298,24 @@ func runResponseSinkSharedPressure(t *testing.T, existingHealthy bool) {
 type responseSinkFakeLink struct {
 	*fixedBindingFakeLink
 	installErr error
+	prepareErr error
 	sink       func(LinkEvent) error
 	installs   int
+	prepares   int
 }
 
 func newResponseSinkFakeLink() *responseSinkFakeLink {
 	return &responseSinkFakeLink{fixedBindingFakeLink: newFixedBindingFakeLink()}
+}
+
+func (l *responseSinkFakeLink) prepareResponseSink() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.prepares++
+	if l.startCalls != 0 {
+		return errLinkResponseSink
+	}
+	return l.prepareErr
 }
 
 func (l *responseSinkFakeLink) installResponseSink(sink func(LinkEvent) error) error {
@@ -372,9 +384,10 @@ func TestResponseSinkReplacementInstallation(t *testing.T) {
 				synctest.Wait()
 				candidate.mu.Lock()
 				installedBeforeProbe := candidate.installs
+				preparedBeforeProbe := candidate.prepares
 				candidate.mu.Unlock()
-				if installedBeforeProbe != 0 {
-					t.Fatal("candidate sink bypassed its channel probe")
+				if installedBeforeProbe != 0 || preparedBeforeProbe != 1 {
+					t.Fatal("candidate did not guard responses before its channel probe")
 				}
 				ping := candidatePing(t, candidate.fixedBindingFakeLink)
 				candidate.emit(LinkEvent{Kind: LinkEventPong, KeepaliveID: ping.ID})

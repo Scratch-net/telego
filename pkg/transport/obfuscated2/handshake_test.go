@@ -224,7 +224,7 @@ func TestLegacyGenerateServerFrame_DefaultsToPaddedIntermediate(t *testing.T) {
 	plain, _, _ := decodeServerFrame(t, wire)
 	gotType := ConnectionType(binary.LittleEndian.Uint32(plain[56:60]))
 	if gotType != ConnectionTypePaddedIntermediate {
-		t.Errorf("connection type = 0x%08x, want legacy default 0x%08x", gotType, ConnectionTypePaddedIntermediate)
+		t.Errorf("connection type = 0x%08x, want legacy default 0x%08x", gotType, uint32(ConnectionTypePaddedIntermediate))
 	}
 }
 
@@ -563,7 +563,7 @@ func TestFrameSize(t *testing.T) {
 // TestConnectionTypePaddedIntermediate tests the accurately named connection type constant.
 func TestConnectionTypePaddedIntermediate(t *testing.T) {
 	if ConnectionTypePaddedIntermediate != 0xdddddddd {
-		t.Errorf("ConnectionTypePaddedIntermediate should be 0xdddddddd, got 0x%x", ConnectionTypePaddedIntermediate)
+		t.Errorf("ConnectionTypePaddedIntermediate should be 0xdddddddd, got 0x%x", uint32(ConnectionTypePaddedIntermediate))
 	}
 }
 
@@ -572,8 +572,8 @@ func TestConnectionTypeFakeTLSAlias(t *testing.T) {
 	if ConnectionTypeFakeTLS != ConnectionTypePaddedIntermediate {
 		t.Errorf(
 			"ConnectionTypeFakeTLS = 0x%08x, want alias of ConnectionTypePaddedIntermediate 0x%08x",
-			ConnectionTypeFakeTLS,
-			ConnectionTypePaddedIntermediate,
+			uint32(ConnectionTypeFakeTLS),
+			uint32(ConnectionTypePaddedIntermediate),
 		)
 	}
 }
@@ -581,21 +581,21 @@ func TestConnectionTypeFakeTLSAlias(t *testing.T) {
 // TestConnectionTypeIntermediate tests the intermediate connection type constant.
 func TestConnectionTypeIntermediate(t *testing.T) {
 	if ConnectionTypeIntermediate != 0xeeeeeeee {
-		t.Errorf("ConnectionTypeIntermediate should be 0xeeeeeeee, got 0x%x", ConnectionTypeIntermediate)
+		t.Errorf("ConnectionTypeIntermediate should be 0xeeeeeeee, got 0x%x", uint32(ConnectionTypeIntermediate))
 	}
 }
 
 // TestConnectionTypeConstants verifies all supported connection type constants.
 func TestConnectionTypeConstants(t *testing.T) {
 	if ConnectionTypeAbridged != 0xefefefef {
-		t.Errorf("ConnectionTypeAbridged = 0x%08x, want 0xefefefef", ConnectionTypeAbridged)
+		t.Errorf("ConnectionTypeAbridged = 0x%08x, want 0xefefefef", uint32(ConnectionTypeAbridged))
 	}
 
 	if ConnectionTypePaddedIntermediate != 0xdddddddd {
-		t.Errorf("ConnectionTypePaddedIntermediate = 0x%08x, want 0xdddddddd", ConnectionTypePaddedIntermediate)
+		t.Errorf("ConnectionTypePaddedIntermediate = 0x%08x, want 0xdddddddd", uint32(ConnectionTypePaddedIntermediate))
 	}
 
 	if ConnectionTypeIntermediate != 0xeeeeeeee {
-		t.Errorf("ConnectionTypeIntermediate = 0x%08x, want 0xeeeeeeee", ConnectionTypeIntermediate)
+		t.Errorf("ConnectionTypeIntermediate = 0x%08x, want 0xeeeeeeee", uint32(ConnectionTypeIntermediate))
 	}
 }

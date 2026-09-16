@@ -49,6 +49,10 @@ type fakePeerConfig struct {
 	// owner. send emits one RPC frame before returning; nil preserves echo.
 	respond       func(ProxyRequest, func([]byte) error) (bool, error)
 	maxOperations uint64 // zero preserves the existing recorder policy
+	// Test-only unsolicited RPCs share the real CBC/frame stream with the
+	// handshake or each probe reply. Empty slices preserve normal behavior.
+	initialPayloads    [][]byte
+	beforePongPayloads [][]byte
 }
 
 type fakePeerRecord struct {
@@ -166,6 +170,13 @@ func (p *fakeMiddleEndPeer) run() error {
 			return fmt.Errorf("fake peer encode ping: %w", err)
 		}
 		initial = append(initial, ping...)
+	}
+	for _, payload := range p.config.initialPayloads {
+		wire, err := server.encodePayloadRuntime(payload)
+		if err != nil {
+			return fmt.Errorf("fake peer encode initial payload: %w", err)
+		}
+		initial = append(initial, wire...)
 	}
 	if err := writeFragments(p.conn, initial, p.config.fragmentPattern); err != nil {
 		return fmt.Errorf("fake peer write coalesced handshake: %w", err)
@@ -335,9 +346,22 @@ func (p *fakeMiddleEndPeer) handleFrame(server *runtimeTestServer, frame Frame) 
 		if err := p.record(fakePeerRecord{operation: operation, keepaliveID: ping.ID}); err != nil {
 			return err
 		}
-		wire, err := server.encodePayloadRuntime(Pong(ping).MarshalBinary())
+		var wire []byte
+		for _, payload := range p.config.beforePongPayloads {
+			encoded, err := server.encodePayloadRuntime(payload)
+			if err != nil {
+				return err
+			}
+			wire = append(wire, encoded...)
+		}
+		pong, err := server.encodePayloadRuntime(Pong(ping).MarshalBinary())
 		if err != nil {
 			return err
+		}
+		if wire == nil {
+			wire = pong
+		} else {
+			wire = append(wire, pong...)
 		}
 		return writeFragments(p.conn, wire, p.config.fragmentPattern)
 	case OperationPong:

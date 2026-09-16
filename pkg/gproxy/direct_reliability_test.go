@@ -45,7 +45,7 @@ type directClientTestHandler struct {
 
 func (h *directClientTestHandler) OnOpen(c gnet.Conn) ([]byte, gnet.Action) {
 	ctx := c.Context().(*ConnContext)
-	atomic.AddInt64(&h.activeConns, 1)
+	h.activeConns.Add(1)
 	go h.dialDC(c, ctx)
 	if h.waitEarlyTraffic != nil {
 		<-h.waitEarlyTraffic
