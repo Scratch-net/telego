@@ -4,6 +4,7 @@ High-performance Telegram MTProxy in Go with Telegram Middle-End, TLS fronting, 
 
 - Source: [github.com/Scratch-net/telego](https://github.com/Scratch-net/telego)
 - Releases: [github.com/Scratch-net/telego/releases](https://github.com/Scratch-net/telego/releases)
+- Middle-End guide: [docs/middle-end.md](https://github.com/Scratch-net/telego/blob/main/docs/middle-end.md)
 - WEB proxy guide: [docs/web-proxy.md](https://github.com/Scratch-net/telego/blob/main/docs/web-proxy.md)
 - Docker examples: [examples](https://github.com/Scratch-net/telego/tree/main/examples)
 - License: Apache-2.0
@@ -12,9 +13,9 @@ The image uses `telego` as its entry point. It contains a static binary and no s
 
 ## Supported image tags
 
-Release `v0.6.4` publishes these tags:
+Release `v0.6.5` publishes these tags:
 
-- `scratchnet/telego:v0.6.4` — fixed release
+- `scratchnet/telego:v0.6.5` — fixed release
 - `scratchnet/telego:v0.6` — latest `v0.6.x` release
 - `scratchnet/telego:v0` — latest `v0.x` release
 - `scratchnet/telego:latest` — moving image from a release or a successful `main` build
@@ -23,19 +24,34 @@ The current manifests support Linux on AMD64, ARM64, and ARMv7.
 
 For repeatable deployments, use a fixed release tag. The `latest` tag can contain unreleased changes from `main`.
 
+## Changes in v0.6.5
+
+Middle-End response buffering now uses one shared memory pool across clients, generations, and frontend output.
+Clients can recover from temporary pauses without the former fixed 2 MiB or 768-event response cutoff for each binding.
+The existing 100-second output stall timeout remains. Exhaustion of the shared pool can require an earlier closure.
+
+The default response pool is approximately 66 MiB on 64-bit builds. It includes reserved output capacity and response metadata.
+Other buffers and runtime memory have separate allowances, so this is not a container memory limit.
+An explicit nonzero `[middle-end].queue-budget-mb` sets the combined response pool to twice that value, including the processing reserve.
+
+New metrics cover response memory, admission waits, pressure evictions, and output stalls.
+This release also fixes a 32-bit connection-counter alignment error and adds mandatory 32-bit tests.
+
+Existing configurations remain valid. Read the [v0.6.5 release notes](https://github.com/Scratch-net/telego/releases/tag/v0.6.5) for the complete changes.
+
 ## Generate a secret
 
 Replace `www.google.com` with the FakeTLS mask hostname:
 
 ```bash
-docker run --rm scratchnet/telego:v0.6.4 \
+docker run --rm scratchnet/telego:v0.6.5 \
   generate www.google.com
 ```
 
 To also print Telegram WEB proxy links, add the public WEB hostname:
 
 ```bash
-docker run --rm scratchnet/telego:v0.6.4 \
+docker run --rm scratchnet/telego:v0.6.5 \
   generate www.google.com --web-host proxy.example.com
 ```
 
@@ -66,7 +82,7 @@ docker run -d \
   --restart unless-stopped \
   -p 443:443 \
   -v "$PWD/config.toml:/config.toml:ro" \
-  scratchnet/telego:v0.6.4 \
+  scratchnet/telego:v0.6.5 \
   run -c /config.toml -l
 ```
 
@@ -81,7 +97,7 @@ docker logs telego
 ```yaml
 services:
   telego:
-    image: scratchnet/telego:v0.6.4
+    image: scratchnet/telego:v0.6.5
     restart: unless-stopped
     ports:
       - "443:443"
@@ -143,7 +159,7 @@ Replace `proxy.example.com` in these files:
 Generate the secret and WEB links:
 
 ```bash
-docker run --rm scratchnet/telego:v0.6.4 \
+docker run --rm scratchnet/telego:v0.6.5 \
   generate proxy.example.com --web-host proxy.example.com
 ```
 
@@ -183,7 +199,8 @@ Read the [complete WEB proxy guide](https://github.com/Scratch-net/telego/blob/m
 
 ## Update the container
 
-For a Compose installation:
+For a Compose installation, set the Telego image to `scratchnet/telego:v0.6.5` in the Compose file.
+Then update the service:
 
 ```bash
 docker compose pull telego
