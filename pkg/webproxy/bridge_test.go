@@ -150,13 +150,13 @@ func TestRenderBridgeWebSocketCarrierImplementations(t *testing.T) {
 				"if(carrier==='websocket')await openWebSocket()",
 				"webSocket.send(batch.body)",
 				"webSocket.bufferedAmount+queuedBytes>queueByteLimit",
-				"socket.onclose=()=>{if(!closed)fail()}",
+				"socket.onclose=event=>{if(!closed)fail('ws_closed'",
 				"function openWebSocketLane(lane)",
 				"function runWebSocketLaneUp(lane)",
 				"if(!lane.socket)openWebSocketLane(lane)",
 				"finishWebSocketLane(lane,!lane.localClosed&&!lane.remoteClosed)",
 				"laneQueueLimit=8388608,laneItemLimit=1024",
-				"if(!lane.opened){fail();return}",
+				"if(!lane.opened){fail('ws_lane_open'",
 			} {
 				if !strings.Contains(body, required) {
 					t.Errorf("%s bridge omitted %q", test.carrier, required)

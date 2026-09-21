@@ -108,6 +108,7 @@ func newCarrierLane() *carrierLane {
 // Session is one authenticated HTTPS carrier session. The serialized carrier
 // permits one uplink and downlink. The lanes carrier permits one pair per lane.
 type Session struct {
+	diagnostic     *bridgeDiagnosticState
 	profile        Profile
 	carrier        CarrierMode
 	clientIP       string

@@ -216,8 +216,8 @@ function release(bytes,items,lane){queuedBytes-=bytes;queuedItems-=items;if(lane
 			"if(carrier==='https')poll();else if(carrier==='https-lanes')pollLane(lanes.get(0));",
 		},
 		{
-			"try{if(carrier==='https')queueUp(data);else for(const frame of splitFrames(data))queueLane(frame)}catch(error){fail()}",
-			"try{\n  if(carrier==='https')queueUp(data);\n  else if(carrier==='https-lanes')for(const frame of splitFrames(data))queueLane(frame);\n  else if(carrier==='websocket')queueWebSocket(data);\n  else for(const frame of splitFrames(data))queueWebSocketLane(frame);\n }catch(error){fail()}",
+			"try{if(carrier==='https')queueUp(data);else for(const frame of splitFrames(data))queueLane(frame)}catch(error){fail('carrier_queue',error)}",
+			"try{\n  if(carrier==='https')queueUp(data);\n  else if(carrier==='https-lanes')for(const frame of splitFrames(data))queueLane(frame);\n  else if(carrier==='websocket')queueWebSocket(data);\n  else for(const frame of splitFrames(data))queueWebSocketLane(frame);\n }catch(error){fail('carrier_queue',error)}",
 		},
 		{
 			"lane={id,sequence:1,cursor:'0',pending:[],running:false,polling:false,controller:null};",
@@ -254,14 +254,14 @@ function release(bytes,items,lane){queuedBytes-=bytes;queuedItems-=items;if(lane
 
 const webSocketBridgeFunctions = `function waitForWebSocketOpen(socket){
  return new Promise((resolve,reject)=>{
-  let settled=false;const deadline=Date.now()+requestTimeoutMs;
+  let settled=false;const started=Date.now(),deadline=started+requestTimeoutMs;
   const finish=error=>{
    if(settled)return;settled=true;clearTimeout(timer);
    socket.removeEventListener('open',opened);socket.removeEventListener('error',failed);socket.removeEventListener('close',failed);
    lifecycleController.signal.removeEventListener('abort',aborted);
-   if(error){try{socket.close()}catch(closeError){}reject(error)}else resolve();
+   if(error){try{socket.close()}catch(closeError){}reject(diagnosticException(error,{operationMS:Date.now()-started}))}else resolve();
   };
-  const failed=()=>finish(new Error('websocket failed'));
+  const failed=event=>finish(diagnosticException(new Error(event.type==='close'?'websocket closed':'websocket failed'),{closeCode:event.code}));
   const aborted=()=>finish(new DOMException('carrier closed','AbortError'));
   const opened=()=>{if(closed||lifecycleController.signal.aborted){aborted();return}finish(Date.now()>=deadline?new Error('websocket opening deadline reached'):null)};
   const timer=setTimeout(()=>finish(new Error('websocket opening deadline reached')),requestTimeoutMs);
@@ -274,14 +274,14 @@ async function openWebSocket(){
  const socket=new WebSocket(webSocketTarget,'tproxy-v1.'+sessionToken);webSocket=socket;socket.binaryType='arraybuffer';let opened=false;
  socket.onmessage=event=>{
   if(closed||!opened||webSocket!==socket)return;
-  if(!(event.data instanceof ArrayBuffer)||!event.data.byteLength){fail();return}
+  if(!(event.data instanceof ArrayBuffer)||!event.data.byteLength){fail('ws_receive_type',null,0,socket);return}
   port.postMessage({t:'traffic',up:0,down:event.data.byteLength});port.postMessage(event.data,[event.data]);status('connected');
  };
- socket.onclose=()=>{if(!closed)fail()};
- await waitForWebSocketOpen(socket);ensureOpen();opened=true;
+ socket.onclose=event=>{if(!closed)fail('ws_closed',null,0,socket,event.code)};
+ try{await waitForWebSocketOpen(socket);ensureOpen();opened=true}catch(error){fail('ws_open',error,0,socket);throw error}
 }
 function queueWebSocket(data){
- if(!reserve(data)){fail();return}upPending.push(data);runWebSocketUp();
+ if(!reserve(data)){fail('ws_capacity',null,0,webSocket);return}upPending.push(data);runWebSocketUp();
 }
 function scheduleWebSocketUp(){
  if(!webSocketTimer)webSocketTimer=setTimeout(()=>{webSocketTimer=0;runWebSocketUp()},10);
@@ -295,7 +295,7 @@ function runWebSocketUp(){
  try{
   const batch=joinPending(upPending);webSocket.send(batch.body);refreshWebSocketBuffered(webSocket,null);release(batch.total,batch.count);
   port.postMessage({t:'traffic',up:batch.total,down:0});if(upPending.length)queueMicrotask(runWebSocketUp);else if(webSocket.bufferedAmount)scheduleWebSocketUp();
- }catch(error){fail()}
+ }catch(error){fail('ws_send',error,0,webSocket)}
 }
 function closeFrame(id){
  const data=new ArrayBuffer(8),view=new DataView(data);
@@ -311,32 +311,33 @@ function finishWebSocketLane(lane,notify){
  if(notify&&port&&!closed){const frame=closeFrame(lane.id);port.postMessage(frame,[frame])}
 }
 function openWebSocketLane(lane){
+ const started=Date.now();
  const socket=new WebSocket(webSocketTarget,'tproxy-lane-v1.'+sessionToken+'.'+lane.id);
  lane.socket=socket;socket.binaryType='arraybuffer';
  socket.onmessage=event=>{
   if(closed||lane.finished||!lane.opened||lanes.get(lane.id)!==lane||lane.socket!==socket)return;
-  if(!(event.data instanceof ArrayBuffer)||!event.data.byteLength){fail();return}
-  let frames;try{frames=splitFrames(event.data)}catch(error){fail();return}
-  if(frames.some(frame=>frame.id!==lane.id)){fail();return}if(frames.some(frame=>frame.type===3))lane.remoteClosed=true;
+  if(!(event.data instanceof ArrayBuffer)||!event.data.byteLength){fail('ws_lane_receive_type',null,lane.id,socket);return}
+  let frames;try{frames=splitFrames(event.data)}catch(error){fail('ws_lane_frames',error,lane.id,socket);return}
+  if(frames.some(frame=>frame.id!==lane.id)){fail('ws_lane_cross_lane',null,lane.id,socket);return}if(frames.some(frame=>frame.type===3))lane.remoteClosed=true;
   port.postMessage({t:'traffic',up:0,down:event.data.byteLength});port.postMessage(event.data,[event.data]);status('connected');
  };
  socket.onerror=()=>{};
- socket.onclose=()=>{
-  if(closed||lane.finished)return;if(!lane.opened){fail();return}
+ socket.onclose=event=>{
+  if(closed||lane.finished)return;if(!lane.opened){fail('ws_lane_open',diagnosticException(new Error('websocket closed'),{operationMS:Date.now()-started}),lane.id,socket,event.code);return}
   finishWebSocketLane(lane,!lane.localClosed&&!lane.remoteClosed);
  };
  waitForWebSocketOpen(socket).then(()=>{
   if(closed||lane.finished||lanes.get(lane.id)!==lane||lane.socket!==socket){socket.close();return}
   lane.opened=true;status('connected');runWebSocketLaneUp(lane);
- },()=>{if(!closed&&!lane.finished&&lanes.get(lane.id)===lane)fail()});
+ },error=>{if(!closed&&!lane.finished&&lanes.get(lane.id)===lane)fail('ws_lane_open',error,lane.id,socket)});
 }
 function queueWebSocketLane(frame){
  let lane=lanes.get(frame.id);
  if(!lane&&(frame.type===2||frame.type===3||frame.type===4))return;
  if(!frame.id||(!lane&&closedLanes.has(frame.id)))throw new Error('closed lane was reused');
  if(!lane&&frame.type!==1)throw new Error('lane did not begin with OPEN');
- if(!lane&&webSocketLaneReservations>=maxWebSocketLanes){fail();return}
- if(!lane){webSocketLaneReservations++;lane=ensureLane(frame.id)}if(!reserve(frame.data,lane)){fail();return}
+ if(!lane&&webSocketLaneReservations>=maxWebSocketLanes){fail('ws_lane_limit',null,frame.id);return}
+ if(!lane){webSocketLaneReservations++;lane=ensureLane(frame.id)}if(!reserve(frame.data,lane)){fail('ws_lane_capacity',null,lane.id,lane.socket);return}
  lane.pending.push(frame.data);if(frame.type===3)lane.localClosed=true;
  if(!lane.socket)openWebSocketLane(lane);else runWebSocketLaneUp(lane);
 }
@@ -353,7 +354,7 @@ function runWebSocketLaneUp(lane){
  try{
   const batch=joinPending(lane.pending,lane);socket.send(batch.body);refreshWebSocketBuffered(socket,lane);release(batch.total,batch.count,lane);
   port.postMessage({t:'traffic',up:batch.total,down:0});if(lane.pending.length)queueMicrotask(()=>runWebSocketLaneUp(lane));else if(socket.bufferedAmount)scheduleWebSocketLaneUp(lane);
- }catch(error){fail()}
+ }catch(error){fail('ws_lane_send',error,lane.id,socket)}
 }
 `
 
@@ -374,6 +375,8 @@ const match=/^#android=([A-Za-z0-9_-]{43})$/.exec(location.hash),androidNonce=ma
 history.replaceState(null,'',location.pathname);
 const queueByteLimit=33554432,queueItemLimit=16384,maxFrames=4096,maxPayload=1048576,closedLaneLimit=4096;
 const requestTimeoutMs=90000;
+const bridgeStartedAt=Date.now();
+let failureReported=false;
 let initialized=false,closed=false,port=null,sessionToken='',createStarted=false;
 let queuedBytes=0,queuedItems=0,upSequence=1,downCursor='0',upRunning=false,pollController=null;
 const lifecycleController=new AbortController();
@@ -473,7 +476,7 @@ async function readResponse(response,limit,exact,signal,deadline){
  finally{signal.removeEventListener('abort',cancel);reader.releaseLock()}
 }
 async function request(path,makeOptions,onHeaders){
- let delay=250,attempt=0;const deadline=Date.now()+requestTimeoutMs;
+ let delay=250,attempt=0;const started=Date.now(),deadline=started+requestTimeoutMs;
  while(true){
   ensureOpen();const requestOptions=makeOptions(),controller=new AbortController(),external=requestOptions.signal;
   ensureOpen(external);const remaining=deadline-Date.now();if(remaining<=0)throw new Error('carrier retry deadline reached');
@@ -495,13 +498,46 @@ async function request(path,makeOptions,onHeaders){
     return {status:response.status,headers:response.headers,body};
    }
    unavailable=true;retry=retryAfterMs(response);cancelResponse(response);
-  }catch(error){controller.abort();cancelResponse(response);ensureOpen(external);if(response)throw error;if(++attempt===9)throw new Error('carrier retry limit reached')}
+  }catch(error){controller.abort();cancelResponse(response);ensureOpen(external);if(response)throw diagnosticException(error,{httpStatus:response.status,operationMS:Date.now()-started});if(++attempt===9)throw new Error('carrier retry limit reached')}
   finally{clearTimeout(timer);lifecycleController.signal.removeEventListener('abort',abort);if(external)external.removeEventListener('abort',abort)}
   ensureOpen(external);const backoffRemaining=deadline-Date.now();if(backoffRemaining<=0)throw new Error('carrier retry deadline reached');
   status('reconnecting');const backoff=Math.min(retry||(delay+Math.floor(Math.random()*Math.max(1,delay/4))),backoffRemaining);await pause(backoff,external);if(!unavailable)delay=Math.min(delay*2,5000);
  }
 }
-function fail(){if(closed)return;status('failed');if(port)port.postMessage({t:'close'});close(true)}
+function diagnosticException(error,fields){return Object.assign(new Error(error&&error.message||''),{name:error&&error.name||'Error'},fields)}
+function diagnosticError(error){
+ if(!error)return 'none';
+ const messages=new Map([
+  ['websocket opening deadline reached','timeout'],['websocket failed','ws_error'],['websocket closed','ws_close'],
+  ['invalid frame batch','invalid_frame'],['invalid frame','invalid_frame'],['empty frame batch','invalid_frame'],
+  ['response body exceeds its limit','response_size'],['response batch exceeds its limit','response_size'],
+  ['invalid response length','response_length'],['missing response body','response_missing'],
+  ['response deadline reached','response_deadline'],['carrier retry deadline reached','retry_deadline'],
+  ['carrier retry limit reached','retry_limit'],['session creation rejected','session_rejected'],
+  ['invalid session creation','session_invalid'],['uplink rejected','up_rejected'],['lane uplink rejected','up_rejected'],
+  ['downlink rejected','down_rejected'],['lane downlink rejected','down_rejected'],
+  ['invalid downlink response','down_invalid'],['invalid lane downlink response','down_invalid'],
+  ['closed lane was reused','lane_reused'],['lane did not begin with OPEN','lane_missing_open'],['cross-lane frame','cross_lane']
+ ]);
+ return messages.get(error.message)||({TypeError:'type_error',RangeError:'range_error',AbortError:'abort',NetworkError:'network',SecurityError:'security',InvalidStateError:'invalid_state'})[error.name]||'error';
+}
+function reportFailure(reason,error,laneID,socket,closeCode){
+ try{
+  const number=(value,limit)=>Number.isFinite(value)?Math.max(0,Math.min(Math.floor(value),limit)):0;
+  const body=JSON.stringify({reason,error:diagnosticError(error),lane_id:number(laneID,16777215),
+   close_code:number(closeCode||(error&&error.closeCode),4999),ready_state:number(socket&&socket.readyState,3),
+   http_status:number(error&&error.httpStatus,599),elapsed_ms:number(Date.now()-bridgeStartedAt,2592000000),
+   operation_ms:number(error&&error.operationMS,2592000000),queued_bytes:number(queuedBytes,1073741824),
+   queued_items:number(queuedItems,1048576),buffered_bytes:number(socket&&socket.bufferedAmount,1073741824)});
+  // A separate keepalive request survives normal page cleanup. Never delay recovery for diagnostics.
+  fetch(relayOrigin+'/api/v1/diagnostic',options('POST',sessionToken||bootstrap,body,null,undefined,true)).then(cancelResponse).catch(()=>{});
+ }catch(reportError){}
+}
+function fail(reason,error,laneID,socket,closeCode){
+ if(closed||failureReported)return;failureReported=true;
+ reportFailure(reason,error,laneID,socket,closeCode);
+ try{status('failed');if(port)port.postMessage({t:'close'})}finally{close(true)}
+}
 async function createSession(first){
  try{
   status('connecting');
@@ -517,14 +553,14 @@ async function createSession(first){
   if(carrier==='https-lanes')ensureLane(0);
   for(const data of beforeSession.splice(0)){release(data.byteLength,1);queueCarrier(data)}
   if(carrier==='https')poll();else pollLane(lanes.get(0));
- }catch(error){fail()}
+ }catch(error){fail('session_create',error)}
 }
 function queueCarrier(data){
- try{if(carrier==='https')queueUp(data);else for(const frame of splitFrames(data))queueLane(frame)}catch(error){fail()}
+ try{if(carrier==='https')queueUp(data);else for(const frame of splitFrames(data))queueLane(frame)}catch(error){fail('carrier_queue',error)}
 }
 function queueUp(data){
- try{splitFrames(data)}catch(error){fail();return}
- if(!reserve(data)){fail();return}upPending.push(data);runUp();
+ try{splitFrames(data)}catch(error){fail('up_frames',error);return}
+ if(!reserve(data)){fail('up_capacity');return}upPending.push(data);runUp();
 }
 async function runUp(){
  if(upRunning)return;upRunning=true;
@@ -532,10 +568,10 @@ async function runUp(){
   while(!closed&&sessionToken&&upPending.length){
    const batch=joinPending(upPending),sequence=String(upSequence);
    const response=await request('/api/v1/up',()=>options('POST',sessionToken,batch.body,{'X-Up-Seq':sequence}));
-   if(response.status!==204||response.headers.get('X-Up-Ack')!==sequence)throw new Error('uplink rejected');
+   if(response.status!==204||response.headers.get('X-Up-Ack')!==sequence)throw diagnosticException(new Error('uplink rejected'),{httpStatus:response.status});
    release(batch.total,batch.count);port.postMessage({t:'traffic',up:batch.total,down:0});upSequence++;
   }
- }catch(error){fail()}finally{upRunning=false;if(!closed&&sessionToken&&upPending.length)runUp()}
+ }catch(error){fail('up_send',error)}finally{upRunning=false;if(!closed&&sessionToken&&upPending.length)runUp()}
 }
 async function poll(){
  while(!closed&&sessionToken){
@@ -543,11 +579,11 @@ async function poll(){
    pollController=new AbortController();
    const response=await request('/api/v1/down',()=>options('POST',sessionToken,null,{'X-Down-Cursor':downCursor},pollController.signal));
    if(response.status===204){status('connected');continue}
-   if(response.status!==200)throw new Error('downlink rejected');
+   if(response.status!==200)throw diagnosticException(new Error('downlink rejected'),{httpStatus:response.status});
    const next=response.headers.get('X-Down-Cursor')||'',data=response.body,frames=splitFrames(data);
    if(!next||!frames.length)throw new Error('invalid downlink response');
    if(closed)return;port.postMessage({t:'traffic',up:0,down:data.byteLength});port.postMessage(data,[data]);downCursor=next;status('connected');
-  }catch(error){if(!closed)fail();return}
+  }catch(error){if(!closed)fail('down_poll',error);return}
  }
 }
 function ensureLane(id){
@@ -571,7 +607,7 @@ function queueLane(frame){
  if(!lane&&closedLanes.has(frame.id))throw new Error('closed lane was reused');
  if(!lane&&frame.type!==1)throw new Error('lane did not begin with OPEN');
  lane=lane||ensureLane(frame.id);
- if(!reserve(frame.data)){fail();return}
+ if(!reserve(frame.data)){fail('lane_capacity',null,frame.id);return}
  lane.pending.push(frame.data);runLaneUp(lane);
 }
 async function runLaneUp(lane){
@@ -580,11 +616,11 @@ async function runLaneUp(lane){
   while(!closed&&sessionToken&&lane.pending.length){
    const batch=joinPending(lane.pending),sequence=String(lane.sequence),laneID=String(lane.id);
    const response=await request('/api/v1/up',()=>options('POST',sessionToken,batch.body,{'X-Up-Seq':sequence,'X-Lane-ID':laneID}));
-   if(response.status!==204||response.headers.get('X-Up-Ack')!==sequence)throw new Error('lane uplink rejected');
+   if(response.status!==204||response.headers.get('X-Up-Ack')!==sequence)throw diagnosticException(new Error('lane uplink rejected'),{httpStatus:response.status});
    release(batch.total,batch.count);port.postMessage({t:'traffic',up:batch.total,down:0});lane.sequence++;
    if(!lane.polling)pollLane(lane);
   }
- }catch(error){fail()}finally{lane.running=false;if(!closed&&sessionToken&&lane.pending.length)runLaneUp(lane)}
+ }catch(error){fail('lane_up',error,lane.id)}finally{lane.running=false;if(!closed&&sessionToken&&lane.pending.length)runLaneUp(lane)}
 }
 async function pollLane(lane){
  if(!lane||lane.polling)return;lane.polling=true;
@@ -593,13 +629,13 @@ async function pollLane(lane){
    const controller=new AbortController(),laneID=String(lane.id);lane.controller=controller;
    const response=await request('/api/v1/down',()=>options('POST',sessionToken,null,{'X-Down-Cursor':lane.cursor,'X-Lane-ID':laneID},controller.signal));
    if(response.status===204){if(response.headers.get('X-Lane-Closed')==='1'){finishLane(lane);return}status('connected');continue}
-   if(response.status!==200)throw new Error('lane downlink rejected');
+   if(response.status!==200)throw diagnosticException(new Error('lane downlink rejected'),{httpStatus:response.status});
    const next=response.headers.get('X-Down-Cursor')||'',data=response.body,frames=splitFrames(data);
    if(!next||!frames.length)throw new Error('invalid lane downlink response');
    for(const frame of frames)if(frame.id!==lane.id)throw new Error('cross-lane frame');
    if(closed)return;port.postMessage({t:'traffic',up:0,down:data.byteLength});port.postMessage(data,[data]);lane.cursor=next;status('connected');
   }
- }catch(error){if(!closed)fail()}finally{lane.polling=false;lane.controller=null}
+ }catch(error){if(!closed)fail('lane_down',error,lane.id)}finally{lane.polling=false;lane.controller=null}
 }
 function deleteSession(){if(sessionToken)fetch(relayOrigin+'/api/v1/session',options('DELETE',sessionToken,null,null,undefined,true)).then(cancelResponse).catch(()=>{})}
 function close(notifyServer){
@@ -612,8 +648,8 @@ function activatePort(nextPort){
  initialized=true;port=nextPort;
  port.onmessage=message=>{
   if(message.data instanceof ArrayBuffer){
-   if(!createStarted){if(message.data.byteLength>64){fail();return}createStarted=true;createSession(message.data)}
-   else if(!sessionToken){try{splitFrames(message.data)}catch(error){fail();return}if(!reserve(message.data)){fail();return}beforeSession.push(message.data)}
+   if(!createStarted){if(message.data.byteLength>64){fail('hello_size');return}createStarted=true;createSession(message.data)}
+   else if(!sessionToken){try{splitFrames(message.data)}catch(error){fail('pre_session_frames',error);return}if(!reserve(message.data)){fail('pre_session_capacity');return}beforeSession.push(message.data)}
    else queueCarrier(message.data);
   }else if(message.data&&message.data.t==='close')close(true);
  };
@@ -630,7 +666,7 @@ addEventListener('message',event=>{
 const androidBridge=globalThis.TelegramWebProxy;
 if(!initialized&&androidNonce&&androidBridge&&typeof androidBridge.postMessage==='function'){
  const androidPort={onmessage:null,start(){},close(){androidBridge.onmessage=null},postMessage(value){
-  if(value instanceof ArrayBuffer){let frames;try{frames=splitFrames(value)}catch(error){fail();return}for(const frame of frames)androidBridge.postMessage(frame.data)}
+  if(value instanceof ArrayBuffer){let frames;try{frames=splitFrames(value)}catch(error){fail('native_frames',error);return}for(const frame of frames)androidBridge.postMessage(frame.data)}
   else androidBridge.postMessage(JSON.stringify(value));
  }};
  androidBridge.onmessage=event=>{let data=event.data;if(typeof data==='string'){try{data=JSON.parse(data)}catch(error){return}}if(androidPort.onmessage)androidPort.onmessage({data})};

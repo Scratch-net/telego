@@ -14,6 +14,7 @@ Existing MTProxy configurations do not start this listener. You must set `[web-p
 - [Configure Telego](#configure-telego)
 - [Configure Nginx](#configure-nginx)
 - [Check the configuration](#check-the-configuration)
+- [Bridge failure diagnostics](#bridge-failure-diagnostics)
 - [Docker](#docker)
 - [Existing installations](#existing-installations)
 - [Rollback](#rollback)
@@ -502,6 +503,26 @@ https://t.me/webproxy?server=proxy.example.com&secret=dd0123456789abcdef01234567
 ```
 
 Telego derives the plain and `dd` WEB credentials from each existing base secret. Do not add a second `desktop-dd` secret.
+
+## Bridge failure diagnostics
+
+When the WEB bridge fails, it sends one diagnostic request before it tells Telegram to reconnect.
+Telego records the report at warning level with the message `WEB bridge reported failure`.
+This report requires no additional configuration.
+
+The report identifies the failure stage, error category, lane, WebSocket close code, HTTP status, and queue sizes.
+`elapsed_ms` measures time since the bridge document started.
+When the duration is available, `operation_ms` measures the failed operation. Otherwise, it is zero.
+
+The bridge sends `POST /api/v1/diagnostic` with its bootstrap or session bearer token.
+Telego accepts at most 512 bytes and one report per issued bridge.
+The server accepts only fixed reason and error values with bounded numeric fields.
+It supplies the user name and carrier from its own configuration.
+Reports exclude credentials, URLs, raw exception text, WebSocket close reasons, and Telegram payloads.
+
+Diagnostic delivery does not delay reconnection or retry failed reports.
+Network outages and WebView termination can prevent delivery.
+Normal page closure and closure of an established WebSocket lane do not produce a bridge failure report.
 
 ## Docker
 

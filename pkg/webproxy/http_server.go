@@ -52,6 +52,8 @@ var (
 // deployment's TLS-terminating Nginx. It does not alter the public MTProxy
 // gnet engine or own Manager shutdown.
 type HTTPServerConfig struct {
+	// OnBridgeFailure receives at most one validated report per issued bridge.
+	OnBridgeFailure              func(BridgeFailure)
 	Bind                         string
 	Hostname                     string
 	Manager                      *Manager
@@ -755,6 +757,7 @@ const (
 	requestDown
 	requestDelete
 	requestWebSocket
+	requestDiagnostic
 )
 
 type requestDisposition uint8
@@ -766,6 +769,7 @@ const (
 )
 
 type preparedRequest struct {
+	diagnostic         *bridgeDiagnosticState
 	owner              gnet.EventLoop
 	request            carrierRequest
 	kind               requestKind
@@ -843,7 +847,7 @@ func (h *httpEventHandler) prepare(
 		return nil, requestSanitizedFallback
 	}
 	if request.query != "" || request.path != "/api/v1/session" &&
-		request.path != "/api/v1/up" && request.path != "/api/v1/down" {
+		request.path != "/api/v1/up" && request.path != "/api/v1/down" && request.path != bridgeDiagnosticPath {
 		return nil, requestSanitizedFallback
 	}
 	token, ok := bearerToken(request.headers["authorization"])
@@ -852,6 +856,18 @@ func (h *httpEventHandler) prepare(
 	}
 
 	switch request.path {
+	case bridgeDiagnosticPath:
+		if request.method != "POST" || request.headers["content-type"] != "application/octet-stream" ||
+			!request.hasContentLength || request.contentLength == 0 || request.contentLength > maxBridgeDiagnosticBytes ||
+			anyHeaderPresent(request, "x-up-seq", "x-down-cursor", "x-lane-id", "x-session-token", "x-carrier-mode", "x-up-ack") {
+			return nil, requestSanitizedFallback
+		}
+		diagnostic := config.Manager.authenticateBridgeDiagnostic(token)
+		if diagnostic == nil {
+			return nil, requestSanitizedFallback
+		}
+		return &preparedRequest{request: request, kind: requestDiagnostic, diagnostic: diagnostic}, requestCarrier
+
 	case "/api/v1/session":
 		if anyHeaderPresent(request, "x-up-seq", "x-down-cursor", "x-lane-id", "x-session-token", "x-carrier-mode", "x-up-ack") {
 			return nil, requestSanitizedFallback
@@ -933,7 +949,7 @@ func requestCarrierLane(request carrierRequest, carrier CarrierMode) (uint32, bo
 
 func reservedCarrierRequest(request carrierRequest) bool {
 	if request.path == "/api/v1/session" || request.path == "/api/v1/up" ||
-		request.path == "/api/v1/down" || request.path == webSocketPath {
+		request.path == "/api/v1/down" || request.path == webSocketPath || request.path == bridgeDiagnosticPath {
 		return true
 	}
 	if request.path == "/" && bridgeQueryPresent(request.query) {
@@ -1111,6 +1127,18 @@ func (h *httpEventHandler) serve(
 ) carrierResponse {
 	manager := h.server.config.Manager
 	switch request.kind {
+	case requestDiagnostic:
+		failure, valid := parseBridgeFailure(body)
+		if !valid {
+			return rejectResponse(400)
+		}
+		if request.diagnostic.reported.CompareAndSwap(false, true) && h.server.config.OnBridgeFailure != nil {
+			failure.User = request.diagnostic.user
+			failure.Carrier = manager.CarrierMode()
+			h.server.config.OnBridgeFailure(failure)
+		}
+		return carrierResponse{status: 204, headers: []responseHeader{{"Cache-Control", "no-store"}}}
+
 	case requestBridge:
 		bootstrap, err := manager.IssueBootstrap(request.capability, request.clientIP)
 		if err != nil {

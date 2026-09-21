@@ -11,6 +11,7 @@ import (
 
 	"github.com/scratch-net/telego/pkg/config"
 	"github.com/scratch-net/telego/pkg/gproxy"
+	"github.com/scratch-net/telego/pkg/log"
 	"github.com/scratch-net/telego/pkg/webproxy"
 )
 
@@ -55,6 +56,7 @@ func newWebProxyRuntime(runtimeConfig config.WebProxyRuntimeConfig, internalAuth
 		return nil, fmt.Errorf("create WEB session manager: %w", err)
 	}
 	server, err := webproxy.NewHTTPServer(webproxy.HTTPServerConfig{
+		OnBridgeFailure:   logWebBridgeFailure,
 		Bind:              runtimeConfig.BindAddr,
 		Hostname:          runtimeConfig.Hostname,
 		Manager:           manager,
@@ -68,6 +70,17 @@ func newWebProxyRuntime(runtimeConfig config.WebProxyRuntimeConfig, internalAuth
 		return nil, errors.Join(fmt.Errorf("create WEB HTTP server: %w", err), manager.Shutdown(ctx))
 	}
 	return &webProxyRuntime{manager: manager, server: server}, nil
+}
+
+func logWebBridgeFailure(failure webproxy.BridgeFailure) {
+	log.Warn().Str("user", failure.User).Str("carrier", string(failure.Carrier)).
+		Str("reason", failure.Reason).Str("error_category", failure.Error).
+		Uint32("lane_id", failure.LaneID).Uint16("close_code", failure.CloseCode).
+		Uint8("ready_state", failure.ReadyState).Uint16("http_status", failure.HTTPStatus).
+		Uint64("elapsed_ms", failure.ElapsedMS).Uint64("operation_ms", failure.OperationMS).
+		Uint64("queued_bytes", failure.QueuedBytes).Uint32("queued_items", failure.QueuedItems).
+		Uint64("buffered_bytes", failure.BufferedBytes).
+		Msg("WEB bridge reported failure")
 }
 
 func webProxyLogicalBackendFactory(handler *gproxy.ProxyHandler, listener net.Addr) webproxy.BackendFactory {

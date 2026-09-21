@@ -42,6 +42,7 @@ function harness(carrier, smallBatch = false) {
     fetch(url, options) {
       requests.push({ url, options });
       if (options.method === 'DELETE') return Promise.resolve(new Response(null, { status: 204 }));
+      if (url.endsWith('/api/v1/diagnostic')) return Promise.resolve(new Response(null, { status: 204 }));
       return sandbox.respond(url, options);
     },
     respond() { throw new Error('unexpected fetch'); },
@@ -49,7 +50,7 @@ function harness(carrier, smallBatch = false) {
   };
   // Expose existing functions only inside the test VM. Production exports stay unchanged.
   const hooks = `
-globalThis.bridgeTest={request,options,close,createSession,activatePort,poll,pollLane,ensureLane,
+globalThis.bridgeTest={request,options,close,createSession,activatePort,poll,pollLane,ensureLane,fail,
   state:()=>({closed,sessionToken,queuedBytes,queuedItems,lanes,downCursor}),
   signal:lifecycleController.signal,
   setSession:()=>{sessionToken='test-token';port=globalThis.testPort},
@@ -384,7 +385,92 @@ test('established WebSocket lane closure preserves its healthy sibling', async (
   assert.equal(h.api.state().lanes.size, 1);
   assert.ok(h.api.state().lanes.has(2));
   assert.equal(h.sockets[1].closeCalls, 0);
+  assert.equal(h.requests.some(request => request.url.endsWith('/api/v1/diagnostic')), false);
   await h.advance(2 * budget);
   assert.equal(h.sockets[1].closeCalls, 0);
   h.pagehide(); await flush(); assertClean(h);
+});
+
+for (const carrier of carriers) {
+  test(carrier + ': failure is reported once before native teardown without exception text', async () => {
+    const h = harness(carrier); h.api.setSession();
+    let reportedBeforeFailure = false;
+    h.sandbox.testPort.postMessage = value => {
+      if (value.state === 'failed') reportedBeforeFailure = h.requests.some(request => request.url.endsWith('/api/v1/diagnostic'));
+    };
+    await h.advance(1250);
+    h.api.fail('carrier_queue', new TypeError('private-token https://example.invalid/?secret=private'), 9);
+    h.api.fail('carrier_queue', new Error('second error'), 10);
+    await flush();
+    const requests = h.requests.filter(request => request.url.endsWith('/api/v1/diagnostic'));
+    assert.equal(requests.length, 1);
+    assert.equal(reportedBeforeFailure, true);
+    const { options } = requests[0], report = JSON.parse(options.body);
+    assert.equal(options.headers.Authorization, 'Bearer test-token');
+    assert.equal(options.keepalive, true);
+    assert.equal(options.signal, undefined, 'cleanup must not abort diagnostic delivery');
+    assert.equal(report.reason, 'carrier_queue');
+    assert.equal(report.error, 'type_error');
+    assert.equal(report.lane_id, 9);
+    assert.equal(report.elapsed_ms, 1250);
+    assert.ok(options.body.length <= 512);
+    assert.equal(options.body.includes('private'), false);
+    assert.equal(options.body.includes('test-token'), false);
+    assert.equal(h.api.state().closed, true);
+    assertClean(h);
+  });
+
+  test(carrier + ': failed session creation uses bootstrap authentication and records HTTP status', async () => {
+    const h = harness(carrier);
+    h.sandbox.respond = async () => new Response(null, { status: 400 });
+    await h.api.createSession(new ArrayBuffer(8)); await flush();
+    const request = h.requests.find(request => request.url.endsWith('/api/v1/diagnostic'));
+    assert.ok(request);
+    assert.match(request.options.headers.Authorization, /^Bearer [A-Za-z0-9_-]{43}$/);
+    const report = JSON.parse(request.options.body);
+    assert.equal(report.reason, 'session_create');
+    assert.equal(report.error, 'session_rejected');
+    assert.equal(report.http_status, 400);
+    assert.equal(h.api.state().closed, true);
+    assertClean(h);
+  });
+
+  test(carrier + ': diagnostic delivery failure cannot block cleanup', async () => {
+    const h = harness(carrier); h.api.setSession();
+    const fetch = h.sandbox.fetch;
+    h.sandbox.fetch = (url, options) => {
+      if (url.endsWith('/api/v1/diagnostic')) throw new TypeError('offline');
+      return fetch(url, options);
+    };
+    h.api.fail('carrier_queue', new Error('failure')); await flush();
+    assert.equal(h.api.state().closed, true);
+    assert.equal(h.requests.filter(request => request.options.method === 'DELETE').length, 1);
+    assertClean(h);
+  });
+
+  test(carrier + ': ordinary page closure does not report a failure', async () => {
+    const h = harness(carrier); h.api.setSession(); h.pagehide(); await flush();
+    assert.equal(h.requests.some(request => request.url.endsWith('/api/v1/diagnostic')), false);
+    assertClean(h);
+  });
+}
+
+test('WebSocket lane opening failure retains close code and operation duration', async () => {
+  const h = harness('websocket-lanes'); h.api.setSession();
+  const frame = new ArrayBuffer(8); new DataView(frame).setUint32(0, 0x01000007);
+  h.api.queueWebSocketLane({ type: 1, id: 7, data: frame });
+  await h.advance(40);
+  const socket = h.sockets[0]; socket.readyState = 3;
+  const event = new Event('close'); event.code = 1006; event.reason = 'private close reason';
+  socket.onclose(event); socket.dispatchEvent(event); await flush();
+  const request = h.requests.find(request => request.url.endsWith('/api/v1/diagnostic'));
+  const report = JSON.parse(request.options.body);
+  assert.equal(report.reason, 'ws_lane_open');
+  assert.equal(report.error, 'ws_close');
+  assert.equal(report.lane_id, 7);
+  assert.equal(report.close_code, 1006);
+  assert.equal(report.ready_state, 3);
+  assert.equal(report.operation_ms, 40);
+  assert.equal(request.options.body.includes('private'), false);
+  assertClean(h);
 });

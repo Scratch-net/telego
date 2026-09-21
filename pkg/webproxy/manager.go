@@ -49,6 +49,7 @@ func (*BootstrapAuthorization) String() string { return "WEB bootstrap authoriza
 func (*BootstrapAuthorization) GoString() string { return "WEB bootstrap authorization" }
 
 type bootstrap struct {
+	diagnostic   *bridgeDiagnosticState
 	expires      time.Time
 	profile      Profile
 	issuanceIP   string
@@ -59,8 +60,9 @@ type bootstrap struct {
 }
 
 type closedToken struct {
-	expires time.Time
-	order   *list.Element
+	diagnostic *bridgeDiagnosticState
+	expires    time.Time
+	order      *list.Element
 }
 
 // Capacity is a point-in-time view of the manager's bounded resources.
@@ -199,6 +201,7 @@ func (m *Manager) IssueBootstrap(capability Capability, clientIP string) (string
 		}
 	}
 	m.bootstraps[hash] = &bootstrap{
+		diagnostic: &bridgeDiagnosticState{user: profile.Name()},
 		expires:    now.Add(m.timeouts.BootstrapLifetime),
 		profile:    profile,
 		issuanceIP: clientIP,
@@ -308,6 +311,7 @@ func (a *BootstrapAuthorization) create(clientIP string, body []byte, owner gnet
 		onBackendDialFinished: m.backendDialFinished,
 		onStreamFinished:      m.streamFinished,
 	})
+	created.diagnostic = entry.diagnostic
 	created.onFinished = func(session *Session, reason sessionCloseReason) {
 		m.sessionFinished(sessionHash, session, reason)
 	}
@@ -522,6 +526,7 @@ func (m *Manager) sessionFinished(hash [sha256.Size]byte, session *Session, reas
 	if m.sessions[hash] == session {
 		delete(m.sessions, hash)
 		m.rememberClosedTokenLocked(hash, time.Now().Add(m.timeouts.BootstrapLifetime))
+		m.closedTokens[hash].diagnostic = session.diagnostic
 	}
 	for bootstrapHash, entry := range m.bootstraps {
 		if entry.session == session {
