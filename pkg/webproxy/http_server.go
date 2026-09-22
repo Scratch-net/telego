@@ -1139,18 +1139,7 @@ func (h *httpEventHandler) serve(
 		if !valid {
 			return rejectResponse(400)
 		}
-		var allowed bool
-		if failure.IsLaneClosure() {
-			failure.Suppressed, allowed = request.diagnostic.claimLane(failure.LaneID, 0, time.Now())
-		} else {
-			allowed = request.diagnostic.reported.CompareAndSwap(false, true)
-		}
-		if allowed && h.server.config.OnBridgeFailure != nil {
-			failure.BridgeID = request.diagnostic.id
-			failure.User = request.diagnostic.user
-			failure.Carrier = manager.CarrierMode()
-			h.server.config.OnBridgeFailure(failure)
-		}
+		request.diagnostic.report(failure, manager.CarrierMode(), "http", h.server.config.OnBridgeFailure)
 		return carrierResponse{status: 204, headers: []responseHeader{{"Cache-Control", "no-store"}}}
 
 	case requestBridge:

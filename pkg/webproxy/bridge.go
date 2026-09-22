@@ -270,6 +270,13 @@ const webSocketBridgeFunctions = `function waitForWebSocketOpen(socket){
   if(closed||lifecycleController.signal.aborted)aborted();
  });
 }
+function closeWebSocketsWithFailure(report){
+ try{
+  const reason=JSON.stringify({r:report.reason,e:report.error,l:report.lane_id,t:report.operation_ms,c:report.close_code,s:report.ready_state});
+  const notify=socket=>{if(socket&&socket.readyState===WebSocket.OPEN)try{socket.close(4000,reason)}catch(error){}};
+  notify(webSocket);for(const lane of lanes.values())notify(lane.socket);
+ }catch(error){}
+}
 async function openWebSocket(){
  const socket=new WebSocket(webSocketTarget,'tproxy-v1.'+sessionToken);webSocket=socket;socket.binaryType='arraybuffer';let opened=false;
  socket.onmessage=event=>{
@@ -524,16 +531,18 @@ function diagnosticError(error){
  return messages.get(error.message)||({TypeError:'type_error',RangeError:'range_error',AbortError:'abort',NetworkError:'network',SecurityError:'security',InvalidStateError:'invalid_state'})[error.name]||'error';
 }
 function reportFailure(reason,error,laneID,socket,closeCode,wasClean){
+ let report;
  try{
   const number=(value,limit)=>Number.isFinite(value)?Math.max(0,Math.min(Math.floor(value),limit)):0;
-  const body=JSON.stringify({reason,error:diagnosticError(error),lane_id:number(laneID,16777215),
+  report={reason,error:diagnosticError(error),lane_id:number(laneID,16777215),
    close_code:number(closeCode||(error&&error.closeCode),4999),ready_state:number(socket&&socket.readyState,3),
    http_status:number(error&&error.httpStatus,599),elapsed_ms:number(Date.now()-bridgeStartedAt,2592000000),
    operation_ms:number(error&&error.operationMS,2592000000),queued_bytes:number(queuedBytes,1073741824),
-   queued_items:number(queuedItems,1048576),buffered_bytes:number(socket&&socket.bufferedAmount,1073741824),was_clean:!!wasClean});
+   queued_items:number(queuedItems,1048576),buffered_bytes:number(socket&&socket.bufferedAmount,1073741824),was_clean:!!wasClean};
   // A separate keepalive request survives normal page cleanup. Never delay recovery for diagnostics.
-  fetch(relayOrigin+'/api/v1/diagnostic',options('POST',sessionToken||bootstrap,body,null,undefined,true)).then(cancelResponse).catch(()=>{});
+  fetch(relayOrigin+'/api/v1/diagnostic',options('POST',sessionToken||bootstrap,JSON.stringify(report),null,undefined,true)).then(cancelResponse).catch(()=>{});
  }catch(reportError){}
+ return report;
 }
 function reportLaneClose(lane,socket,event,started){
  const now=Date.now();if(now-laneReportWindow>=60000){laneReportWindow=now;laneReportCount=0}
@@ -543,7 +552,8 @@ function reportLaneClose(lane,socket,event,started){
 }
 function fail(reason,error,laneID,socket,closeCode){
  if(closed||failureReported)return;failureReported=true;
- reportFailure(reason,error,laneID,socket,closeCode);
+ const report=reportFailure(reason,error,laneID,socket,closeCode);
+ if(report&&(carrier==='websocket'||carrier==='websocket-lanes'))closeWebSocketsWithFailure(report);
  try{status('failed');if(port)port.postMessage({t:'close'})}finally{close(true)}
 }
 async function createSession(first){

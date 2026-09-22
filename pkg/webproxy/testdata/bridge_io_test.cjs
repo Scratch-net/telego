@@ -19,7 +19,7 @@ function harness(carrier, smallBatch = false) {
   const timers = new Map(), sockets = [], events = new Map(), messages = [], requests = [];
   class Socket extends EventTarget {
     static CONNECTING = 0; static OPEN = 1; static CLOSED = 3;
-    readyState = Socket.CONNECTING; bufferedAmount = 0; sent = []; closeCalls = 0;
+    readyState = Socket.CONNECTING; bufferedAmount = 0; sent = []; closeCalls = 0; closes = [];
     constructor(url, protocol) { super(); this.url = url; this.protocol = protocol; sockets.push(this); }
     emit(type, data) {
       const event = new Event(type);
@@ -28,7 +28,7 @@ function harness(carrier, smallBatch = false) {
       this.dispatchEvent(event);
     }
     open() { this.readyState = Socket.OPEN; this.emit('open'); }
-    close() { this.closeCalls++; this.readyState = Socket.CLOSED; }
+    close(code, reason) { this.closeCalls++; this.closes.push({ code, reason }); this.readyState = Socket.CLOSED; }
     send(data) { assert.equal(this.readyState, Socket.OPEN); this.sent.push(data); }
   }
   const sandbox = {
@@ -516,5 +516,59 @@ test('WebSocket lane opening failure retains close code and operation duration',
   assert.equal(report.ready_state, 3);
   assert.equal(report.operation_ms, 40);
   assert.equal(request.options.body.includes('private'), false);
+  assertClean(h);
+});
+
+for (const carrier of ['websocket', 'websocket-lanes']) {
+  for (const delivery of ['pending', 'throws']) {
+    test(carrier + ': close messages retain failure before native teardown when HTTP ' + delivery, async () => {
+      const h = harness(carrier); h.api.setSession();
+      if (carrier === 'websocket') {
+        const opened = h.api.openWebSocket(); h.sockets[0].open(); await opened;
+      } else {
+        for (const id of [7, 8, 9]) {
+          const data = new ArrayBuffer(8); new DataView(data).setUint32(0, 0x01000000 | id);
+          h.api.queueWebSocketLane({ type: 1, id, data });
+          if (id !== 9) h.sockets.at(-1).open();
+        }
+        await flush();
+      }
+      const active = h.sockets.filter(socket => socket.readyState === 1);
+      const fetch = h.sandbox.fetch;
+      h.sandbox.fetch = (url, options) => {
+        if (url.endsWith('/api/v1/diagnostic')) {
+          if (delivery === 'throws') throw new TypeError('private network error');
+          return new Promise(() => {});
+        }
+        return fetch(url, options);
+      };
+      let observed = false;
+      h.sandbox.testPort.postMessage = value => {
+        if (value.state !== 'failed') return;
+        for (const socket of active) {
+          const { code, reason } = socket.closes[0];
+          assert.equal(code, 4000);
+          assert.ok(Buffer.byteLength(reason) <= 123);
+          assert.deepEqual(JSON.parse(reason), { r: 'ws_lane_open', e: 'ws_close', l: 9, t: 10042, c: 1006, s: 0 });
+          assert.equal(reason.includes('private'), false);
+        }
+        observed = true;
+      };
+      h.api.fail('ws_lane_open', Object.assign(new Error('websocket closed'), { operationMS: 10042, closeCode: 1006 }), 9);
+      await flush();
+      assert.equal(observed, true);
+      assertClean(h);
+    });
+  }
+}
+
+test('failure close diagnostic stays within control frame size at numeric limits', async () => {
+  const h = harness('websocket'); h.api.setSession();
+  const opened = h.api.openWebSocket(); h.sockets[0].open(); await opened;
+  h.api.fail('ws_lane_receive_type', Object.assign(new Error('carrier retry deadline reached'), { operationMS: 2592000000, closeCode: 4999 }), 16777215, h.sockets[0]);
+  await flush();
+  const reason = h.sockets[0].closes[0].reason;
+  assert.ok(Buffer.byteLength(reason) <= 123);
+  assert.equal(JSON.parse(reason).e, 'retry_deadline');
   assertClean(h);
 });

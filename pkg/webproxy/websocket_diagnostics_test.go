@@ -11,6 +11,53 @@ import (
 	"github.com/gobwas/ws"
 )
 
+func TestWebSocketFailureCloseSharesHTTPAllowance(t *testing.T) {
+	for _, first := range []string{"http", "websocket_close"} {
+		t.Run(first, func(t *testing.T) {
+			reports := make(chan BridgeFailure, 8)
+			app := newHTTPTestApplicationWithConfig(t, time.Second, func(config *ManagerConfig) {
+				config.Carrier = CarrierWebSocketLanes
+			}, func(config *HTTPServerConfig) {
+				config.OnBridgeFailure = func(event BridgeFailure) { reports <- event }
+			})
+			created := createTestSession(t, app.manager, app.profiles[0])
+			post := func() {
+				response := app.do(t, &http.Client{Timeout: time.Second}, "POST", bridgeDiagnosticPath, []byte(testBridgeFailureBody), map[string]string{
+					"Authorization": "Bearer " + created.Token, "Content-Type": "application/octet-stream",
+				})
+				readHTTPBody(t, response)
+				if response.StatusCode != 204 {
+					t.Fatalf("diagnostic status = %d", response.StatusCode)
+				}
+			}
+			if first == "http" {
+				post()
+			}
+			for lane, reason := range []string{
+				`{"r":"private reason","e":"none"}`,
+				`{"r":"ws_lane_open","e":"ws_close","l":7,"t":25,"c":1006,"s":3}`,
+				`{"r":"ws_lane_open","e":"ws_close","l":7,"t":25,"c":1006,"s":3}`,
+			} {
+				client, response := dialWebSocketTest(t, app.address, fmt.Sprintf("tproxy-lane-v1.%s.%d", created.Token, lane+1), "", nil)
+				if response.StatusCode != http.StatusSwitchingProtocols {
+					t.Fatalf("upgrade = %d", response.StatusCode)
+				}
+				client.write(t, ws.OpClose, true, append([]byte{0x0f, 0xa0}, reason...))
+				expectWebSocketCloseCode(t, client, bridgeFailureCloseCode, time.Second)
+				client.close()
+			}
+			post()
+			if len(reports) != 1 {
+				t.Fatalf("reports = %d, want one", len(reports))
+			}
+			report := <-reports
+			if report.Delivery != first || report.BridgeID == 0 || report.User != app.profiles[0].Name() || report.Carrier != CarrierWebSocketLanes || report.LaneID != 7 || report.CloseCode != 1006 || report.OperationMS != 25 {
+				t.Fatalf("unexpected failure: %+v", report)
+			}
+		})
+	}
+}
+
 func TestWebSocketCloseDiagnostics(t *testing.T) {
 	for _, kind := range []string{"peer", "transport", "client frame", "backend", "liveness"} {
 		t.Run(kind, func(t *testing.T) {

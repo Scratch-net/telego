@@ -875,6 +875,11 @@ uplinkResults:
 		case webSocketMessageClose:
 			if len(message.payload) >= 2 {
 				transport.peerCloseCode = binary.BigEndian.Uint16(message.payload)
+				if transport.peerCloseCode == bridgeFailureCloseCode {
+					if failure, valid := parseBridgeFailureClose(message.payload[2:]); valid {
+						transport.session.diagnostic.report(failure, transport.session.carrier, "websocket_close", h.server.config.OnBridgeFailure)
+					}
+				}
 			}
 			transport.noteClose("peer_close", ws.StatusCode(transport.peerCloseCode))
 			if !transport.beginClose(connection, 0, message.payload) {

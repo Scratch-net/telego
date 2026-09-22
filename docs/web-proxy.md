@@ -518,7 +518,15 @@ The bridge sends `POST /api/v1/diagnostic` with its bootstrap or session bearer 
 Telego accepts at most 512 bytes and one bridge failure report per issued bridge.
 The server accepts only fixed reason and error values with bounded numeric fields.
 It supplies the user name and carrier from its own configuration.
-Reports exclude credentials, URLs, raw exception text, WebSocket close reasons, and Telegram payloads.
+Reports exclude credentials, URLs, raw exception text, arbitrary WebSocket close reasons, and Telegram payloads.
+
+WebSocket carriers also put a compact failure report in each open socket's CLOSE message before they notify Telegram.
+The application close code is `4000`. The reason contains only validated diagnostic fields and is limited to 123 bytes.
+This provides another delivery path when the diagnostic HTTP request cannot finish before WebView termination.
+HTTP and WebSocket reports share the same one-report allowance.
+The log field `delivery` identifies the first accepted report: `http` or `websocket_close`.
+A WebSocket report includes the failure stage, error category, failed lane, operation duration, original close code, and socket state.
+Its queue sizes, HTTP status, and elapsed time are unavailable and appear as zero.
 
 Diagnostic delivery does not delay reconnection or retry failed reports.
 Network outages and WebView termination can prevent delivery.

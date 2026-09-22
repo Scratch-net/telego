@@ -58,6 +58,29 @@ func TestLaneDiagnosticsDoNotConsumeFailureAllowance(t *testing.T) {
 
 const testBridgeFailureBody = `{"reason":"ws_lane_open","error":"ws_close","lane_id":7,"close_code":1006,"ready_state":3,"elapsed_ms":1234,"operation_ms":25}`
 
+func TestBridgeFailureCloseValidation(t *testing.T) {
+	for _, body := range []string{
+		``, `null`, `{}`, strings.Repeat(" ", 124),
+		`{"r":"private reason","e":"none"}`,
+		`{"r":"ws_open","e":"private error"}`,
+		`{"r":"ws_open","e":"none","secret":"private"}`,
+		`{"r":"ws_open","r":"ws_send","e":"none"}`,
+		`{"r":"ws_open","e":"none","l":16777216}`,
+		`{"r":"ws_open","e":"none","t":2592000001}`,
+		`{"r":"ws_open","e":"none","c":5000}`,
+		`{"r":"ws_open","e":"none","s":4}`,
+		`{"r":"ws_lane_closed_transport","e":"ws_close","l":7}`,
+	} {
+		if _, valid := parseBridgeFailureClose([]byte(body)); valid {
+			t.Errorf("accepted invalid close diagnostic %q", body)
+		}
+	}
+	failure, valid := parseBridgeFailureClose([]byte(`{"r":"ws_lane_open","e":"ws_close","l":7,"t":25,"c":1006,"s":3}`))
+	if !valid || failure.Reason != "ws_lane_open" || failure.Error != "ws_close" || failure.LaneID != 7 || failure.OperationMS != 25 || failure.CloseCode != 1006 || failure.ReadyState != 3 {
+		t.Fatalf("invalid parsed diagnostic: %+v, %v", failure, valid)
+	}
+}
+
 func TestBridgeDiagnosticAuthenticationAndBounds(t *testing.T) {
 	reports := make(chan BridgeFailure, 8)
 	app := newHTTPTestApplicationWithConfig(t, time.Second, nil, func(config *HTTPServerConfig) {

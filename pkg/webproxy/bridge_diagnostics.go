@@ -22,6 +22,7 @@ type BridgeFailure struct {
 	Suppressed    uint64      `json:"-"`
 	User          string      `json:"-"`
 	Carrier       CarrierMode `json:"-"`
+	Delivery      string      `json:"-"`
 	Reason        string      `json:"reason"`
 	Error         string      `json:"error"`
 	LaneID        uint32      `json:"lane_id"`
@@ -111,6 +112,10 @@ func parseBridgeFailure(body []byte) (BridgeFailure, bool) {
 		json.Unmarshal(body, &failure, json.RejectUnknownMembers(true)) != nil {
 		return BridgeFailure{}, false
 	}
+	return failure, validBridgeFailure(failure)
+}
+
+func validBridgeFailure(failure BridgeFailure) bool {
 	if !slices.Contains([]string{
 		"session_create", "carrier_queue", "up_frames", "up_capacity", "up_send", "down_poll",
 		"lane_capacity", "lane_up", "lane_down", "hello_size", "pre_session_frames",
@@ -125,16 +130,55 @@ func parseBridgeFailure(body []byte) (BridgeFailure, bool) {
 		"session_rejected", "session_invalid", "up_rejected", "down_rejected", "down_invalid",
 		"lane_reused", "lane_missing_open", "cross_lane",
 	}, failure.Error) {
-		return BridgeFailure{}, false
+		return false
 	}
 	if failure.IsLaneClosure() && failure.LaneID == 0 {
-		return BridgeFailure{}, false
+		return false
 	}
 	const maxDiagnosticMS = 30 * 24 * 60 * 60 * 1000
 	if failure.LaneID > MaxStreamID || failure.CloseCode > 4999 || failure.ReadyState > 3 ||
 		failure.HTTPStatus > 599 || failure.ElapsedMS > maxDiagnosticMS || failure.OperationMS > maxDiagnosticMS ||
 		failure.QueuedBytes > 1<<30 || failure.QueuedItems > 1<<20 || failure.BufferedBytes > 1<<30 {
+		return false
+	}
+	return true
+}
+
+// An authenticated WebSocket can carry the failure even when a new HTTP
+// request cannot reach the server before the native client discards its WebView.
+const bridgeFailureCloseCode = 4000
+
+func parseBridgeFailureClose(body []byte) (BridgeFailure, bool) {
+	var compact struct {
+		Reason      string `json:"r"`
+		Error       string `json:"e"`
+		LaneID      uint32 `json:"l"`
+		OperationMS uint64 `json:"t"`
+		CloseCode   uint16 `json:"c"`
+		ReadyState  uint8  `json:"s"`
+	}
+	if len(body) == 0 || len(body) > 123 || json.Unmarshal(body, &compact, json.RejectUnknownMembers(true)) != nil {
 		return BridgeFailure{}, false
 	}
-	return failure, true
+	failure := BridgeFailure{
+		Reason: compact.Reason, Error: compact.Error, LaneID: compact.LaneID,
+		OperationMS: compact.OperationMS, CloseCode: compact.CloseCode, ReadyState: compact.ReadyState,
+	}
+	return failure, !failure.IsLaneClosure() && validBridgeFailure(failure)
+}
+
+func (d *bridgeDiagnosticState) report(failure BridgeFailure, carrier CarrierMode, delivery string, callback func(BridgeFailure)) {
+	if d == nil {
+		return
+	}
+	var allowed bool
+	if failure.IsLaneClosure() {
+		failure.Suppressed, allowed = d.claimLane(failure.LaneID, 0, time.Now())
+	} else {
+		allowed = d.reported.CompareAndSwap(false, true)
+	}
+	if allowed && callback != nil {
+		failure.BridgeID, failure.User, failure.Carrier, failure.Delivery = d.id, d.user, carrier, delivery
+		callback(failure)
+	}
 }

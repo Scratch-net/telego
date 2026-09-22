@@ -79,6 +79,7 @@ func logWebBridgeFailure(failure webproxy.BridgeFailure) {
 		message = "WEB bridge lane closed"
 	}
 	log.Warn().Str("user", failure.User).Str("carrier", string(failure.Carrier)).
+		Str("delivery", failure.Delivery).
 		Uint64("bridge_id", failure.BridgeID).Uint64("suppressed", failure.Suppressed).
 		Str("reason", failure.Reason).Str("error_category", failure.Error).
 		Uint32("lane_id", failure.LaneID).Uint16("close_code", failure.CloseCode).
