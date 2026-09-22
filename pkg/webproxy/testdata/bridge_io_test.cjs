@@ -394,6 +394,60 @@ test('established WebSocket lane closure preserves its healthy sibling', async (
   h.pagehide(); await flush(); assertClean(h);
 });
 
+for (const failure of ['error', 'close', 'timeout']) {
+  test('lane opening ' + failure + ' preserves established traffic and permits a replacement', async () => {
+    const h = harness('websocket-lanes'); h.api.setSession();
+    const queue = (id, type = 1, data) => {
+      if (!data) { data = new ArrayBuffer(8); new DataView(data).setUint32(0, (type << 24) | id); }
+      h.api.queueWebSocketLane({ id, type, data });
+    };
+    queue(1); h.sockets[0].open(); await flush();
+    queue(2);
+    const sibling = h.sockets[0], failed = h.sockets[1];
+    if (failure === 'timeout') await h.advance(budget);
+    else { failed.emit(failure); await flush(); }
+    // Browsers can deliver both an error and a later close for one attempt.
+    failed.emit('close'); await flush();
+    assert.equal(h.api.state().closed, false, 'one opening failure must not discard the bridge');
+    assert.equal(sibling.closeCalls, 0);
+    assert.equal(h.api.state().lanes.size, 1);
+    assert.equal(h.api.state().queuedBytes, 0);
+    assert.equal(h.api.state().queuedItems, 0);
+    assert.equal(h.messages.some(value => value.state === 'failed'), false);
+    const closed = h.messages.filter(value => value instanceof ArrayBuffer && new DataView(value).getUint8(0) === 3);
+    assert.equal(closed.length, 1, 'Telegram gets one CLOSE for only the failed attempt');
+    assert.equal(new DataView(closed[0]).getUint32(0), 0x03000002);
+    const up = dataFrame(1, 8).buffer;
+    queue(1, 2, up); await flush();
+    assert.deepEqual(new Uint8Array(sibling.sent.at(-1)), new Uint8Array(up));
+    const down = dataFrame(1, 8).buffer;
+    sibling.emit('message', down); await flush();
+    assert.ok(h.messages.includes(down), 'sibling still delivers downstream traffic');
+    queue(3); h.sockets[2].open(); await flush();
+    assert.equal(h.sockets[2].sent.length, 1, 'replacement OPEN is forwarded');
+    assert.equal(h.api.state().lanes.size, 2);
+    h.pagehide(); await flush(); assertClean(h);
+  });
+}
+
+for (const state of ['connecting', 'closing', 'locally closed', 'remotely closed']) {
+  test('opening failure retains bridge recovery when its only sibling is ' + state, async () => {
+    const h = harness('websocket-lanes'); h.api.setSession();
+    for (const id of [1, 2]) {
+      const data = new ArrayBuffer(8); new DataView(data).setUint32(0, 0x01000000 | id);
+      h.api.queueWebSocketLane({ id, type: 1, data });
+    }
+    if (state !== 'connecting') { h.sockets[0].open(); await flush(); }
+    if (state === 'closing') h.sockets[0].readyState = 2;
+    if (state === 'locally closed') h.api.state().lanes.get(1).localClosed = true;
+    if (state === 'remotely closed') h.api.state().lanes.get(1).remoteClosed = true;
+    h.sockets[1].emit('error'); await flush();
+    assert.equal(h.api.state().closed, true);
+    assert.equal(h.messages.filter(value => value.state === 'failed').length, 1);
+    assertClean(h);
+  });
+}
+
 for (const origin of ['client', 'server', 'transport']) {
   test('established lane records ' + origin + ' closure without failing the bridge', async () => {
     const h = harness('websocket-lanes'); h.api.setSession();

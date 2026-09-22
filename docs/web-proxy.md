@@ -237,6 +237,10 @@ Telego supplies the carrier document during the authenticated WEB setup. This do
 
 In `websocket` mode, the carrier opens one same-host `wss` connection. In `websocket-lanes` mode, it opens one connection for each active lane.
 
+If a new WebSocket lane fails to open while another lane remains open, the bridge closes only the failed stream.
+Telegram can replace that stream while existing lanes continue to carry traffic.
+If no other lane remains open, the bridge reports failure so Telegram can recreate it.
+
 The WebSocket target is `wss://<WEB host>/api/v1/ws`. The bridge sends the bearer credential in `Sec-WebSocket-Protocol`.
 
 In `https` mode, the carrier uses serialized fetch requests and long polls. In `https-lanes` mode, it uses independent fetch and long-poll lanes.
@@ -532,7 +536,7 @@ Diagnostic delivery does not delay reconnection or retry failed reports.
 Network outages and WebView termination can prevent delivery.
 Normal page closure does not produce a bridge failure report.
 
-Established WebSocket lane closures produce separate diagnostics:
+WebSocket lane closures produce separate diagnostics:
 
 - `WEB bridge lane closed` records the browser close code, clean-close flag, and observed CLOSE frame direction.
 - `WEB server WebSocket closed` records the server close path, lane origin, close codes, connection age, and binary byte counts.

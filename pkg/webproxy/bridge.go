@@ -317,6 +317,14 @@ function finishWebSocketLane(lane,notify){
  if(lane.socket&&(lane.socket.readyState===WebSocket.OPEN||lane.socket.readyState===WebSocket.CONNECTING))try{lane.socket.close()}catch(error){}
  if(notify&&port&&!closed){const frame=closeFrame(lane.id);port.postMessage(frame,[frame])}
 }
+function failWebSocketLaneOpen(lane,socket,error,closeCode,started){
+ if(closed||lane.finished||lanes.get(lane.id)!==lane)return;
+ const sibling=[...lanes.values()].some(other=>other!==lane&&other.opened&&!other.finished&&!other.localClosed&&!other.remoteClosed&&other.socket&&other.socket.readyState===WebSocket.OPEN);
+ if(!sibling){fail('ws_lane_open',error,lane.id,socket,closeCode);return}
+ // Telegram can replace one failed stream without discarding working streams.
+ reportLaneClose(lane,socket,{code:closeCode,wasClean:false},started,error);
+ finishWebSocketLane(lane,!lane.localClosed&&!lane.remoteClosed);
+}
 function openWebSocketLane(lane){
  const started=Date.now();
  const socket=new WebSocket(webSocketTarget,'tproxy-lane-v1.'+sessionToken+'.'+lane.id);
@@ -330,14 +338,14 @@ function openWebSocketLane(lane){
  };
  socket.onerror=()=>{};
  socket.onclose=event=>{
-  if(closed||lane.finished)return;if(!lane.opened){fail('ws_lane_open',diagnosticException(new Error('websocket closed'),{operationMS:Date.now()-started}),lane.id,socket,event.code);return}
+  if(closed||lane.finished)return;if(!lane.opened){failWebSocketLaneOpen(lane,socket,diagnosticException(new Error('websocket closed'),{operationMS:Date.now()-started}),event.code,started);return}
   reportLaneClose(lane,socket,event,started);
   finishWebSocketLane(lane,!lane.localClosed&&!lane.remoteClosed);
  };
  waitForWebSocketOpen(socket).then(()=>{
   if(closed||lane.finished||lanes.get(lane.id)!==lane||lane.socket!==socket){socket.close();return}
   lane.opened=true;status('connected');runWebSocketLaneUp(lane);
- },error=>{if(!closed&&!lane.finished&&lanes.get(lane.id)===lane)fail('ws_lane_open',error,lane.id,socket)});
+ },error=>failWebSocketLaneOpen(lane,socket,error,error&&error.closeCode,started));
 }
 function queueWebSocketLane(frame){
  let lane=lanes.get(frame.id);
@@ -544,11 +552,11 @@ function reportFailure(reason,error,laneID,socket,closeCode,wasClean){
  }catch(reportError){}
  return report;
 }
-function reportLaneClose(lane,socket,event,started){
+function reportLaneClose(lane,socket,event,started,error){
  const now=Date.now();if(now-laneReportWindow>=60000){laneReportWindow=now;laneReportCount=0}
  if(laneReportCount>=32)return;laneReportCount++;
  const reason=lane.localClosed?'ws_lane_closed_client':lane.remoteClosed?'ws_lane_closed_server':'ws_lane_closed_transport';
- reportFailure(reason,diagnosticException(new Error('websocket closed'),{operationMS:now-started}),lane.id,socket,event.code,event.wasClean);
+ reportFailure(reason,diagnosticException(error||new Error('websocket closed'),{operationMS:now-started}),lane.id,socket,event.code,event.wasClean);
 }
 function fail(reason,error,laneID,socket,closeCode){
  if(closed||failureReported)return;failureReported=true;
