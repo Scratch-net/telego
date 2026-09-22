@@ -324,6 +324,7 @@ function openWebSocketLane(lane){
  socket.onerror=()=>{};
  socket.onclose=event=>{
   if(closed||lane.finished)return;if(!lane.opened){fail('ws_lane_open',diagnosticException(new Error('websocket closed'),{operationMS:Date.now()-started}),lane.id,socket,event.code);return}
+  reportLaneClose(lane,socket,event,started);
   finishWebSocketLane(lane,!lane.localClosed&&!lane.remoteClosed);
  };
  waitForWebSocketOpen(socket).then(()=>{
@@ -377,6 +378,7 @@ const queueByteLimit=33554432,queueItemLimit=16384,maxFrames=4096,maxPayload=104
 const requestTimeoutMs=90000;
 const bridgeStartedAt=Date.now();
 let failureReported=false;
+let laneReportWindow=bridgeStartedAt,laneReportCount=0;
 let initialized=false,closed=false,port=null,sessionToken='',createStarted=false;
 let queuedBytes=0,queuedItems=0,upSequence=1,downCursor='0',upRunning=false,pollController=null;
 const lifecycleController=new AbortController();
@@ -521,17 +523,23 @@ function diagnosticError(error){
  ]);
  return messages.get(error.message)||({TypeError:'type_error',RangeError:'range_error',AbortError:'abort',NetworkError:'network',SecurityError:'security',InvalidStateError:'invalid_state'})[error.name]||'error';
 }
-function reportFailure(reason,error,laneID,socket,closeCode){
+function reportFailure(reason,error,laneID,socket,closeCode,wasClean){
  try{
   const number=(value,limit)=>Number.isFinite(value)?Math.max(0,Math.min(Math.floor(value),limit)):0;
   const body=JSON.stringify({reason,error:diagnosticError(error),lane_id:number(laneID,16777215),
    close_code:number(closeCode||(error&&error.closeCode),4999),ready_state:number(socket&&socket.readyState,3),
    http_status:number(error&&error.httpStatus,599),elapsed_ms:number(Date.now()-bridgeStartedAt,2592000000),
    operation_ms:number(error&&error.operationMS,2592000000),queued_bytes:number(queuedBytes,1073741824),
-   queued_items:number(queuedItems,1048576),buffered_bytes:number(socket&&socket.bufferedAmount,1073741824)});
+   queued_items:number(queuedItems,1048576),buffered_bytes:number(socket&&socket.bufferedAmount,1073741824),was_clean:!!wasClean});
   // A separate keepalive request survives normal page cleanup. Never delay recovery for diagnostics.
   fetch(relayOrigin+'/api/v1/diagnostic',options('POST',sessionToken||bootstrap,body,null,undefined,true)).then(cancelResponse).catch(()=>{});
  }catch(reportError){}
+}
+function reportLaneClose(lane,socket,event,started){
+ const now=Date.now();if(now-laneReportWindow>=60000){laneReportWindow=now;laneReportCount=0}
+ if(laneReportCount>=32)return;laneReportCount++;
+ const reason=lane.localClosed?'ws_lane_closed_client':lane.remoteClosed?'ws_lane_closed_server':'ws_lane_closed_transport';
+ reportFailure(reason,diagnosticException(new Error('websocket closed'),{operationMS:now-started}),lane.id,socket,event.code,event.wasClean);
 }
 function fail(reason,error,laneID,socket,closeCode){
  if(closed||failureReported)return;failureReported=true;

@@ -3,9 +3,12 @@ package webproxy
 import (
 	"encoding/json/v2"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 )
+
+var bridgeDiagnosticIDs atomic.Uint64
 
 const (
 	bridgeDiagnosticPath     = "/api/v1/diagnostic"
@@ -15,6 +18,8 @@ const (
 // BridgeFailure contains client-reported diagnostics, never exception text,
 // URLs, credentials, frame contents, or WebSocket close reason strings.
 type BridgeFailure struct {
+	BridgeID      uint64      `json:"-"`
+	Suppressed    uint64      `json:"-"`
 	User          string      `json:"-"`
 	Carrier       CarrierMode `json:"-"`
 	Reason        string      `json:"reason"`
@@ -28,13 +33,53 @@ type BridgeFailure struct {
 	QueuedBytes   uint64      `json:"queued_bytes"`
 	QueuedItems   uint32      `json:"queued_items"`
 	BufferedBytes uint64      `json:"buffered_bytes"`
+	WasClean      bool        `json:"was_clean,omitzero"`
+}
+
+func (f BridgeFailure) IsLaneClosure() bool {
+	return f.Reason == "ws_lane_closed_client" || f.Reason == "ws_lane_closed_server" || f.Reason == "ws_lane_closed_transport"
 }
 
 // One shared allowance follows a bridge from bootstrap through session cleanup.
 // Existing manager limits and token expiry bound its lifetime and storage.
 type bridgeDiagnosticState struct {
+	id       uint64
 	user     string
 	reported atomic.Bool
+	mu       sync.Mutex
+	lanes    [2]laneDiagnosticWindow // browser and server allowances are independent
+}
+
+type laneDiagnosticWindow struct {
+	start      time.Time
+	count      int
+	recent     [64]uint32
+	next       int
+	suppressed uint64
+}
+
+// Each source gets 32 reports per minute, with a fixed recent-ID cache.
+// Lane churn never consumes the separate bridge-failure allowance.
+func (d *bridgeDiagnosticState) claimLane(lane uint32, source int, now time.Time) (uint64, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	w := &d.lanes[source]
+	if lane != 0 && slices.Contains(w.recent[:], lane) {
+		return 0, false
+	}
+	if w.start.IsZero() || now.Sub(w.start) >= time.Minute {
+		w.start, w.count = now, 0
+	}
+	if w.count >= 32 {
+		w.suppressed++
+		return 0, false
+	}
+	w.count++
+	w.recent[w.next] = lane
+	w.next = (w.next + 1) % len(w.recent)
+	suppressed := w.suppressed
+	w.suppressed = 0
+	return suppressed, true
 }
 
 func (m *Manager) authenticateBridgeDiagnostic(token string) *bridgeDiagnosticState {
@@ -72,6 +117,7 @@ func parseBridgeFailure(body []byte) (BridgeFailure, bool) {
 		"pre_session_capacity", "native_frames", "ws_open", "ws_receive_type", "ws_closed",
 		"ws_capacity", "ws_send", "ws_lane_receive_type", "ws_lane_frames", "ws_lane_cross_lane",
 		"ws_lane_open", "ws_lane_limit", "ws_lane_capacity", "ws_lane_send",
+		"ws_lane_closed_client", "ws_lane_closed_server", "ws_lane_closed_transport",
 	}, failure.Reason) || !slices.Contains([]string{
 		"none", "error", "type_error", "range_error", "abort", "network", "security",
 		"invalid_state", "timeout", "ws_error", "ws_close", "invalid_frame", "response_size",
@@ -79,6 +125,9 @@ func parseBridgeFailure(body []byte) (BridgeFailure, bool) {
 		"session_rejected", "session_invalid", "up_rejected", "down_rejected", "down_invalid",
 		"lane_reused", "lane_missing_open", "cross_lane",
 	}, failure.Error) {
+		return BridgeFailure{}, false
+	}
+	if failure.IsLaneClosure() && failure.LaneID == 0 {
 		return BridgeFailure{}, false
 	}
 	const maxDiagnosticMS = 30 * 24 * 60 * 60 * 1000

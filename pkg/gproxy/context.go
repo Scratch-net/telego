@@ -96,6 +96,7 @@ type ConnContext struct {
 	// Atomic state - no lock needed for reads
 	state            atomic.Int32
 	closeStarted     atomic.Bool
+	webCloseReason   atomic.Uint32
 	directDialCancel context.CancelFunc // protected by mu; retired after setup
 	// handshakeFailureRecorded makes explicit failure accounting one-shot.
 	handshakeFailureRecorded atomic.Bool

@@ -57,6 +57,7 @@ func newWebProxyRuntime(runtimeConfig config.WebProxyRuntimeConfig, internalAuth
 	}
 	server, err := webproxy.NewHTTPServer(webproxy.HTTPServerConfig{
 		OnBridgeFailure:   logWebBridgeFailure,
+		OnWebSocketClose:  logWebSocketClose,
 		Bind:              runtimeConfig.BindAddr,
 		Hostname:          runtimeConfig.Hostname,
 		Manager:           manager,
@@ -73,14 +74,29 @@ func newWebProxyRuntime(runtimeConfig config.WebProxyRuntimeConfig, internalAuth
 }
 
 func logWebBridgeFailure(failure webproxy.BridgeFailure) {
+	message := "WEB bridge reported failure"
+	if failure.IsLaneClosure() {
+		message = "WEB bridge lane closed"
+	}
 	log.Warn().Str("user", failure.User).Str("carrier", string(failure.Carrier)).
+		Uint64("bridge_id", failure.BridgeID).Uint64("suppressed", failure.Suppressed).
 		Str("reason", failure.Reason).Str("error_category", failure.Error).
 		Uint32("lane_id", failure.LaneID).Uint16("close_code", failure.CloseCode).
 		Uint8("ready_state", failure.ReadyState).Uint16("http_status", failure.HTTPStatus).
 		Uint64("elapsed_ms", failure.ElapsedMS).Uint64("operation_ms", failure.OperationMS).
 		Uint64("queued_bytes", failure.QueuedBytes).Uint32("queued_items", failure.QueuedItems).
 		Uint64("buffered_bytes", failure.BufferedBytes).
-		Msg("WEB bridge reported failure")
+		Bool("was_clean", failure.WasClean).Msg(message)
+}
+
+func logWebSocketClose(event webproxy.WebSocketClose) {
+	log.Warn().Str("user", event.User).Str("carrier", string(event.Carrier)).
+		Uint64("bridge_id", event.BridgeID).Uint32("lane_id", event.LaneID).
+		Str("reason", event.Reason).Str("stream_origin", event.StreamOrigin).
+		Str("error_category", event.ErrorCategory).Uint16("close_code", event.CloseCode).
+		Uint16("peer_close_code", event.PeerCloseCode).Int64("age_ms", event.AgeMS).
+		Uint64("received_bytes", event.ReceivedBytes).Uint64("sent_bytes", event.SentBytes).
+		Uint64("suppressed", event.Suppressed).Msg("WEB server WebSocket closed")
 }
 
 func webProxyLogicalBackendFactory(handler *gproxy.ProxyHandler, listener net.Addr) webproxy.BackendFactory {

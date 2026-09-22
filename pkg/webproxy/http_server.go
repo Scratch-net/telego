@@ -52,8 +52,9 @@ var (
 // deployment's TLS-terminating Nginx. It does not alter the public MTProxy
 // gnet engine or own Manager shutdown.
 type HTTPServerConfig struct {
-	// OnBridgeFailure receives at most one validated report per issued bridge.
+	// OnBridgeFailure receives one failure plus bounded lane-close reports per bridge.
 	OnBridgeFailure              func(BridgeFailure)
+	OnWebSocketClose             func(WebSocketClose)
 	Bind                         string
 	Hostname                     string
 	Manager                      *Manager
@@ -377,6 +378,9 @@ func (*httpEventHandler) OnClose(connection gnet.Conn, err error) gnet.Action {
 		return gnet.None
 	}
 	if state, ok := connection.Context().(*httpConnectionState); ok {
+		if state.websocket != nil && state.websocket.closeError == "" {
+			state.websocket.closeError = diagnosticNetworkError(err)
+		}
 		state.close()
 	}
 	return gnet.None
@@ -674,6 +678,9 @@ func (s *httpConnectionState) armDeadlineLocked(connection gnet.Conn, duration t
 			}
 			// This runnable is executing on the owning event loop. No phase
 			// transition can occur between the generation check and close.
+			if s.websocket != nil {
+				s.websocket.noteClose("write_timeout", 0)
+			}
 			return connection.EventLoop().Close(connection)
 		}))
 	})
@@ -1132,7 +1139,14 @@ func (h *httpEventHandler) serve(
 		if !valid {
 			return rejectResponse(400)
 		}
-		if request.diagnostic.reported.CompareAndSwap(false, true) && h.server.config.OnBridgeFailure != nil {
+		var allowed bool
+		if failure.IsLaneClosure() {
+			failure.Suppressed, allowed = request.diagnostic.claimLane(failure.LaneID, 0, time.Now())
+		} else {
+			allowed = request.diagnostic.reported.CompareAndSwap(false, true)
+		}
+		if allowed && h.server.config.OnBridgeFailure != nil {
+			failure.BridgeID = request.diagnostic.id
 			failure.User = request.diagnostic.user
 			failure.Carrier = manager.CarrierMode()
 			h.server.config.OnBridgeFailure(failure)

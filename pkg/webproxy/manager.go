@@ -201,7 +201,7 @@ func (m *Manager) IssueBootstrap(capability Capability, clientIP string) (string
 		}
 	}
 	m.bootstraps[hash] = &bootstrap{
-		diagnostic: &bridgeDiagnosticState{user: profile.Name()},
+		diagnostic: &bridgeDiagnosticState{id: bridgeDiagnosticIDs.Add(1), user: profile.Name()},
 		expires:    now.Add(m.timeouts.BootstrapLifetime),
 		profile:    profile,
 		issuanceIP: clientIP,

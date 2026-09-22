@@ -515,14 +515,34 @@ The report identifies the failure stage, error category, lane, WebSocket close c
 When the duration is available, `operation_ms` measures the failed operation. Otherwise, it is zero.
 
 The bridge sends `POST /api/v1/diagnostic` with its bootstrap or session bearer token.
-Telego accepts at most 512 bytes and one report per issued bridge.
+Telego accepts at most 512 bytes and one bridge failure report per issued bridge.
 The server accepts only fixed reason and error values with bounded numeric fields.
 It supplies the user name and carrier from its own configuration.
 Reports exclude credentials, URLs, raw exception text, WebSocket close reasons, and Telegram payloads.
 
 Diagnostic delivery does not delay reconnection or retry failed reports.
 Network outages and WebView termination can prevent delivery.
-Normal page closure and closure of an established WebSocket lane do not produce a bridge failure report.
+Normal page closure does not produce a bridge failure report.
+
+Established WebSocket lane closures produce separate diagnostics:
+
+- `WEB bridge lane closed` records the browser close code, clean-close flag, and observed CLOSE frame direction.
+- `WEB server WebSocket closed` records the server close path, lane origin, close codes, connection age, and binary byte counts.
+- `WEB proxy stream closed` records closure of the authenticated internal MTProxy stream, including idle expiry and Middle-End CLOSE events.
+
+Browser and server WebSocket records share `bridge_id` and `lane_id`. Bridge IDs restart with the Telego process and contain no credential data.
+For lane closures, `operation_ms` measures time since WebSocket creation.
+
+Each bridge permits 32 lane reports per minute from each source. Telego suppresses repeated reports for the 64 most recently reported lane IDs.
+These limits do not consume the separate bridge failure allowance.
+Internal MTProxy closure warnings have a process limit of 128 per minute.
+The next accepted server record includes the number of reports suppressed by its limit.
+
+The `idle_timeout` marker means that Telego closed an idle stream.
+The `middleend_close` marker means that the Middle-End binding delivered a CLOSE event.
+It does not prove that the external Telegram server initiated that event.
+The `unspecified` marker means that the internal stream has no more specific close marker.
+Activity ages of `-1` mean that Telego recorded no payload in that direction.
 
 ## Docker
 

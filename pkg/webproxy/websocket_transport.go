@@ -57,7 +57,8 @@ type webSocketOutbound struct {
 }
 
 type webSocketFailure struct {
-	code ws.StatusCode
+	code   ws.StatusCode
+	reason string
 }
 
 type webSocketInboundBuffer interface {
@@ -206,10 +207,18 @@ func (r *webSocketOwnedInput) Release() {
 }
 
 type webSocketConnection struct {
-	session *Session
-	lane    *WebSocketLaneLease
-	decoder *webSocketDecoder
-	manager *Manager
+	createdAt     time.Time
+	onClose       func(WebSocketClose)
+	closeReason   string
+	closeError    string
+	closeCode     uint16
+	peerCloseCode uint16
+	receivedBytes uint64
+	sentBytes     uint64
+	session       *Session
+	lane          *WebSocketLaneLease
+	decoder       *webSocketDecoder
+	manager       *Manager
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -248,12 +257,13 @@ func newWebSocketConnection(
 	messageLimit := min(session.limits.MaxBodyBytes, maxWebSocketMessageBytes)
 	ctx, cancel := context.WithCancel(context.Background())
 	connection := &webSocketConnection{
-		session: session,
-		lane:    lane,
-		manager: manager,
-		ctx:     ctx,
-		cancel:  cancel,
-		phase:   webSocketHandshake,
+		createdAt: time.Now(),
+		session:   session,
+		lane:      lane,
+		manager:   manager,
+		ctx:       ctx,
+		cancel:    cancel,
+		phase:     webSocketHandshake,
 		inboundBudget: &webSocketInboundBudget{
 			// Chunked messages are coalesced off the event loop. During that
 			// transition, payload, linked metadata, and contiguous body coexist.
@@ -378,7 +388,7 @@ func (w *webSocketConnection) start(connection gnet.Conn) {
 	w.workers.Go(func() {
 		select {
 		case <-w.session.doneChannel():
-			w.fail(connection, ws.StatusNormalClosure)
+			w.fail(connection, ws.StatusNormalClosure, "session_closed")
 		case <-w.ctx.Done():
 		}
 	})
@@ -473,12 +483,12 @@ func (w *webSocketConnection) downlinkLoop(connection gnet.Conn) {
 		}
 		if err != nil {
 			if w.ctx.Err() == nil {
-				w.fail(connection, ws.StatusProtocolError)
+				w.fail(connection, ws.StatusProtocolError, "downlink_error")
 			}
 			return
 		}
 		if laneClosed {
-			w.fail(connection, ws.StatusNormalClosure)
+			w.fail(connection, ws.StatusNormalClosure, "lane_closed")
 			return
 		}
 		message := webSocketMessage{typeID: webSocketMessagePing}
@@ -499,7 +509,7 @@ func (w *webSocketConnection) sendOutbound(connection gnet.Conn, item *webSocket
 	} else {
 		item.lease.Release()
 		if w.ctx.Err() == nil {
-			w.fail(connection, ws.StatusInternalServerError)
+			w.fail(connection, ws.StatusInternalServerError, "output_capacity")
 		}
 		return false
 	}
@@ -525,12 +535,12 @@ func (w *webSocketConnection) enqueueOutbound(item *webSocketOutbound) bool {
 	}
 }
 
-func (w *webSocketConnection) fail(connection gnet.Conn, code ws.StatusCode) {
+func (w *webSocketConnection) fail(connection gnet.Conn, code ws.StatusCode, reason string) {
 	if w.ctx.Err() != nil {
 		return
 	}
 	select {
-	case w.failures <- webSocketFailure{code: code}:
+	case w.failures <- webSocketFailure{code: code, reason: reason}:
 	default:
 	}
 	_ = connection.Wake(nil)
@@ -556,6 +566,7 @@ func (w *webSocketConnection) touchLiveness(connection gnet.Conn) {
 				w.livenessExpired = true
 				return nil
 			}
+			w.noteClose("liveness_timeout", 0)
 			return connection.EventLoop().Close(connection)
 		}))
 	})
@@ -569,6 +580,7 @@ func (w *webSocketConnection) beginClose(
 	if w.phase == webSocketClosing {
 		return true
 	}
+	w.noteClose("server_close", code)
 	w.phase = webSocketClosing
 	w.cancel()
 	w.livenessID++
@@ -614,6 +626,7 @@ func (w *webSocketConnection) releaseInbound() {
 
 func (w *webSocketConnection) close() {
 	w.closeOnce.Do(func() {
+		w.reportClose()
 		if w.metricsActive {
 			w.manager.webSocketsActive.Add(-1)
 			w.metricsActive = false
@@ -692,6 +705,7 @@ func (h *httpEventHandler) upgradeWebSocket(
 		return h.writeImmediate(connection, state, h.sanitizedFallback())
 	}
 	transport.backpressureTimeout = h.server.config.webSocketBackpressureTimeout
+	transport.onClose = h.server.config.OnWebSocketClose
 	transport.backpressureRetry = h.server.config.webSocketBackpressureRetry
 	request.webSocketLane = nil
 	request.webSocketMultiplex = false
@@ -734,6 +748,7 @@ func (h *httpEventHandler) onWebSocketTraffic(
 	}
 	select {
 	case failure := <-transport.failures:
+		transport.noteClose(failure.reason, failure.code)
 		if !transport.beginClose(connection, failure.code, nil) {
 			return gnet.Close
 		}
@@ -748,6 +763,7 @@ uplinkResults:
 			}
 			transport.uplinkPending--
 			if result.code != 0 {
+				transport.noteClose("uplink_error", result.code)
 				if !transport.beginClose(connection, result.code, nil) {
 					return gnet.Close
 				}
@@ -809,6 +825,7 @@ uplinkResults:
 		return gnet.Close
 	}
 	if unreadOverflow {
+		transport.noteClose("input_capacity", ws.StatusInternalServerError)
 		if !transport.beginClose(connection, ws.StatusInternalServerError, nil) {
 			return gnet.Close
 		}
@@ -824,12 +841,14 @@ uplinkResults:
 		case errors.Is(decodeErr, errWebSocketResource):
 			code = ws.StatusInternalServerError
 		}
+		transport.noteClose("decode_error", code)
 		if !transport.beginClose(connection, code, nil) {
 			return gnet.Close
 		}
 	} else if emitted {
 		switch message.typeID {
 		case webSocketMessageBinary:
+			transport.receivedBytes += uint64(message.payloadBytes)
 			input := webSocketInbound{
 				body:         message.payload,
 				fragments:    message.fragments,
@@ -844,6 +863,7 @@ uplinkResults:
 				transport.touchLiveness(connection)
 			default:
 				input.reservation.Release()
+				transport.noteClose("input_capacity", 0)
 				return gnet.Close
 			}
 		case webSocketMessagePing:
@@ -853,6 +873,10 @@ uplinkResults:
 		case webSocketMessagePong:
 			transport.touchLiveness(connection)
 		case webSocketMessageClose:
+			if len(message.payload) >= 2 {
+				transport.peerCloseCode = binary.BigEndian.Uint16(message.payload)
+			}
+			transport.noteClose("peer_close", ws.StatusCode(transport.peerCloseCode))
 			if !transport.beginClose(connection, 0, message.payload) {
 				return gnet.Close
 			}
@@ -919,6 +943,7 @@ func (h *httpEventHandler) pumpWebSocketWrites(
 	header, payload, err := encodeWebSocketServerParts(item.message)
 	if err != nil {
 		item.lease.Release()
+		transport.noteClose("encode_error", 0)
 		select {
 		case item.done <- err:
 		default:
@@ -935,11 +960,18 @@ func (h *httpEventHandler) pumpWebSocketWrites(
 	if err := connection.AsyncWritev(item.writeBatch, func(current gnet.Conn, writeErr error) error {
 		transport.asyncWritePending = false
 		if writeErr != nil {
+			transport.noteClose("write_error", 0)
+			transport.closeError = diagnosticNetworkError(writeErr)
 			transport.finishCurrent(writeErr)
 			return current.EventLoop().Close(current)
 		}
+		if item.message.typeID == webSocketMessageBinary {
+			transport.sentBytes += uint64(len(item.message.payload))
+		}
 		return current.Wake(nil)
 	}); err != nil {
+		transport.noteClose("write_error", 0)
+		transport.closeError = diagnosticNetworkError(err)
 		transport.finishCurrent(err)
 		return gnet.Close
 	}

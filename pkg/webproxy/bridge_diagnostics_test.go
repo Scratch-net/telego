@@ -1,12 +1,60 @@
 package webproxy
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestLaneDiagnosticsDoNotConsumeFailureAllowance(t *testing.T) {
+	reports := make(chan BridgeFailure, 40)
+	app := newHTTPTestApplicationWithConfig(t, time.Second, nil, func(config *HTTPServerConfig) {
+		config.OnBridgeFailure = func(failure BridgeFailure) { reports <- failure }
+	})
+	bootstrap, err := app.manager.IssueBootstrap(app.profiles[0].Capability(), "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Timeout: time.Second}
+	post := func(body string) {
+		response := app.do(t, client, "POST", bridgeDiagnosticPath, []byte(body), map[string]string{
+			"Authorization": "Bearer " + bootstrap, "Content-Type": "application/octet-stream",
+		})
+		readHTTPBody(t, response)
+		if response.StatusCode != 204 {
+			t.Fatalf("diagnostic status = %d", response.StatusCode)
+		}
+	}
+	for lane := range 40 {
+		body := fmt.Sprintf(`{"reason":"ws_lane_closed_transport","error":"ws_close","lane_id":%d,"close_code":1006}`, lane+1)
+		post(body)
+		post(body)
+	}
+	if len(reports) != 32 {
+		t.Fatalf("lane reports = %d, want 32", len(reports))
+	}
+	post(testBridgeFailureBody)
+	post(testBridgeFailureBody)
+	if len(reports) != 33 {
+		t.Fatalf("reports after bridge failure = %d, want 33", len(reports))
+	}
+	state := app.manager.authenticateBridgeDiagnostic(bootstrap)
+	if _, allowed := state.claimLane(100, 1, time.Now()); !allowed {
+		t.Fatal("browser exhausted server allowance")
+	}
+	suppressed, allowed := state.claimLane(100, 0, time.Now().Add(time.Minute))
+	if !allowed || suppressed != 16 {
+		t.Fatalf("refilled allowance = %d, %v", suppressed, allowed)
+	}
+	for len(reports) != 0 {
+		if report := <-reports; report.BridgeID == 0 {
+			t.Fatal("report omitted server-derived bridge ID")
+		}
+	}
+}
 
 const testBridgeFailureBody = `{"reason":"ws_lane_open","error":"ws_close","lane_id":7,"close_code":1006,"ready_state":3,"elapsed_ms":1234,"operation_ms":25}`
 

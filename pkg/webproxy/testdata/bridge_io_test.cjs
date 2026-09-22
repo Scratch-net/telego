@@ -385,9 +385,53 @@ test('established WebSocket lane closure preserves its healthy sibling', async (
   assert.equal(h.api.state().lanes.size, 1);
   assert.ok(h.api.state().lanes.has(2));
   assert.equal(h.sockets[1].closeCalls, 0);
-  assert.equal(h.requests.some(request => request.url.endsWith('/api/v1/diagnostic')), false);
+  const reports = h.requests.filter(request => request.url.endsWith('/api/v1/diagnostic'));
+  assert.equal(reports.length, 1);
+  assert.equal(JSON.parse(reports[0].options.body).reason, 'ws_lane_closed_transport');
+  assert.equal(JSON.parse(reports[0].options.body).lane_id, 1);
   await h.advance(2 * budget);
   assert.equal(h.sockets[1].closeCalls, 0);
+  h.pagehide(); await flush(); assertClean(h);
+});
+
+for (const origin of ['client', 'server', 'transport']) {
+  test('established lane records ' + origin + ' closure without failing the bridge', async () => {
+    const h = harness('websocket-lanes'); h.api.setSession();
+    const frame = type => { const data = new ArrayBuffer(8); new DataView(data).setUint32(0, (type << 24) | 7); return data; };
+    h.api.queueWebSocketLane({ type: 1, id: 7, data: frame(1) });
+    const socket = h.sockets[0]; socket.open(); await flush();
+    await h.advance(1234);
+    if (origin === 'client') h.api.queueWebSocketLane({ type: 3, id: 7, data: frame(3) });
+    if (origin === 'server') socket.onmessage({ data: frame(3) });
+    socket.readyState = 3;
+    socket.onclose({ code: 1001, wasClean: true, reason: 'private reason text' });
+    socket.onclose({ code: 1001, wasClean: true });
+    await flush();
+    const requests = h.requests.filter(request => request.url.endsWith('/api/v1/diagnostic'));
+    assert.equal(requests.length, 1);
+    const report = JSON.parse(requests[0].options.body);
+    assert.equal(report.reason, 'ws_lane_closed_' + origin);
+    assert.equal(report.close_code, 1001);
+    assert.equal(report.was_clean, true);
+    assert.equal(report.operation_ms, 1234);
+    assert.equal(requests[0].options.body.includes('private'), false);
+    assert.equal(h.api.state().closed, false);
+    h.api.fail('carrier_queue', new Error('later failure')); await flush();
+    assert.equal(h.requests.filter(request => request.url.endsWith('/api/v1/diagnostic')).length, 2);
+    assertClean(h);
+  });
+}
+
+test('lane diagnostic delivery failure cannot prevent lane cleanup', async () => {
+  const h = harness('websocket-lanes'); h.api.setSession();
+  const frame = new ArrayBuffer(8); new DataView(frame).setUint32(0, 0x01000007);
+  h.api.queueWebSocketLane({ type: 1, id: 7, data: frame });
+  h.sockets[0].open(); await flush();
+  const fetch = h.sandbox.fetch;
+  h.sandbox.fetch = (url, options) => { if (url.endsWith('/api/v1/diagnostic')) throw new Error('offline'); return fetch(url, options); };
+  h.sockets[0].readyState = 3; h.sockets[0].emit('close'); await flush();
+  assert.equal(h.api.state().closed, false);
+  assert.equal(h.api.state().lanes.size, 0);
   h.pagehide(); await flush(); assertClean(h);
 });
 

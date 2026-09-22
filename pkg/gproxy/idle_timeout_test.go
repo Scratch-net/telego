@@ -83,6 +83,9 @@ func TestAuthenticatedIdleExpiryRechecksActivityOnOwner(t *testing.T) {
 			if !conn.IsClosed() {
 				t.Fatal("owner did not close expired session")
 			}
+			if ctx.webCloseReason.Load() != webCloseIdle {
+				t.Fatal("idle expiry did not preserve its diagnostic reason")
+			}
 		})
 	}
 }

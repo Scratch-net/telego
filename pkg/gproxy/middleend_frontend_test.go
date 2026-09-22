@@ -1075,6 +1075,9 @@ func TestMiddleEndAnswerFlagsIgnoredAndOrderlyCloseDrainsOutput(t *testing.T) {
 	if !ctx.middleEnd.closeAfterDrain {
 		t.Fatal("CloseExternal did not enter close-after-drain state")
 	}
+	if ctx.webCloseReason.Load() != webCloseMiddleEnd {
+		t.Fatal("Middle-End CLOSE did not preserve its diagnostic reason")
+	}
 	conn.SetReadData(make([]byte, ctx.middleEnd.frontend.maxPendingClient+1))
 	if action := runMiddleEndOwner(conn, func() gnet.Action { return handler.OnTraffic(conn) }); action != gnet.Close {
 		t.Fatalf("close-drain input overflow action = %v, want Close", action)

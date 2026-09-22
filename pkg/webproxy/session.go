@@ -78,6 +78,7 @@ type downBatch struct {
 }
 
 type carrierLane struct {
+	closeOrigin     string // protected by Session.mu, retained through lease release
 	pendingFrames   []queuedFrame
 	pendingWindows  map[uint32]int
 	unacked         []byte
@@ -979,6 +980,7 @@ func (s *Session) applyBatchLocked(frames []Frame, reservedCost, reservedItems i
 			s.usedStreams.Add(frame.StreamID)
 			if len(s.streams) >= s.limits.MaxStreamsPerSession ||
 				(s.acquireStream != nil && !s.acquireStream()) {
+				s.noteLaneCloseLocked(frame.StreamID, "stream_limit")
 				s.rememberClosedLocked(frame.StreamID)
 				if !s.queueFrameLocked(FrameClose, frame.StreamID, nil) {
 					return opened, closed, unusedCost, unusedItems, false
@@ -1015,6 +1017,7 @@ func (s *Session) applyBatchLocked(frames []Frame, reservedCost, reservedItems i
 			if state == nil && wasUsed {
 				continue
 			}
+			s.noteLaneCloseLocked(frame.StreamID, "client_frame")
 			s.dropPendingStreamFramesLocked(frame.StreamID)
 			s.releaseStreamWritesLocked(state)
 			state.backend.cancelContext()
@@ -1148,6 +1151,7 @@ func (s *Session) backendClosed(streamID uint32, backend *backendStream) {
 	s.mu.Lock()
 	state := s.streams[streamID]
 	if !s.closed && state != nil && state.backend == backend {
+		s.noteLaneCloseLocked(streamID, "backend_close")
 		s.dropPendingStreamFramesLocked(streamID)
 		s.releaseStreamWritesLocked(state)
 		backend.cancelContext()
@@ -1160,6 +1164,14 @@ func (s *Session) backendClosed(streamID uint32, backend *backendStream) {
 	s.mu.Unlock()
 	requestBackendCloses(detached)
 	backend.close()
+}
+
+func (s *Session) noteLaneCloseLocked(laneID uint32, origin string) {
+	if s.carrier.usesLanes() {
+		if lane := s.carrierLanes[laneID]; lane != nil && lane.closeOrigin == "" {
+			lane.closeOrigin = origin
+		}
+	}
 }
 
 func (s *Session) queueFrameLocked(frameType FrameType, streamID uint32, payload []byte) bool {

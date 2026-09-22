@@ -55,7 +55,8 @@ type ProxyHandler struct {
 	serverHelloFetcher *tlsfront.ServerHelloFetcher // Hybrid mode: fetches real ServerHello
 
 	// Logger
-	logger Logger
+	logger              Logger
+	webCloseDiagnostics webCloseDiagnosticWindow
 
 	// Metrics
 	activeConns       atomic.Int64
@@ -376,6 +377,9 @@ func (h *ProxyHandler) closeClient(c clientEndpoint, ctx *ConnContext, err error
 	duration := time.Since(ctx.connTime)
 	prefix := ctx.LogPrefix()
 	dcID := ctx.DCID()
+	if authenticated && ctx.internalProxyAuthenticated {
+		h.logWebStreamClose(ctx, err)
+	}
 
 	// Determine if this is a real error (not just EOF/normal close)
 	isRealError := err != nil && !errors.Is(err, io.EOF)
