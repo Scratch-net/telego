@@ -318,7 +318,7 @@
           "type": "timeseries",
           "gridPos": {
             "h": 8,
-            "w": 12,
+            "w": 24,
             "x": 0,
             "y": 16
           },
@@ -341,48 +341,6 @@
               "expr": "label_replace(label_replace(sum by (instance, reason) (rate(telego_middleend_response_admission_waits_completed_total{job=\"telego\",instance=~\"$instance\"}[$__rate_interval])), \"server\", \"VPS\", \"instance\", \"127[.]0[.]0[.]1:9090\"), \"server\", \"NAS\", \"instance\", \"nas\")",
               "refId": "B",
               "legendFormat": "{{server}} / {{reason}} completed",
-              "instant": false
-            }
-          ],
-          "options": {
-            "legend": {
-              "displayMode": "table",
-              "placement": "bottom",
-              "showLegend": true,
-              "calcs": [
-                "lastNotNull",
-                "max"
-              ]
-            },
-            "tooltip": {
-              "mode": "multi",
-              "sort": "desc"
-            }
-          }
-        },
-        {
-          "title": "ME mean completed response wait",
-          "description": "Duration sum divided by completed interval count over the same rate window. No value means no completed waits or unavailable metrics. Active waits are separate.",
-          "type": "timeseries",
-          "gridPos": {
-            "h": 8,
-            "w": 12,
-            "x": 12,
-            "y": 16
-          },
-          "fieldConfig": {
-            "defaults": {
-              "unit": "s",
-              "min": 0,
-              "noValue": "Metric unavailable"
-            },
-            "overrides": []
-          },
-          "targets": [
-            {
-              "expr": "label_replace(label_replace(sum by (instance, reason) (rate(telego_middleend_response_admission_wait_seconds_total{job=\"telego\",instance=~\"$instance\"}[$__rate_interval])) / (sum by (instance, reason) (rate(telego_middleend_response_admission_waits_completed_total{job=\"telego\",instance=~\"$instance\"}[$__rate_interval])) > 0), \"server\", \"VPS\", \"instance\", \"127[.]0[.]0[.]1:9090\"), \"server\", \"NAS\", \"instance\", \"nas\")",
-              "refId": "A",
-              "legendFormat": "{{server}} / {{reason}}",
               "instant": false
             }
           ],

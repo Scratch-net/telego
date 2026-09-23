@@ -13,9 +13,9 @@ The image uses `telego` as its entry point. It contains a static binary and no s
 
 ## Supported image tags
 
-Release `v0.6.6` publishes these tags:
+Release `v0.6.7` publishes these tags:
 
-- `scratchnet/telego:v0.6.6` — fixed release
+- `scratchnet/telego:v0.6.7` — fixed release
 - `scratchnet/telego:v0.6` — latest `v0.6.x` release
 - `scratchnet/telego:v0` — latest `v0.x` release
 - `scratchnet/telego:latest` — moving image from a release or a successful `main` build
@@ -24,29 +24,31 @@ The current manifests support Linux on AMD64, ARM64, and ARMv7.
 
 For repeatable deployments, use a fixed release tag. The `latest` tag can contain unreleased changes from `main`.
 
-## Changes in v0.6.6
+## Changes in v0.6.7
 
-A failed WebSocket lane opening no longer closes the WEB bridge when another lane remains usable.
-Existing streams continue to carry traffic, and Telegram can replace the failed lane.
+ME starts automatically unless `[middle-end].enabled = false`. New clients use direct routes until ME is ready.
+INFO logs report the ME startup result. Private direct routes complete public-IP discovery before they open ME TCP connections.
 
-Extra WEB diagnostics require debug or trace logging at startup. Normal operation skips diagnostic requests and counters.
-This release also updates Go to 1.27.1 and updates Go package dependencies.
+The gateway installer and WEB examples now select `websocket-lanes` for maximum performance.
+Existing explicit carrier values remain unchanged. An absent `carrier` still selects `https`.
 
-Existing configurations remain valid. Read the [v0.6.6 release notes](https://github.com/Scratch-net/telego/releases/tag/v0.6.6) for the complete changes.
+Automatic ME startup also enables its existing resource limits, including the default limit of 10,000 accepted clients.
+An existing explicit ME disablement remains effective after an upgrade.
+Read the [v0.6.7 release notes](https://github.com/Scratch-net/telego/releases/tag/v0.6.7) for upgrade instructions and the complete changes.
 
 ## Generate a secret
 
 Replace `www.google.com` with the FakeTLS mask hostname:
 
 ```bash
-docker run --rm scratchnet/telego:v0.6.6 \
+docker run --rm scratchnet/telego:v0.6.7 \
   generate www.google.com
 ```
 
 To also print Telegram WEB proxy links, add the public WEB hostname:
 
 ```bash
-docker run --rm scratchnet/telego:v0.6.6 \
+docker run --rm scratchnet/telego:v0.6.7 \
   generate www.google.com --web-host proxy.example.com
 ```
 
@@ -77,7 +79,7 @@ docker run -d \
   --restart unless-stopped \
   -p 443:443 \
   -v "$PWD/config.toml:/config.toml:ro" \
-  scratchnet/telego:v0.6.6 \
+  scratchnet/telego:v0.6.7 \
   run -c /config.toml -l
 ```
 
@@ -92,7 +94,7 @@ docker logs telego
 ```yaml
 services:
   telego:
-    image: scratchnet/telego:v0.6.6
+    image: scratchnet/telego:v0.6.7
     restart: unless-stopped
     ports:
       - "443:443"
@@ -154,7 +156,7 @@ Replace `proxy.example.com` in these files:
 Generate the secret and WEB links:
 
 ```bash
-docker run --rm scratchnet/telego:v0.6.6 \
+docker run --rm scratchnet/telego:v0.6.7 \
   generate proxy.example.com --web-host proxy.example.com
 ```
 
@@ -183,7 +185,9 @@ docker compose logs telego
 
 The log must contain `WEB proxy started`.
 
-The example defaults to `https-lanes`. Set `[web-proxy].carrier` to one of these values:
+The example defaults to `websocket-lanes`, the recommended carrier for maximum WEB performance. Its Nginx configuration forwards WebSocket upgrades.
+
+Set `[web-proxy].carrier` to one of these values:
 
 - `https`;
 - `https-lanes`;
@@ -194,7 +198,7 @@ Read the [complete WEB proxy guide](https://github.com/Scratch-net/telego/blob/m
 
 ## Update the container
 
-For a Compose installation, set the Telego image to `scratchnet/telego:v0.6.6` in the Compose file.
+For a Compose installation, set the Telego image to `scratchnet/telego:v0.6.7` in the Compose file.
 Then update the service:
 
 ```bash
@@ -203,4 +207,6 @@ docker compose up -d --force-recreate telego
 docker compose logs telego
 ```
 
-An existing configuration without `[web-proxy]` keeps the existing MTProxy behavior. WEB proxy support is disabled until you set `[web-proxy].enabled = true`.
+WEB proxy support stays disabled until you set `[web-proxy].enabled = true`.
+
+ME starts automatically unless `[middle-end].enabled = false`. During ME setup or failure, new clients use direct DC connections. INFO logs report the ME result.

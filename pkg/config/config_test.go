@@ -85,6 +85,42 @@ idle-timeout = "5m"
 	}
 }
 
+func TestLoadMiddleEndDefaultAndOverride(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		section string
+		enabled bool
+	}{
+		{name: "absent section", enabled: true},
+		{name: "empty section", section: "[middle-end]\n", enabled: true},
+		{name: "other settings", section: "[middle-end]\nmax-connections = 100\n", enabled: true},
+		{name: "explicit true", section: "[middle-end]\nenabled = true\n", enabled: true},
+		{name: "explicit false", section: "[middle-end]\nenabled = false\nproxy-tag = \"invalid\"\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := os.WriteFile(path, []byte(test.section), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.MiddleEnd.Enabled != test.enabled {
+				t.Fatalf("Middle-End enabled = %t, want %t", cfg.MiddleEnd.Enabled, test.enabled)
+			}
+			runtimeConfig, err := cfg.ToMiddleEndRuntimeConfig()
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(runtimeConfig.CloseIdleConnections)
+			if runtimeConfig.Enabled != test.enabled {
+				t.Fatalf("Middle-End runtime enabled = %t, want %t", runtimeConfig.Enabled, test.enabled)
+			}
+		})
+	}
+}
+
 // TestLoad_MissingFile tests that missing file returns appropriate error.
 func TestLoad_MissingFile(t *testing.T) {
 	_, err := Load("/nonexistent/path/config.toml")
@@ -990,7 +1026,7 @@ func TestDockerWebProxyExampleConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToWebProxyRuntimeConfig: %v", err)
 	}
-	if runtime.Carrier != webproxy.CarrierHTTPSLanes {
+	if runtime.Carrier != webproxy.CarrierWebSocketLanes {
 		t.Fatalf("example carrier = %q", runtime.Carrier)
 	}
 	managerConfig := webproxy.DefaultManagerConfig(runtime.Profiles, runtime.Backend)
@@ -1097,9 +1133,9 @@ func TestDockerWebProxyOperationalContracts(t *testing.T) {
 		t.Fatal(err)
 	}
 	setupText := string(setupGuide)
-	if !strings.Contains(setupText, "carrier = \"https-lanes\"") ||
-		!strings.Contains(setupText, "http2 on;") {
-		t.Fatal("setup guide does not enable the recommended lanes carrier with public HTTP/2")
+	if !strings.Contains(setupText, "carrier = \"websocket-lanes\"") ||
+		!strings.Contains(setupText, "proxy_set_header Upgrade $http_upgrade;") {
+		t.Fatal("setup guide does not enable the recommended WebSocket lanes carrier with upgrade forwarding")
 	}
 	if !strings.Contains(setupText, "legacy mode intentionally trusts PROXY headers") {
 		t.Fatal("setup guide does not qualify legacy public PROXY trust")

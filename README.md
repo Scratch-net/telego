@@ -53,6 +53,8 @@ curl -fsSL https://raw.githubusercontent.com/Scratch-net/telego/main/examples/ga
 
 The installer configures Telego, Nginx, the TLS certificate, automatic renewal, and persistent host storage.
 
+The installer selects `websocket-lanes`, the recommended carrier for maximum WEB performance. ME starts automatically and uses direct routing until its connections are ready.
+
 By default, MTProxy and WEB share port 443. Use `--mtproxy-port 9443` to keep WEB on 443 and move MTProxy.
 
 Add `--no-web` if you only need MTProxy and the ordinary probe site.
@@ -189,21 +191,25 @@ Each ME request uses the public source IP of its selected link. This behavior su
 
 Telegram proxy registration and `proxy-tag` are optional. Without a tag, Telego sends untagged ME requests and ME still works.
 
-ME stays off by default because it changes the outbound topology and reserves persistent links and bounded queues. An upgrade does not enable these requirements silently.
+ME is enabled by default. Telego prepares and checks ME connections in the background while new clients use direct DC connections.
 
-Before you enable ME, allow HTTPS to `core.telegram.org` and TCP to the ME endpoints in the Telegram artifacts. Private direct sockets also need UDP STUN access or a correct `nat-ip`. Any NAT on direct links must preserve TCP source ports.
+For ME connections, allow HTTPS to `core.telegram.org` and TCP to the ME endpoints in the Telegram artifacts. Private direct sockets also need UDP STUN access or a correct `nat-ip`. Any NAT on direct links must preserve TCP source ports.
 
-Add this section to enable ME:
+Use this optional section to change the ME configuration:
 
 ```toml
 [middle-end]
-enabled = true
+# enabled = false # Uncomment to disable ME and its background connection attempts.
 # proxy-tag = "0123456789abcdef0123456789abcdef" # Optional tag issued by Telegram
 # socks5 = "127.0.0.1:1080"
 # nat-ip = "YOUR_PUBLIC_IP" # Usually empty. Automatic STUN supports Docker bridge networks.
 ```
 
-Restart Telego after a change to this section. If the section is absent or `enabled` is `false`, ME stays disabled.
+Restart Telego after a change to this section. An absent section or `enabled` value enables ME. An explicit `enabled = false` disables it.
+
+On upgrade, remove an existing `enabled = false` to use the default. Configurations without that override start ME automatically.
+
+INFO logs report whether ME is established, unavailable, or explicitly disabled. If setup fails, new clients use direct routing while Telego retries.
 
 Telego replaces a failed link in place. Healthy bindings and healthy DC pools stay on their existing physical links.
 
@@ -241,7 +247,7 @@ Add this section to enable WEB for existing secrets:
 [web-proxy]
 enabled = true
 hostname = "proxy.example.com"
-carrier = "https-lanes"
+carrier = "websocket-lanes"
 bind-to = "127.0.0.1:8080"
 trusted-proxy-cidrs = ["127.0.0.1/32"]
 ```
@@ -250,14 +256,16 @@ WEB streams enter the shared MTProxy session core directly on gnet. The default 
 
 An explicit `backend` value selects a local TCP or Unix socket for compatibility. This path retains the authenticated PROXY preface. Nginx terminates real TLS in both paths.
 
+For maximum WEB performance, use `websocket-lanes`. The installer selects this carrier and configures Nginx to forward WebSocket upgrades.
+
 The `carrier` value selects one of four transports:
 
 | Value | Transport | Requirements |
 |-------|-----------|--------------|
 | `https` | One serialized fetch and long-poll carrier | This value is the default when `carrier` is empty or absent. |
-| `https-lanes` | One fetch and long-poll lane for each Telegram stream | Enable HTTP/2 on the public Nginx server. This value is the conservative recommendation until comparative benchmarks exist. |
+| `https-lanes` | One fetch and long-poll lane for each Telegram stream | Alternative for deployments without WebSocket support. Requires public HTTP/2. |
 | `websocket` | One multiplexed WebSocket for the WEB session | Forward HTTP/1.1 `Upgrade` and `Connection` headers to Telego. |
-| `websocket-lanes` | One WebSocket for each Telegram stream | Use this value for the official WebSocket lane option. Forward HTTP/1.1 upgrade headers to Telego. |
+| `websocket-lanes` | One WebSocket for each Telegram stream | Recommended for maximum WEB performance. Installer default. Requires HTTP/1.1 upgrade forwarding. |
 
 Current Telegram Desktop manages the WEB carrier. The user does not need to open or keep a browser tab.
 
@@ -361,17 +369,17 @@ mask-host = "www.google.com"  # Host to mimic (SNI validation, proxy links)
 # Native Telegram Desktop WEB proxy (optional; requires Nginx with real TLS)
 [web-proxy]
 enabled = false
-# carrier = "https-lanes"                  # Conservative recommendation. Requires public HTTP/2.
-# Other values: https, websocket, websocket-lanes
+carrier = "websocket-lanes"              # Recommended for maximum WEB performance. Requires upgrade forwarding.
+# Other values: https, https-lanes, websocket
 # hostname = "proxy.example.com"            # Required public certificate hostname
 # bind-to = "127.0.0.1:8080"               # Private HTTP/1.1 listener
 # backend = "127.0.0.1:443"                # Explicit local socket compatibility path
 # trusted-proxy-cidrs = ["127.0.0.1/32"]   # Nginx peers allowed to send X-Forwarded-For
 # num-event-loops = 0                       # 0 = automatic
 
-# Telegram Middle-End transport (optional; requires a restart)
+# Telegram Middle-End transport (enabled by default; changes require a restart)
 [middle-end]
-enabled = false
+# enabled = false                         # Uncomment to disable ME and its background connection attempts.
 # proxy-tag = "0123456789abcdef0123456789abcdef" # Optional tag issued by Telegram
 # socks5 = "127.0.0.1:1080"                # Defaults to [upstream].socks5
 # socks5-username = "proxy-user"

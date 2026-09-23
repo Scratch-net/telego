@@ -103,13 +103,13 @@ mask-host = "www.google.com"
 enabled = false
 
 # Carrier for new WEB sessions:
-# - https: one serialized fetch and long-poll carrier. This is the default.
+# - https: one serialized fetch and long-poll carrier. Used when carrier is absent.
 # - https-lanes: one fetch and long-poll lane for each Telegram stream.
 # - websocket: one multiplexed WebSocket for the WEB session.
 # - websocket-lanes: one WebSocket for each Telegram stream.
-# Use https-lanes as the conservative recommendation until benchmarks exist.
-# It requires public HTTP/2. WebSocket modes require HTTP/1.1 upgrade forwarding.
-carrier = "https-lanes"
+# For maximum WEB performance, use websocket-lanes (the installer default).
+# WebSocket modes require HTTP/1.1 upgrade forwarding. HTTPS lanes require public HTTP/2.
+carrier = "websocket-lanes"
 
 # Public DNS hostname on the real TLS certificate. Do not include a scheme,
 # port, path, or trailing dot. This value is required when WEB is enabled.
@@ -134,10 +134,11 @@ carrier = "https-lanes"
 # gnet event loops for the private WEB HTTP listener (0 = automatic).
 # num-event-loops = 0
 
-# Telegram Middle-End transport. This section has no effect while `enabled` is false.
+# Telegram Middle-End transport is enabled by default, including when this section is absent.
+# Telego checks ME connections in the background and uses direct DC routes until ME is ready.
 # Changes to this section require a restart.
 [middle-end]
-enabled = false
+# enabled = false # Uncomment to disable ME and its background connection attempts.
 
 # Registered Telegram proxy tag. The value contains exactly 32 hexadecimal characters.
 # Leave this value empty if Telegram did not issue a proxy tag.

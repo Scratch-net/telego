@@ -175,10 +175,15 @@ func (m *middleEndMonitor) observe() {
 				Int64("decoder_growth_capacity_bytes", decoderGrowthCapacity).
 				Int64("decoder_plaintext_capacity_bytes", decoderPlaintextCapacity).
 				Str("memory_scope", "configured bounds; excludes WEB carrier, runtime, and kernel memory").
-				Msg("Middle-End active generation ready; new clients use gnet ME links")
+				Msg("Middle-End established; new clients use gnet ME links")
 		} else if previous.initialized {
-			log.Warn().Msg("Middle-End admission unavailable; new clients use direct fallback")
+			log.Info().Msg("Middle-End unavailable; new clients use direct fallback")
 		}
+	}
+	if !current.admitting && !previous.admitting &&
+		(current.refreshFailures > previous.refreshFailures || current.generationFailures > previous.generationFailures) {
+		log.Info().Err(snapshot.Coordinator.LastError).
+			Msg("Middle-End not established; new clients use direct fallback; retrying in the background")
 	}
 	if newFallbacks := middleEndCounterIncrease(current.directFallbacksTotal, previous.directFallbacksTotal); newFallbacks > 0 {
 		log.Warn().

@@ -2,15 +2,19 @@
 
 Telego can send authenticated MTProxy sessions through Telegram Middle-End (ME) servers. The public listener and the ME client runtime both use gnet.
 
-ME is disabled by default. Existing configurations keep the direct Telegram DC path.
+ME is enabled by default, including when the section or `enabled` value is absent. An explicit `enabled = false` disables ME.
 
-## Why ME is opt-in
+Telego prepares and checks ME connections in the background. New clients use direct Telegram DC connections until ME is ready.
+
+If ME setup fails, direct routing remains available while Telego retries. Existing direct connections keep their route until the clients reconnect.
+
+## Startup requirements
 
 Telegram proxy registration and `proxy-tag` are not prerequisites. If the tag is empty, Telego omits it from each ME request. This does not disable ME.
 
-ME changes the outbound network topology. It also reserves persistent gnet links and bounded queues for each signed DC. Telego does not make these changes during an upgrade unless the operator enables ME.
+ME changes the outbound network topology. It also reserves persistent gnet links and bounded queues for each signed DC.
 
-Before you enable ME, make sure that:
+ME connections require the following:
 
 - Telego can resolve DNS and fetch all three artifacts from `core.telegram.org` over HTTPS.
 - Telego can open TCP connections to the signed ME endpoints in those artifacts.
@@ -22,11 +26,11 @@ SOCKS5 links do not use STUN. The SOCKS5 server must return its public `BND.ADDR
 
 ## Configuration
 
-Add this section to the configuration:
+Use this optional section to change the ME configuration:
 
 ```toml
 [middle-end]
-enabled = true
+# enabled = false # Uncomment to disable ME and its background connection attempts.
 
 # Optional. Set this only if Telegram issued a tag for this proxy.
 # proxy-tag = "0123456789abcdef0123456789abcdef"
@@ -49,6 +53,12 @@ enabled = true
 
 Restart Telego after a change to this section. The hot reload does not change the ME runtime.
 
+On upgrade, a configuration without an explicit `enabled = false` starts ME automatically. Remove an existing `enabled = false` to use the default.
+
+The default ME limit permits 10,000 accepted client connections, including clients on direct fallback. The derived limits apply during background setup too.
+
+INFO logs report whether ME is established, unavailable, or explicitly disabled. Failed setup logs include the error and state that direct fallback remains available.
+
 Do not publish the proxy tag or the SOCKS5 credentials in an issue or log.
 
 ## Direct links and NAT
@@ -59,7 +69,9 @@ Each client request also carries the public proxy endpoint. The endpoint combine
 
 If the TCP socket has a public IP, Telego uses the exact socket tuple. Telego does not run a NAT probe.
 
-If a direct ME socket has a private IP, Telego gets its public IP from a fixed STUN pool. This behavior supports Docker bridge networks.
+If a direct route has a private local IP, Telego gets its public IP from a fixed STUN pool. This behavior supports Docker bridge networks.
+
+Telego completes discovery before it opens the ME TCP connection. A cold STUN probe no longer leaves that connection idle before the handshake.
 
 Telego keeps the kernel-assigned TCP source port. It does not use the UDP port from the STUN response.
 

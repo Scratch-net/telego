@@ -16,9 +16,9 @@ splice-proxy-protocol = 2
 enabled = true
 hostname = "proxy.example.com"
 # Accepted values: https, https-lanes, websocket, websocket-lanes.
-# An empty or absent value selects https. Keep https-lanes as the conservative
-# recommendation until comparative benchmarks exist.
-carrier = "https-lanes"
+# For maximum WEB performance, use websocket-lanes with Nginx upgrade forwarding.
+# An empty or absent value selects https.
+carrier = "websocket-lanes"
 bind-to = "0.0.0.0:8080"
 # Without backend, WEB streams enter the shared MTProxy core directly on gnet.
 trusted-proxy-cidrs = ["172.28.0.2/32"]

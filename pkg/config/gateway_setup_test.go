@@ -114,6 +114,9 @@ printf '%s\n' "$*" >> "$GATEWAY_TEST_DOCKER_LOG"
 			if len(proxyCfg.Secrets) != 1 || proxyCfg.BindAddr != "0.0.0.0:9443" || proxyCfg.MaskHost != "proxy.example.com" {
 				t.Error("generated gateway configuration lost its secret or listener settings")
 			}
+			if cfg.WebProxy.Carrier != "websocket-lanes" || !cfg.MiddleEnd.Enabled {
+				t.Error("generated gateway configuration must select websocket-lanes and enable Middle-End")
+			}
 			if _, err := cfg.ToWebProxyRuntimeConfig(proxyCfg.BindAddr); err != nil {
 				t.Fatalf("convert generated WEB configuration: %v", err)
 			}

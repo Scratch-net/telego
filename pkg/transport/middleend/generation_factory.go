@@ -106,8 +106,9 @@ type generationLinkBuilder interface {
 }
 
 type productionGenerationDialer struct {
-	socks5 *SOCKS5Dialer
-	nat    *NATResolver
+	socks5      *SOCKS5Dialer
+	nat         *NATResolver
+	dialContext func(context.Context, string, string) (net.Conn, error)
 }
 
 // NewGnetGenerationFactory validates and retains one immutable artifact
@@ -118,7 +119,10 @@ func NewGnetGenerationFactory(config GnetGenerationFactoryConfig) (*GnetGenerati
 	}
 	return newGnetGenerationFactory(
 		config,
-		productionGenerationDialer{socks5: config.SOCKS5, nat: config.NATResolver},
+		productionGenerationDialer{
+			socks5: config.SOCKS5, nat: config.NATResolver,
+			dialContext: (&net.Dialer{}).DialContext,
+		},
 		config.Runtime,
 		os.Getpid(),
 		time.Now(),
@@ -456,6 +460,14 @@ func (d productionGenerationDialer) Dial(
 	endpoint netip.AddrPort,
 	connectTimeout time.Duration,
 ) (*net.TCPConn, netip.AddrPort, netip.AddrPort, error) {
+	var publicIP netip.Addr
+	if d.socks5 == nil && d.nat != nil {
+		var err error
+		publicIP, err = d.resolveDirectNAT(ctx, endpoint)
+		if err != nil {
+			return nil, netip.AddrPort{}, netip.AddrPort{}, fmt.Errorf("direct NAT tuple: %w", err)
+		}
+	}
 	dialContext, cancelDial := context.WithTimeout(ctx, connectTimeout)
 	defer cancelDial()
 	if d.socks5 != nil {
@@ -475,7 +487,7 @@ func (d productionGenerationDialer) Dial(
 	if endpoint.Addr().Unmap().Is4() {
 		network = "tcp4"
 	}
-	connection, err := (&net.Dialer{}).DialContext(dialContext, network, endpoint.String())
+	connection, err := d.dialContext(dialContext, network, endpoint.String())
 	if err != nil {
 		return nil, netip.AddrPort{}, netip.AddrPort{}, fmt.Errorf("direct CONNECT: %w", err)
 	}
@@ -485,26 +497,35 @@ func (d productionGenerationDialer) Dial(
 		return nil, netip.AddrPort{}, netip.AddrPort{}, fmt.Errorf("direct CONNECT returned %T, want *net.TCPConn", connection)
 	}
 	cancelDial()
-	serverAddr, clientAddr, tupleErr := DirectAddressTuple(conn, endpoint)
-	if tupleErr == nil {
-		return conn, serverAddr, clientAddr, nil
-	}
-	rawServer, rawClient, rawErr := directSocketAddressTuple(conn, endpoint)
-	if rawErr != nil || validatePublicEndpoint("server", rawServer) != nil || validatePublicEndpoint("client", rawClient) == nil || d.nat == nil {
-		_ = conn.Close()
-		return nil, netip.AddrPort{}, netip.AddrPort{}, tupleErr
-	}
-	publicIP, err := d.nat.Resolve(ctx, addressFamily(rawClient.Addr()))
-	if err != nil {
-		_ = conn.Close()
-		return nil, netip.AddrPort{}, netip.AddrPort{}, fmt.Errorf("direct NAT tuple: %w", err)
-	}
-	serverAddr, clientAddr, err = DirectNATAddressTuple(conn, endpoint, publicIP)
+	serverAddr, clientAddr, err := DirectNATAddressTuple(conn, endpoint, publicIP)
 	if err != nil {
 		_ = conn.Close()
 		return nil, netip.AddrPort{}, netip.AddrPort{}, err
 	}
 	return conn, serverAddr, clientAddr, nil
+}
+
+func (d productionGenerationDialer) resolveDirectNAT(ctx context.Context, endpoint netip.AddrPort) (netip.Addr, error) {
+	// A connected UDP socket selects the route's local address without sending
+	// any packets. Finish discovery before opening TCP: ME peers can close an
+	// idle connection while a cold STUN probe is still running.
+	network := "udp6"
+	if endpoint.Addr().Unmap().Is4() {
+		network = "udp4"
+	}
+	route, err := d.dialContext(ctx, network, endpoint.String())
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("select direct route: %w", err)
+	}
+	local, ok := route.LocalAddr().(*net.UDPAddr)
+	_ = route.Close()
+	if !ok || local == nil {
+		return netip.Addr{}, fmt.Errorf("%w: invalid direct route address", ErrTupleNotAuthoritative)
+	}
+	if validatePublicEndpoint("client", local.AddrPort()) == nil {
+		return netip.Addr{}, nil
+	}
+	return d.nat.Resolve(ctx, addressFamily(local.AddrPort().Addr()))
 }
 
 var _ FixedBindingGenerationFactory = (*GnetGenerationFactory)(nil).Build

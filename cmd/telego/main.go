@@ -133,11 +133,11 @@ func (c *RunCmd) Run() error {
 		middleEndService, err = middleend.NewService(middleEndRuntimeConfig.Service)
 		if err != nil {
 			middleEndRuntimeConfig.CloseIdleConnections()
-			log.Warn().Err(err).Msg("Middle-End runtime unavailable; starting with direct fallback")
+			log.Info().Err(err).Msg("Middle-End runtime unavailable; starting with direct fallback")
 		} else if err := middleEndService.Start(); err != nil {
 			closeMiddleEndService(middleEndService, middleEndRuntimeConfig)
 			middleEndService = nil
-			log.Warn().Err(err).Msg("Middle-End startup unavailable; starting with direct fallback")
+			log.Info().Err(err).Msg("Middle-End startup unavailable; starting with direct fallback")
 		} else {
 			log.Info().
 				Int("max_connections", middleEndRuntimeConfig.MaxConnections).
@@ -147,6 +147,8 @@ func (c *RunCmd) Run() error {
 				Int("per_link_queue_budget_bytes", middleEndRuntimeConfig.Service.LinkLimits.MaxPendingSubmissionBytes).
 				Msg("Middle-End service started; direct fallback remains active until an active generation is ready")
 		}
+	} else {
+		log.Info().Msg("Middle-End disabled by configuration; clients use direct DC connections")
 	}
 
 	var (

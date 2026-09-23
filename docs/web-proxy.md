@@ -211,23 +211,27 @@ splice-proxy-protocol = 2
 [web-proxy]
 enabled = true
 hostname = "proxy.example.com"
-carrier = "https-lanes"
+carrier = "websocket-lanes"
 bind-to = "127.0.0.1:8080"
 trusted-proxy-cidrs = ["127.0.0.1/32"]
 ```
 
 Replace the hostname and secret. The `hostname` value must match the public TLS certificate.
 
+For maximum WEB performance, use `websocket-lanes`. The installer and examples select this carrier and configure Nginx to forward WebSocket upgrades.
+
 The `carrier` value selects one of these transports:
 
 | Value | Transport | Compatibility and use |
 |-------|-----------|-----------------------|
 | `https` | One serialized fetch and long-poll carrier | This value has the least Nginx requirements. It is the default when `carrier` is empty or absent. |
-| `https-lanes` | One fetch and long-poll lane for each Telegram stream | Enable public HTTP/2. This value is the conservative recommendation until comparative benchmarks exist. |
+| `https-lanes` | One fetch and long-poll lane for each Telegram stream | Alternative for deployments without WebSocket support. Requires public HTTP/2. |
 | `websocket` | One multiplexed WebSocket for the WEB session | Forward HTTP/1.1 `Upgrade` and `Connection` headers to Telego. |
-| `websocket-lanes` | One WebSocket for each Telegram stream | Use this value for the official WebSocket lane option. Forward HTTP/1.1 upgrade headers to Telego. |
+| `websocket-lanes` | One WebSocket for each Telegram stream | Recommended for maximum WEB performance. Installer default. Requires HTTP/1.1 upgrade forwarding. |
 
 If `carrier` is absent, Telego uses serialized `https`. Existing configurations keep their current behavior after an upgrade.
+
+Carrier selection is explicit. If a WebSocket connection fails, Telego does not switch to HTTPS.
 
 ### Telegram Desktop carrier
 
@@ -707,8 +711,8 @@ docker compose up -d --force-recreate telego
 
 An existing MTProxy installation needs no secret migration. Complete these actions:
 
-1. Add the `[web-proxy]` section with `carrier = "https-lanes"`.
-2. Enable HTTP/2 on the public Nginx TLS server.
+1. Add the `[web-proxy]` section with `carrier = "websocket-lanes"`.
+2. Forward HTTP/1.1 WebSocket upgrade headers through every reverse proxy.
 3. Add the Nginx map, WEB ingress, and fallback locations.
 4. Restart Telego.
 5. Reload Nginx.
@@ -733,6 +737,6 @@ If you migrate from `tproxy-server`, keep its old Nginx upstream during the firs
 
 The native implementation supports `https`, `https-lanes`, `websocket`, and `websocket-lanes`.
 
-The default remains `https`. `https-lanes` remains the conservative recommendation until comparative benchmarks exist.
+The installer and examples select `websocket-lanes`, the recommended carrier for maximum WEB performance.
 
-`websocket-lanes` is the official WebSocket lane option. This documentation makes no speed claim for either WebSocket mode.
+An absent or empty `carrier` still selects `https` for compatibility. Explicit carrier values remain unchanged.

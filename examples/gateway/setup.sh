@@ -5,7 +5,7 @@ gateway_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 state_root="$gateway_root/state"
 domain=
 email=
-carrier=https-lanes
+carrier=websocket-lanes
 telego_image=scratchnet/telego:latest
 web_enabled=true
 mtproxy_port=443
@@ -18,7 +18,7 @@ usage() {
         "Options:" \
         "  --mtproxy-port PORT  Public MTProxy port (default: 443)" \
         "  --no-web             Disable the Telegram WEB proxy" \
-        "  --carrier MODE       https, https-lanes, websocket, or websocket-lanes" \
+        "  --carrier MODE       https, https-lanes, websocket, or websocket-lanes (default)" \
         "  --image IMAGE        Telego image (default: scratchnet/telego:latest)" \
         "  --help               Show this help"
 }

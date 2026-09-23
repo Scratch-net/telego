@@ -103,14 +103,18 @@ Open the installation directory before you run management commands:
 cd telego-gateway
 ```
 
-The default carrier is `https-lanes`. Select a different carrier with `--carrier`:
+The default carrier is `websocket-lanes`, the recommended choice for maximum WEB performance. The generated Nginx configuration forwards WebSocket upgrades.
+
+ME starts automatically. Telego uses direct routing until its ME connections pass their startup checks.
+
+To select HTTPS lanes instead, use `--carrier https-lanes`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Scratch-net/telego/main/examples/gateway/install.sh \
   | sh -s -- \
       --domain proxy.example.com \
       --email admin@example.com \
-      --carrier websocket-lanes
+      --carrier https-lanes
 ```
 
 To keep WEB on port 443 and move MTProxy to port 9443, run:
@@ -243,6 +247,8 @@ Open the existing gateway directory that contains `state/` before the update.
 
 Use the same domain, email, carrier, port, and WEB arguments as the existing installation.
 If the image is pinned, include the selected `--image` value.
+
+For an installation that uses the previous `https-lanes` default, include `--carrier https-lanes` when you rerun the installer.
 
 For the default shared-port layout, run:
 

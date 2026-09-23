@@ -141,7 +141,8 @@ type WebProxyConfig struct {
 	NumEventLoops     int      `toml:"num-event-loops"`
 }
 
-// MiddleEndConfig enables Telegram's official Middle-End transport. Queue,
+// MiddleEndConfig configures Telegram's official Middle-End transport, which
+// Load enables by default unless the configuration explicitly disables it. Queue,
 // topology, and timeout details are derived by ToMiddleEndRuntimeConfig. The
 // two expert bounds can only reduce the production defaults.
 type MiddleEndConfig struct {
@@ -195,7 +196,7 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
 
-	var cfg Config
+	cfg := Config{MiddleEnd: MiddleEndConfig{Enabled: true}}
 	if err := toml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}

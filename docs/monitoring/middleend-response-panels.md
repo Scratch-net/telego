@@ -26,7 +26,7 @@ rtk proxy python3 docs/monitoring/merge-response-panels.py \
   --output /tmp/telego-health.response-review.json
 ```
 
-The script appends three summary panels or nine health panels.
+The script appends three summary panels or eight health panels.
 It preserves existing panels, UIDs, variables, links, and datasource definitions.
 It assigns unused panel IDs and places the new panels after existing content.
 An already present panel with matching queries stays unchanged. A conflicting panel title stops the merge.
@@ -48,14 +48,15 @@ The processing reserve forms part of the combined pool limit.
 Persistent ME decoders and WEB carrier storage have separate bounds.
 
 Wait entries and completed intervals have separate counters.
-Mean completed duration divides duration growth by completed interval growth over the same interval.
-It excludes unfinished waits. The active-wait panel shows those intervals separately.
+The dashboards show active waits and entry/completion rates.
+The default panels omit mean completed duration because it has no value when no waits complete.
+Wait duration metrics remain available for targeted diagnosis.
 
 The reclamation panel counts budget charge released synchronously by pressure closure.
 It excludes deferred cleanup and later output release, which instead change the pool gauges.
 This counter does not measure physical memory returned to the operating system.
 
-All 16 panel expressions passed read-only Prometheus execution during preparation.
-Their results were empty before the new exporter deployment.
-Post-deployment checks must establish actual series, instance filtering, and panel appearance.
+After deployment, check the panel expressions against Prometheus.
+Verify that both servers supply series and that the instance filter selects the correct server.
+Check the panel appearance in Grafana.
 The [ME guide](../middle-end.md#metrics-and-logs) defines the metric names and bounded labels.
