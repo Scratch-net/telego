@@ -56,6 +56,7 @@ func TestAuthenticatedIdleExpiryRechecksActivityOnOwner(t *testing.T) {
 	for _, direction := range []string{"client", "server"} {
 		t.Run(direction, func(t *testing.T) {
 			conn, ctx, owner := newIdleTestSession(t, time.Hour)
+			ctx.webDiagnostics = true
 			timer := ctx.authenticatedIdle.Load()
 			timer.mu.Lock()
 			timer.deadline = time.Now().Add(-time.Second)

@@ -265,6 +265,7 @@ func (h *ProxyHandler) OnShutdown(eng gnet.Engine) {
 // OnOpen is called when a new connection is accepted.
 func (h *ProxyHandler) OnOpen(c gnet.Conn) ([]byte, gnet.Action) {
 	ctx := NewConnContext()
+	ctx.webDiagnostics = h.logger.DebugEnabled()
 
 	// A local WEB connection remains only a candidate until its process-local
 	// authentication preface is validated. Public PROXY acceptance remains an
@@ -377,7 +378,7 @@ func (h *ProxyHandler) closeClient(c clientEndpoint, ctx *ConnContext, err error
 	duration := time.Since(ctx.connTime)
 	prefix := ctx.LogPrefix()
 	dcID := ctx.DCID()
-	if authenticated && ctx.internalProxyAuthenticated {
+	if authenticated && ctx.internalProxyAuthenticated && ctx.webDiagnostics && h.logger.DebugEnabled() {
 		h.logWebStreamClose(ctx, err)
 	}
 

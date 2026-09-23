@@ -25,18 +25,25 @@ func TestBridgeBoundedIO(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, carrier := range []CarrierMode{CarrierHTTPS, CarrierHTTPSLanes, CarrierWebSocket, CarrierWebSocketLanes} {
-		page, err := RenderBridgeForCarrier("proxy.example.com", token, maxCarrierBatchBytes, carrier)
+		page, err := renderBridgeForCarrier("proxy.example.com", token, maxCarrierBatchBytes, carrier, DefaultLimits().MaxStreamsPerSession, true)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if err := os.WriteFile(filepath.Join(dir, string(carrier)+".html"), page.Body, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		page, err = RenderBridgeForCarrier("proxy.example.com", token, 16, carrier)
+		page, err = renderBridgeForCarrier("proxy.example.com", token, 16, carrier, DefaultLimits().MaxStreamsPerSession, true)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if err := os.WriteFile(filepath.Join(dir, string(carrier)+".small.html"), page.Body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		page, err = RenderBridgeForCarrier("proxy.example.com", token, maxCarrierBatchBytes, carrier)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, string(carrier)+".quiet.html"), page.Body, 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}

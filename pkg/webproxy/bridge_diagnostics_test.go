@@ -11,7 +11,9 @@ import (
 
 func TestLaneDiagnosticsDoNotConsumeFailureAllowance(t *testing.T) {
 	reports := make(chan BridgeFailure, 40)
-	app := newHTTPTestApplicationWithConfig(t, time.Second, nil, func(config *HTTPServerConfig) {
+	app := newHTTPTestApplicationWithConfig(t, time.Second, func(config *ManagerConfig) {
+		config.DebugDiagnostics = true
+	}, func(config *HTTPServerConfig) {
 		config.OnBridgeFailure = func(failure BridgeFailure) { reports <- failure }
 	})
 	bootstrap, err := app.manager.IssueBootstrap(app.profiles[0].Capability(), "127.0.0.1")
@@ -83,10 +85,16 @@ func TestBridgeFailureCloseValidation(t *testing.T) {
 
 func TestBridgeDiagnosticAuthenticationAndBounds(t *testing.T) {
 	reports := make(chan BridgeFailure, 8)
-	app := newHTTPTestApplicationWithConfig(t, time.Second, nil, func(config *HTTPServerConfig) {
+	app := newHTTPTestApplicationWithConfig(t, time.Second, func(config *ManagerConfig) {
+		config.DebugDiagnostics = true
+	}, func(config *HTTPServerConfig) {
 		config.OnBridgeFailure = func(failure BridgeFailure) { reports <- failure }
 	})
 	client := &http.Client{Timeout: time.Second}
+	response := app.do(t, client, "GET", "/?bridge="+app.profiles[0].Capability().String(), nil, nil)
+	if body := readHTTPBody(t, response); response.StatusCode != 200 || !strings.Contains(string(body), "const diagnostics=true,") {
+		t.Fatal("debug manager did not enable diagnostics in the bridge page")
+	}
 	bootstrap, err := app.manager.IssueBootstrap(app.profiles[0].Capability(), "127.0.0.1")
 	if err != nil {
 		t.Fatal(err)
@@ -130,7 +138,9 @@ func TestBridgeDiagnosticAllowanceSurvivesSessionLifecycle(t *testing.T) {
 	for _, firstReport := range []string{"bootstrap", "active session", "closed session"} {
 		t.Run(firstReport, func(t *testing.T) {
 			reports := make(chan BridgeFailure, 32)
-			app := newHTTPTestApplicationWithConfig(t, time.Second, nil, func(config *HTTPServerConfig) {
+			app := newHTTPTestApplicationWithConfig(t, time.Second, func(config *ManagerConfig) {
+				config.DebugDiagnostics = true
+			}, func(config *HTTPServerConfig) {
 				config.OnBridgeFailure = func(failure BridgeFailure) { reports <- failure }
 			})
 			bootstrap, err := app.manager.IssueBootstrap(app.profiles[0].Capability(), "127.0.0.1")

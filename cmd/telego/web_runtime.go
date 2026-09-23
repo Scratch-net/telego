@@ -39,6 +39,7 @@ func newWebProxyRuntime(runtimeConfig config.WebProxyRuntimeConfig, internalAuth
 	}
 
 	managerConfig := webproxy.DefaultManagerConfig(runtimeConfig.Profiles, runtimeConfig.Backend)
+	managerConfig.DebugDiagnostics = log.Debug().Enabled()
 	if runtimeConfig.Carrier != "" {
 		managerConfig.Carrier = runtimeConfig.Carrier
 	}
@@ -78,7 +79,7 @@ func logWebBridgeFailure(failure webproxy.BridgeFailure) {
 	if failure.IsLaneClosure() {
 		message = "WEB bridge lane closed"
 	}
-	log.Warn().Str("user", failure.User).Str("carrier", string(failure.Carrier)).
+	log.Debug().Str("user", failure.User).Str("carrier", string(failure.Carrier)).
 		Str("delivery", failure.Delivery).
 		Uint64("bridge_id", failure.BridgeID).Uint64("suppressed", failure.Suppressed).
 		Str("reason", failure.Reason).Str("error_category", failure.Error).
@@ -91,7 +92,7 @@ func logWebBridgeFailure(failure webproxy.BridgeFailure) {
 }
 
 func logWebSocketClose(event webproxy.WebSocketClose) {
-	log.Warn().Str("user", event.User).Str("carrier", string(event.Carrier)).
+	log.Debug().Str("user", event.User).Str("carrier", string(event.Carrier)).
 		Uint64("bridge_id", event.BridgeID).Uint32("lane_id", event.LaneID).
 		Str("reason", event.Reason).Str("stream_origin", event.StreamOrigin).
 		Str("error_category", event.ErrorCategory).Uint16("close_code", event.CloseCode).

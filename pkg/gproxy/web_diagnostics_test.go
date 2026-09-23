@@ -7,33 +7,58 @@ import (
 	"time"
 )
 
-type webDiagnosticTestLogger struct{ testLogger }
+type webDiagnosticTestLogger struct {
+	testLogger
+	debug bool
+}
 
-func (l *webDiagnosticTestLogger) Warn(format string, args ...any) {
+func (l *webDiagnosticTestLogger) DebugEnabled() bool { return l.debug }
+
+func (l *webDiagnosticTestLogger) Debug(format string, args ...any) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.warnings = append(l.warnings, fmt.Sprintf(format, args...))
+	l.debugs = append(l.debugs, fmt.Sprintf(format, args...))
 }
 
 func TestWebStreamCloseDiagnosticsAreBoundedAndScoped(t *testing.T) {
-	logger := &webDiagnosticTestLogger{}
-	handler := NewProxyHandler(&Config{}, logger)
-	for _, internal := range []bool{false, true} {
-		conn := newTestMockGnetConn()
-		ctx := NewConnContext()
-		ctx.secret = &Secret{Name: "desktop"}
-		ctx.internalProxyAuthenticated = internal
-		ctx.webCloseReason.Store(webCloseIdle)
-		conn.SetContext(ctx)
-		handler.activeConns.Add(1)
-		handler.OnClose(conn, nil)
-		handler.OnClose(conn, nil)
-	}
-	logger.mu.Lock()
-	warnings := append([]string(nil), logger.warnings...)
-	logger.mu.Unlock()
-	if len(warnings) != 1 || !strings.Contains(warnings[0], "WEB proxy stream closed") || !strings.Contains(warnings[0], "reason=idle_timeout") {
-		t.Fatalf("unexpected warnings: %v", warnings)
+	for _, debug := range []bool{false, true} {
+		logger := &webDiagnosticTestLogger{debug: debug}
+		handler := NewProxyHandler(&Config{}, logger)
+		for _, internal := range []bool{false, true} {
+			conn := newTestMockGnetConn()
+			ctx := NewConnContext()
+			ctx.secret = &Secret{Name: "desktop"}
+			ctx.internalProxyAuthenticated = internal
+			ctx.webDiagnostics = debug
+			ctx.noteWebClose(webCloseIdle)
+			if !debug && ctx.webCloseReason.Load() != 0 {
+				t.Fatal("disabled diagnostics recorded a close reason")
+			}
+			conn.SetContext(ctx)
+			handler.activeConns.Add(1)
+			handler.OnClose(conn, nil)
+			handler.OnClose(conn, nil)
+		}
+		logger.mu.Lock()
+		debugs := append([]string(nil), logger.debugs...)
+		warnings := len(logger.warnings)
+		logger.mu.Unlock()
+		var reports []string
+		for _, message := range debugs {
+			if strings.Contains(message, "WEB proxy stream closed") {
+				reports = append(reports, message)
+			}
+		}
+		if warnings != 0 {
+			t.Fatalf("debug=%v: diagnostic reached warning level", debug)
+		}
+		if debug {
+			if len(reports) != 1 || !strings.Contains(reports[0], "reason=idle_timeout") {
+				t.Fatalf("unexpected reports: %v", reports)
+			}
+		} else if len(reports) != 0 || !handler.webCloseDiagnostics.start.IsZero() {
+			t.Fatalf("disabled diagnostics logged or consumed allowance: %v", reports)
+		}
 	}
 	w := &webCloseDiagnosticWindow{}
 	now := time.Now()

@@ -126,6 +126,7 @@ func (h *ProxyHandler) OpenLogicalStream(options LogicalStreamOptions) (*Logical
 		handler: h, ctx: NewConnContext(), options: options,
 		local: options.LocalAddr, remote: net.TCPAddrFromAddrPort(options.ClientAddr),
 	}
+	stream.ctx.webDiagnostics = h.logger.DebugEnabled()
 	if err := stream.schedule(); err != nil {
 		return nil, err
 	}

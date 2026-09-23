@@ -42,6 +42,7 @@ func RenderBridgeForCarrier(
 		batchBytes,
 		carrier,
 		DefaultLimits().MaxStreamsPerSession,
+		false,
 	)
 }
 
@@ -51,6 +52,7 @@ func renderBridgeForCarrier(
 	batchBytes int,
 	carrier CarrierMode,
 	maxStreamsPerSession int,
+	diagnostics bool,
 ) (BridgePage, error) {
 	relayOrigin, webSocketOrigin, err := bridgeOrigins(hostname)
 	if err != nil {
@@ -93,11 +95,12 @@ func renderBridgeForCarrier(
 		"__BATCH_LIMIT__", strconv.Itoa(batchBytes),
 		"__MAX_STREAMS__", strconv.Itoa(maxStreamsPerSession),
 		"__WEBSOCKET_TARGET__", string(webSocketTargetJSON),
+		"__DIAGNOSTICS__", strconv.FormatBool(diagnostics),
 	).Replace(document)
 	if strings.Contains(body, "__NONCE__") || strings.Contains(body, "__ORIGIN__") ||
 		strings.Contains(body, "__BOOTSTRAP__") || strings.Contains(body, "__CARRIER__") ||
 		strings.Contains(body, "__BATCH_LIMIT__") || strings.Contains(body, "__MAX_STREAMS__") ||
-		strings.Contains(body, "__WEBSOCKET_TARGET__") {
+		strings.Contains(body, "__WEBSOCKET_TARGET__") || strings.Contains(body, "__DIAGNOSTICS__") {
 		return BridgePage{}, errors.New("WEB bridge template replacement failed")
 	}
 	connectSource := "connect-src 'self'"
@@ -326,7 +329,7 @@ function failWebSocketLaneOpen(lane,socket,error,closeCode,started){
  finishWebSocketLane(lane,!lane.localClosed&&!lane.remoteClosed);
 }
 function openWebSocketLane(lane){
- const started=Date.now();
+ const started=diagnostics?Date.now():0;
  const socket=new WebSocket(webSocketTarget,'tproxy-lane-v1.'+sessionToken+'.'+lane.id);
  lane.socket=socket;socket.binaryType='arraybuffer';
  socket.onmessage=event=>{
@@ -391,7 +394,7 @@ const match=/^#android=([A-Za-z0-9_-]{43})$/.exec(location.hash),androidNonce=ma
 history.replaceState(null,'',location.pathname);
 const queueByteLimit=33554432,queueItemLimit=16384,maxFrames=4096,maxPayload=1048576,closedLaneLimit=4096;
 const requestTimeoutMs=90000;
-const bridgeStartedAt=Date.now();
+const diagnostics=__DIAGNOSTICS__,bridgeStartedAt=diagnostics?Date.now():0;
 let failureReported=false;
 let laneReportWindow=bridgeStartedAt,laneReportCount=0;
 let initialized=false,closed=false,port=null,sessionToken='',createStarted=false;
@@ -521,7 +524,7 @@ async function request(path,makeOptions,onHeaders){
   status('reconnecting');const backoff=Math.min(retry||(delay+Math.floor(Math.random()*Math.max(1,delay/4))),backoffRemaining);await pause(backoff,external);if(!unavailable)delay=Math.min(delay*2,5000);
  }
 }
-function diagnosticException(error,fields){return Object.assign(new Error(error&&error.message||''),{name:error&&error.name||'Error'},fields)}
+function diagnosticException(error,fields){return diagnostics?Object.assign(new Error(error&&error.message||''),{name:error&&error.name||'Error'},fields):error}
 function diagnosticError(error){
  if(!error)return 'none';
  const messages=new Map([
@@ -539,6 +542,7 @@ function diagnosticError(error){
  return messages.get(error.message)||({TypeError:'type_error',RangeError:'range_error',AbortError:'abort',NetworkError:'network',SecurityError:'security',InvalidStateError:'invalid_state'})[error.name]||'error';
 }
 function reportFailure(reason,error,laneID,socket,closeCode,wasClean){
+ if(!diagnostics)return;
  let report;
  try{
   const number=(value,limit)=>Number.isFinite(value)?Math.max(0,Math.min(Math.floor(value),limit)):0;
@@ -553,6 +557,7 @@ function reportFailure(reason,error,laneID,socket,closeCode,wasClean){
  return report;
 }
 function reportLaneClose(lane,socket,event,started,error){
+ if(!diagnostics)return;
  const now=Date.now();if(now-laneReportWindow>=60000){laneReportWindow=now;laneReportCount=0}
  if(laneReportCount>=32)return;laneReportCount++;
  const reason=lane.localClosed?'ws_lane_closed_client':lane.remoteClosed?'ws_lane_closed_server':'ws_lane_closed_transport';

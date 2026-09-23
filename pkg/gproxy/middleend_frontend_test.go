@@ -1019,6 +1019,7 @@ func TestMiddleEndAnswerFlagsIgnoredAndOrderlyCloseDrainsOutput(t *testing.T) {
 		obfuscated2.ConnectionTypeIntermediate,
 		nil,
 	)
+	ctx.webDiagnostics = true
 	_, _, _, requestEncryptor, err := obfuscated2.ParseClientFrameWithType(handler.config.Secrets[0].Key, frame)
 	if err != nil {
 		t.Fatal(err)

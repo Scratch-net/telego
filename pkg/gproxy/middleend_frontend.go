@@ -749,7 +749,7 @@ func (h *ProxyHandler) handleMiddleEndToken(
 		action := gnet.None
 		if ok {
 			event.Release()
-			ctx.webCloseReason.CompareAndSwap(0, webCloseMiddleEnd)
+			ctx.noteWebClose(webCloseMiddleEnd)
 			action = client.beginOrderlyClose(c)
 		}
 		if err := client.finishToken(token); err != nil {
@@ -1042,7 +1042,7 @@ func (h *ProxyHandler) writeMiddleEndEvent(
 		payloadSize = 4
 		wire, err = middleend.EncodeSimpleAckForClient(client.connectionType, event.ConfirmKey)
 	case middleend.LinkEventCloseExternal:
-		ctx.webCloseReason.CompareAndSwap(0, webCloseMiddleEnd)
+		ctx.noteWebClose(webCloseMiddleEnd)
 		return client.beginOrderlyClose(c)
 	default:
 		err = fmt.Errorf("%w: unexpected event kind %d", ErrMiddleEndClientProtocol, event.Kind)

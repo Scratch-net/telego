@@ -283,7 +283,7 @@ func TestHTTPServerMatchedBridgeRenderErrorNeverFallsThrough(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server.renderBridge = func(string, string, int, CarrierMode, int) (BridgePage, error) {
+	server.renderBridge = func(string, string, int, CarrierMode, int, bool) (BridgePage, error) {
 		return BridgePage{}, errors.New("injected render failure")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

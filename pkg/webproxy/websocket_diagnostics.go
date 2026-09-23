@@ -47,16 +47,28 @@ func diagnosticNetworkError(err error) string {
 	}
 }
 
-// These fields belong to the WebSocket owner. Worker failures carry their
-// reason through the existing failure channel instead of mutating this state.
+// Allocated only for debug diagnostics. Fields belong to the WebSocket owner;
+// worker failures carry their reason through the existing failure channel.
+type webSocketDiagnostic struct {
+	createdAt     time.Time
+	onClose       func(WebSocketClose)
+	closeReason   string
+	closeError    string
+	closeCode     uint16
+	peerCloseCode uint16
+	receivedBytes uint64
+	sentBytes     uint64
+}
+
 func (w *webSocketConnection) noteClose(reason string, code ws.StatusCode) {
-	if w.closeReason == "" {
-		w.closeReason, w.closeCode = reason, uint16(code)
+	if d := w.diagnostic; d != nil && d.closeReason == "" {
+		d.closeReason, d.closeCode = reason, uint16(code)
 	}
 }
 
 func (w *webSocketConnection) reportClose() {
-	if w.onClose == nil || w.session.diagnostic == nil {
+	stats := w.diagnostic
+	if stats == nil || w.session.diagnostic == nil {
 		return
 	}
 	d := w.session.diagnostic
@@ -72,19 +84,19 @@ func (w *webSocketConnection) reportClose() {
 	if !allowed {
 		return
 	}
-	reason := w.closeReason
+	reason := stats.closeReason
 	if reason == "" {
 		reason = "transport_closed"
 	}
-	errorCategory := w.closeError
+	errorCategory := stats.closeError
 	if errorCategory == "" {
 		errorCategory = "none"
 	}
-	w.onClose(WebSocketClose{
+	stats.onClose(WebSocketClose{
 		User: d.user, Carrier: w.session.carrier, BridgeID: d.id, LaneID: laneID,
 		Reason: reason, StreamOrigin: origin, ErrorCategory: errorCategory,
-		CloseCode: w.closeCode, PeerCloseCode: w.peerCloseCode,
-		AgeMS:         max(0, time.Since(w.createdAt).Milliseconds()),
-		ReceivedBytes: w.receivedBytes, SentBytes: w.sentBytes, Suppressed: suppressed,
+		CloseCode: stats.closeCode, PeerCloseCode: stats.peerCloseCode,
+		AgeMS:         max(0, time.Since(stats.createdAt).Milliseconds()),
+		ReceivedBytes: stats.receivedBytes, SentBytes: stats.sentBytes, Suppressed: suppressed,
 	})
 }

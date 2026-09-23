@@ -207,18 +207,11 @@ func (r *webSocketOwnedInput) Release() {
 }
 
 type webSocketConnection struct {
-	createdAt     time.Time
-	onClose       func(WebSocketClose)
-	closeReason   string
-	closeError    string
-	closeCode     uint16
-	peerCloseCode uint16
-	receivedBytes uint64
-	sentBytes     uint64
-	session       *Session
-	lane          *WebSocketLaneLease
-	decoder       *webSocketDecoder
-	manager       *Manager
+	diagnostic *webSocketDiagnostic
+	session    *Session
+	lane       *WebSocketLaneLease
+	decoder    *webSocketDecoder
+	manager    *Manager
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -257,13 +250,12 @@ func newWebSocketConnection(
 	messageLimit := min(session.limits.MaxBodyBytes, maxWebSocketMessageBytes)
 	ctx, cancel := context.WithCancel(context.Background())
 	connection := &webSocketConnection{
-		createdAt: time.Now(),
-		session:   session,
-		lane:      lane,
-		manager:   manager,
-		ctx:       ctx,
-		cancel:    cancel,
-		phase:     webSocketHandshake,
+		session: session,
+		lane:    lane,
+		manager: manager,
+		ctx:     ctx,
+		cancel:  cancel,
+		phase:   webSocketHandshake,
 		inboundBudget: &webSocketInboundBudget{
 			// Chunked messages are coalesced off the event loop. During that
 			// transition, payload, linked metadata, and contiguous body coexist.
@@ -705,7 +697,12 @@ func (h *httpEventHandler) upgradeWebSocket(
 		return h.writeImmediate(connection, state, h.sanitizedFallback())
 	}
 	transport.backpressureTimeout = h.server.config.webSocketBackpressureTimeout
-	transport.onClose = h.server.config.OnWebSocketClose
+	if request.session.diagnostic != nil && h.server.config.OnWebSocketClose != nil {
+		transport.diagnostic = &webSocketDiagnostic{
+			createdAt: time.Now(),
+			onClose:   h.server.config.OnWebSocketClose,
+		}
+	}
 	transport.backpressureRetry = h.server.config.webSocketBackpressureRetry
 	request.webSocketLane = nil
 	request.webSocketMultiplex = false
@@ -848,7 +845,9 @@ uplinkResults:
 	} else if emitted {
 		switch message.typeID {
 		case webSocketMessageBinary:
-			transport.receivedBytes += uint64(message.payloadBytes)
+			if d := transport.diagnostic; d != nil {
+				d.receivedBytes += uint64(message.payloadBytes)
+			}
 			input := webSocketInbound{
 				body:         message.payload,
 				fragments:    message.fragments,
@@ -873,15 +872,19 @@ uplinkResults:
 		case webSocketMessagePong:
 			transport.touchLiveness(connection)
 		case webSocketMessageClose:
+			var peerCloseCode uint16
 			if len(message.payload) >= 2 {
-				transport.peerCloseCode = binary.BigEndian.Uint16(message.payload)
-				if transport.peerCloseCode == bridgeFailureCloseCode {
+				peerCloseCode = binary.BigEndian.Uint16(message.payload)
+				if peerCloseCode == bridgeFailureCloseCode && transport.session.diagnostic != nil && h.server.config.OnBridgeFailure != nil {
 					if failure, valid := parseBridgeFailureClose(message.payload[2:]); valid {
 						transport.session.diagnostic.report(failure, transport.session.carrier, "websocket_close", h.server.config.OnBridgeFailure)
 					}
 				}
 			}
-			transport.noteClose("peer_close", ws.StatusCode(transport.peerCloseCode))
+			if d := transport.diagnostic; d != nil {
+				d.peerCloseCode = peerCloseCode
+			}
+			transport.noteClose("peer_close", ws.StatusCode(peerCloseCode))
 			if !transport.beginClose(connection, 0, message.payload) {
 				return gnet.Close
 			}
@@ -966,17 +969,21 @@ func (h *httpEventHandler) pumpWebSocketWrites(
 		transport.asyncWritePending = false
 		if writeErr != nil {
 			transport.noteClose("write_error", 0)
-			transport.closeError = diagnosticNetworkError(writeErr)
+			if d := transport.diagnostic; d != nil {
+				d.closeError = diagnosticNetworkError(writeErr)
+			}
 			transport.finishCurrent(writeErr)
 			return current.EventLoop().Close(current)
 		}
-		if item.message.typeID == webSocketMessageBinary {
-			transport.sentBytes += uint64(len(item.message.payload))
+		if d := transport.diagnostic; d != nil && item.message.typeID == webSocketMessageBinary {
+			d.sentBytes += uint64(len(item.message.payload))
 		}
 		return current.Wake(nil)
 	}); err != nil {
 		transport.noteClose("write_error", 0)
-		transport.closeError = diagnosticNetworkError(err)
+		if d := transport.diagnostic; d != nil {
+			d.closeError = diagnosticNetworkError(err)
+		}
 		transport.finishCurrent(err)
 		return gnet.Close
 	}

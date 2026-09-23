@@ -79,6 +79,8 @@ type Capacity struct {
 // Manager owns WEB bootstrap tokens, authenticated sessions, and process-wide
 // stream and queue budgets.
 type Manager struct {
+	debugDiagnostics bool
+
 	profiles       []Profile
 	carrier        CarrierMode
 	backendNet     string
@@ -135,6 +137,8 @@ func NewManager(config ManagerConfig) (*Manager, error) {
 		}
 	}
 	manager := &Manager{
+		debugDiagnostics: config.DebugDiagnostics,
+
 		profiles:       append([]Profile(nil), config.Profiles...),
 		carrier:        config.Carrier,
 		backendNet:     backendNetwork,
@@ -200,8 +204,12 @@ func (m *Manager) IssueBootstrap(capability Capability, clientIP string) (string
 			return "", err
 		}
 	}
+	var diagnostic *bridgeDiagnosticState
+	if m.debugDiagnostics {
+		diagnostic = &bridgeDiagnosticState{id: bridgeDiagnosticIDs.Add(1), user: profile.Name()}
+	}
 	m.bootstraps[hash] = &bootstrap{
-		diagnostic: &bridgeDiagnosticState{id: bridgeDiagnosticIDs.Add(1), user: profile.Name()},
+		diagnostic: diagnostic,
 		expires:    now.Add(m.timeouts.BootstrapLifetime),
 		profile:    profile,
 		issuanceIP: clientIP,

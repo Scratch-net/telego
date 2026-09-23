@@ -88,6 +88,8 @@ func DefaultTimeouts() Timeouts {
 // backend accepted for every logical stream. Backend can be numeric loopback
 // TCP or an absolute Unix-socket path, with an optional unix:// prefix.
 type ManagerConfig struct {
+	// DebugDiagnostics enables bounded reconnect diagnostics. Disabled by default.
+	DebugDiagnostics   bool
 	Profiles           []Profile
 	Backend            string
 	Carrier            CarrierMode

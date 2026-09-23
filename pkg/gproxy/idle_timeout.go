@@ -77,7 +77,7 @@ func (timer *authenticatedIdleTimer) expireOnOwner() {
 	}
 	timer.closed = true
 	timer.mu.Unlock()
-	timer.ctx.webCloseReason.CompareAndSwap(0, webCloseIdle)
+	timer.ctx.noteWebClose(webCloseIdle)
 	_ = timer.conn.Close()
 }
 

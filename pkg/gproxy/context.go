@@ -97,6 +97,7 @@ type ConnContext struct {
 	state            atomic.Int32
 	closeStarted     atomic.Bool
 	webCloseReason   atomic.Uint32
+	webDiagnostics   bool               // fixed before the connection starts its owner work
 	directDialCancel context.CancelFunc // protected by mu; retired after setup
 	// handshakeFailureRecorded makes explicit failure accounting one-shot.
 	handshakeFailureRecorded atomic.Bool

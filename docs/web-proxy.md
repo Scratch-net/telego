@@ -510,9 +510,18 @@ Telego derives the plain and `dd` WEB credentials from each existing base secret
 
 ## Bridge failure diagnostics
 
-When the WEB bridge fails, it sends one diagnostic request before it tells Telegram to reconnect.
-Telego records the report at warning level with the message `WEB bridge reported failure`.
-This report requires no additional configuration.
+Extra WEB diagnostics require `[general].log-level = "debug"` or `"trace"` at startup.
+At other log levels, the bridge sends no diagnostic requests or diagnostic WebSocket close reasons.
+Telego allocates no bridge diagnostic state or WebSocket diagnostic counters in this mode.
+The lane recovery fix remains active at every log level.
+
+To enable diagnostics, set the log level to `"debug"` or `"trace"`.
+Then restart Telego and reconnect the WEB clients.
+The bridge page retains its diagnostic mode until the client loads a new page.
+A live log-level change filters server output but does not change this collection mode.
+
+With diagnostics enabled, the bridge sends one report before it tells Telegram to reconnect.
+Telego records the report at debug level with the message `WEB bridge reported failure`.
 
 The report identifies the failure stage, error category, lane, WebSocket close code, HTTP status, and queue sizes.
 `elapsed_ms` measures time since the bridge document started.
@@ -536,7 +545,7 @@ Diagnostic delivery does not delay reconnection or retry failed reports.
 Network outages and WebView termination can prevent delivery.
 Normal page closure does not produce a bridge failure report.
 
-WebSocket lane closures produce separate diagnostics:
+With diagnostics enabled, WebSocket lane closures produce separate debug records:
 
 - `WEB bridge lane closed` records the browser close code, clean-close flag, and observed CLOSE frame direction.
 - `WEB server WebSocket closed` records the server close path, lane origin, close codes, connection age, and binary byte counts.
@@ -547,7 +556,7 @@ For lane closures, `operation_ms` measures time since WebSocket creation.
 
 Each bridge permits 32 lane reports per minute from each source. Telego suppresses repeated reports for the 64 most recently reported lane IDs.
 These limits do not consume the separate bridge failure allowance.
-Internal MTProxy closure warnings have a process limit of 128 per minute.
+Internal MTProxy closure reports use debug level and have a process limit of 128 per minute.
 The next accepted server record includes the number of reports suppressed by its limit.
 
 The `idle_timeout` marker means that Telego closed an idle stream.

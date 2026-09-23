@@ -79,7 +79,7 @@ type HTTPServerConfig struct {
 type HTTPServer struct {
 	config       HTTPServerConfig
 	handler      *httpEventHandler
-	renderBridge func(string, string, int, CarrierMode, int) (BridgePage, error)
+	renderBridge func(string, string, int, CarrierMode, int, bool) (BridgePage, error)
 
 	lifecycleMu    sync.Mutex
 	started        bool
@@ -378,8 +378,8 @@ func (*httpEventHandler) OnClose(connection gnet.Conn, err error) gnet.Action {
 		return gnet.None
 	}
 	if state, ok := connection.Context().(*httpConnectionState); ok {
-		if state.websocket != nil && state.websocket.closeError == "" {
-			state.websocket.closeError = diagnosticNetworkError(err)
+		if state.websocket != nil && state.websocket.diagnostic != nil && state.websocket.diagnostic.closeError == "" {
+			state.websocket.diagnostic.closeError = diagnosticNetworkError(err)
 		}
 		state.close()
 	}
@@ -864,7 +864,7 @@ func (h *httpEventHandler) prepare(
 
 	switch request.path {
 	case bridgeDiagnosticPath:
-		if request.method != "POST" || request.headers["content-type"] != "application/octet-stream" ||
+		if !config.Manager.debugDiagnostics || request.method != "POST" || request.headers["content-type"] != "application/octet-stream" ||
 			!request.hasContentLength || request.contentLength == 0 || request.contentLength > maxBridgeDiagnosticBytes ||
 			anyHeaderPresent(request, "x-up-seq", "x-down-cursor", "x-lane-id", "x-session-token", "x-carrier-mode", "x-up-ack") {
 			return nil, requestSanitizedFallback
@@ -1160,6 +1160,7 @@ func (h *httpEventHandler) serve(
 			manager.limits.CarrierBatchBytes,
 			manager.CarrierMode(),
 			manager.limits.MaxStreamsPerSession,
+			manager.debugDiagnostics,
 		)
 		if err != nil {
 			return rejectResponse(500)

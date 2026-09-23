@@ -182,6 +182,7 @@ func TestRenderBridgeWebSocketLanesUsesConfiguredStreamLimit(t *testing.T) {
 		maxCarrierBatchBytes,
 		CarrierWebSocketLanes,
 		2,
+		false,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -241,6 +242,7 @@ func TestRenderedBridgeWebSocketReservationRefreshesStaleSiblingAtLimit(t *testi
 		maxCarrierBatchBytes,
 		CarrierWebSocketLanes,
 		2,
+		false,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -285,6 +287,7 @@ func TestRenderedBridgeWebSocketClosingLaneRetainsBufferedOwnership(t *testing.T
 		maxCarrierBatchBytes,
 		CarrierWebSocketLanes,
 		2,
+		false,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -441,7 +444,7 @@ func TestRenderBridgeRejectsInvalidInputsAndUsesPerResponseNonce(t *testing.T) {
 			return renderErr
 		},
 		"stream limit": func() error {
-			_, renderErr := renderBridgeForCarrier("proxy.example.com", token, 1024, CarrierWebSocketLanes, 0)
+			_, renderErr := renderBridgeForCarrier("proxy.example.com", token, 1024, CarrierWebSocketLanes, 0, false)
 			return renderErr
 		},
 	} {

@@ -1,6 +1,7 @@
 package webproxy
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -11,12 +12,72 @@ import (
 	"github.com/gobwas/ws"
 )
 
+func TestWebDiagnosticsDisabledByDefault(t *testing.T) {
+	failures := make(chan BridgeFailure, 8)
+	closes := make(chan WebSocketClose, 8)
+	app := newHTTPTestApplicationWithConfig(t, time.Second, func(config *ManagerConfig) {
+		config.Carrier = CarrierWebSocketLanes
+	}, func(config *HTTPServerConfig) {
+		config.OnBridgeFailure = func(event BridgeFailure) { failures <- event }
+		config.OnWebSocketClose = func(event WebSocketClose) { closes <- event }
+	})
+	httpClient := &http.Client{Timeout: time.Second}
+	response := app.do(t, httpClient, "GET", "/?bridge="+app.profiles[0].Capability().String(), nil, nil)
+	body := readHTTPBody(t, response)
+	if response.StatusCode != 200 || !bytes.Contains(body, []byte("const diagnostics=false,")) {
+		t.Fatal("default bridge enabled diagnostics")
+	}
+	bootstrap := extractBridgeBootstrap(t, body)
+	if app.manager.authenticateBridgeDiagnostic(bootstrap) != nil {
+		t.Fatal("default bootstrap allocated diagnostic state")
+	}
+	created, err := app.manager.Create(bootstrap, "127.0.0.1", testFrameBatch(t, Frame{Type: FrameHello, Payload: []byte{1}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Session.diagnostic != nil {
+		t.Fatal("default session allocated diagnostic state")
+	}
+	response = app.do(t, httpClient, "POST", bridgeDiagnosticPath, []byte(testBridgeFailureBody), map[string]string{
+		"Authorization": "Bearer " + created.Token, "Content-Type": "application/octet-stream",
+	})
+	readHTTPBody(t, response)
+	if response.StatusCode != 419 {
+		t.Fatalf("disabled diagnostic endpoint returned %d", response.StatusCode)
+	}
+	client, response := dialWebSocketTest(t, app.address, "tproxy-lane-v1."+created.Token+".7", "", nil)
+	if response.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("upgrade = %d", response.StatusCode)
+	}
+	defer client.close()
+	client.write(t, ws.OpBinary, true, testFrameBatch(t, Frame{Type: FrameOpen, StreamID: 7}, Frame{Type: FrameData, StreamID: 7, Payload: []byte("probe")}))
+	found := false
+	for !found {
+		for _, frame := range readWebSocketBatch(t, client, time.Second) {
+			found = found || (frame.Type == FrameData && bytes.Equal(frame.Payload, []byte("probe")))
+		}
+	}
+	// An older debug page can still submit a close report after a server upgrade.
+	client.write(t, ws.OpClose, true, append([]byte{0x0f, 0xa0}, `{"r":"ws_lane_open","e":"ws_error"}`...))
+	expectWebSocketCloseCode(t, client, bridgeFailureCloseCode, time.Second)
+	client.close()
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	if err := app.server.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(failures) != 0 || len(closes) != 0 {
+		t.Fatal("disabled diagnostics invoked a report callback")
+	}
+}
+
 func TestWebSocketFailureCloseSharesHTTPAllowance(t *testing.T) {
 	for _, first := range []string{"http", "websocket_close"} {
 		t.Run(first, func(t *testing.T) {
 			reports := make(chan BridgeFailure, 8)
 			app := newHTTPTestApplicationWithConfig(t, time.Second, func(config *ManagerConfig) {
 				config.Carrier = CarrierWebSocketLanes
+				config.DebugDiagnostics = true
 			}, func(config *HTTPServerConfig) {
 				config.OnBridgeFailure = func(event BridgeFailure) { reports <- event }
 			})
@@ -65,6 +126,7 @@ func TestWebSocketCloseDiagnostics(t *testing.T) {
 			dialed := make(chan net.Conn, 1)
 			app := newHTTPTestApplicationWithConfig(t, 100*time.Millisecond, func(config *ManagerConfig) {
 				config.Carrier = CarrierWebSocketLanes
+				config.DebugDiagnostics = true
 				config.BackendDialContext = func(ctx context.Context, network, address, _ string) (net.Conn, error) {
 					connection, err := (&net.Dialer{}).DialContext(ctx, network, address)
 					if err == nil {

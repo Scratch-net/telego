@@ -67,7 +67,13 @@ func webStreamCloseError(err error) string {
 	}
 }
 
-// Only process-authenticated WEB streams reach this warning. The marker says
+func (ctx *ConnContext) noteWebClose(reason uint32) {
+	if ctx.webDiagnostics {
+		ctx.webCloseReason.CompareAndSwap(0, reason)
+	}
+}
+
+// Only process-authenticated WEB streams reach this debug log. The marker says
 // where Telego observed the close, not whether the external network caused it.
 func (h *ProxyHandler) logWebStreamClose(ctx *ConnContext, err error) {
 	now := time.Now()
@@ -81,7 +87,7 @@ func (h *ProxyHandler) logWebStreamClose(ctx *ConnContext, err error) {
 		}
 		return max(0, now.UnixMilli()-last)
 	}
-	h.logger.Warn("WEB proxy stream closed connection=%q dc_id=%d reason=%s error_category=%s age_ms=%d client_idle_ms=%d server_idle_ms=%d suppressed=%d",
+	h.logger.Debug("WEB proxy stream closed connection=%q dc_id=%d reason=%s error_category=%s age_ms=%d client_idle_ms=%d server_idle_ms=%d suppressed=%d",
 		ctx.LogPrefix(), ctx.DCID(), webStreamCloseReason(ctx.webCloseReason.Load()), webStreamCloseError(err),
 		now.Sub(ctx.connTime).Milliseconds(), idle(ctx.lastClientByteMs.Load()), idle(ctx.lastServerByteMs.Load()), suppressed)
 }

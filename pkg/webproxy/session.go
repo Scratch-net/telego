@@ -1167,7 +1167,7 @@ func (s *Session) backendClosed(streamID uint32, backend *backendStream) {
 }
 
 func (s *Session) noteLaneCloseLocked(laneID uint32, origin string) {
-	if s.carrier.usesLanes() {
+	if s.diagnostic != nil && s.carrier.usesLanes() {
 		if lane := s.carrierLanes[laneID]; lane != nil && lane.closeOrigin == "" {
 			lane.closeOrigin = origin
 		}
