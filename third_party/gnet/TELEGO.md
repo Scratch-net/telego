@@ -9,8 +9,9 @@ This directory contains the local Telego copy of [gnet v2.10.0](https://github.c
 | Module checksum | `h1:rC4jNF+jtXj/FH+8JOIQ3XxjD+yBunYBLKg9TE3dc4g=` |
 | License | [Apache License 2.0](LICENSE) |
 
-The root module and `benchmark/gnet_vs_uring` use this directory through local `replace` directives.
-The upstream module files, copyright notices, license, and tests remain in this copy.
+The root module uses this directory through a local `replace` directive.
+The upstream copyright notices, license, and tests remain in this copy.
+The local module files use Go 1.27.1 and updated dependencies, including the test dependencies.
 
 ## Local changes
 
@@ -65,7 +66,7 @@ The buffer tests cover mixed ordinary and owned output, partial consumption, and
 5. Run `make test` from the repository root.
 6. Build the Linux release targets with `poll_opt,gc_opt`.
 
-If upstream includes the required lifecycle and owned-buffer APIs, remove both local replacements in the same reviewed change.
+If upstream includes the required lifecycle and owned-buffer APIs, remove the local replacement in the same reviewed change.
 The upstream implementation must pass the local regression tests.
 
 ## Rollback

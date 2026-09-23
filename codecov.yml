@@ -13,4 +13,3 @@ coverage:
 ignore:
   - "cmd/**"
   - "tools/**"
-  - "benchmark/**"

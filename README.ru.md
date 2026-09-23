@@ -279,7 +279,7 @@ services:
 
 ### Из исходников
 
-Для сборки нужны Go 1.27 или новее и полный репозиторий, включая `third_party/gnet`.
+Для сборки нужны Go 1.27.1 или новее и полный репозиторий, включая `third_party/gnet`.
 
 ```bash
 git clone https://github.com/Scratch-net/telego.git

@@ -111,7 +111,7 @@ Read the [managed gateway guide](examples/gateway/README.md) for updates, backup
 
 ### From Source
 
-Source builds require Go 1.27 or later and the complete repository, including `third_party/gnet`.
+Source builds require Go 1.27.1 or later and the complete repository, including `third_party/gnet`.
 
 ```bash
 git clone https://github.com/Scratch-net/telego.git

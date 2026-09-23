@@ -4,7 +4,7 @@
 
 FROM alpine:latest AS certificates
 
-FROM golang:1.27-alpine AS builder
+FROM golang:1.27.1-alpine AS builder
 
 ARG BUILD_TAGS="poll_opt,gc_opt"
 ARG VERSION="dev"
