@@ -54,6 +54,13 @@ func renderBridgeForCarrier(
 	maxStreamsPerSession int,
 	diagnostics bool,
 ) (BridgePage, error) {
+	return renderBridgeAtPath(hostname, bootstrapToken, batchBytes, carrier, maxStreamsPerSession, diagnostics, "")
+}
+
+func renderBridgeAtPath(hostname, bootstrapToken string, batchBytes int, carrier CarrierMode, maxStreamsPerSession int, diagnostics bool, basePath string) (BridgePage, error) {
+	if err := ValidateBasePath(basePath); err != nil {
+		return BridgePage{}, err
+	}
 	relayOrigin, webSocketOrigin, err := bridgeOrigins(hostname)
 	if err != nil {
 		return BridgePage{}, err
@@ -83,11 +90,16 @@ func renderBridgeForCarrier(
 		return BridgePage{}, err
 	}
 	nonce := base64.RawURLEncoding.EncodeToString(rawNonce[:])
-	originJSON, _ := json.Marshal(relayOrigin)
-	webSocketTargetJSON, _ := json.Marshal(webSocketOrigin + webSocketPath)
+	prefix := ""
+	if basePath != "" {
+		prefix = "/" + basePath
+	}
+	originJSON, _ := json.Marshal(relayOrigin + prefix)
+	webSocketTargetJSON, _ := json.Marshal(webSocketOrigin + prefix + webSocketPath)
 	tokenJSON, _ := json.Marshal(bootstrapToken)
 	carrierJSON, _ := json.Marshal(carrier)
 	body := strings.NewReplacer(
+		"__RECOVERY__", bridgeRecoveryScript,
 		"__NONCE__", nonce,
 		"__ORIGIN__", string(originJSON),
 		"__BOOTSTRAP__", string(tokenJSON),
@@ -211,8 +223,8 @@ function release(bytes,items,lane){queuedBytes-=bytes;queuedItems-=items;if(lane
 		{"function joinPending(values){", "function joinPending(values,lane){"},
 		{"values[0]=values[0].slice(bound.bytes);queuedItems++;", "values[0]=values[0].slice(bound.bytes);queuedItems++;if(lane)lane.items++;"},
 		{
-			"if(closed){deleteSession();return}port.postMessage(welcome,[welcome]);status('connected');",
-			"if(carrier==='websocket')await openWebSocket();\n  if(closed){deleteSession();return}port.postMessage(welcome,[welcome]);status('connected');",
+			"if(closed){deleteSession();return}recoveryComplete();if(!welcomed){port.postMessage(welcome,[welcome]);welcomed=true}status('connected');",
+			"if(carrier==='websocket')await openWebSocket();\n  if(closed){deleteSession();return}recoveryComplete();if(!welcomed){port.postMessage(welcome,[welcome]);welcomed=true}status('connected');",
 		},
 		{
 			"if(carrier==='https')poll();else pollLane(lanes.get(0));",
@@ -229,13 +241,13 @@ function release(bytes,items,lane){queuedBytes-=bytes;queuedItems-=items;if(lane
 		{"function deleteSession(){", webSocketBridgeFunctions + "\nfunction deleteSession(){"},
 		{
 			`function close(notifyServer){
- if(closed)return;closed=true;lifecycleController.abort();if(pollController)pollController.abort();
+ if(closed)return;closed=true;lifecycleController.abort();epochController.abort();if(recoveryTimer)clearTimeout(recoveryTimer);if(pollController)pollController.abort();
  for(const lane of lanes.values())if(lane.controller)lane.controller.abort();
  if(notifyServer)deleteSession();beforeSession.length=0;upPending.length=0;
  for(const lane of lanes.values())lane.pending.length=0;lanes.clear();queuedBytes=0;queuedItems=0;if(port)port.close();
 }`,
 			`function close(notifyServer){
- if(closed)return;closed=true;lifecycleController.abort();if(pollController)pollController.abort();
+ if(closed)return;closed=true;lifecycleController.abort();epochController.abort();if(recoveryTimer)clearTimeout(recoveryTimer);if(pollController)pollController.abort();
  for(const lane of lanes.values()){
   if(lane.controller)lane.controller.abort();if(lane.timer)clearTimeout(lane.timer);
   if(lane.socket)try{lane.socket.close()}catch(error){}
@@ -255,22 +267,24 @@ function release(bytes,items,lane){queuedBytes-=bytes;queuedItems-=items;if(lane
 	return document, nil
 }
 
-const webSocketBridgeFunctions = `function waitForWebSocketOpen(socket){
+const webSocketBridgeFunctions = `function waitForWebSocketOpen(socket,external){
  return new Promise((resolve,reject)=>{
   let settled=false;const started=Date.now(),deadline=started+requestTimeoutMs;
   const finish=error=>{
    if(settled)return;settled=true;clearTimeout(timer);
    socket.removeEventListener('open',opened);socket.removeEventListener('error',failed);socket.removeEventListener('close',failed);
    lifecycleController.signal.removeEventListener('abort',aborted);
+   if(external)external.removeEventListener('abort',aborted);
    if(error){try{socket.close()}catch(closeError){}reject(diagnosticException(error,{operationMS:Date.now()-started}))}else resolve();
   };
   const failed=event=>finish(diagnosticException(new Error(event.type==='close'?'websocket closed':'websocket failed'),{closeCode:event.code}));
   const aborted=()=>finish(new DOMException('carrier closed','AbortError'));
-  const opened=()=>{if(closed||lifecycleController.signal.aborted){aborted();return}finish(Date.now()>=deadline?new Error('websocket opening deadline reached'):null)};
+  const opened=()=>{if(closed||lifecycleController.signal.aborted||(external&&external.aborted)){aborted();return}finish(Date.now()>=deadline?new Error('websocket opening deadline reached'):null)};
   const timer=setTimeout(()=>finish(new Error('websocket opening deadline reached')),requestTimeoutMs);
   socket.addEventListener('open',opened);socket.addEventListener('error',failed);socket.addEventListener('close',failed);
   lifecycleController.signal.addEventListener('abort',aborted,{once:true});
-  if(closed||lifecycleController.signal.aborted)aborted();
+  if(external)external.addEventListener('abort',aborted,{once:true});
+  if(closed||lifecycleController.signal.aborted||(external&&external.aborted))aborted();
  });
 }
 function closeWebSocketsWithFailure(report){
@@ -281,14 +295,15 @@ function closeWebSocketsWithFailure(report){
  }catch(error){}
 }
 async function openWebSocket(){
+ const generation=epoch,retired=epochController.signal;
  const socket=new WebSocket(webSocketTarget,'tproxy-v1.'+sessionToken);webSocket=socket;socket.binaryType='arraybuffer';let opened=false;
  socket.onmessage=event=>{
   if(closed||!opened||webSocket!==socket)return;
   if(!(event.data instanceof ArrayBuffer)||!event.data.byteLength){fail('ws_receive_type',null,0,socket);return}
-  port.postMessage({t:'traffic',up:0,down:event.data.byteLength});port.postMessage(event.data,[event.data]);status('connected');
+  try{deliver(event.data);status('connected')}catch(error){fail('ws_frames',error)}
  };
- socket.onclose=event=>{if(!closed)fail('ws_closed',null,0,socket,event.code)};
- try{await waitForWebSocketOpen(socket);ensureOpen();opened=true}catch(error){fail('ws_open',error,0,socket);throw error}
+ socket.onclose=event=>{if(current(generation))fail('ws_closed',null,0,socket,event.code)};
+ try{await waitForWebSocketOpen(socket,retired);ensureOpen(retired);opened=true}catch(error){error.recoverable=true;if(current(generation))fail('ws_open',error,0,socket);throw error}
 }
 function queueWebSocket(data){
  if(!reserve(data)){fail('ws_capacity',null,0,webSocket);return}upPending.push(data);runWebSocketUp();
@@ -314,9 +329,11 @@ function closeFrame(id){
 function finishWebSocketLane(lane,notify){
  if(lane.finished||lanes.get(lane.id)!==lane)return;
  lane.finished=true;if(lane.timer)clearTimeout(lane.timer);
+ if(lane.openController)lane.openController.abort();
  webSocketBufferedBytes-=lane.buffered;lane.buffered=0;webSocketLaneReservations--;
  if(lane.bytes||lane.items)release(lane.bytes,lane.items,lane);
  lane.pending.length=0;lanes.delete(lane.id);rememberLaneClosed(lane.id);
+ activeStreams.delete(lane.id);
  if(lane.socket&&(lane.socket.readyState===WebSocket.OPEN||lane.socket.readyState===WebSocket.CONNECTING))try{lane.socket.close()}catch(error){}
  if(notify&&port&&!closed){const frame=closeFrame(lane.id);port.postMessage(frame,[frame])}
 }
@@ -331,13 +348,13 @@ function failWebSocketLaneOpen(lane,socket,error,closeCode,started){
 function openWebSocketLane(lane){
  const started=diagnostics?Date.now():0;
  const socket=new WebSocket(webSocketTarget,'tproxy-lane-v1.'+sessionToken+'.'+lane.id);
- lane.socket=socket;socket.binaryType='arraybuffer';
+ lane.socket=socket;lane.openController=new AbortController();socket.binaryType='arraybuffer';
  socket.onmessage=event=>{
   if(closed||lane.finished||!lane.opened||lanes.get(lane.id)!==lane||lane.socket!==socket)return;
   if(!(event.data instanceof ArrayBuffer)||!event.data.byteLength){fail('ws_lane_receive_type',null,lane.id,socket);return}
   let frames;try{frames=splitFrames(event.data)}catch(error){fail('ws_lane_frames',error,lane.id,socket);return}
   if(frames.some(frame=>frame.id!==lane.id)){fail('ws_lane_cross_lane',null,lane.id,socket);return}if(frames.some(frame=>frame.type===3))lane.remoteClosed=true;
-  port.postMessage({t:'traffic',up:0,down:event.data.byteLength});port.postMessage(event.data,[event.data]);status('connected');
+  deliver(event.data);status('connected');
  };
  socket.onerror=()=>{};
  socket.onclose=event=>{
@@ -345,7 +362,7 @@ function openWebSocketLane(lane){
   reportLaneClose(lane,socket,event,started);
   finishWebSocketLane(lane,!lane.localClosed&&!lane.remoteClosed);
  };
- waitForWebSocketOpen(socket).then(()=>{
+ waitForWebSocketOpen(socket,lane.openController.signal).then(()=>{
   if(closed||lane.finished||lanes.get(lane.id)!==lane||lane.socket!==socket){socket.close();return}
   lane.opened=true;status('connected');runWebSocketLaneUp(lane);
  },error=>failWebSocketLaneOpen(lane,socket,error,error&&error.closeCode,started));
@@ -355,6 +372,7 @@ function queueWebSocketLane(frame){
  if(!lane&&(frame.type===2||frame.type===3||frame.type===4))return;
  if(!frame.id||(!lane&&closedLanes.has(frame.id)))throw new Error('closed lane was reused');
  if(!lane&&frame.type!==1)throw new Error('lane did not begin with OPEN');
+ if(lane&&frame.type===3&&!lane.opened){finishWebSocketLane(lane,false);return}
  if(!lane&&webSocketLaneReservations>=maxWebSocketLanes){fail('ws_lane_limit',null,frame.id);return}
  if(!lane){webSocketLaneReservations++;lane=ensureLane(frame.id)}if(!reserve(frame.data,lane)){fail('ws_lane_capacity',null,lane.id,lane.socket);return}
  lane.pending.push(frame.data);if(frame.type===3)lane.localClosed=true;
@@ -389,7 +407,9 @@ const bridgeDocument = `<!doctype html>
 <script nonce="__NONCE__">
 (()=>{
 'use strict';
-const relayOrigin=__ORIGIN__,bootstrap=__BOOTSTRAP__,carrier=__CARRIER__,batchLimit=__BATCH_LIMIT__;
+const relayOrigin=__ORIGIN__,carrier=__CARRIER__,batchLimit=__BATCH_LIMIT__,streamLimit=__MAX_STREAMS__;
+let bootstrap=__BOOTSTRAP__;
+const capabilityMatch=/^\?bridge=([A-Za-z0-9_-]{43})$/.exec(location.search||''),bridgeCapability=capabilityMatch?capabilityMatch[1]:'';
 const match=/^#android=([A-Za-z0-9_-]{43})$/.exec(location.hash),androidNonce=match?match[1]:'';
 history.replaceState(null,'',location.pathname);
 const queueByteLimit=33554432,queueItemLimit=16384,maxFrames=4096,maxPayload=1048576,closedLaneLimit=4096;
@@ -402,13 +422,15 @@ let queuedBytes=0,queuedItems=0,upSequence=1,downCursor='0',upRunning=false,poll
 const lifecycleController=new AbortController();
 const beforeSession=[],upPending=[];
 const lanes=new Map(),closedLanes=new Set(),closedLaneOrder=[];
+__RECOVERY__
 const status=state=>{if(port&&!closed)port.postMessage({t:'status',state})};
 function ensureOpen(external){if(closed||lifecycleController.signal.aborted||(external&&external.aborted))throw new DOMException('carrier closed','AbortError')}
 function pause(milliseconds,external){
  ensureOpen(external);return new Promise((resolve,reject)=>{
+  const retired=epochController.signal;
   let timer;const abort=()=>{clearTimeout(timer);cleanup();reject(new DOMException('carrier closed','AbortError'))};
-  const cleanup=()=>{lifecycleController.signal.removeEventListener('abort',abort);if(external)external.removeEventListener('abort',abort)};
-  lifecycleController.signal.addEventListener('abort',abort,{once:true});if(external)external.addEventListener('abort',abort,{once:true});
+  const cleanup=()=>{lifecycleController.signal.removeEventListener('abort',abort);retired.removeEventListener('abort',abort);if(external)external.removeEventListener('abort',abort)};
+  lifecycleController.signal.addEventListener('abort',abort,{once:true});retired.addEventListener('abort',abort,{once:true});if(external)external.addEventListener('abort',abort,{once:true});
   timer=setTimeout(()=>{cleanup();resolve()},milliseconds);
  });
 }
@@ -496,21 +518,24 @@ async function readResponse(response,limit,exact,signal,deadline){
  finally{signal.removeEventListener('abort',cancel);reader.releaseLock()}
 }
 async function request(path,makeOptions,onHeaders){
- let delay=250,attempt=0;const started=Date.now(),deadline=started+requestTimeoutMs;
+ let delay=250,attempt=0;const started=Date.now(),deadline=started+(recovering?recoveryRemaining():requestTimeoutMs),generation=epoch,retired=epochController.signal;
  while(true){
-  ensureOpen();const requestOptions=makeOptions(),controller=new AbortController(),external=requestOptions.signal;
-  ensureOpen(external);const remaining=deadline-Date.now();if(remaining<=0)throw new Error('carrier retry deadline reached');
-  const abort=()=>controller.abort();lifecycleController.signal.addEventListener('abort',abort,{once:true});if(external)external.addEventListener('abort',abort,{once:true});requestOptions.signal=controller.signal;
+  ensureOpen(retired);const requestOptions=makeOptions(),controller=new AbortController(),external=requestOptions.signal;
+  ensureOpen(external);const remaining=deadline-Date.now();if(remaining<=0)throw transportError('carrier retry deadline reached');
+  const abort=()=>controller.abort();lifecycleController.signal.addEventListener('abort',abort,{once:true});retired.addEventListener('abort',abort,{once:true});if(external)external.addEventListener('abort',abort,{once:true});requestOptions.signal=controller.signal;
   ensureOpen(external);
   const timer=setTimeout(abort,remaining);let retry=0,unavailable=false,response=null;
   try{
    response=await fetch(relayOrigin+path,requestOptions);
-   if(response.status!==503){
+   if(generation!==epoch)throw new DOMException('retired carrier','AbortError');
+   if(response.status!==503&&!(recovering&&[408,429,502,504].includes(response.status))){
     if(onHeaders)onHeaders(response);
     ensureOpen(controller.signal);
     if(Date.now()>=deadline)throw new Error('response deadline reached');
     let body=new ArrayBuffer(0);
-    if(response.status===200&&(path==='/api/v1/session'||path==='/api/v1/down')){
+    if(response.status===200&&path.startsWith('/?bridge=')){
+     body=await readResponse(response,1024,false,controller.signal,deadline);
+    }else if(response.status===200&&(path==='/api/v1/session'||path==='/api/v1/down')){
      // The server can send one whole frame above the configured batch target.
      body=await readResponse(response,path==='/api/v1/session'?8:Math.max(batchLimit,maxPayload+8),path==='/api/v1/session',controller.signal,deadline);
      if(path==='/api/v1/down'&&body.byteLength>batchLimit&&splitFrames(body).length!==1)throw new Error('response batch exceeds its limit');
@@ -518,13 +543,13 @@ async function request(path,makeOptions,onHeaders){
     return {status:response.status,headers:response.headers,body};
    }
    unavailable=true;retry=retryAfterMs(response);cancelResponse(response);
-  }catch(error){controller.abort();cancelResponse(response);ensureOpen(external);if(response)throw diagnosticException(error,{httpStatus:response.status,operationMS:Date.now()-started});if(++attempt===9)throw new Error('carrier retry limit reached')}
-  finally{clearTimeout(timer);lifecycleController.signal.removeEventListener('abort',abort);if(external)external.removeEventListener('abort',abort)}
-  ensureOpen(external);const backoffRemaining=deadline-Date.now();if(backoffRemaining<=0)throw new Error('carrier retry deadline reached');
-  status('reconnecting');const backoff=Math.min(retry||(delay+Math.floor(Math.random()*Math.max(1,delay/4))),backoffRemaining);await pause(backoff,external);if(!unavailable)delay=Math.min(delay*2,5000);
+  }catch(error){controller.abort();cancelResponse(response);ensureOpen(retired);ensureOpen(external);if(response){if(error.name==='AbortError'||error.name==='TypeError'||error.message==='response deadline reached')error.recoverable=true;throw diagnosticException(error,{httpStatus:response.status,operationMS:Date.now()-started})};if(++attempt===9)throw transportError('carrier retry limit reached')}
+  finally{clearTimeout(timer);lifecycleController.signal.removeEventListener('abort',abort);retired.removeEventListener('abort',abort);if(external)external.removeEventListener('abort',abort)}
+  ensureOpen(retired);ensureOpen(external);const backoffRemaining=deadline-Date.now();if(backoffRemaining<=0)throw transportError('carrier retry deadline reached');
+  status('reconnecting');const backoff=Math.min(retry||(delay+Math.floor(Math.random()*Math.max(1,delay/4))),backoffRemaining);await pause(backoff,external);if(!unavailable||recovering)delay=Math.min(delay*2,recovering?2000:5000);
  }
 }
-function diagnosticException(error,fields){return diagnostics?Object.assign(new Error(error&&error.message||''),{name:error&&error.name||'Error'},fields):error}
+function diagnosticException(error,fields){return diagnostics?Object.assign(new Error(error&&error.message||''),{name:error&&error.name||'Error',recoverable:!!(error&&error.recoverable)},fields):error}
 function diagnosticError(error){
  if(!error)return 'none';
  const messages=new Map([
@@ -564,27 +589,35 @@ function reportLaneClose(lane,socket,event,started,error){
  reportFailure(reason,diagnosticException(error||new Error('websocket closed'),{operationMS:now-started}),lane.id,socket,event.code,event.wasClean);
 }
 function fail(reason,error,laneID,socket,closeCode){
+ if(closed||recovering)return;
+ if(canRecover(reason,error)){reportFailure(reason,error,laneID,socket,closeCode);beginRecovery();return}
+ terminalFailure(reason,error,laneID,socket,closeCode);
+}
+function terminalFailure(reason,error,laneID,socket,closeCode){
  if(closed||failureReported)return;failureReported=true;
  const report=reportFailure(reason,error,laneID,socket,closeCode);
  if(report&&(carrier==='websocket'||carrier==='websocket-lanes'))closeWebSocketsWithFailure(report);
  try{status('failed');if(port)port.postMessage({t:'close'})}finally{close(true)}
 }
-async function createSession(first){
+async function createSession(first,replacement=false){
+ const generation=epoch;if(!replacement&&!hello)hello=first.slice(0);
  try{
   status('connecting');
   const response=await request('/api/v1/session',()=>options('POST',bootstrap,first),response=>{
-   if(response.status!==200||response.headers.get('X-Carrier-Mode')!==carrier)throw new Error('session creation rejected');
+   if(response.status!==200)throw transportError('session creation rejected');
+   if(response.headers.get('X-Carrier-Mode')!==carrier)throw new Error('session creation rejected');
    // Retain the cleanup token even if the body stalls or the page closes.
    sessionToken=response.headers.get('X-Session-Token')||'';downCursor=response.headers.get('X-Down-Cursor')||'0';
    if(closed)deleteSession();
   });
   const welcome=response.body;
+  if(generation!==epoch)return;
   if(!sessionToken||welcome.byteLength!==8||new DataView(welcome).getUint8(0)!==17)throw new Error('invalid session creation');
-  if(closed){deleteSession();return}port.postMessage(welcome,[welcome]);status('connected');
+  if(closed){deleteSession();return}recoveryComplete();if(!welcomed){port.postMessage(welcome,[welcome]);welcomed=true}status('connected');
   if(carrier==='https-lanes')ensureLane(0);
   for(const data of beforeSession.splice(0)){release(data.byteLength,1);queueCarrier(data)}
   if(carrier==='https')poll();else pollLane(lanes.get(0));
- }catch(error){fail('session_create',error)}
+ }catch(error){if(generation!==epoch)return;if(replacement)throw error;fail('session_create',error)}
 }
 function queueCarrier(data){
  try{if(carrier==='https')queueUp(data);else for(const frame of splitFrames(data))queueLane(frame)}catch(error){fail('carrier_queue',error)}
@@ -595,26 +628,31 @@ function queueUp(data){
 }
 async function runUp(){
  if(upRunning)return;upRunning=true;
+ const generation=epoch;
  try{
   while(!closed&&sessionToken&&upPending.length){
    const batch=joinPending(upPending),sequence=String(upSequence);
    const response=await request('/api/v1/up',()=>options('POST',sessionToken,batch.body,{'X-Up-Seq':sequence}));
-   if(response.status!==204||response.headers.get('X-Up-Ack')!==sequence)throw diagnosticException(new Error('uplink rejected'),{httpStatus:response.status});
+   if(!current(generation))return;
+   if(response.status!==204)throw diagnosticException(transportError('uplink rejected'),{httpStatus:response.status});
+   if(response.headers.get('X-Up-Ack')!==sequence)throw new Error('uplink rejected');
    release(batch.total,batch.count);port.postMessage({t:'traffic',up:batch.total,down:0});upSequence++;
   }
- }catch(error){fail('up_send',error)}finally{upRunning=false;if(!closed&&sessionToken&&upPending.length)runUp()}
+ }catch(error){if(current(generation))fail('up_send',error)}finally{if(current(generation)){upRunning=false;if(sessionToken&&upPending.length)runUp()}}
 }
 async function poll(){
- while(!closed&&sessionToken){
+ const generation=epoch;
+ while(current(generation)&&sessionToken){
   try{
    pollController=new AbortController();
    const response=await request('/api/v1/down',()=>options('POST',sessionToken,null,{'X-Down-Cursor':downCursor},pollController.signal));
+   if(!current(generation))return;
    if(response.status===204){status('connected');continue}
-   if(response.status!==200)throw diagnosticException(new Error('downlink rejected'),{httpStatus:response.status});
+   if(response.status!==200)throw diagnosticException(transportError('downlink rejected'),{httpStatus:response.status});
    const next=response.headers.get('X-Down-Cursor')||'',data=response.body,frames=splitFrames(data);
    if(!next||!frames.length)throw new Error('invalid downlink response');
-   if(closed)return;port.postMessage({t:'traffic',up:0,down:data.byteLength});port.postMessage(data,[data]);downCursor=next;status('connected');
-  }catch(error){if(!closed)fail('down_poll',error);return}
+   deliver(data);downCursor=next;status('connected');
+  }catch(error){if(current(generation))fail('down_poll',error);return}
  }
 }
 function ensureLane(id){
@@ -631,6 +669,7 @@ function finishLane(lane){
  if(!lane||lanes.get(lane.id)!==lane)return;
  for(const data of lane.pending)release(data.byteLength,1);
  lane.pending.length=0;lanes.delete(lane.id);rememberLaneClosed(lane.id);
+ activeStreams.delete(lane.id);
 }
 function queueLane(frame){
  let lane=lanes.get(frame.id);
@@ -643,34 +682,39 @@ function queueLane(frame){
 }
 async function runLaneUp(lane){
  if(lane.running)return;lane.running=true;
+ const generation=epoch;
  try{
   while(!closed&&sessionToken&&lane.pending.length){
    const batch=joinPending(lane.pending),sequence=String(lane.sequence),laneID=String(lane.id);
    const response=await request('/api/v1/up',()=>options('POST',sessionToken,batch.body,{'X-Up-Seq':sequence,'X-Lane-ID':laneID}));
-   if(response.status!==204||response.headers.get('X-Up-Ack')!==sequence)throw diagnosticException(new Error('lane uplink rejected'),{httpStatus:response.status});
+   if(!current(generation))return;
+   if(response.status!==204)throw diagnosticException(transportError('lane uplink rejected'),{httpStatus:response.status});
+   if(response.headers.get('X-Up-Ack')!==sequence)throw new Error('lane uplink rejected');
    release(batch.total,batch.count);port.postMessage({t:'traffic',up:batch.total,down:0});lane.sequence++;
    if(!lane.polling)pollLane(lane);
   }
- }catch(error){fail('lane_up',error,lane.id)}finally{lane.running=false;if(!closed&&sessionToken&&lane.pending.length)runLaneUp(lane)}
+ }catch(error){if(current(generation))fail('lane_up',error,lane.id)}finally{lane.running=false;if(current(generation)&&sessionToken&&lane.pending.length)runLaneUp(lane)}
 }
 async function pollLane(lane){
  if(!lane||lane.polling)return;lane.polling=true;
+ const generation=epoch;
  try{
   while(!closed&&sessionToken&&lanes.get(lane.id)===lane){
    const controller=new AbortController(),laneID=String(lane.id);lane.controller=controller;
    const response=await request('/api/v1/down',()=>options('POST',sessionToken,null,{'X-Down-Cursor':lane.cursor,'X-Lane-ID':laneID},controller.signal));
+   if(!current(generation))return;
    if(response.status===204){if(response.headers.get('X-Lane-Closed')==='1'){finishLane(lane);return}status('connected');continue}
-   if(response.status!==200)throw diagnosticException(new Error('lane downlink rejected'),{httpStatus:response.status});
+   if(response.status!==200)throw diagnosticException(transportError('lane downlink rejected'),{httpStatus:response.status});
    const next=response.headers.get('X-Down-Cursor')||'',data=response.body,frames=splitFrames(data);
    if(!next||!frames.length)throw new Error('invalid lane downlink response');
    for(const frame of frames)if(frame.id!==lane.id)throw new Error('cross-lane frame');
-   if(closed)return;port.postMessage({t:'traffic',up:0,down:data.byteLength});port.postMessage(data,[data]);lane.cursor=next;status('connected');
+   deliver(data);lane.cursor=next;status('connected');
   }
- }catch(error){if(!closed)fail('lane_down',error,lane.id)}finally{lane.polling=false;lane.controller=null}
+ }catch(error){if(current(generation))fail('lane_down',error,lane.id)}finally{lane.polling=false;lane.controller=null}
 }
 function deleteSession(){if(sessionToken)fetch(relayOrigin+'/api/v1/session',options('DELETE',sessionToken,null,null,undefined,true)).then(cancelResponse).catch(()=>{})}
 function close(notifyServer){
- if(closed)return;closed=true;lifecycleController.abort();if(pollController)pollController.abort();
+ if(closed)return;closed=true;lifecycleController.abort();epochController.abort();if(recoveryTimer)clearTimeout(recoveryTimer);if(pollController)pollController.abort();
  for(const lane of lanes.values())if(lane.controller)lane.controller.abort();
  if(notifyServer)deleteSession();beforeSession.length=0;upPending.length=0;
  for(const lane of lanes.values())lane.pending.length=0;lanes.clear();queuedBytes=0;queuedItems=0;if(port)port.close();
@@ -678,10 +722,14 @@ function close(notifyServer){
 function activatePort(nextPort){
  initialized=true;port=nextPort;
  port.onmessage=message=>{
+  if(closed)return;
   if(message.data instanceof ArrayBuffer){
    if(!createStarted){if(message.data.byteLength>64){fail('hello_size');return}createStarted=true;createSession(message.data)}
-   else if(!sessionToken){try{splitFrames(message.data)}catch(error){fail('pre_session_frames',error);return}if(!reserve(message.data)){fail('pre_session_capacity');return}beforeSession.push(message.data)}
-   else queueCarrier(message.data);
+   else{
+    let data;try{data=acceptNative(message.data)}catch(error){terminalFailure('native_frames',error);return}if(!data.byteLength)return;
+    if(!sessionToken||recovering){if(!reserve(data)){terminalFailure('pre_session_capacity');return}beforeSession.push(data)}
+    else queueCarrier(data);
+   }
   }else if(message.data&&message.data.t==='close')close(true);
  };
  port.start();status('connecting');

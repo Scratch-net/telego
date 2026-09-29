@@ -299,6 +299,11 @@ The `--web-host` value must match `[web-proxy].hostname` and the TLS certificate
 
 Read the [native WEB proxy setup guide](docs/web-proxy.md) for the complete Nginx configuration, Docker setup, and rollback procedure.
 
+The optional `[web-proxy].base-path` serves WEB under a path on the existing HTTPS port.
+For example, `base-path = "telegram/test"` supports a separate instance at `/telegram/test/`.
+Use `--web-base-path telegram/test` with `--web-host` to generate compatible links.
+An empty base path keeps existing root links unchanged. Path links require a Telegram client with WEB base-path support.
+
 For a new VPS, use the [quick managed install](#quick-managed-install). The installer can also disable WEB or select a separate MTProxy port.
 
 Read the [gateway guide](examples/gateway/README.md) for full instructions.
@@ -417,10 +422,11 @@ telego run       Start the proxy server
   -b, --bind     Override bind address
   -l, --link     Print Telegram proxy links on startup (both ee and dd)
 
-telego generate <mask-host> [--web-host <hostname>]
+telego generate <mask-host> [--web-host <hostname>] [--web-base-path <path>]
                              Generate a new secret
                              Print ee (FakeTLS) and dd (raw) MTProxy links
   --web-host <hostname>      Print plain and dd WEB proxy links
+  --web-base-path <path>     Bind WEB links to a path; requires --web-host
 
 telego version   Show version information
 ```

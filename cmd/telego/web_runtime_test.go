@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"io"
 	"net"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -136,6 +139,26 @@ func TestBuildWebProxyLinks(t *testing.T) {
 	}
 	if links.HTTPS != "https://t.me/webproxy?server=proxy.example.com&secret=dd0123456789abcdef0123456789abcdef" {
 		t.Fatalf("HTTPS link = %q", links.HTTPS)
+	}
+}
+
+func TestWebProxyPathLinks(t *testing.T) {
+	profiles, err := webproxy.DeriveProfilesForPath("test", "proxy.example.com", "Trial/web", []byte("0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, profile := range profiles {
+		links := buildWebProxyProfileLinks("proxy.example.com", "Trial/web", profile)
+		for _, link := range []string{links.Telegram, links.HTTPS} {
+			parsed, err := url.Parse(link)
+			if err != nil || parsed.Query().Get("server") != "proxy.example.com/Trial/web" {
+				t.Fatalf("invalid path link: %q, %v", link, err)
+			}
+			secret, err := base64.RawURLEncoding.DecodeString(parsed.Query().Get("secret"))
+			if err != nil || !bytes.Equal(secret, append([]byte{0x70}, profile.SecretBytes()...)) {
+				t.Fatalf("invalid path marker: %x, %v", secret, err)
+			}
+		}
 	}
 }
 

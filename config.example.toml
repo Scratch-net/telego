@@ -115,6 +115,11 @@ carrier = "websocket-lanes"
 # port, path, or trailing dot. This value is required when WEB is enabled.
 # hostname = "proxy.example.com"
 
+# Optional path shared by the bridge and all carrier endpoints. Empty uses root.
+# Use slash-separated [A-Za-z0-9][A-Za-z0-9_-]* segments, up to 128 characters.
+# Do not include a leading or trailing slash. A change requires new client links.
+# base-path = "telegram/test"
+
 # Private HTTP/1.1 listener for Nginx. The default is safe for Nginx on the
 # same host. For Docker, use 0.0.0.0:8080 and expose it only on a private network.
 # bind-to = "127.0.0.1:8080"

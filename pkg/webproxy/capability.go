@@ -115,8 +115,16 @@ func (p Profile) Capability() Capability { return p.capability }
 // DeriveProfiles creates the plain and dd WEB credentials for an existing
 // Telego 16-byte base secret. The returned order is always plain, then dd.
 func DeriveProfiles(name, hostname string, baseSecret []byte) ([2]Profile, error) {
+	return DeriveProfilesForPath(name, hostname, "", baseSecret)
+}
+
+// DeriveProfilesForPath binds both credentials to one canonical WEB base path.
+func DeriveProfilesForPath(name, hostname, basePath string, baseSecret []byte) ([2]Profile, error) {
 	var profiles [2]Profile
 	if err := ValidateHostname(hostname); err != nil {
+		return profiles, err
+	}
+	if err := ValidateBasePath(basePath); err != nil {
 		return profiles, err
 	}
 	if len(baseSecret) != baseSecretSize {
@@ -128,7 +136,7 @@ func DeriveProfiles(name, hostname string, baseSecret []byte) ([2]Profile, error
 	copy(ddSecret[1:], baseSecret)
 	profiles[1] = newProfile(name, SecretDD, ddSecret[:])
 	for i := range profiles {
-		profiles[i].capability = deriveCapability(hostname, profiles[i].secret[:profiles[i].secretSize])
+		profiles[i].capability = deriveCapability(hostname, basePath, profiles[i].secret[:profiles[i].secretSize])
 	}
 	return profiles, nil
 }
@@ -145,21 +153,55 @@ func newProfile(name string, mode SecretMode, secret []byte) Profile {
 // DeriveCapability derives a bridge capability from a canonical hostname and a
 // decoded 16-byte plain or 17-byte dd-prefixed secret.
 func DeriveCapability(hostname string, secret []byte) (Capability, error) {
+	return DeriveCapabilityForPath(hostname, "", secret)
+}
+
+// DeriveCapabilityForPath uses v1 at the root and v2 for a nonempty base path.
+func DeriveCapabilityForPath(hostname, basePath string, secret []byte) (Capability, error) {
 	if err := ValidateHostname(hostname); err != nil {
+		return Capability{}, err
+	}
+	if err := ValidateBasePath(basePath); err != nil {
 		return Capability{}, err
 	}
 	if len(secret) != baseSecretSize && (len(secret) != ddSecretSize || secret[0] != ddSecretPrefix) {
 		return Capability{}, fmt.Errorf("%w: expected 16 bytes or 17 bytes prefixed with dd", ErrInvalidSecret)
 	}
-	return deriveCapability(hostname, secret), nil
+	return deriveCapability(hostname, basePath, secret), nil
 }
 
-func deriveCapability(hostname string, secret []byte) Capability {
+func deriveCapability(hostname, basePath string, secret []byte) Capability {
 	mac := hmac.New(sha256.New, secret)
-	_, _ = mac.Write([]byte(capabilityContext + hostname))
+	context := capabilityContext + hostname
+	if basePath != "" {
+		context = "tdesktop-web-proxy-bridge-v2\n" + hostname + "\n" + basePath
+	}
+	_, _ = mac.Write([]byte(context))
 	var capability Capability
 	copy(capability[:], mac.Sum(nil))
 	return capability
+}
+
+// ValidateBasePath rejects aliases instead of normalizing a credential scope.
+func ValidateBasePath(basePath string) error {
+	if basePath == "" {
+		return nil
+	}
+	if len(basePath) > 128 {
+		return errors.New("WEB base path exceeds 128 characters")
+	}
+	for segment := range strings.SplitSeq(basePath, "/") {
+		if segment == "" {
+			return errors.New("WEB base path contains an empty segment")
+		}
+		for i, character := range segment {
+			alphanumeric := character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9'
+			if !alphanumeric && (i == 0 || character != '-' && character != '_') {
+				return errors.New("WEB base path segments must match [A-Za-z0-9][A-Za-z0-9_-]*")
+			}
+		}
+	}
+	return nil
 }
 
 // ValidateHostname requires the already-canonical hostname spelling used in

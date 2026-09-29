@@ -135,6 +135,7 @@ type WebProxyConfig struct {
 	Enabled           bool     `toml:"enabled"`
 	BindTo            string   `toml:"bind-to"`
 	Hostname          string   `toml:"hostname"`
+	BasePath          string   `toml:"base-path"`
 	Backend           string   `toml:"backend"`
 	Carrier           string   `toml:"carrier"`
 	TrustedProxyCIDRs []string `toml:"trusted-proxy-cidrs"`
@@ -163,6 +164,7 @@ type WebProxyRuntimeConfig struct {
 	Enabled              bool
 	BindAddr             string
 	Hostname             string
+	BasePath             string
 	Backend              string
 	LogicalBackend       bool
 	MTProxyAddr          net.Addr
@@ -358,6 +360,9 @@ func (c *Config) ToWebProxyRuntimeConfig(mtProxyBind string) (WebProxyRuntimeCon
 	if err := webproxy.ValidateHostname(hostname); err != nil {
 		return WebProxyRuntimeConfig{}, fmt.Errorf("invalid web-proxy.hostname: %w", err)
 	}
+	if err := webproxy.ValidateBasePath(c.WebProxy.BasePath); err != nil {
+		return WebProxyRuntimeConfig{}, fmt.Errorf("invalid web-proxy.base-path: %w", err)
+	}
 	if c.WebProxy.NumEventLoops < 0 {
 		return WebProxyRuntimeConfig{}, errors.New("web-proxy.num-event-loops cannot be negative")
 	}
@@ -405,7 +410,7 @@ func (c *Config) ToWebProxyRuntimeConfig(mtProxyBind string) (WebProxyRuntimeCon
 		if err != nil {
 			return WebProxyRuntimeConfig{}, fmt.Errorf("invalid secret %q for WEB proxy: %w", name, err)
 		}
-		derived, err := webproxy.DeriveProfiles(name, hostname, key)
+		derived, err := webproxy.DeriveProfilesForPath(name, hostname, c.WebProxy.BasePath, key)
 		if err != nil {
 			return WebProxyRuntimeConfig{}, fmt.Errorf("derive WEB profiles for secret %q: %w", name, err)
 		}
@@ -425,6 +430,7 @@ func (c *Config) ToWebProxyRuntimeConfig(mtProxyBind string) (WebProxyRuntimeCon
 		Enabled:              true,
 		BindAddr:             bindAddr,
 		Hostname:             hostname,
+		BasePath:             c.WebProxy.BasePath,
 		Backend:              backend,
 		LogicalBackend:       logicalBackend,
 		MTProxyAddr:          listenerAddr,
@@ -463,10 +469,11 @@ func (c *Config) webProxyFingerprint() string {
 	}
 	trusted := strings.Join(c.WebProxy.TrustedProxyCIDRs, ",")
 	return fmt.Sprintf(
-		"enabled=%t\x00bind=%s\x00hostname=%s\x00backend=%s\x00carrier=%s\x00trusted=%s\x00loops=%d",
+		"enabled=%t\x00bind=%s\x00hostname=%s\x00base-path=%s\x00backend=%s\x00carrier=%s\x00trusted=%s\x00loops=%d",
 		c.WebProxy.Enabled,
 		c.WebProxy.BindTo,
 		c.WebProxy.Hostname,
+		c.WebProxy.BasePath,
 		c.WebProxy.Backend,
 		c.WebProxy.Carrier,
 		trusted,

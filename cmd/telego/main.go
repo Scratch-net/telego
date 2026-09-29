@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
@@ -109,7 +110,7 @@ func (c *RunCmd) Run() error {
 			log.Warn().Err(err).Msg("failed to generate Telegram links")
 		}
 		if webRuntimeConfig.Enabled {
-			printWebProxyLinks(webRuntimeConfig.Hostname, webRuntimeConfig.Profiles)
+			printWebProxyLinks(webRuntimeConfig.Hostname, webRuntimeConfig.BasePath, webRuntimeConfig.Profiles)
 		}
 	}
 
@@ -377,9 +378,17 @@ func buildWebProxyLinks(hostname, secret string) webProxyLinks {
 	}
 }
 
-func printWebProxyLinks(hostname string, profiles []webproxy.Profile) {
+func buildWebProxyProfileLinks(hostname, basePath string, profile webproxy.Profile) webProxyLinks {
+	if basePath == "" {
+		return buildWebProxyLinks(hostname, profile.SecretHex())
+	}
+	marked := append([]byte{0x70}, profile.SecretBytes()...)
+	return buildWebProxyLinks(hostname+"/"+basePath, base64.RawURLEncoding.EncodeToString(marked))
+}
+
+func printWebProxyLinks(hostname, basePath string, profiles []webproxy.Profile) {
 	for _, profile := range profiles {
-		links := buildWebProxyLinks(hostname, profile.SecretHex())
+		links := buildWebProxyProfileLinks(hostname, basePath, profile)
 		log.Info().
 			Str("name", profile.Name()).
 			Str("mode", profile.Mode().String()).
@@ -426,13 +435,17 @@ func getPublicIP() (string, error) {
 
 // GenerateCmd generates a new secret key.
 type GenerateCmd struct {
-	Host    string `arg:"" help:"FakeTLS mask hostname (e.g., www.google.com)"`
-	WebHost string `name:"web-host" help:"Public WEB proxy hostname; print WEB proxy links"`
+	Host        string `arg:"" help:"FakeTLS mask hostname (e.g., www.google.com)"`
+	WebHost     string `name:"web-host" help:"Public WEB proxy hostname; print WEB proxy links"`
+	WebBasePath string `name:"web-base-path" help:"WEB path without leading or trailing slash; requires --web-host"`
 }
 
 func (c *GenerateCmd) Run() error {
 	if c.Host == "" {
 		return fmt.Errorf("hostname required")
+	}
+	if c.WebBasePath != "" && c.WebHost == "" {
+		return fmt.Errorf("--web-base-path requires --web-host")
 	}
 
 	keyHex, err := config.GenerateKey()
@@ -449,7 +462,7 @@ func (c *GenerateCmd) Run() error {
 
 	var webProfiles [2]webproxy.Profile
 	if c.WebHost != "" {
-		webProfiles, err = webproxy.DeriveProfiles("generated", c.WebHost, key)
+		webProfiles, err = webproxy.DeriveProfilesForPath("generated", c.WebHost, c.WebBasePath, key)
 		if err != nil {
 			return fmt.Errorf("--web-host: %w", err)
 		}
@@ -461,7 +474,7 @@ func (c *GenerateCmd) Run() error {
 		Str("dd_link", "tg://proxy?server=YOUR_IP&port=443&secret="+ddSecret).
 		Msg("generated secret (use ee for FakeTLS, dd for raw)")
 	if c.WebHost != "" {
-		printWebProxyLinks(c.WebHost, webProfiles[:])
+		printWebProxyLinks(c.WebHost, c.WebBasePath, webProfiles[:])
 	}
 
 	return nil

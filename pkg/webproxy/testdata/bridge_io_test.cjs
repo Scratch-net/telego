@@ -32,10 +32,11 @@ function harness(carrier, smallBatch = false, diagnostics = true) {
     send(data) { assert.equal(this.readyState, Socket.OPEN); this.sent.push(data); }
   }
   const sandbox = {
-    ArrayBuffer, Uint8Array, DataView, AbortController, DOMException, URL,
+    ArrayBuffer, Uint8Array, DataView, AbortController, DOMException, URL, TextDecoder,
+    performance: { now() { return now; } },
     Date: class extends Date { static now() { return now; } },
     WebSocket: Socket, queueMicrotask,
-    location: { hash: '', pathname: '/' }, history: { replaceState() {} }, parent: {},
+    location: { hash: '', pathname: '/', search: '?bridge=' + 'A'.repeat(43) }, history: { replaceState() {} }, parent: {},
     addEventListener(name, callback) { events.set(name, callback); },
     setTimeout(callback, delay) { const id = ++nextTimer; timers.set(id, { at: now + delay, callback }); return id; },
     clearTimeout(id) { timers.delete(id); },
@@ -50,8 +51,8 @@ function harness(carrier, smallBatch = false, diagnostics = true) {
   };
   // Expose existing functions only inside the test VM. Production exports stay unchanged.
   const hooks = `
-globalThis.bridgeTest={request,options,close,createSession,activatePort,poll,pollLane,ensureLane,fail,
-  state:()=>({closed,sessionToken,queuedBytes,queuedItems,lanes,downCursor}),
+globalThis.bridgeTest={request,options,close,createSession,activatePort,poll,pollLane,ensureLane,fail,beginRecovery,
+  state:()=>({closed,sessionToken,queuedBytes,queuedItems,lanes,downCursor,recovering,epoch,activeStreams,welcomed}),
   signal:lifecycleController.signal,
   setSession:()=>{sessionToken='test-token';port=globalThis.testPort},
   ${carrier.startsWith('websocket') ? 'openWebSocket,queueWebSocketLane,' : ''}
@@ -71,6 +72,7 @@ globalThis.bridgeTest={request,options,close,createSession,activatePort,poll,pol
       await flush();
     },
     pagehide() { events.get('pagehide')(); },
+    online() { events.get('online')(); },
   };
   return h;
 }
@@ -102,6 +104,145 @@ function dataFrame(id, size = 1) {
   const data = new ArrayBuffer(8 + size), view = new DataView(data);
   view.setUint32(0, 0x02000000 | id); view.setUint32(4, size);
   return new Uint8Array(data);
+}
+
+function nativeFrame(h, id, type = 1) {
+  const data = type === 2 ? dataFrame(id).buffer : new ArrayBuffer(8);
+  if (type !== 2) new DataView(data).setUint32(0, (type << 24) | id);
+  h.sandbox.testPort.onmessage({ data });
+  return data;
+}
+
+function parked(options) {
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(new DOMException('aborted', 'AbortError'));
+    options.signal.addEventListener('abort', abort, { once: true });
+    if (options.signal.aborted) abort();
+  });
+}
+
+async function liveBridge(carrier, diagnostics = false) {
+  const h = harness(carrier, false, diagnostics);
+  let sessions = 0;
+  h.recoveryResponse = () => new Response(JSON.stringify({ version: 1, bootstrap: 'B'.repeat(43), carrier, batch: batchLimit, streams: 128 }), {
+    headers: { 'Content-Type': 'application/vnd.telego.web-recovery+json' },
+  });
+  h.sandbox.respond = async (url, options) => {
+    if (url.includes('/?bridge=')) return h.recoveryResponse();
+    if (url.endsWith('/api/v1/session')) {
+      const welcome = new Uint8Array(8); welcome[0] = 17;
+      return new Response(welcome, { headers: { 'X-Carrier-Mode': carrier, 'X-Session-Token': (++sessions === 1 ? 'C' : 'D').repeat(43) } });
+    }
+    if (url.endsWith('/api/v1/up')) return new Response(null, { status: 204, headers: { 'X-Up-Ack': options.headers['X-Up-Seq'] } });
+    return parked(options);
+  };
+  h.api.activatePort(h.sandbox.testPort);
+  const hello = new ArrayBuffer(9); new DataView(hello).setUint32(0, 0x10000000); new DataView(hello).setUint32(4, 1);
+  h.sandbox.testPort.onmessage({ data: hello }); await flush();
+  if (carrier === 'websocket') { h.sockets[0].open(); await flush(); }
+  assert.equal(h.api.state().welcomed, true);
+  return h;
+}
+
+for (const carrier of carriers) {
+  for (const diagnostics of [false, true]) {
+    test(carrier + ': recovery retires old streams, fences late callbacks, and sends WELCOME only once; diagnostics=' + diagnostics, async () => {
+      const h = await liveBridge(carrier, diagnostics);
+      nativeFrame(h, 1); await flush();
+      if (carrier === 'websocket-lanes') { h.sockets[0].open(); await flush(); }
+      const oldSockets = [...h.sockets];
+      let resume;
+      const respond = h.sandbox.respond;
+      h.sandbox.respond = (url, options) => url.includes('/?bridge=') ? new Promise(resolve => { resume = resolve; }) : respond(url, options);
+      const before = h.requests.length;
+      h.api.fail('down_poll', Object.assign(new Error('downlink rejected'), { recoverable: true })); await flush();
+      h.api.beginRecovery(); h.online();
+      assert.equal(h.api.state().recovering, true);
+      assert.equal(h.api.state().closed, false);
+      assert.equal(h.requests.slice(before).filter(r => r.url.includes('/?bridge=')).length, 1, 'concurrent triggers share one recovery');
+      const close = h.messages.filter(value => value instanceof ArrayBuffer && new DataView(value).getUint32(0) === 0x03000001);
+      assert.equal(close.length, 1);
+      nativeFrame(h, 1, 2); nativeFrame(h, 1, 3); nativeFrame(h, 2);
+      for (const socket of oldSockets) { socket.emit('close'); socket.emit('message', dataFrame(1).buffer); }
+      resume(h.recoveryResponse()); await flush();
+      for (const socket of h.sockets.filter(s => !oldSockets.includes(s))) socket.open();
+      await flush();
+      assert.equal(h.api.state().recovering, false);
+      assert.equal(h.api.state().closed, false);
+      assert.equal(h.messages.filter(value => value instanceof ArrayBuffer && new DataView(value).getUint8(0) === 17).length, 1);
+      assert.equal(h.messages.some(value => value.t === 'close' || value.state === 'failed'), false);
+      assert.equal(h.api.state().activeStreams.has(1), false);
+      assert.equal(h.api.state().activeStreams.has(2), true);
+      assert.equal(h.api.state().queuedBytes, 0);
+      const newBatches = h.requests.slice(before).filter(r => r.url.endsWith('/api/v1/up')).map(r => r.options.body);
+      for (const socket of h.sockets.filter(s => !oldSockets.includes(s))) newBatches.push(...socket.sent);
+      assert.ok(newBatches.length);
+      for (const batch of newBatches) assert.equal(new DataView(batch).getUint32(0), 0x01000002, 'only replacement OPEN crosses the new session');
+      h.pagehide(); await flush(); assertClean(h);
+    });
+  }
+
+  test(carrier + ': stalled recovery has one 15-second deadline and page shutdown releases it', async () => {
+    const h = await liveBridge(carrier);
+    h.sandbox.respond = (url, options) => parked(options);
+    h.api.beginRecovery(); await flush();
+    await h.advance(15000);
+    assert.equal(h.api.state().closed, true);
+    assert.equal(h.messages.filter(value => value.t === 'close').length, 1);
+    assertClean(h);
+  });
+
+  test(carrier + ': delayed recovery response cannot outrun its wall-clock deadline', async () => {
+    const h = await liveBridge(carrier); let resume;
+    h.sandbox.respond = () => new Promise(resolve => { resume = resolve; });
+    h.api.beginRecovery(); await flush(); await h.advance(15000, false);
+    resume(h.recoveryResponse()); await flush();
+    assert.equal(h.api.state().closed, true);
+    assertClean(h);
+  });
+
+  test(carrier + ': shutdown while recovering cancels requests and ignores late completion', async () => {
+    const h = await liveBridge(carrier); let resume;
+    h.sandbox.respond = () => new Promise(resolve => { resume = resolve; });
+    h.api.beginRecovery(); await flush(); h.pagehide();
+    const before = h.messages.length;
+    resume(h.recoveryResponse()); await flush();
+    assert.equal(h.messages.length, before);
+    assertClean(h);
+  });
+}
+
+test('replacement WebSocket failure retries within one deadline and its late close cannot retire the successor', async () => {
+  const h = await liveBridge('websocket');
+  h.api.beginRecovery(); await flush();
+  const failed = h.sockets[1]; failed.emit('error'); await flush();
+  assert.equal(h.api.state().closed, false);
+  assert.equal(h.api.state().recovering, true);
+  await h.advance(250);
+  const successor = h.sockets[2]; successor.open(); await flush();
+  failed.emit('close'); failed.open(); failed.emit('message', dataFrame(1).buffer); await flush();
+  assert.equal(h.api.state().closed, false);
+  assert.equal(h.api.state().recovering, false);
+  assert.equal(successor.closeCalls, 0);
+  assert.equal(h.requests.filter(r => r.url.includes('/?bridge=')).length, 2);
+  h.pagehide(); await flush(); assertClean(h);
+});
+
+for (const status of [408, 429, 502, 503, 504]) {
+  test('recovery retries temporary gateway status ' + status + ' within the original deadline', async () => {
+    const h = await liveBridge('websocket-lanes'), respond = h.sandbox.respond;
+    let failures = 1;
+    h.sandbox.respond = (url, options) => url.includes('/?bridge=') && failures-- > 0 ?
+      Promise.resolve(new Response(null, { status, headers: { 'Retry-After': '1' } })) : respond(url, options);
+    h.api.beginRecovery(); await flush();
+    assert.equal(h.api.state().recovering, true);
+    assert.equal(h.api.state().closed, false);
+    await h.advance(1000);
+    assert.equal(h.api.state().recovering, false);
+    assert.equal(h.api.state().closed, false);
+    assert.equal(h.requests.filter(r => r.url.includes('/?bridge=')).length, 2);
+    h.pagehide(); await flush(); assertClean(h);
+  });
 }
 
 for (const carrier of carriers) {
@@ -395,6 +536,28 @@ test('established WebSocket lane closure preserves its healthy sibling', async (
 });
 
 for (const diagnostics of [false, true]) {
+  test('diagnostics=' + diagnostics + ': CLOSE cancels a pending lane without waiting for socket events', async () => {
+    const h = harness('websocket-lanes', false, diagnostics); h.api.setSession();
+    const queue = (id, type) => {
+      const data = new ArrayBuffer(8); new DataView(data).setUint32(0, (type << 24) | id);
+      h.api.queueWebSocketLane({ id, type, data });
+    };
+    queue(1, 1); queue(1, 3); await flush();
+    assert.equal(h.api.state().closed, false);
+    assert.equal(h.api.state().lanes.size, 0);
+    assert.equal(h.api.state().queuedBytes, 0);
+    assert.equal(h.api.state().queuedItems, 0);
+    assertClean(h);
+    const messages = h.messages.length;
+    h.sockets[0].open(); h.sockets[0].emit('error'); h.sockets[0].emit('close'); await flush();
+    assert.equal(h.messages.length, messages);
+    assert.equal(h.sockets[0].sent.length, 0);
+    queue(2, 1); h.sockets[1].open(); await flush();
+    assert.equal(h.sockets[1].sent.length, 1);
+    assert.equal(h.requests.length, 0);
+    h.pagehide(); await flush(); assertClean(h);
+  });
+
   for (const failure of ['error', 'close', 'timeout']) {
     test('diagnostics=' + diagnostics + ': lane opening ' + failure + ' preserves established traffic and permits a replacement', async () => {
       const h = harness('websocket-lanes', false, diagnostics); h.api.setSession();

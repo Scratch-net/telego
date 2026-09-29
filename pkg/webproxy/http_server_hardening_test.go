@@ -29,7 +29,7 @@ func TestHTTPServerFallbackClassesAndBridgeCookie(t *testing.T) {
 		body    []byte
 		headers map[string]string
 	}{
-		"ordinary query":                    {method: "GET", path: "/public?bridge=" + capability + "&site=1"},
+		"ordinary query":                    {method: "GET", path: "/public?bridge=site-value&site=1"},
 		"ordinary cookie":                   {method: "GET", path: "/", headers: map[string]string{"Cookie": "site=value"}},
 		"ordinary body":                     {method: "POST", path: "/submit?site=1", body: []byte("site-body"), headers: map[string]string{"Content-Type": "application/x-www-form-urlencoded", "Cookie": "site=value", "X-Site": "kept"}},
 		"ordinary Basic":                    {method: "GET", path: "/private", headers: map[string]string{"Authorization": "Basic Zm9vOmJhcg=="}},
@@ -50,8 +50,9 @@ func TestHTTPServerFallbackClassesAndBridgeCookie(t *testing.T) {
 		path    string
 		headers map[string]string
 	}{
-		"root bridge parameter":                    {path: "/?site=1&bridge=" + capability},
-		"arbitrary path reserved carrier metadata": {path: "/downloads/archive?site=1", headers: map[string]string{"Authorization": "Bearer " + unknown, "X-Down-Cursor": "0"}},
+		"root bridge parameter":                      {path: "/?site=1&bridge=" + capability},
+		"recognized bridge capability on wrong path": {path: "/public?bridge=" + capability + "&site=1"},
+		"arbitrary path reserved carrier metadata":   {path: "/downloads/archive?site=1", headers: map[string]string{"Authorization": "Bearer " + unknown, "X-Down-Cursor": "0"}},
 		"API cookie": {path: "/api/v1/down", headers: map[string]string{"Authorization": "Bearer " + unknown, "X-Down-Cursor": "0", "Cookie": "secret=value"}},
 	} {
 		t.Run(name, func(t *testing.T) {

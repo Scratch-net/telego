@@ -776,6 +776,7 @@ enabled = true
 bind-to = "127.0.0.1:9080"
 hostname = "proxy.example.com"
 carrier = "https-lanes"
+base-path = "Trial/web"
 trusted-proxy-cidrs = ["127.0.0.1/32"]
 num-event-loops = 2
 `
@@ -808,6 +809,18 @@ num-event-loops = 2
 	}
 	if len(runtime.Profiles) != 2 {
 		t.Fatalf("profiles = %d, want 2", len(runtime.Profiles))
+	}
+	if runtime.BasePath != "Trial/web" {
+		t.Fatalf("base path = %q", runtime.BasePath)
+	}
+	wantCapability, err := webproxy.DeriveCapabilityForPath(runtime.Hostname, runtime.BasePath, runtime.Profiles[0].SecretBytes())
+	if err != nil || !runtime.Profiles[0].Capability().Equal(wantCapability) {
+		t.Fatalf("runtime capability does not bind to base path: %v", err)
+	}
+	fingerprint := cfg.webProxyFingerprint()
+	cfg.WebProxy.BasePath = "changed"
+	if fingerprint == cfg.webProxyFingerprint() {
+		t.Fatal("base path change omitted from restart fingerprint")
 	}
 	if runtime.Profiles[0].Name() != "alice" || runtime.Profiles[0].Mode() != webproxy.SecretPlain ||
 		runtime.Profiles[0].SecretHex() != "0123456789abcdef0123456789abcdef" {
@@ -1194,6 +1207,7 @@ func TestWebProxyConfigRequiresExplicitValuesWhenNotDerivable(t *testing.T) {
 	}{
 		{name: "hostname", bind: "0.0.0.0:443", wantErr: "web-proxy.hostname is required"},
 		{name: "canonical hostname", bind: "0.0.0.0:443", mutate: func(c *Config) { c.WebProxy.Hostname = "Proxy.Example.com" }, wantErr: "invalid web-proxy.hostname"},
+		{name: "canonical base path", bind: "0.0.0.0:443", mutate: func(c *Config) { c.WebProxy.Hostname = "proxy.example.com"; c.WebProxy.BasePath = "/test/" }, wantErr: "invalid web-proxy.base-path"},
 		{name: "event loops", bind: "0.0.0.0:443", mutate: func(c *Config) { c.WebProxy.Hostname = "proxy.example.com"; c.WebProxy.NumEventLoops = -1 }, wantErr: "cannot be negative"},
 		{name: "carrier", bind: "0.0.0.0:443", mutate: func(c *Config) { c.WebProxy.Hostname = "proxy.example.com"; c.WebProxy.Carrier = "quic" }, wantErr: "unsupported WEB carrier mode"},
 		{name: "nonlocal explicit backend", bind: "192.0.2.1:443", mutate: func(c *Config) {

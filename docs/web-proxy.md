@@ -243,7 +243,21 @@ In `websocket` mode, the carrier opens one same-host `wss` connection. In `webso
 
 If a new WebSocket lane fails to open while another lane remains open, the bridge closes only the failed stream.
 Telegram can replace that stream while existing lanes continue to carry traffic.
-If no other lane remains open, the bridge reports failure so Telegram can recreate it.
+If the client closes a lane before its WebSocket opens, the bridge cancels that socket and releases its queued data immediately.
+
+After an established session loses its carrier, the bridge can obtain a new bootstrap without replacing the page.
+This also works after a server restart. The bridge closes the retired streams and discards their queued data.
+Telegram opens replacement streams. The bridge does not replay old data or send a second `WELCOME`.
+
+Each recovery attempt has a 15-second total limit, including requests, retries, and WebSocket setup.
+Concurrent failures use the same attempt. Page closure cancels the attempt.
+An online or visible-page event can start recovery after 30 seconds without stream activity.
+If recovery fails or the carrier configuration changes, the bridge reports failure so Telegram can recreate it.
+Recovery uses the configured carrier. It does not automatically select another carrier.
+
+The recovery request uses the bridge capability and an optional previous session bearer.
+A bearer that belongs to another profile cannot retire that session.
+Recovery responses have a 1 KiB limit and use `Cache-Control: no-store`.
 
 The WebSocket target is `wss://<WEB host>/api/v1/ws`. The bridge sends the bearer credential in `Sec-WebSocket-Protocol`.
 
@@ -494,6 +508,49 @@ telego generate proxy.example.com --web-host proxy.example.com
 The positional hostname is the FakeTLS mask hostname. The `--web-host` value is the public WEB proxy hostname.
 
 The `--web-host` value must match `[web-proxy].hostname` and the TLS certificate in Nginx.
+
+### Serve WEB under a path
+
+The optional `base-path` places the bridge and all carrier endpoints under one path on the existing HTTPS port:
+
+```toml
+[web-proxy]
+enabled = true
+hostname = "proxy.example.com"
+base-path = "telegram/test"
+bind-to = "127.0.0.1:8084"
+carrier = "websocket-lanes"
+trusted-proxy-cidrs = ["127.0.0.1/32"]
+```
+
+The bridge URL starts with `/telegram/test/`. The session endpoint becomes `/telegram/test/api/v1/session`.
+Paths are case-sensitive. Each segment must match `[A-Za-z0-9][A-Za-z0-9_-]*`, and the complete value cannot exceed 128 characters.
+Leading slashes, trailing slashes, empty segments, dot segments, and percent escapes are invalid.
+The server does not redirect aliases.
+
+An empty or absent `base-path` keeps the existing root URLs and credentials.
+A nonempty path uses the Telegram v2 capability context, which binds the credential to the hostname and path.
+A path change requires new client links and a service restart.
+
+For a separate instance, give that instance a private native listener, WEB listener, metrics listener, and secret.
+In the existing TLS server block, copy the WEB `location /` block to `location ^~ /telegram/test/`.
+Change its upstream to the private WEB listener of the separate instance.
+Keep both fallback handlers and all proxy headers from the original block.
+Use `proxy_pass http://127.0.0.1:8084;` without a URI suffix, so Nginx preserves the complete path.
+Do not strip the prefix or add a trailing slash to `proxy_pass`.
+Run `nginx -t` before you reload Nginx.
+
+For new secrets, generate path links with:
+
+```bash
+telego generate proxy.example.com --web-host proxy.example.com --web-base-path telegram/test
+```
+
+Path links contain `server=proxy.example.com%2Ftelegram%2Ftest` and a marked, unpadded base64url secret.
+The marker is byte `0x70` before the original secret. Telego adds this marker when it prints path links.
+These links require a Telegram client with WEB base-path support.
+
+### Print links for configured secrets
 
 For configured secrets, add `-l` to the Telego service command. This option prints the links during startup:
 
