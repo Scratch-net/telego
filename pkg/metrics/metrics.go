@@ -4,6 +4,7 @@ package metrics
 import (
 	"context"
 	"math"
+	"net"
 	"net/http"
 	"strconv"
 	"time"
@@ -101,18 +102,18 @@ func NewServer(cfg Config, limiter StatsProvider) (*Server, error) {
 	mux.Handle(path, promhttp.Handler())
 
 	httpServer := &http.Server{
-		Addr:    cfg.BindAddr,
-		Handler: mux,
+		Addr:              cfg.BindAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 3 * time.Second,
+		ReadTimeout:       5 * time.Second,
+		WriteTimeout:      diagnosticsRequestTimeout,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    8 << 10,
 	}
 	var profiles *diagnostics
 	if cfg.Diagnostics {
 		profiles = newDiagnostics()
 		profiles.register(mux)
-		httpServer.ReadHeaderTimeout = 3 * time.Second
-		httpServer.ReadTimeout = 5 * time.Second
-		httpServer.WriteTimeout = diagnosticsRequestTimeout
-		httpServer.IdleTimeout = 30 * time.Second
-		httpServer.MaxHeaderBytes = 8 << 10
 	}
 
 	return &Server{
@@ -803,13 +804,19 @@ func registerMetrics(meter metric.Meter, limiter StatsProvider) {
 	)
 }
 
-// Start starts the metrics HTTP server in a goroutine.
-// Errors during ListenAndServe are silently ignored because metrics are optional.
-// The caller should verify the server is accessible if metrics are required.
+// Start opens the metrics listener and serves HTTP in a goroutine.
+// Listener errors are returned before background serving starts.
 func (s *Server) Start() error {
+	address := s.httpServer.Addr
+	if address == "" {
+		address = ":http"
+	}
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return err
+	}
 	go func() {
-		_ = s.httpServer.ListenAndServe()
-		// Errors ignored: metrics are optional, and ErrServerClosed is expected on shutdown
+		_ = s.httpServer.Serve(listener)
 	}()
 	return nil
 }

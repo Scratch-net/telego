@@ -12,8 +12,44 @@ import (
 	"github.com/panjf2000/gnet/v2"
 	errorx "github.com/panjf2000/gnet/v2/pkg/errors"
 
+	"github.com/scratch-net/telego/pkg/tlsfront"
 	"github.com/scratch-net/telego/pkg/transport/middleend"
 )
+
+func TestLogicalTLSWithEmptyFrontingCachesDoesNotDial(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var attempts atomic.Int32
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			attempts.Add(1)
+			_ = conn.Close()
+		}
+	}()
+	t.Cleanup(func() { _ = listener.Close(); <-done })
+	addr := listener.Addr().(*net.TCPAddr)
+	key := []byte("0123456789abcdef")
+	handler := NewProxyHandler(&Config{
+		Secrets:           []Secret{{Name: "test", Key: key, Host: "example.com"}},
+		TimeSkewTolerance: time.Minute, CertHost: addr.IP.String(), CertPort: addr.Port,
+	}, &testLogger{})
+	t.Cleanup(func() { _ = handler.stopServing() })
+	handler.certFetcher = tlsfront.NewCertFetcher(5, "example.com")
+	handler.serverHelloFetcher = tlsfront.NewServerHelloFetcher(addr.IP.String(), addr.Port)
+	stream := newLogicalTestStream(t, handler, nil)
+	stream.fakeTLSHello(t, key)
+	if got := attempts.Load(); got != 0 {
+		t.Fatalf("handshake made %d network fetches with empty caches", got)
+	}
+}
 
 func TestPreparedFrontingServesLogicalTLSBeforePublicBoot(t *testing.T) {
 	mask := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))

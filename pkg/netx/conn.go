@@ -14,7 +14,9 @@ const (
 	// KeepAliveInterval for TCP keepalive probes.
 	KeepAliveInterval = 30 * time.Second
 
-	// LingerTimeout for graceful close.
+	// LingerTimeout is the former positive linger timeout.
+	//
+	// Deprecated: TuneConn preserves the default background close behavior.
 	LingerTimeout = 3
 )
 
@@ -41,10 +43,8 @@ func TuneConn(conn *net.TCPConn) error {
 		return err
 	}
 
-	// Set linger for graceful close
-	if err := conn.SetLinger(LingerTimeout); err != nil {
-		return err
-	}
+	// Leave SO_LINGER disabled so pending writes drain in the background.
+	// A positive linger timeout can block the caller during Close.
 
 	// Get raw socket for advanced options
 	rawConn, err := conn.SyscallConn()

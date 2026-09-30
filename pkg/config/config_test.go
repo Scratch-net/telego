@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -13,9 +15,187 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pelletier/go-toml/v2"
+
 	"github.com/scratch-net/telego/pkg/dc"
 	"github.com/scratch-net/telego/pkg/webproxy"
 )
+
+func writeConfigTestFile(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestLoadRejectsUnknownFields(t *testing.T) {
+	const privateValue = "value-must-not-appear-in-errors"
+	for _, test := range []struct {
+		name    string
+		content string
+		key     string
+	}{
+		{"limit typo", "[general]\nmax-connection-per-ip = 5\n", "general.max-connection-per-ip"},
+		{"misplaced setting", "[performance]\nmax-connections-per-ip = 5\n", "performance.max-connections-per-ip"},
+		{"unknown top-level setting", "unknown = \"" + privateValue + "\"\n", "unknown"},
+		{"unknown section", "[generla]\n", "generla"},
+		{"disabled section typo", "[web-proxy]\nenabled = false\ntrusted-proxy-cidr = [\"" + privateValue + "\"]\n", "web-proxy.trusted-proxy-cidr"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := Load(writeConfigTestFile(t, test.content))
+			if err == nil || !strings.Contains(err.Error(), test.key) {
+				t.Fatalf("Load error = %v, want unknown field %q", err, test.key)
+			}
+			if strings.Contains(err.Error(), privateValue) {
+				t.Fatal("unknown-field error includes a configuration value")
+			}
+		})
+	}
+}
+
+func TestLoadRejectsDuplicateKeys(t *testing.T) {
+	for _, content := range []string{
+		"[general]\nmax-connections-per-ip = 1\nmax-connections-per-ip = 2\n",
+		"[secrets]\nmain = \"first-private-value\"\nmain = \"second-private-value\"\n",
+	} {
+		_, err := Load(writeConfigTestFile(t, content))
+		if err == nil {
+			t.Fatal("Load accepted a duplicate TOML key")
+		}
+		if strings.Contains(err.Error(), "private-value") {
+			t.Fatal("duplicate-key error includes a configuration value")
+		}
+	}
+}
+
+func TestConfigRejectsInvalidScalars(t *testing.T) {
+	const base = `secrets.test = "0123456789abcdef0123456789abcdef"
+tls-fronting.mask-host = "example.com"
+web-proxy.enabled = true
+middle-end.enabled = true
+`
+	for _, test := range []struct {
+		key   string
+		value string
+	}{
+		{"general.max-connections-per-ip", "-1"},
+		{"general.max-ips-per-user", "-1"},
+		{"general.ip-block-timeout", `"-1s"`},
+		{"general.handshake-timeout", `"-1s"`},
+		{"tls-fronting.mask-port", "-1"},
+		{"tls-fronting.mask-port", "65536"},
+		{"tls-fronting.cert-port", "-1"},
+		{"tls-fronting.cert-port", "65536"},
+		{"tls-fronting.splice-port", "-1"},
+		{"tls-fronting.splice-port", "65536"},
+		{"tls-fronting.fake-cert-size", "-1"},
+		{"tls-fronting.splice-proxy-protocol", "-1"},
+		{"tls-fronting.splice-proxy-protocol", "3"},
+		{"tls-fronting.splice-idle-timeout", `"-1s"`},
+		{"performance.tcp-buffer-kb", "-1"},
+		{"performance.num-event-loops", "-1"},
+		{"performance.idle-timeout", `"-1s"`},
+		{"performance.max-write-buffer-mb", "-1"},
+		{"performance.max-write-buffer-mb", fmt.Sprint(math.MaxInt/(1024*1024) + 1)},
+		{"performance.client-silence-close", `"-1s"`},
+		{"web-proxy.num-event-loops", "-1"},
+		{"middle-end.max-connections", "-1"},
+		{"middle-end.queue-budget-mb", "-1"},
+	} {
+		t.Run(test.key+"="+test.value, func(t *testing.T) {
+			content := base + test.key + " = " + test.value + "\n"
+			_, err := Load(writeConfigTestFile(t, content))
+			if err == nil || !strings.Contains(err.Error(), test.key) {
+				t.Errorf("Load error = %v, want rejection naming %s", err, test.key)
+			}
+
+			// Callers can construct Config without Load, so conversion must also
+			// prevent invalid limits from reaching the proxy runtime.
+			var cfg Config
+			if err := toml.Unmarshal([]byte(content), &cfg); err != nil {
+				t.Fatal(err)
+			}
+			_, err = cfg.ToGProxyConfig()
+			if err == nil || !strings.Contains(err.Error(), test.key) {
+				t.Errorf("ToGProxyConfig error = %v, want rejection naming %s", err, test.key)
+			}
+		})
+	}
+}
+
+func TestConfigPreservesZeroAndBoundaryScalars(t *testing.T) {
+	const base = `secrets.test = "0123456789abcdef0123456789abcdef"
+tls-fronting.mask-host = "example.com"
+general.max-connections-per-ip = 0
+general.max-ips-per-user = 0
+general.ip-block-timeout = "0s"
+general.handshake-timeout = "0s"
+tls-fronting.splice-idle-timeout = "0s"
+performance.tcp-buffer-kb = 0
+performance.num-event-loops = 0
+performance.idle-timeout = "0s"
+performance.max-write-buffer-mb = 0
+performance.client-silence-close = "0s"
+middle-end.max-connections = 0
+middle-end.queue-budget-mb = 0
+`
+	for _, port := range []int{0, 1, 65535} {
+		t.Run(fmt.Sprint(port), func(t *testing.T) {
+			content := base + fmt.Sprintf("tls-fronting.mask-port = %d\ntls-fronting.cert-port = %d\ntls-fronting.splice-port = %d\n", port, port, port)
+			cfg, err := Load(writeConfigTestFile(t, content))
+			if err != nil {
+				t.Fatal(err)
+			}
+			runtime, err := cfg.ToGProxyConfig()
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantPort := port
+			if wantPort == 0 {
+				wantPort = 443
+			}
+			if runtime.MaskPort != wantPort || runtime.CertPort != wantPort || runtime.SplicePort != wantPort {
+				t.Fatalf("TLS ports = %d, %d, %d; want %d", runtime.MaskPort, runtime.CertPort, runtime.SplicePort, wantPort)
+			}
+			if runtime.MaxConnectionsPerIP != 0 || runtime.MaxIPsPerUser != 0 || runtime.ClientSilenceClose != 0 || runtime.NumEventLoop != 0 {
+				t.Fatal("zero unlimited/disabled/auto settings changed")
+			}
+			if runtime.IdleTimeout != 5*time.Minute || runtime.IPBlockTimeout != 5*time.Minute || runtime.MaxWriteBuffer != 0 {
+				t.Fatal("zero-derived runtime defaults changed")
+			}
+		})
+	}
+}
+
+func TestLoadPreservesDisabledOptionalScalars(t *testing.T) {
+	const content = `secrets.test = "0123456789abcdef0123456789abcdef"
+tls-fronting.mask-host = "example.com"
+web-proxy.enabled = false
+web-proxy.num-event-loops = -1
+middle-end.enabled = false
+middle-end.max-connections = -1
+middle-end.queue-budget-mb = -1
+`
+	cfg, err := Load(writeConfigTestFile(t, content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cfg.ToGProxyConfig(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadShippedExample(t *testing.T) {
+	cfg, err := Load("../../config.example.toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cfg.ToGProxyConfig(); err != nil {
+		t.Fatal(err)
+	}
+}
 
 // TestLoad_Valid tests loading a valid TOML configuration.
 func TestLoad_Valid(t *testing.T) {

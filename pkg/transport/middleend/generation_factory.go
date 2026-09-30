@@ -460,6 +460,10 @@ func (d productionGenerationDialer) Dial(
 	endpoint netip.AddrPort,
 	connectTimeout time.Duration,
 ) (*net.TCPConn, netip.AddrPort, netip.AddrPort, error) {
+	// Reject artifact targets before route discovery or opening any connection.
+	if err := validatePublicEndpoint("server", endpoint); err != nil {
+		return nil, netip.AddrPort{}, netip.AddrPort{}, err
+	}
 	var publicIP netip.Addr
 	if d.socks5 == nil && d.nat != nil {
 		var err error

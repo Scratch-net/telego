@@ -348,10 +348,11 @@ func (h *ProxyHandler) handleTLSPayload(c clientEndpoint, ctx *ConnContext) gnet
 			}
 			response, err = faketls.BuildServerHelloWithOptions(matchedSecret.Key, hello, opts)
 			if err != nil {
-				h.logger.Debug("BuildServerHelloWithOptions (hybrid) failed: %v", err)
-				return h.failHandshake(ctx, handshakeFailureTLSServerHello)
+				h.logger.Debug("BuildServerHelloWithOptions (hybrid) failed: %v, falling back", err)
+				response = nil
+			} else {
+				h.logger.Debug("[#%d] using hybrid ServerHello (real TLS fingerprint)", ctx.id)
 			}
-			h.logger.Debug("[#%d] using hybrid ServerHello (real TLS fingerprint)", ctx.id)
 		} else {
 			h.logger.Debug("[#%d] hybrid ServerHello fetch failed: %v, falling back", ctx.id, fetchErr)
 		}
@@ -360,8 +361,8 @@ func (h *ProxyHandler) handleTLSPayload(c clientEndpoint, ctx *ConnContext) gnet
 	// LEGACY MODE: Synthetic ServerHello with optional real cert embedding
 	if response == nil {
 		if h.certFetcher != nil {
-			cachedCert, certErr := h.certFetcher.FetchCert(h.config.CertHost, h.config.CertPort)
-			if certErr == nil && cachedCert != nil && len(cachedCert.RawChain) > 0 {
+			cachedCert := h.certFetcher.CachedCert(h.config.CertHost, h.config.CertPort)
+			if cachedCert != nil && len(cachedCert.RawChain) > 0 {
 				opts := &faketls.ServerHelloOptions{
 					CertChain: cachedCert.GetRawCertChain(),
 				}

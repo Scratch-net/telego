@@ -4,3 +4,12 @@ telego-linux-*
 *.log
 .git
 .gitignore
+config.toml
+/certbot/
+/grafana/
+/nginx/
+/docker-compose*.yml
+/prometheus.yml
+/.codex-stage/
+/.local/
+/tools/web-transfer/__pycache__/

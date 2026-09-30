@@ -55,5 +55,15 @@ Thumbs.db
 
 # Config with secrets
 config.toml
+
+# Local deployment state and credentials (examples remain tracked)
+/certbot/
+/grafana/
+/nginx/
+/docker-compose*.yml
+/prometheus.yml
+/.codex-stage/
+/.local/
+/tools/web-transfer/__pycache__/
 .build/
 /docs/superpowers/

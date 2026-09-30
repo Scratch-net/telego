@@ -68,7 +68,7 @@ uninstall:
 
 # Race-test gc_opt with gnet's portable poller. gnet's poll_opt uses unsafe
 # poll attachments that are incompatible with the race build's checkptr.
-test: test-gnet
+test: test-gnet test-synlimit
 	sh dist/test-go.sh -race ./...
 	sh dist/test-go.sh -race -tags=gc_opt ./...
 	sh dist/test-go.sh -tags="$(TAGS)" ./...
@@ -98,6 +98,10 @@ test-rpm:
 .PHONY: test-web-nginx
 test-web-nginx:
 	python3 dist/test-web-nginx.py
+
+.PHONY: test-synlimit
+test-synlimit:
+	python3 dist/test-synlimit.py
 
 # Run benchmarks
 bench:

@@ -326,6 +326,10 @@ The WEB configuration is inactive by default. Configurations without `[web-proxy
 
 ## Configuration
 
+Telego rejects unknown TOML keys, negative limits, and invalid TLS ports.
+Error messages identify the configuration fields that need correction.
+Zero retains its documented default or unlimited meaning.
+
 ### Config Reference
 
 ```toml

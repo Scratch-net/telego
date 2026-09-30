@@ -62,11 +62,9 @@ func (f *CertFetcher) FetchCert(host string, port int) (*CachedCert, error) {
 	key := fmt.Sprintf("%s:%d", host, port)
 
 	// Check cache first
-	f.mu.RLock()
-	cached, ok := f.cache[key]
-	f.mu.RUnlock()
+	cached := f.CachedCert(host, port)
 
-	if ok && !cached.IsExpired() {
+	if cached != nil && !cached.IsExpired() {
 		return cached, nil
 	}
 
@@ -88,10 +86,20 @@ func (f *CertFetcher) FetchCert(host string, port int) (*CachedCert, error) {
 	return cert, nil
 }
 
+// CachedCert returns the last fetched certificate, even when it is due for
+// refresh. It never performs network I/O. Callers must treat it as immutable.
+// A nil result means no successful fetch has completed for this endpoint.
+func (f *CertFetcher) CachedCert(host string, port int) *CachedCert {
+	key := fmt.Sprintf("%s:%d", host, port)
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.cache[key]
+}
+
 // fetchFromHost connects to the host and extracts its certificate.
 // Uses the fetcher's SNI field for ServerName (allows connecting to different host than SNI).
 func (f *CertFetcher) fetchFromHost(host string, port int) (*CachedCert, error) {
-	addr := fmt.Sprintf("%s:%d", host, port)
+	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 
 	// Use configured SNI, or fall back to host
 	sni := f.sni

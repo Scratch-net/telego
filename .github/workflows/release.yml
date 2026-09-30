@@ -31,6 +31,9 @@ jobs:
       - name: Test WEB Nginx fallback templates
         run: make test-web-nginx
 
+      - name: Test SYN limiter rule generation
+        run: make test-synlimit
+
       - name: Set up Node for bridge behavior tests
         uses: actions/setup-node@v7
         with:

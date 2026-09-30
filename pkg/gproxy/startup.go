@@ -30,7 +30,7 @@ func (h *ProxyHandler) prepareFrontends() {
 		}
 		h.serverHelloFetcher = tlsfront.NewServerHelloFetcher(cfg.CertHost, cfg.CertPort)
 		h.logger.Debug("Fetching real ServerHello from %s:%d for hybrid TLS mode...", cfg.CertHost, cfg.CertPort)
-		if _, _, err := h.serverHelloFetcher.GetServerHelloTemplate(); err != nil {
+		if err := h.serverHelloFetcher.Refresh(); err != nil {
 			h.logger.Warn("Failed to fetch ServerHello template: %v (will retry)", err)
 		} else {
 			h.logger.Info("Hybrid TLS mode enabled: using real ServerHello from %s", cfg.CertHost)
