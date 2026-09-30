@@ -796,7 +796,19 @@ uplinkResults:
 		return gnet.Close
 	}
 	if !transport.canDecodeWhileUplinkPending(peeked) {
-		return gnet.None
+		// Deferred control or invalid frames still occupy gnet's input buffer.
+		// Bound that storage while the uplink worker retries backpressure.
+		if buffered <= maxWebSocketControlInputBytes {
+			return gnet.None
+		}
+		if _, err := connection.Discard(buffered); err != nil {
+			return gnet.Close
+		}
+		transport.noteClose("input_capacity", ws.StatusInternalServerError)
+		if !transport.beginClose(connection, ws.StatusInternalServerError, nil) {
+			return gnet.Close
+		}
+		return h.pumpWebSocketWrites(connection, state, transport)
 	}
 	consumed, work, message, emitted, decodeErr := transport.decoder.decodeWindow(
 		peeked,

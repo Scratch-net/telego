@@ -150,7 +150,7 @@ func TestRenderBridgeWebSocketCarrierImplementations(t *testing.T) {
 				"if(carrier==='websocket')await openWebSocket()",
 				"webSocket.send(batch.body)",
 				"webSocket.bufferedAmount+queuedBytes>queueByteLimit",
-				"socket.onclose=event=>{if(!closed)fail('ws_closed'",
+				"socket.onclose=event=>{if(current(generation))fail('ws_closed'",
 				"function openWebSocketLane(lane)",
 				"function runWebSocketLaneUp(lane)",
 				"if(!lane.socket)openWebSocketLane(lane)",

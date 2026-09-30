@@ -2,11 +2,13 @@
 package config
 
 import (
+	"bytes"
 	cryptoRand "crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"net"
 	"net/netip"
 	"os"
@@ -135,6 +137,7 @@ type WebProxyConfig struct {
 	Enabled           bool     `toml:"enabled"`
 	BindTo            string   `toml:"bind-to"`
 	Hostname          string   `toml:"hostname"`
+	BasePath          string   `toml:"base-path"`
 	Backend           string   `toml:"backend"`
 	Carrier           string   `toml:"carrier"`
 	TrustedProxyCIDRs []string `toml:"trusted-proxy-cidrs"`
@@ -163,6 +166,7 @@ type WebProxyRuntimeConfig struct {
 	Enabled              bool
 	BindAddr             string
 	Hostname             string
+	BasePath             string
 	Backend              string
 	LogicalBackend       bool
 	MTProxyAddr          net.Addr
@@ -197,8 +201,20 @@ func Load(path string) (*Config, error) {
 	}
 
 	cfg := Config{MiddleEnd: MiddleEndConfig{Enabled: true}}
-	if err := toml.Unmarshal(data, &cfg); err != nil {
+	if err := toml.NewDecoder(bytes.NewReader(data)).DisallowUnknownFields().Decode(&cfg); err != nil {
+		if missing, ok := errors.AsType[*toml.StrictMissingError](err); ok {
+			fields := make([]string, len(missing.Errors))
+			for i, field := range missing.Errors {
+				fields[i] = fmt.Sprintf("%q", strings.Join(field.Key(), "."))
+			}
+			// StrictMissingError.String includes TOML values, which can contain
+			// credentials. Report only the offending field names.
+			return nil, fmt.Errorf("failed to parse config: unknown fields %s: %w", strings.Join(fields, ", "), err)
+		}
 		return nil, fmt.Errorf("failed to parse config: %w", err)
+	}
+	if err := cfg.validateScalars(); err != nil {
+		return nil, err
 	}
 	if err := cfg.Metrics.Validate(); err != nil {
 		return nil, err
@@ -207,8 +223,67 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
+// validateScalars preserves zero defaults and unlimited settings while rejecting
+// values that would disable limits or fail later in runtime initialization.
+func (c *Config) validateScalars() error {
+	for _, field := range []struct {
+		name  string
+		value int64
+	}{
+		{"general.max-connections-per-ip", int64(c.General.MaxConnectionsPerIP)},
+		{"general.max-ips-per-user", int64(c.General.MaxIPsPerUser)},
+		{"general.ip-block-timeout", int64(c.General.IPBlockTimeout)},
+		{"general.handshake-timeout", int64(c.General.HandshakeTimeout)},
+		{"tls-fronting.fake-cert-size", int64(c.TLSFronting.FakeCertSize)},
+		{"tls-fronting.splice-idle-timeout", int64(c.TLSFronting.SpliceIdleTimeout)},
+		{"performance.tcp-buffer-kb", int64(c.Performance.TCPBufferKB)},
+		{"performance.num-event-loops", int64(c.Performance.NumEventLoops)},
+		{"performance.idle-timeout", int64(c.Performance.IdleTimeout)},
+		{"performance.max-write-buffer-mb", int64(c.Performance.MaxWriteBufferMB)},
+		{"performance.client-silence-close", int64(c.Performance.ClientSilenceClose)},
+	} {
+		if field.value < 0 {
+			return fmt.Errorf("%s cannot be negative", field.name)
+		}
+	}
+	for _, field := range []struct {
+		name  string
+		value int
+	}{
+		{"tls-fronting.mask-port", c.TLSFronting.MaskPort},
+		{"tls-fronting.cert-port", c.TLSFronting.CertPort},
+		{"tls-fronting.splice-port", c.TLSFronting.SplicePort},
+	} {
+		if field.value < 0 || field.value > 65535 {
+			return fmt.Errorf("%s must be between 0 and 65535 (0 uses the default)", field.name)
+		}
+	}
+	if c.TLSFronting.SpliceProxyProtocol < 0 || c.TLSFronting.SpliceProxyProtocol > 2 {
+		return errors.New("tls-fronting.splice-proxy-protocol must be 0, 1, or 2")
+	}
+	if c.Performance.MaxWriteBufferMB > math.MaxInt/(1024*1024) {
+		return errors.New("performance.max-write-buffer-mb is too large to represent in bytes")
+	}
+	// Disabled optional sections have always ignored dormant settings.
+	if c.WebProxy.Enabled && c.WebProxy.NumEventLoops < 0 {
+		return errors.New("web-proxy.num-event-loops cannot be negative")
+	}
+	if c.MiddleEnd.Enabled {
+		if c.MiddleEnd.MaxConnections < 0 {
+			return errors.New("middle-end.max-connections cannot be negative")
+		}
+		if c.MiddleEnd.QueueBudgetMB < 0 {
+			return errors.New("middle-end.queue-budget-mb cannot be negative")
+		}
+	}
+	return nil
+}
+
 // ToGProxyConfig converts to gproxy.Config.
 func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
+	if err := c.validateScalars(); err != nil {
+		return gproxy.Config{}, err
+	}
 	if err := c.Metrics.Validate(); err != nil {
 		return gproxy.Config{}, err
 	}
@@ -358,6 +433,9 @@ func (c *Config) ToWebProxyRuntimeConfig(mtProxyBind string) (WebProxyRuntimeCon
 	if err := webproxy.ValidateHostname(hostname); err != nil {
 		return WebProxyRuntimeConfig{}, fmt.Errorf("invalid web-proxy.hostname: %w", err)
 	}
+	if err := webproxy.ValidateBasePath(c.WebProxy.BasePath); err != nil {
+		return WebProxyRuntimeConfig{}, fmt.Errorf("invalid web-proxy.base-path: %w", err)
+	}
 	if c.WebProxy.NumEventLoops < 0 {
 		return WebProxyRuntimeConfig{}, errors.New("web-proxy.num-event-loops cannot be negative")
 	}
@@ -405,7 +483,7 @@ func (c *Config) ToWebProxyRuntimeConfig(mtProxyBind string) (WebProxyRuntimeCon
 		if err != nil {
 			return WebProxyRuntimeConfig{}, fmt.Errorf("invalid secret %q for WEB proxy: %w", name, err)
 		}
-		derived, err := webproxy.DeriveProfiles(name, hostname, key)
+		derived, err := webproxy.DeriveProfilesForPath(name, hostname, c.WebProxy.BasePath, key)
 		if err != nil {
 			return WebProxyRuntimeConfig{}, fmt.Errorf("derive WEB profiles for secret %q: %w", name, err)
 		}
@@ -425,6 +503,7 @@ func (c *Config) ToWebProxyRuntimeConfig(mtProxyBind string) (WebProxyRuntimeCon
 		Enabled:              true,
 		BindAddr:             bindAddr,
 		Hostname:             hostname,
+		BasePath:             c.WebProxy.BasePath,
 		Backend:              backend,
 		LogicalBackend:       logicalBackend,
 		MTProxyAddr:          listenerAddr,
@@ -463,10 +542,11 @@ func (c *Config) webProxyFingerprint() string {
 	}
 	trusted := strings.Join(c.WebProxy.TrustedProxyCIDRs, ",")
 	return fmt.Sprintf(
-		"enabled=%t\x00bind=%s\x00hostname=%s\x00backend=%s\x00carrier=%s\x00trusted=%s\x00loops=%d",
+		"enabled=%t\x00bind=%s\x00hostname=%s\x00base-path=%s\x00backend=%s\x00carrier=%s\x00trusted=%s\x00loops=%d",
 		c.WebProxy.Enabled,
 		c.WebProxy.BindTo,
 		c.WebProxy.Hostname,
+		c.WebProxy.BasePath,
 		c.WebProxy.Backend,
 		c.WebProxy.Carrier,
 		trusted,

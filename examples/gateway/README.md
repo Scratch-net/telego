@@ -103,7 +103,10 @@ Open the installation directory before you run management commands:
 cd telego-gateway
 ```
 
-The default carrier is `websocket-lanes`, the recommended choice for maximum WEB performance. The generated Nginx configuration forwards WebSocket upgrades.
+The default carrier for a new installation is `websocket`, which shares one connection across Telegram streams. The generated Nginx configuration forwards WebSocket upgrades.
+
+Repeat installations preserve the saved carrier unless `--carrier` is supplied. An explicit value must match the saved carrier.
+`websocket-lanes` remains available for separate stream queues, with additional connections and handshakes.
 
 ME starts automatically. Telego uses direct routing until its ME connections pass their startup checks.
 

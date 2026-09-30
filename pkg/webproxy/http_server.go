@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -57,6 +58,7 @@ type HTTPServerConfig struct {
 	OnWebSocketClose             func(WebSocketClose)
 	Bind                         string
 	Hostname                     string
+	BasePath                     string
 	Manager                      *Manager
 	PassthroughStatus            int
 	SanitizedFallbackStatus      int
@@ -116,6 +118,9 @@ func NewHTTPServer(config HTTPServerConfig) (*HTTPServer, error) {
 	if err := ValidateHostname(config.Hostname); err != nil {
 		return nil, fmt.Errorf("%w: hostname: %v", ErrInvalidHTTPServerConfig, err)
 	}
+	if err := ValidateBasePath(config.BasePath); err != nil {
+		return nil, fmt.Errorf("%w: base path: %v", ErrInvalidHTTPServerConfig, err)
+	}
 	if config.PassthroughStatus == 0 {
 		config.PassthroughStatus = defaultPassthroughStatus
 	}
@@ -164,8 +169,10 @@ func NewHTTPServer(config HTTPServerConfig) (*HTTPServer, error) {
 	}
 
 	server := &HTTPServer{
-		config:         config,
-		renderBridge:   renderBridgeForCarrier,
+		config: config,
+		renderBridge: func(hostname, token string, batch int, carrier CarrierMode, streams int, diagnostics bool) (BridgePage, error) {
+			return renderBridgeAtPath(hostname, token, batch, carrier, streams, diagnostics, config.BasePath)
+		},
 		ready:          make(chan struct{}),
 		done:           make(chan struct{}),
 		errors:         make(chan error, 1),
@@ -765,6 +772,7 @@ const (
 	requestDelete
 	requestWebSocket
 	requestDiagnostic
+	requestRecovery
 )
 
 type requestDisposition uint8
@@ -798,7 +806,24 @@ func (h *httpEventHandler) prepare(
 	peerIP string,
 	trailingBytes int,
 ) (*preparedRequest, requestDisposition) {
+	if basePath := h.server.config.BasePath; basePath != "" {
+		prefix := "/" + basePath
+		if !strings.HasPrefix(request.path, prefix+"/") {
+			if reservedCarrierRequest(request) || h.hasBridgeCapability(request.query) || h.hasCarrierBearer(request) {
+				return nil, requestSanitizedFallback
+			}
+			return nil, requestPassthrough
+		}
+		// Only the local copy is made relative. Nginx fallback keeps the original URI.
+		request.path = strings.TrimPrefix(request.path, prefix)
+	}
+	if request.path != "/" && h.hasBridgeCapability(request.query) {
+		return nil, requestSanitizedFallback
+	}
 	if !reservedCarrierRequest(request) {
+		if h.hasCarrierBearer(request) {
+			return nil, requestSanitizedFallback
+		}
 		return nil, requestPassthrough
 	}
 	if request.path != webSocketPath && (request.upgrade || headerPresent(request, "upgrade")) {
@@ -939,6 +964,44 @@ func (h *httpEventHandler) prepare(
 	}
 }
 
+func (h *httpEventHandler) hasCarrierBearer(request carrierRequest) bool {
+	// Recognize alternate spellings for sanitization only. Carrier
+	// authentication still requires the canonical bearerToken spelling.
+	scheme := true
+	for field := range strings.FieldsSeq(request.headers["authorization"]) {
+		if scheme {
+			if !strings.EqualFold(field, "Bearer") {
+				return false
+			}
+			scheme = false
+			continue
+		}
+		return h.server.config.Manager.recognizesToken(field)
+	}
+	return false
+}
+
+func (h *httpEventHandler) hasBridgeCapability(query string) bool {
+	for field := range strings.SplitSeq(query, "&") {
+		name, value, _ := strings.Cut(field, "=")
+		name, err := url.QueryUnescape(name)
+		if err != nil || name != "bridge" {
+			continue
+		}
+		value, err = url.QueryUnescape(value)
+		if err != nil {
+			continue
+		}
+		raw, ok := decodeFallbackCredential(value)
+		if ok {
+			if _, matched := h.server.config.Manager.MatchCapability(Capability(raw)); matched {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func requestCarrierLane(request carrierRequest, carrier CarrierMode) (uint32, bool) {
 	value, present := request.headers["x-lane-id"]
 	if carrier == CarrierHTTPS {
@@ -992,7 +1055,8 @@ func (r *preparedRequest) releaseWebSocket() {
 func bridgeQueryPresent(query string) bool {
 	for field := range strings.SplitSeq(query, "&") {
 		name, _, _ := strings.Cut(field, "=")
-		if name == "bridge" {
+		name, err := url.QueryUnescape(name)
+		if err == nil && name == "bridge" {
 			return true
 		}
 	}
@@ -1027,7 +1091,7 @@ func (h *httpEventHandler) clientIP(request carrierRequest, peer string) (string
 
 func (h *httpEventHandler) prepareBridge(request carrierRequest) (*preparedRequest, bool) {
 	if request.method != "GET" || !emptyRequestBody(request) || headerPresent(request, "content-type") ||
-		anyHeaderPresent(request, "authorization", "x-up-seq", "x-down-cursor", "x-lane-id", "x-session-token", "x-carrier-mode", "x-up-ack") {
+		anyHeaderPresent(request, "x-up-seq", "x-down-cursor", "x-lane-id", "x-session-token", "x-carrier-mode", "x-up-ack") {
 		return nil, false
 	}
 	const prefix = "bridge="
@@ -1041,7 +1105,23 @@ func (h *httpEventHandler) prepareBridge(request carrierRequest) (*preparedReque
 	if _, matched := h.server.config.Manager.MatchCapability(capability); !matched {
 		return nil, false
 	}
-	return &preparedRequest{request: request, kind: requestBridge, capability: capability}, true
+	prepared := &preparedRequest{request: request, kind: requestBridge, capability: capability}
+	if request.headers["accept"] == bridgeRecoveryMediaType {
+		if request.headers["cookie"] != "" {
+			return nil, false
+		}
+		prepared.kind = requestRecovery
+		if headerPresent(request, "authorization") {
+			token, ok := bearerToken(request.headers["authorization"])
+			if !ok {
+				return nil, false
+			}
+			prepared.token = token
+		}
+	} else if headerPresent(request, "authorization") {
+		return nil, false
+	}
+	return prepared, true
 }
 
 func emptyRequestBody(request carrierRequest) bool {
@@ -1134,6 +1214,9 @@ func (h *httpEventHandler) serve(
 ) carrierResponse {
 	manager := h.server.config.Manager
 	switch request.kind {
+	case requestRecovery:
+		return h.serveRecovery(request)
+
 	case requestDiagnostic:
 		failure, valid := parseBridgeFailure(body)
 		if !valid {

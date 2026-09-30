@@ -60,6 +60,39 @@ func TestProfileSecretBytesReturnsCopy(t *testing.T) {
 	}
 }
 
+func TestBasePathCapabilities(t *testing.T) {
+	secret := []byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+	profiles, err := DeriveProfilesForPath("test", "proxy.example.com", "dobry-cola-super-app", secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"hHz99Xs93EN1j91G9gpNepXwGNNt5YdAFkEVk_LlqdQ", "TGUkZaevsavLbHvlNWipnRoYxgzZ51ioWvbxgGT3wHo"}
+	for i, profile := range profiles {
+		if profile.Capability().String() != want[i] {
+			t.Fatalf("path capability %d: %s", i, profile.Capability())
+		}
+		for _, path := range []string{"", "another/path", "Dobry-cola-super-app"} {
+			other, err := DeriveCapabilityForPath("proxy.example.com", path, profile.SecretBytes())
+			if err != nil || other.Equal(profile.Capability()) {
+				t.Fatalf("capability not isolated from %q: %v", path, err)
+			}
+		}
+	}
+}
+
+func TestValidateBasePath(t *testing.T) {
+	for _, path := range []string{"", "Test-1/x_y", strings.Repeat("x", 128)} {
+		if err := ValidateBasePath(path); err != nil {
+			t.Errorf("valid path %q: %v", path, err)
+		}
+	}
+	for _, path := range []string{"/test", "test/", "test//x", ".", "test/..", "x%2Fy", "x?y", "x#y", "_x", "-x", "x/_y", "тест", strings.Repeat("x", 129)} {
+		if err := ValidateBasePath(path); err == nil {
+			t.Errorf("accepted invalid path %q", path)
+		}
+	}
+}
+
 func TestValidateHostname(t *testing.T) {
 	t.Parallel()
 

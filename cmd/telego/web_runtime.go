@@ -61,6 +61,7 @@ func newWebProxyRuntime(runtimeConfig config.WebProxyRuntimeConfig, internalAuth
 		OnWebSocketClose:  logWebSocketClose,
 		Bind:              runtimeConfig.BindAddr,
 		Hostname:          runtimeConfig.Hostname,
+		BasePath:          runtimeConfig.BasePath,
 		Manager:           manager,
 		Multicore:         true,
 		NumEventLoop:      runtimeConfig.NumEventLoops,

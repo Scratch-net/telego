@@ -29,6 +29,11 @@ var diagnosticsCollection sync.Mutex
 var errDiagnosticsTooLarge = errors.New("profile exceeded the 8 MiB response limit")
 
 func validateDiagnosticsConfig(cfg Config) error {
+	// Invalid custom patterns must return an error instead of panicking during
+	// mux construction, even when diagnostic endpoints are disabled.
+	if cfg.Path != "" && (!strings.HasPrefix(cfg.Path, "/") || strings.ContainsAny(cfg.Path, " %{}\t\r\n")) {
+		return errors.New("metrics path must be an absolute HTTP path without patterns or escapes")
+	}
 	if !cfg.Diagnostics {
 		return nil
 	}
@@ -37,11 +42,6 @@ func validateDiagnosticsConfig(cfg Config) error {
 	}
 	if strings.HasPrefix(cfg.Path, strings.TrimSuffix(diagnosticsPrefix, "/")) {
 		return errors.New("metrics path conflicts with the reserved diagnostics paths")
-	}
-	// Invalid custom patterns must return an error instead of panicking during
-	// private mux construction. Disabled diagnostics preserve existing behavior.
-	if cfg.Path != "" && (!strings.HasPrefix(cfg.Path, "/") || strings.ContainsAny(cfg.Path, " %{}\t\r\n")) {
-		return errors.New("metrics path must be an absolute HTTP path without patterns or escapes")
 	}
 	return nil
 }

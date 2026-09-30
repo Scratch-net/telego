@@ -123,6 +123,7 @@ func validBridgeFailure(failure BridgeFailure) bool {
 		"ws_capacity", "ws_send", "ws_lane_receive_type", "ws_lane_frames", "ws_lane_cross_lane",
 		"ws_lane_open", "ws_lane_limit", "ws_lane_capacity", "ws_lane_send",
 		"ws_lane_closed_client", "ws_lane_closed_server", "ws_lane_closed_transport",
+		"ws_frames", "recovery_timeout", "recovery_failed",
 	}, failure.Reason) || !slices.Contains([]string{
 		"none", "error", "type_error", "range_error", "abort", "network", "security",
 		"invalid_state", "timeout", "ws_error", "ws_close", "invalid_frame", "response_size",

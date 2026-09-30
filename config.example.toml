@@ -107,13 +107,19 @@ enabled = false
 # - https-lanes: one fetch and long-poll lane for each Telegram stream.
 # - websocket: one multiplexed WebSocket for the WEB session.
 # - websocket-lanes: one WebSocket for each Telegram stream.
-# For maximum WEB performance, use websocket-lanes (the installer default).
+# The installer selects websocket to share one connection across all streams.
+# WebSocket lanes use separate stream queues with additional connections and handshakes.
 # WebSocket modes require HTTP/1.1 upgrade forwarding. HTTPS lanes require public HTTP/2.
-carrier = "websocket-lanes"
+carrier = "websocket"
 
 # Public DNS hostname on the real TLS certificate. Do not include a scheme,
 # port, path, or trailing dot. This value is required when WEB is enabled.
 # hostname = "proxy.example.com"
+
+# Optional path shared by the bridge and all carrier endpoints. Empty uses root.
+# Use slash-separated [A-Za-z0-9][A-Za-z0-9_-]* segments, up to 128 characters.
+# Do not include a leading or trailing slash. A change requires new client links.
+# base-path = "telegram/test"
 
 # Private HTTP/1.1 listener for Nginx. The default is safe for Nginx on the
 # same host. For Docker, use 0.0.0.0:8080 and expose it only on a private network.

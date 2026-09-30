@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>WEB transfer check</title>
+<body>
+<script>
+(() => {
+  'use strict';
+  const limit = 8 * 1024 * 1024;
+  const setupError = JSON.stringify({t: 'error', reason: 'bridge_setup'});
+  const states = new Set(['connecting', 'connected', 'reconnecting', 'failed']);
+  let socket = null, port = null, stopped = false, initialized = false;
+  window.bridgeSetupError = null;
+
+  window.closeBridge = () => {
+    if (port) {
+      try { port.postMessage({t: 'close'}); } catch (_) {}
+    }
+  };
+
+  function fail() {
+    if (stopped) return;
+    stopped = true;
+    window.bridgeSetupError = setupError;
+    window.closeBridge();
+    if (socket) {
+      if (socket.readyState === WebSocket.OPEN && socket.bufferedAmount + setupError.length < limit) {
+        try { socket.send(setupError); } catch (_) {}
+      }
+      try { socket.close(1011, 'bridge setup failed'); } catch (_) {}
+    }
+  }
+
+  function sendLocal(value) {
+    const size = typeof value === 'string' ? value.length : value.byteLength;
+    if (stopped || !socket || socket.readyState !== WebSocket.OPEN || socket.bufferedAmount + size >= limit) {
+      fail();
+      return;
+    }
+    try { socket.send(value); } catch (_) { fail(); }
+  }
+
+  try {
+    const bootstrap = __BOOTSTRAP_JSON__;
+    const target = new URL(bootstrap.url);
+    const local = new URL(bootstrap.socket);
+    if (location.protocol !== 'http:' || location.hostname !== '127.0.0.1' || !location.port ||
+        target.protocol !== 'https:' || target.username || target.password ||
+        local.protocol !== 'ws:' || local.hostname !== '127.0.0.1' || !local.port || local.username || local.password) {
+      throw new Error('invalid setup');
+    }
+    socket = new WebSocket(local.href);
+    socket.binaryType = 'arraybuffer';
+    socket.onerror = fail;
+    socket.onclose = () => {
+      window.closeBridge();
+      stopped = true;
+    };
+    socket.onmessage = event => {
+      if (stopped) return;
+      if (!(event.data instanceof ArrayBuffer) || !event.data.byteLength || event.data.byteLength >= limit ||
+          socket.bufferedAmount >= limit || !port) {
+        fail();
+        return;
+      }
+      try { port.postMessage(event.data, [event.data]); } catch (_) { fail(); }
+    };
+    socket.onopen = () => {
+      if (stopped) return;
+      try {
+        const iframe = document.createElement('iframe');
+        iframe.hidden = true;
+        iframe.referrerPolicy = 'no-referrer';
+        iframe.onerror = fail;
+        iframe.onload = () => {
+          if (stopped) return;
+          if (initialized) { fail(); return; }
+          try {
+            const channel = new MessageChannel();
+            port = channel.port1;
+            port.onmessageerror = fail;
+            port.onmessage = event => {
+              if (stopped) return;
+              if (event.data instanceof ArrayBuffer) {
+                if (!event.data.byteLength) { fail(); return; }
+                sendLocal(event.data);
+              } else if (event.data && event.data.t === 'status' && states.has(event.data.state)) {
+                sendLocal(JSON.stringify({t: 'status', state: event.data.state}));
+              } else if (event.data && event.data.t === 'close') {
+                sendLocal(JSON.stringify({t: 'close'}));
+              }
+              // Traffic counters are observations, not flow-control credits.
+            };
+            port.start();
+            iframe.contentWindow.postMessage({t: 'tproxy-init', v: 1}, target.origin, [channel.port2]);
+            initialized = true;
+            const hello = new ArrayBuffer(9);
+            const view = new DataView(hello);
+            view.setUint8(0, 0x10);
+            view.setUint32(4, 1);
+            view.setUint8(8, 1);
+            port.postMessage(hello, [hello]);
+          } catch (_) { fail(); }
+        };
+        iframe.src = target.href;
+        document.body.append(iframe);
+      } catch (_) { fail(); }
+    };
+  } catch (_) { fail(); }
+  addEventListener('pagehide', window.closeBridge, {once: true});
+})();
+</script>
+</body>
+</html>

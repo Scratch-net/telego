@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # telego SYN limiter — telemt two-tier scheme (iOS lane + generic lane) in DOCKER-USER.
-# Usage: sudo ./synlimit.sh <port> [apply|clear] [public-interface]
+# Usage: sudo ./synlimit.sh <published-port> [apply|clear] [public-interface]
 set -euo pipefail
 
 PORT="${1:?usage: $0 <port> [apply|clear] [public-interface]}"
+[[ "$PORT" =~ ^[0-9]{1,5}$ ]] && (( 10#$PORT >= 1 && 10#$PORT <= 65535 )) || {
+  echo "port must be an integer from 1 to 65535" >&2
+  exit 1
+}
+PORT=$((10#$PORT))
 ACTION="${2:-apply}"
 PUBLIC_IF="${3:-${PUBLIC_IF:-}}"
 if [ -z "$PUBLIC_IF" ]; then
@@ -34,7 +39,8 @@ clear_family() {
   have_chain "$ipt" || return 0
   while :; do
     local n
-    n=$("$ipt" -L "$CHAIN" --line-numbers -n 2>/dev/null | awk -v t="$TAG" '$0 ~ t {print $1; exit}')
+    n=$("$ipt" -L "$CHAIN" --line-numbers -n 2>/dev/null | awk -v t="$TAG" \
+      '{for (i=1; i<=NF-2; i++) if ($i == "/*" && $(i+1) == t && $(i+2) == "*/") {print $1; exit}}')
     [ -n "${n:-}" ] || break
     "$ipt" -D "$CHAIN" "$n"
   done
@@ -43,23 +49,29 @@ clear_family() {
 apply_family() {
   local ipt="$1" len="$2" ttlmatch="$3" ios_tag="$4" gen_tag="$5"
   have_chain "$ipt" || { echo "[$ipt] no $CHAIN chain, skipping"; return 0; }
+  # DOCKER-USER sees the translated container port. Match the original public
+  # destination so published 443 -> container 9443 is covered as well.
   # Match public ingress only. Container egress to Telegram also uses port 443.
   # order (top->bottom): ios-accept, ios-reject, generic-accept, generic-reject
-  "$ipt" -I "$CHAIN" 1 -i "$PUBLIC_IF" -p tcp --dport "$PORT" --syn \
+  "$ipt" -I "$CHAIN" 1 -i "$PUBLIC_IF" -p tcp --syn \
+    -m conntrack --ctdir ORIGINAL --ctorigdstport "$PORT" \
     -m length --length "$len" $ttlmatch "$IOS_TTL" \
     -m hashlimit --hashlimit-mode srcip --hashlimit-name "$ios_tag" \
     --hashlimit-upto "$IOS_RATE" --hashlimit-burst "$IOS_BURST" \
     --hashlimit-htable-expire "$HT_EXPIRE" --hashlimit-htable-size "$HT_SIZE" \
     -m comment --comment "$TAG" -j ACCEPT
-  "$ipt" -I "$CHAIN" 2 -i "$PUBLIC_IF" -p tcp --dport "$PORT" --syn \
+  "$ipt" -I "$CHAIN" 2 -i "$PUBLIC_IF" -p tcp --syn \
+    -m conntrack --ctdir ORIGINAL --ctorigdstport "$PORT" \
     -m length --length "$len" $ttlmatch "$IOS_TTL" \
     -m comment --comment "$TAG" -j REJECT --reject-with tcp-reset
-  "$ipt" -I "$CHAIN" 3 -i "$PUBLIC_IF" -p tcp --dport "$PORT" --syn \
+  "$ipt" -I "$CHAIN" 3 -i "$PUBLIC_IF" -p tcp --syn \
+    -m conntrack --ctdir ORIGINAL --ctorigdstport "$PORT" \
     -m hashlimit --hashlimit-mode srcip --hashlimit-name "$gen_tag" \
     --hashlimit-upto "$GEN_RATE" --hashlimit-burst "$GEN_BURST" \
     --hashlimit-htable-expire "$HT_EXPIRE" --hashlimit-htable-size "$HT_SIZE" \
     -m comment --comment "$TAG" -j ACCEPT
-  "$ipt" -I "$CHAIN" 4 -i "$PUBLIC_IF" -p tcp --dport "$PORT" --syn \
+  "$ipt" -I "$CHAIN" 4 -i "$PUBLIC_IF" -p tcp --syn \
+    -m conntrack --ctdir ORIGINAL --ctorigdstport "$PORT" \
     -m comment --comment "$TAG" -j REJECT --reject-with tcp-reset
   echo "[$ipt] applied two-tier SYN limit on port $PORT"
 }

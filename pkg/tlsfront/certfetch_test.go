@@ -12,6 +12,20 @@ import (
 	"time"
 )
 
+func TestCachedCertNeverFetches(t *testing.T) {
+	fetcher := NewCertFetcher(5, "")
+	// A cache lookup must work with no usable dialer on both miss and expiry.
+	fetcher.dialer = nil
+	if got := fetcher.CachedCert("localhost", 443); got != nil {
+		t.Fatal("empty cache returned a certificate")
+	}
+	stale := &CachedCert{ExpiresAt: time.Now().Add(-time.Hour)}
+	fetcher.cache["localhost:443"] = stale
+	if got := fetcher.CachedCert("localhost", 443); got != stale {
+		t.Fatal("cache lookup did not preserve the last certificate")
+	}
+}
+
 // TestIsExpired_NotExpired tests that far future returns false.
 func TestIsExpired_NotExpired(t *testing.T) {
 	cert := &CachedCert{

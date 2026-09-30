@@ -16,9 +16,9 @@ splice-proxy-protocol = 2
 enabled = true
 hostname = "proxy.example.com"
 # Accepted values: https, https-lanes, websocket, websocket-lanes.
-# For maximum WEB performance, use websocket-lanes with Nginx upgrade forwarding.
+# Use websocket to share one connection across Telegram streams.
 # An empty or absent value selects https.
-carrier = "websocket-lanes"
+carrier = "websocket"
 bind-to = "0.0.0.0:8080"
 # Without backend, WEB streams enter the shared MTProxy core directly on gnet.
 trusted-proxy-cidrs = ["172.28.0.2/32"]

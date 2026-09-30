@@ -153,3 +153,55 @@ func TestProductionGenerationDialerSOCKS5BypassesDirectNAT(t *testing.T) {
 		t.Fatalf("Dial error = %v, want %v", err, proxyStopped)
 	}
 }
+
+func TestProductionGenerationDialerRejectsNonPublicBeforeDial(t *testing.T) {
+	endpoints := []string{
+		"127.0.0.1:8888",
+		"10.0.0.1:8888",
+		"169.254.169.254:80",
+		"192.0.2.1:8888",
+		"100.64.0.1:8888",
+		"0.0.0.0:8888",
+		"[::1]:8888",
+		"[fd00::1]:8888",
+		"[fe80::1]:8888",
+		"[2001:db8::1]:8888",
+		"[::ffff:127.0.0.1]:8888",
+	}
+	for _, mode := range []string{"direct", "NAT", "SOCKS5"} {
+		for _, address := range endpoints {
+			t.Run(mode+"/"+address, func(t *testing.T) {
+				calls := 0
+				unexpectedDial := errors.New("unexpected dial before endpoint validation")
+				dialer := productionGenerationDialer{
+					dialContext: func(context.Context, string, string) (net.Conn, error) {
+						calls++
+						return nil, unexpectedDial
+					},
+				}
+				switch mode {
+				case "NAT":
+					dialer.nat = new(NATResolver)
+				case "SOCKS5":
+					dialer.socks5 = &SOCKS5Dialer{
+						proxyAddress: "127.0.0.1:1080",
+						dialTCP: func(context.Context, string, string) (*net.TCPConn, error) {
+							calls++
+							return nil, unexpectedDial
+						},
+					}
+				}
+				conn, server, client, err := dialer.Dial(t.Context(), netip.MustParseAddrPort(address), time.Second)
+				if conn != nil || server.IsValid() || client.IsValid() {
+					t.Fatalf("rejected endpoint returned connection=%v server=%v client=%v", conn, server, client)
+				}
+				if !errors.Is(err, ErrTupleNotAuthoritative) {
+					t.Errorf("Dial error = %v, want %v", err, ErrTupleNotAuthoritative)
+				}
+				if calls != 0 {
+					t.Errorf("dial calls = %d, want zero before endpoint validation", calls)
+				}
+			})
+		}
+	}
+}

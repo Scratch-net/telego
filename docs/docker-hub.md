@@ -13,9 +13,9 @@ The image uses `telego` as its entry point. It contains a static binary and no s
 
 ## Supported image tags
 
-Release `v0.6.7` publishes these tags:
+Release `v0.6.8` publishes these tags:
 
-- `scratchnet/telego:v0.6.7` — fixed release
+- `scratchnet/telego:v0.6.8` — fixed release
 - `scratchnet/telego:v0.6` — latest `v0.6.x` release
 - `scratchnet/telego:v0` — latest `v0.x` release
 - `scratchnet/telego:latest` — moving image from a release or a successful `main` build
@@ -24,31 +24,36 @@ The current manifests support Linux on AMD64, ARM64, and ARMv7.
 
 For repeatable deployments, use a fixed release tag. The `latest` tag can contain unreleased changes from `main`.
 
-## Changes in v0.6.7
+## Custom paths for WEB in v0.6.8
 
-ME starts automatically unless `[middle-end].enabled = false`. New clients use direct routes until ME is ready.
-INFO logs report the ME startup result. Private direct routes complete public-IP discovery before they open ME TCP connections.
+The optional `web-proxy.base-path` lets separate instances share one hostname and HTTPS port.
+The Telego path and Nginx route must match. The `generate` command accepts `--web-base-path` with `--web-host`.
+Read the [path guide](https://github.com/Scratch-net/telego/blob/v0.6.8/docs/web-proxy.md#serve-web-under-a-path) before deployment.
 
-The gateway installer and WEB examples now select `websocket-lanes` for maximum performance.
-Existing explicit carrier values remain unchanged. An absent `carrier` still selects `https`.
+The gateway installer and WEB examples now select `websocket`, which shares one connection across Telegram streams.
+Repeat installations preserve the saved carrier. Explicit carrier values remain unchanged, and an absent `carrier` still selects `https`.
+The browser bridge can recover after a carrier failure or server restart, within a 15-second total limit per attempt.
 
-Automatic ME startup also enables its existing resource limits, including the default limit of 10,000 accepted clients.
-An existing explicit ME disablement remains effective after an upgrade.
-Read the [v0.6.7 release notes](https://github.com/Scratch-net/telego/releases/tag/v0.6.7) for upgrade instructions and the complete changes.
+This release also corrects configuration reload, TLS cache refresh, connection closure, WEB memory bounds, and metrics listener errors.
+Telego rejects unknown TOML keys, negative limits, and invalid TLS ports. Zero retains its documented default or unlimited meaning.
+
+Existing WEB installations need the corrected Nginx fallback configuration as well as the Telego update.
+Updating the binary or image does not update Nginx. Reconnect WEB clients after the upgrade to load the new browser code.
+Read the [v0.6.8 release notes](https://github.com/Scratch-net/telego/releases/tag/v0.6.8) for the Nginx change and complete upgrade instructions.
 
 ## Generate a secret
 
 Replace `www.google.com` with the FakeTLS mask hostname:
 
 ```bash
-docker run --rm scratchnet/telego:v0.6.7 \
+docker run --rm scratchnet/telego:v0.6.8 \
   generate www.google.com
 ```
 
 To also print Telegram WEB proxy links, add the public WEB hostname:
 
 ```bash
-docker run --rm scratchnet/telego:v0.6.7 \
+docker run --rm scratchnet/telego:v0.6.8 \
   generate www.google.com --web-host proxy.example.com
 ```
 
@@ -79,7 +84,7 @@ docker run -d \
   --restart unless-stopped \
   -p 443:443 \
   -v "$PWD/config.toml:/config.toml:ro" \
-  scratchnet/telego:v0.6.7 \
+  scratchnet/telego:v0.6.8 \
   run -c /config.toml -l
 ```
 
@@ -94,7 +99,7 @@ docker logs telego
 ```yaml
 services:
   telego:
-    image: scratchnet/telego:v0.6.7
+    image: scratchnet/telego:v0.6.8
     restart: unless-stopped
     ports:
       - "443:443"
@@ -156,7 +161,7 @@ Replace `proxy.example.com` in these files:
 Generate the secret and WEB links:
 
 ```bash
-docker run --rm scratchnet/telego:v0.6.7 \
+docker run --rm scratchnet/telego:v0.6.8 \
   generate proxy.example.com --web-host proxy.example.com
 ```
 
@@ -185,7 +190,8 @@ docker compose logs telego
 
 The log must contain `WEB proxy started`.
 
-The example defaults to `websocket-lanes`, the recommended carrier for maximum WEB performance. Its Nginx configuration forwards WebSocket upgrades.
+The example selects `websocket`, which shares one connection across Telegram streams. Its Nginx configuration forwards WebSocket upgrades.
+`websocket-lanes` remains available for separate stream queues, with additional connections and handshakes.
 
 Set `[web-proxy].carrier` to one of these values:
 
@@ -198,7 +204,7 @@ Read the [complete WEB proxy guide](https://github.com/Scratch-net/telego/blob/m
 
 ## Update the container
 
-For a Compose installation, set the Telego image to `scratchnet/telego:v0.6.7` in the Compose file.
+For a Compose installation, set the Telego image to `scratchnet/telego:v0.6.8` in the Compose file.
 Then update the service:
 
 ```bash
