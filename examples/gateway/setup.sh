@@ -5,7 +5,8 @@ gateway_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 state_root="$gateway_root/state"
 domain=
 email=
-carrier=websocket-lanes
+carrier=websocket
+carrier_set=false
 telego_image=scratchnet/telego:latest
 web_enabled=true
 mtproxy_port=443
@@ -18,7 +19,7 @@ usage() {
         "Options:" \
         "  --mtproxy-port PORT  Public MTProxy port (default: 443)" \
         "  --no-web             Disable the Telegram WEB proxy" \
-        "  --carrier MODE       https, https-lanes, websocket, or websocket-lanes (default)" \
+        "  --carrier MODE       https, https-lanes, websocket (default), or websocket-lanes" \
         "  --image IMAGE        Telego image (default: scratchnet/telego:latest)" \
         "  --help               Show this help"
 }
@@ -102,6 +103,7 @@ while [ "$#" -gt 0 ]; do
         --carrier)
             need_value "$@"
             carrier=$2
+            carrier_set=true
             shift 2
             ;;
         --mtproxy-port)
@@ -145,6 +147,9 @@ esac
 case "$email" in
     *[!A-Za-z0-9._+@-]*) fail "--email contains an unsupported character" ;;
 esac
+if [ "$web_enabled" = true ] && [ "$carrier_set" = false ] && [ -f "$state_root/carrier" ]; then
+    IFS= read -r carrier < "$state_root/carrier"
+fi
 case "$carrier" in
     https | https-lanes | websocket | websocket-lanes) ;;
     *) fail "--carrier has an unsupported value" ;;

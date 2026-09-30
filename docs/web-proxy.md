@@ -211,14 +211,15 @@ splice-proxy-protocol = 2
 [web-proxy]
 enabled = true
 hostname = "proxy.example.com"
-carrier = "websocket-lanes"
+carrier = "websocket"
 bind-to = "127.0.0.1:8080"
 trusted-proxy-cidrs = ["127.0.0.1/32"]
 ```
 
 Replace the hostname and secret. The `hostname` value must match the public TLS certificate.
 
-For maximum WEB performance, use `websocket-lanes`. The installer and examples select this carrier and configure Nginx to forward WebSocket upgrades.
+The installer and examples select `websocket`, which shares one connection across Telegram streams. Nginx must forward WebSocket upgrades.
+`websocket-lanes` remains available for separate stream queues. It requires more connections and handshakes, and its performance depends on the client, network, and workload.
 
 The `carrier` value selects one of these transports:
 
@@ -226,8 +227,8 @@ The `carrier` value selects one of these transports:
 |-------|-----------|-----------------------|
 | `https` | One serialized fetch and long-poll carrier | This value has the least Nginx requirements. It is the default when `carrier` is empty or absent. |
 | `https-lanes` | One fetch and long-poll lane for each Telegram stream | Alternative for deployments without WebSocket support. Requires public HTTP/2. |
-| `websocket` | One multiplexed WebSocket for the WEB session | Forward HTTP/1.1 `Upgrade` and `Connection` headers to Telego. |
-| `websocket-lanes` | One WebSocket for each Telegram stream | Recommended for maximum WEB performance. Installer default. Requires HTTP/1.1 upgrade forwarding. |
+| `websocket` | One multiplexed WebSocket for the WEB session | Installer default. Forward HTTP/1.1 `Upgrade` and `Connection` headers to Telego. |
+| `websocket-lanes` | One WebSocket for each Telegram stream | Separate stream queues, with additional connections and handshakes. Requires HTTP/1.1 upgrade forwarding. |
 
 If `carrier` is absent, Telego uses serialized `https`. Existing configurations keep their current behavior after an upgrade.
 
@@ -317,6 +318,12 @@ map $http_upgrade $telego_connection_upgrade {
     ''      '';
 }
 
+# Preserve the escaped path while removing query arguments.
+map $request_uri $telego_sanitized_uri {
+    ~^(/[^?]*) $1;
+    default /;
+}
+
 upstream telego_web {
     server 127.0.0.1:8080;
     keepalive 64;
@@ -402,7 +409,7 @@ server {
 
     location @telego_sanitized {
         internal;
-        proxy_pass http://public_site$uri;
+        proxy_pass http://public_site$telego_sanitized_uri;
         proxy_http_version 1.1;
         proxy_method GET;
         proxy_pass_request_body off;
@@ -476,6 +483,7 @@ Telego uses status 419 for a carrier-shaped request that did not authenticate. T
 
 - It changes the method to `GET`.
 - It removes the query and request body.
+- It preserves percent escapes in the path.
 - It preserves the actual `Host` value from `$http_host`.
 - It removes WEB credentials and sequence headers.
 - It removes `Cookie` and `Authorization`.
@@ -486,6 +494,17 @@ Telego uses status 419 for a carrier-shaped request that did not authenticate. T
 The WEB listener adds `X-Telego-Fallback` to each sentinel response. Nginx consumes both sentinel statuses and never sends them to the public client.
 
 Do not replace the named 418 location with a URI error page. A URI error page changes non-GET methods to `GET`.
+
+### Update an existing Nginx configuration
+
+The v0.6.8 fallback correction requires an Nginx configuration update. Updating the Telego binary or container does not update Nginx.
+
+1. Add the `$telego_sanitized_uri` map above to the `http` block.
+2. In `@telego_sanitized`, replace `proxy_pass http://public_site$uri;` with `proxy_pass http://public_site$telego_sanitized_uri;`.
+3. Run `nginx -t` in the Nginx service environment.
+4. If validation succeeds, reload Nginx with `nginx -s reload` in the same environment.
+
+The map removes query arguments from the original escaped URI. Do not substitute `$uri`: it contains decoded characters that can change the upstream request.
 
 ## Check the configuration
 
@@ -511,7 +530,12 @@ The `--web-host` value must match `[web-proxy].hostname` and the TLS certificate
 
 ### Serve WEB under a path
 
-The optional `base-path` places the bridge and all carrier endpoints under one path on the existing HTTPS port:
+Path hosting uses both the Telego configuration and the Nginx configuration.
+Telego uses `base-path` to serve the bridge and all carrier endpoints under the configured prefix.
+Nginx forwards requests under that prefix to the correct private WEB listener.
+Separate instances can share the same public hostname and HTTPS port, such as port 443.
+
+For example, this Telego configuration serves WEB under `/telegram/test/`:
 
 ```toml
 [web-proxy]
@@ -519,7 +543,7 @@ enabled = true
 hostname = "proxy.example.com"
 base-path = "telegram/test"
 bind-to = "127.0.0.1:8084"
-carrier = "websocket-lanes"
+carrier = "websocket"
 trusted-proxy-cidrs = ["127.0.0.1/32"]
 ```
 
@@ -533,18 +557,24 @@ A nonempty path uses the Telegram v2 capability context, which binds the credent
 A path change requires new client links and a service restart.
 
 For a separate instance, give that instance a private native listener, WEB listener, metrics listener, and secret.
-In the existing TLS server block, copy the WEB `location /` block to `location ^~ /telegram/test/`.
-Change its upstream to the private WEB listener of the separate instance.
-Keep both fallback handlers and all proxy headers from the original block.
-Use `proxy_pass http://127.0.0.1:8084;` without a URI suffix, so Nginx preserves the complete path.
-Do not strip the prefix or add a trailing slash to `proxy_pass`.
-Run `nginx -t` before you reload Nginx.
+
+Configure the matching Nginx route:
+
+1. In the existing TLS server block, copy the WEB `location /` block to `location ^~ /telegram/test/`.
+2. Change its upstream to the private WEB listener of the separate instance.
+3. Keep both fallback handlers and all proxy headers from the original block.
+4. Use `proxy_pass http://127.0.0.1:8084;` without a URI suffix.
+5. Run `nginx -t` before you reload Nginx.
+
+Nginx must preserve the complete path. A trailing slash on this `proxy_pass` value strips the prefix and prevents Telego from matching the route.
 
 For new secrets, generate path links with:
 
 ```bash
 telego generate proxy.example.com --web-host proxy.example.com --web-base-path telegram/test
 ```
+
+The `--web-base-path` value must match `[web-proxy].base-path`.
 
 Path links contain `server=proxy.example.com%2Ftelegram%2Ftest` and a marked, unpadded base64url secret.
 The marker is byte `0x70` before the original secret. Telego adds this marker when it prints path links.
@@ -768,7 +798,7 @@ docker compose up -d --force-recreate telego
 
 An existing MTProxy installation needs no secret migration. Complete these actions:
 
-1. Add the `[web-proxy]` section with `carrier = "websocket-lanes"`.
+1. Add the `[web-proxy]` section with `carrier = "websocket"`.
 2. Forward HTTP/1.1 WebSocket upgrade headers through every reverse proxy.
 3. Add the Nginx map, WEB ingress, and fallback locations.
 4. Restart Telego.
@@ -794,6 +824,7 @@ If you migrate from `tproxy-server`, keep its old Nginx upstream during the firs
 
 The native implementation supports `https`, `https-lanes`, `websocket`, and `websocket-lanes`.
 
-The installer and examples select `websocket-lanes`, the recommended carrier for maximum WEB performance.
+The installer and examples select `websocket`, which shares one connection across Telegram streams.
+Repeat installations preserve the saved carrier.
 
 An absent or empty `carrier` still selects `https` for compatibility. Explicit carrier values remain unchanged.

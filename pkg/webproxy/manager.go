@@ -368,6 +368,40 @@ func (m *Manager) Get(token string) (*Session, error) {
 	return session, nil
 }
 
+// recognizesToken is only a fallback classification check. Retained tokens
+// remain private after retirement without becoming valid credentials again.
+func (m *Manager) recognizesToken(token string) bool {
+	raw, ok := decodeFallbackCredential(token)
+	if !ok {
+		return false
+	}
+	hash := sha256.Sum256(raw[:])
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.tokenHashUsedLocked(hash)
+}
+
+// decodeFallbackCredential recognizes equivalent base64 spellings only for
+// fallback sanitization. Authentication continues to use canonical parsers.
+func decodeFallbackCredential(value string) ([sha256.Size]byte, bool) {
+	var raw [sha256.Size]byte
+	if len(value) == capabilityLength+1 && value[len(value)-1] == '=' {
+		value = value[:len(value)-1]
+	}
+	if len(value) != capabilityLength {
+		return raw, false
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		decoded, err = base64.RawStdEncoding.DecodeString(value)
+	}
+	if err != nil || len(decoded) != len(raw) {
+		return raw, false
+	}
+	copy(raw[:], decoded)
+	return raw, true
+}
+
 // Close terminates the authenticated session. A recently closed valid token is
 // idempotent; an unknown token remains indistinguishable from bad authentication.
 func (m *Manager) Close(token string) error {

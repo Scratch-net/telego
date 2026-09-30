@@ -29,7 +29,7 @@ For repeatable deployments, use a fixed release tag. The `latest` tag can contai
 ME starts automatically unless `[middle-end].enabled = false`. New clients use direct routes until ME is ready.
 INFO logs report the ME startup result. Private direct routes complete public-IP discovery before they open ME TCP connections.
 
-The gateway installer and WEB examples now select `websocket-lanes` for maximum performance.
+The gateway installer and WEB examples switched to `websocket-lanes` in v0.6.7.
 Existing explicit carrier values remain unchanged. An absent `carrier` still selects `https`.
 
 Automatic ME startup also enables its existing resource limits, including the default limit of 10,000 accepted clients.
@@ -185,7 +185,8 @@ docker compose logs telego
 
 The log must contain `WEB proxy started`.
 
-The example defaults to `websocket-lanes`, the recommended carrier for maximum WEB performance. Its Nginx configuration forwards WebSocket upgrades.
+The example selects `websocket`, which shares one connection across Telegram streams. Its Nginx configuration forwards WebSocket upgrades.
+`websocket-lanes` remains available for separate stream queues, with additional connections and handshakes.
 
 Set `[web-proxy].carrier` to one of these values:
 

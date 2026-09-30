@@ -94,6 +94,11 @@ test-32:
 test-rpm:
 	sh dist/test-rpm.sh
 
+# Requires Docker and Python 3. Tests both shipped Nginx fallback templates.
+.PHONY: test-web-nginx
+test-web-nginx:
+	python3 dist/test-web-nginx.py
+
 # Run benchmarks
 bench:
 	go test -tags="$(TAGS)" -bench=. -benchmem ./pkg/transport/...

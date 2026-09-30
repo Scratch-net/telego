@@ -1,8 +1,10 @@
 package gproxy
 
 import (
+	"errors"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -19,8 +21,8 @@ type HotReloader struct {
 	logger     Logger
 	setLogFn   func(level string) // callback to set log level
 
-	mu      sync.Mutex
-	lastCfg *Config // last loaded config for comparison
+	mu         sync.Mutex // serializes file and signal reloads
+	initialCfg *Config    // effective restart-only settings remain fixed until restart
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -47,7 +49,7 @@ func NewHotReloader(cfg HotReloadConfig) *HotReloader {
 		handler:    cfg.Handler,
 		logger:     cfg.Logger,
 		setLogFn:   cfg.SetLogFn,
-		lastCfg:    initialConfig,
+		initialCfg: initialConfig,
 		stopCh:     make(chan struct{}),
 	}
 }
@@ -94,15 +96,77 @@ func (r *HotReloader) watchFile() {
 	}
 	defer watcher.Close()
 
-	if err := watcher.Add(r.configPath); err != nil {
+	configPath, err := filepath.Abs(r.configPath)
+	if err != nil {
+		r.logger.Warn("failed to resolve config file path: %v", err)
+		return
+	}
+	// Editors commonly replace the file atomically. Watching its parent keeps
+	// the watch alive after replacement and also sees later writes to the file.
+	configDir := filepath.Dir(configPath)
+	if err := watcher.Add(configDir); err != nil {
 		r.logger.Warn("failed to watch config file: %v", err)
 		return
 	}
 
+	// A symlink target can be replaced in a different directory. Watch that
+	// directory too, and move the watch if the config symlink changes targets.
+	resolvedConfigDir, err := filepath.EvalSymlinks(configDir)
+	if err != nil {
+		r.logger.Warn("failed to resolve config directory: %v", err)
+		return
+	}
+	var targetPath, targetDir string
+	watchTargetParent := func() {
+		resolved, err := filepath.EvalSymlinks(configPath)
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				r.logger.Warn("failed to resolve config file target: %v", err)
+			}
+			// Keep the previous target watch across a delete/create interval.
+			return
+		}
+		nextDir := filepath.Dir(resolved)
+		if nextDir == resolvedConfigDir {
+			// fsnotify reports names under the original directory watch path.
+			resolved = filepath.Join(configDir, filepath.Base(resolved))
+			nextDir = ""
+		}
+		if nextDir != targetDir {
+			if nextDir != "" {
+				if err := watcher.Add(nextDir); err != nil {
+					r.logger.Warn("failed to watch config target directory: %v", err)
+					return
+				}
+			}
+			if targetDir != "" {
+				_ = watcher.Remove(targetDir)
+			}
+			targetDir = nextDir
+		}
+		targetPath = resolved
+	}
+	watchTargetParent()
+
+	// Retain direct file events for mount points and rearm after replacement.
+	watchConfigFile := func() {
+		_ = watcher.Remove(configPath)
+		if err := watcher.Add(configPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			r.logger.Warn("failed to watch config file target: %v", err)
+		}
+	}
+	watchConfigFile()
 	r.logger.Debug("watching config file: %s", r.configPath)
 
-	// Debounce timer to avoid multiple reloads on rapid changes
+	// Run debounced reloads on this goroutine so Stop waits for active reloads
+	// and no timer callback can apply config after the watcher has exited.
 	var debounceTimer *time.Timer
+	var debounce <-chan time.Time
+	defer func() {
+		if debounceTimer != nil {
+			debounceTimer.Stop()
+		}
+	}()
 
 	for {
 		select {
@@ -111,19 +175,29 @@ func (r *HotReloader) watchFile() {
 				return
 			}
 
-			// Only reload on write or create (editor may delete+create)
-			if event.Op&(fsnotify.Write|fsnotify.Create) == 0 {
+			path := filepath.Clean(event.Name)
+			if path != configPath && path != targetPath ||
+				event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) == 0 {
 				continue
 			}
 
-			// Debounce: wait 100ms after last event before reloading
-			if debounceTimer != nil {
-				debounceTimer.Stop()
+			if event.Op&(fsnotify.Create|fsnotify.Rename|fsnotify.Remove) != 0 {
+				watchTargetParent()
+				watchConfigFile()
 			}
-			debounceTimer = time.AfterFunc(100*time.Millisecond, func() {
-				r.logger.Info("config file changed, reloading")
-				r.reload()
-			})
+
+			// Wait 100ms after the last event, including an atomic replacement.
+			if debounceTimer == nil {
+				debounceTimer = time.NewTimer(100 * time.Millisecond)
+			} else {
+				debounceTimer.Reset(100 * time.Millisecond)
+			}
+			debounce = debounceTimer.C
+
+		case <-debounce:
+			debounce = nil
+			r.logger.Info("config file changed, reloading")
+			r.reload()
 
 		case err, ok := <-watcher.Errors:
 			if !ok {
@@ -132,9 +206,6 @@ func (r *HotReloader) watchFile() {
 			r.logger.Warn("file watcher error: %v", err)
 
 		case <-r.stopCh:
-			if debounceTimer != nil {
-				debounceTimer.Stop()
-			}
 			return
 		}
 	}
@@ -142,16 +213,24 @@ func (r *HotReloader) watchFile() {
 
 // reload loads the config and applies hot fields.
 func (r *HotReloader) reload() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	select {
+	case <-r.stopCh:
+		return
+	default:
+	}
 	newCfg, logLevel, err := r.loadConfig()
 	if err != nil {
 		r.logger.Warn("config reload failed: %v", err)
 		return
 	}
 
-	r.mu.Lock()
-	oldCfg := r.lastCfg
-	r.lastCfg = newCfg
-	r.mu.Unlock()
+	select {
+	case <-r.stopCh:
+		return
+	default:
+	}
 
 	// Apply log level (always hot-reloadable)
 	if logLevel != "" && r.setLogFn != nil {
@@ -161,8 +240,8 @@ func (r *HotReloader) reload() {
 
 	// Warn about non-hot changes
 	restartRequired := false
-	if oldCfg != nil {
-		restartRequired = r.warnNonHotChanges(oldCfg, newCfg)
+	if r.initialCfg != nil {
+		restartRequired = r.warnNonHotChanges(r.initialCfg, newCfg)
 	}
 
 	// Apply hot config to handler

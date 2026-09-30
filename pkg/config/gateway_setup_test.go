@@ -20,12 +20,16 @@ func TestGatewaySetupACMEWebrootPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, repeat := range []bool{false, true} {
-		name := "fresh"
-		if repeat {
-			name = "repair_existing_private_webroot"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		repeat  bool
+		carrier string
+	}{
+		{name: "fresh", carrier: "websocket"},
+		{name: "repair_existing_private_webroot", repeat: true, carrier: "websocket"},
+		{name: "preserve_existing_lanes", repeat: true, carrier: "websocket-lanes"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
 			root := t.TempDir()
 			for _, path := range []string{
 				"setup.sh", "compose.yaml", "nginx/watch-certificate.sh",
@@ -53,12 +57,13 @@ esac
 printf '%s\n' "$*" >> "$GATEWAY_TEST_DOCKER_LOG"
 `), 0o700)
 			dockerLog := filepath.Join(root, "docker-calls")
-			runSetup := func() {
+			runSetup := func(options ...string) {
 				t.Helper()
 				ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 				defer cancel()
-				cmd := exec.CommandContext(ctx, shell, filepath.Join(root, "setup.sh"),
-					"--domain", "proxy.example.com", "--email", "operator@example.com")
+				args := append([]string{filepath.Join(root, "setup.sh"),
+					"--domain", "proxy.example.com", "--email", "operator@example.com"}, options...)
+				cmd := exec.CommandContext(ctx, shell, args...)
 				cmd.Dir = root
 				cmd.Env = append(os.Environ(), "PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
 					"GATEWAY_TEST_DOCKER_LOG="+dockerLog)
@@ -68,10 +73,10 @@ printf '%s\n' "$*" >> "$GATEWAY_TEST_DOCKER_LOG"
 				}
 			}
 			unchanged := make(map[string][]byte)
-			if repeat {
-				runSetup()
+			if test.repeat {
+				runSetup("--carrier", test.carrier)
 				for _, path := range []string{
-					"state/telego/config.toml", "state/links.txt",
+					"state/telego/config.toml", "state/links.txt", "state/carrier",
 					"state/nginx/nginx.conf", "state/nginx/gateway-server.conf",
 					certificateDir + "/fullchain.pem", certificateDir + "/privkey.pem",
 				} {
@@ -114,14 +119,14 @@ printf '%s\n' "$*" >> "$GATEWAY_TEST_DOCKER_LOG"
 			if len(proxyCfg.Secrets) != 1 || proxyCfg.BindAddr != "0.0.0.0:9443" || proxyCfg.MaskHost != "proxy.example.com" {
 				t.Error("generated gateway configuration lost its secret or listener settings")
 			}
-			if cfg.WebProxy.Carrier != "websocket-lanes" || !cfg.MiddleEnd.Enabled {
-				t.Error("generated gateway configuration must select websocket-lanes and enable Middle-End")
+			if cfg.WebProxy.Carrier != test.carrier || !cfg.MiddleEnd.Enabled {
+				t.Errorf("generated gateway configuration must select %s and enable Middle-End", test.carrier)
 			}
 			if _, err := cfg.ToWebProxyRuntimeConfig(proxyCfg.BindAddr); err != nil {
 				t.Fatalf("convert generated WEB configuration: %v", err)
 			}
 			wantCalls := "compose version\ninfo\ncompose config --quiet\ncompose up -d nginx\ncompose exec -T nginx nginx -t\ncompose up -d\ncompose ps\n"
-			if repeat {
+			if test.repeat {
 				wantCalls = strings.Repeat(wantCalls, 2)
 			}
 			if !bytes.Equal(gatewaySetupRead(t, dockerLog), []byte(wantCalls)) {

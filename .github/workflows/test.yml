@@ -16,6 +16,9 @@ jobs:
       - name: Test RPM workflow
         run: make test-rpm
 
+      - name: Test WEB Nginx fallback templates
+        run: make test-web-nginx
+
       - name: Set up Go
         uses: actions/setup-go@v6
         with:

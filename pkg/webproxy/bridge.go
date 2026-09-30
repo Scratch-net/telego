@@ -373,7 +373,10 @@ function queueWebSocketLane(frame){
  if(!frame.id||(!lane&&closedLanes.has(frame.id)))throw new Error('closed lane was reused');
  if(!lane&&frame.type!==1)throw new Error('lane did not begin with OPEN');
  if(lane&&frame.type===3&&!lane.opened){finishWebSocketLane(lane,false);return}
- if(!lane&&webSocketLaneReservations>=maxWebSocketLanes){fail('ws_lane_limit',null,frame.id);return}
+ if(!lane&&webSocketLaneReservations>=maxWebSocketLanes){
+  activeStreams.delete(frame.id);rememberLaneClosed(frame.id);
+  const close=closeFrame(frame.id);port.postMessage(close,[close]);return;
+ }
  if(!lane){webSocketLaneReservations++;lane=ensureLane(frame.id)}if(!reserve(frame.data,lane)){fail('ws_lane_capacity',null,lane.id,lane.socket);return}
  lane.pending.push(frame.data);if(frame.type===3)lane.localClosed=true;
  if(!lane.socket)openWebSocketLane(lane);else runWebSocketLaneUp(lane);

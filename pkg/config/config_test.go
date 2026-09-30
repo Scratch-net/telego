@@ -1039,7 +1039,7 @@ func TestDockerWebProxyExampleConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToWebProxyRuntimeConfig: %v", err)
 	}
-	if runtime.Carrier != webproxy.CarrierWebSocketLanes {
+	if runtime.Carrier != webproxy.CarrierWebSocket {
 		t.Fatalf("example carrier = %q", runtime.Carrier)
 	}
 	managerConfig := webproxy.DefaultManagerConfig(runtime.Profiles, runtime.Backend)
@@ -1146,9 +1146,9 @@ func TestDockerWebProxyOperationalContracts(t *testing.T) {
 		t.Fatal(err)
 	}
 	setupText := string(setupGuide)
-	if !strings.Contains(setupText, "carrier = \"websocket-lanes\"") ||
+	if !strings.Contains(setupText, "carrier = \"websocket\"") ||
 		!strings.Contains(setupText, "proxy_set_header Upgrade $http_upgrade;") {
-		t.Fatal("setup guide does not enable the recommended WebSocket lanes carrier with upgrade forwarding")
+		t.Fatal("setup guide does not enable the recommended shared WebSocket carrier with upgrade forwarding")
 	}
 	if !strings.Contains(setupText, "legacy mode intentionally trusts PROXY headers") {
 		t.Fatal("setup guide does not qualify legacy public PROXY trust")

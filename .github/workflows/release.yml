@@ -28,6 +28,9 @@ jobs:
       - name: Run local gnet patch regressions
         run: make test-gnet
 
+      - name: Test WEB Nginx fallback templates
+        run: make test-web-nginx
+
       - name: Set up Node for bridge behavior tests
         uses: actions/setup-node@v7
         with:

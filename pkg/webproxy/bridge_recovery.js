@@ -29,14 +29,15 @@ function visitFrames(data,visit){
 function acceptNative(data){
  let skipped=null;
  visitFrames(data,(type,id,start,end)=>{
-  if(closedLanes.has(id)){
-   if(type===1){const close=streamClose(id);port.postMessage(close,[close])}
+  const excess=type===1&&!activeStreams.has(id)&&activeStreams.size>=streamLimit;
+  // Stream traffic must belong to a live native OPEN, even after the bounded
+  // lane tombstones forget an older closed or retired stream.
+  if(closedLanes.has(id)||excess||((type===2||type===3||type===4)&&!activeStreams.has(id))){
+   if(type===1){rememberLaneClosed(id);const close=streamClose(id);port.postMessage(close,[close])}
    if(!skipped)skipped=[];skipped.push([start,end]);return;
   }
-  if(type===1){
-   if(activeStreams.size>=streamLimit&&!activeStreams.has(id))throw new Error('stream limit reached');
-   activeStreams.add(id);
-  }else if(type===3)activeStreams.delete(id);
+  if(type===1)activeStreams.add(id);
+  else if(type===3)activeStreams.delete(id);
  });
  lastActivity=Date.now();
  if(!skipped)return data;

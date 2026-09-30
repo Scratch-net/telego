@@ -53,7 +53,7 @@ curl -fsSL https://raw.githubusercontent.com/Scratch-net/telego/main/examples/ga
 
 The installer configures Telego, Nginx, the TLS certificate, automatic renewal, and persistent host storage.
 
-The installer selects `websocket-lanes`, the recommended carrier for maximum WEB performance. ME starts automatically and uses direct routing until its connections are ready.
+The installer selects `websocket`, which shares one connection across Telegram streams. ME starts automatically and uses direct routing until its connections are ready.
 
 By default, MTProxy and WEB share port 443. Use `--mtproxy-port 9443` to keep WEB on 443 and move MTProxy.
 
@@ -247,7 +247,7 @@ Add this section to enable WEB for existing secrets:
 [web-proxy]
 enabled = true
 hostname = "proxy.example.com"
-carrier = "websocket-lanes"
+carrier = "websocket"
 bind-to = "127.0.0.1:8080"
 trusted-proxy-cidrs = ["127.0.0.1/32"]
 ```
@@ -256,7 +256,8 @@ WEB streams enter the shared MTProxy session core directly on gnet. The default 
 
 An explicit `backend` value selects a local TCP or Unix socket for compatibility. This path retains the authenticated PROXY preface. Nginx terminates real TLS in both paths.
 
-For maximum WEB performance, use `websocket-lanes`. The installer selects this carrier and configures Nginx to forward WebSocket upgrades.
+The installer selects `websocket` and configures Nginx to forward WebSocket upgrades. Repeat installations preserve the saved carrier.
+`websocket-lanes` remains available for separate stream queues. It requires more connections and handshakes, and its performance depends on the client, network, and workload.
 
 The `carrier` value selects one of four transports:
 
@@ -264,8 +265,8 @@ The `carrier` value selects one of four transports:
 |-------|-----------|--------------|
 | `https` | One serialized fetch and long-poll carrier | This value is the default when `carrier` is empty or absent. |
 | `https-lanes` | One fetch and long-poll lane for each Telegram stream | Alternative for deployments without WebSocket support. Requires public HTTP/2. |
-| `websocket` | One multiplexed WebSocket for the WEB session | Forward HTTP/1.1 `Upgrade` and `Connection` headers to Telego. |
-| `websocket-lanes` | One WebSocket for each Telegram stream | Recommended for maximum WEB performance. Installer default. Requires HTTP/1.1 upgrade forwarding. |
+| `websocket` | One multiplexed WebSocket for the WEB session | Installer default. Forward HTTP/1.1 `Upgrade` and `Connection` headers to Telego. |
+| `websocket-lanes` | One WebSocket for each Telegram stream | Separate stream queues, with additional connections and handshakes. Requires HTTP/1.1 upgrade forwarding. |
 
 Current Telegram Desktop manages the WEB carrier. The user does not need to open or keep a browser tab.
 
@@ -301,8 +302,17 @@ Read the [native WEB proxy setup guide](docs/web-proxy.md) for the complete Ngin
 
 The optional `[web-proxy].base-path` serves WEB under a path on the existing HTTPS port.
 For example, `base-path = "telegram/test"` supports a separate instance at `/telegram/test/`.
+Separate instances can share the same public hostname and port 443.
+
+Configure the path in both Telego and Nginx.
+The Nginx route `location ^~ /telegram/test/` must forward the complete path to that instance's private WEB listener.
+Use `proxy_pass` without a URI suffix or trailing slash.
+
 Use `--web-base-path telegram/test` with `--web-host` to generate compatible links.
+The path must match the Telego configuration. A path change requires new client links and a Telego restart.
 An empty base path keeps existing root links unchanged. Path links require a Telegram client with WEB base-path support.
+
+See the [path setup instructions](docs/web-proxy.md#serve-web-under-a-path) for the complete procedure.
 
 For a new VPS, use the [quick managed install](#quick-managed-install). The installer can also disable WEB or select a separate MTProxy port.
 
@@ -374,8 +384,8 @@ mask-host = "www.google.com"  # Host to mimic (SNI validation, proxy links)
 # Native Telegram Desktop WEB proxy (optional; requires Nginx with real TLS)
 [web-proxy]
 enabled = false
-carrier = "websocket-lanes"              # Recommended for maximum WEB performance. Requires upgrade forwarding.
-# Other values: https, https-lanes, websocket
+carrier = "websocket"                    # Installer default. Requires upgrade forwarding.
+# Other values: https, https-lanes, websocket-lanes
 # hostname = "proxy.example.com"            # Required public certificate hostname
 # bind-to = "127.0.0.1:8080"               # Private HTTP/1.1 listener
 # backend = "127.0.0.1:443"                # Explicit local socket compatibility path

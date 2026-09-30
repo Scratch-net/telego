@@ -107,9 +107,10 @@ enabled = false
 # - https-lanes: one fetch and long-poll lane for each Telegram stream.
 # - websocket: one multiplexed WebSocket for the WEB session.
 # - websocket-lanes: one WebSocket for each Telegram stream.
-# For maximum WEB performance, use websocket-lanes (the installer default).
+# The installer selects websocket to share one connection across all streams.
+# WebSocket lanes use separate stream queues with additional connections and handshakes.
 # WebSocket modes require HTTP/1.1 upgrade forwarding. HTTPS lanes require public HTTP/2.
-carrier = "websocket-lanes"
+carrier = "websocket"
 
 # Public DNS hostname on the real TLS certificate. Do not include a scheme,
 # port, path, or trailing dot. This value is required when WEB is enabled.

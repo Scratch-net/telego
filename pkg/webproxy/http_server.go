@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -964,26 +965,36 @@ func (h *httpEventHandler) prepare(
 }
 
 func (h *httpEventHandler) hasCarrierBearer(request carrierRequest) bool {
-	token, ok := bearerToken(request.headers["authorization"])
-	if !ok {
-		return false
+	// Recognize alternate spellings for sanitization only. Carrier
+	// authentication still requires the canonical bearerToken spelling.
+	scheme := true
+	for field := range strings.FieldsSeq(request.headers["authorization"]) {
+		if scheme {
+			if !strings.EqualFold(field, "Bearer") {
+				return false
+			}
+			scheme = false
+			continue
+		}
+		return h.server.config.Manager.recognizesToken(field)
 	}
-	if _, err := h.server.config.Manager.Get(token); err == nil {
-		return true
-	}
-	_, err := h.server.config.Manager.AuthenticateBootstrap(token)
-	return err == nil
+	return false
 }
 
 func (h *httpEventHandler) hasBridgeCapability(query string) bool {
 	for field := range strings.SplitSeq(query, "&") {
 		name, value, _ := strings.Cut(field, "=")
-		if name != "bridge" {
+		name, err := url.QueryUnescape(name)
+		if err != nil || name != "bridge" {
 			continue
 		}
-		capability, err := ParseCapability(value)
-		if err == nil {
-			if _, matched := h.server.config.Manager.MatchCapability(capability); matched {
+		value, err = url.QueryUnescape(value)
+		if err != nil {
+			continue
+		}
+		raw, ok := decodeFallbackCredential(value)
+		if ok {
+			if _, matched := h.server.config.Manager.MatchCapability(Capability(raw)); matched {
 				return true
 			}
 		}
@@ -1044,7 +1055,8 @@ func (r *preparedRequest) releaseWebSocket() {
 func bridgeQueryPresent(query string) bool {
 	for field := range strings.SplitSeq(query, "&") {
 		name, _, _ := strings.Cut(field, "=")
-		if name == "bridge" {
+		name, err := url.QueryUnescape(name)
+		if err == nil && name == "bridge" {
 			return true
 		}
 	}
