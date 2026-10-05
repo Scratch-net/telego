@@ -7,9 +7,11 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -81,6 +83,9 @@ type Capacity struct {
 type Manager struct {
 	debugDiagnostics bool
 
+	// Built from the copied profiles before publication; never mutated.
+	capabilityPrefixes map[uint64]struct{}
+
 	profiles       []Profile
 	carrier        CarrierMode
 	backendNet     string
@@ -139,7 +144,9 @@ func NewManager(config ManagerConfig) (*Manager, error) {
 	manager := &Manager{
 		debugDiagnostics: config.DebugDiagnostics,
 
-		profiles:       append([]Profile(nil), config.Profiles...),
+		capabilityPrefixes: make(map[uint64]struct{}, len(config.Profiles)),
+
+		profiles:       slices.Clone(config.Profiles),
 		carrier:        config.Carrier,
 		backendNet:     backendNetwork,
 		backend:        backendAddress,
@@ -155,13 +162,21 @@ func NewManager(config ManagerConfig) (*Manager, error) {
 		cleanupDone:    make(chan struct{}),
 		shutdownDone:   make(chan struct{}),
 	}
+	for _, profile := range manager.profiles {
+		capability := profile.Capability()
+		manager.capabilityPrefixes[binary.LittleEndian.Uint64(capability[:])] = struct{}{}
+	}
 	go manager.cleanupLoop()
 	return manager, nil
 }
 
-// MatchCapability scans the complete profile set and never returns manager-owned
-// profile storage.
+// MatchCapability rejects unknown 8-byte prefixes before scanning every profile
+// with constant-time comparisons. A prefix match alone never authenticates a
+// credential. The returned profile does not alias manager-owned storage.
 func (m *Manager) MatchCapability(capability Capability) (Profile, bool) {
+	if _, ok := m.capabilityPrefixes[binary.LittleEndian.Uint64(capability[:])]; !ok {
+		return Profile{}, false
+	}
 	matched := -1
 	for index := range m.profiles {
 		candidate := m.profiles[index].Capability()
