@@ -11,7 +11,7 @@ This directory contains the local Telego copy of [gnet v2.10.0](https://github.c
 
 The root module uses this directory through a local `replace` directive.
 The upstream copyright notices, license, and tests remain in this copy.
-The local module files use Go 1.27.1 and updated dependencies, including the test dependencies.
+The local module files use Go 1.27.2 and updated dependencies, including the test dependencies.
 
 ## Local changes
 

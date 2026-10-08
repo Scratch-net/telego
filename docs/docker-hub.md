@@ -13,9 +13,9 @@ The image uses `telego` as its entry point. It contains a static binary and no s
 
 ## Supported image tags
 
-Release `v0.6.8` publishes these tags:
+Release `v0.6.9` publishes these tags:
 
-- `scratchnet/telego:v0.6.8` — fixed release
+- `scratchnet/telego:v0.6.9` — fixed release
 - `scratchnet/telego:v0.6` — latest `v0.6.x` release
 - `scratchnet/telego:v0` — latest `v0.x` release
 - `scratchnet/telego:latest` — moving image from a release or a successful `main` build
@@ -24,7 +24,16 @@ The current manifests support Linux on AMD64, ARM64, and ARMv7.
 
 For repeatable deployments, use a fixed release tag. The `latest` tag can contain unreleased changes from `main`.
 
-## Custom paths for WEB in v0.6.8
+## Changes in v0.6.9
+
+This release adds a WEB credential prefilter and updates the dependencies and Go toolchain.
+Unknown credential prefixes no longer require a scan of every configured profile.
+Possible matches still require full constant-time credential comparisons.
+
+Existing v0.6.8 configuration and proxy links remain compatible.
+Read the [v0.6.9 release notes](https://github.com/Scratch-net/telego/releases/tag/v0.6.9) for details.
+
+## Upgrading from v0.6.7 or earlier
 
 The optional `web-proxy.base-path` lets separate instances share one hostname and HTTPS port.
 The Telego path and Nginx route must match. The `generate` command accepts `--web-base-path` with `--web-host`.
@@ -34,7 +43,7 @@ The gateway installer and WEB examples now select `websocket`, which shares one 
 Repeat installations preserve the saved carrier. Explicit carrier values remain unchanged, and an absent `carrier` still selects `https`.
 The browser bridge can recover after a carrier failure or server restart, within a 15-second total limit per attempt.
 
-This release also corrects configuration reload, TLS cache refresh, connection closure, WEB memory bounds, and metrics listener errors.
+Version v0.6.8 also corrected configuration reload, TLS cache refresh, connection closure, WEB memory bounds, and metrics listener errors.
 Telego rejects unknown TOML keys, negative limits, and invalid TLS ports. Zero retains its documented default or unlimited meaning.
 
 Existing WEB installations need the corrected Nginx fallback configuration as well as the Telego update.
@@ -46,14 +55,14 @@ Read the [v0.6.8 release notes](https://github.com/Scratch-net/telego/releases/t
 Replace `www.google.com` with the FakeTLS mask hostname:
 
 ```bash
-docker run --rm scratchnet/telego:v0.6.8 \
+docker run --rm scratchnet/telego:v0.6.9 \
   generate www.google.com
 ```
 
 To also print Telegram WEB proxy links, add the public WEB hostname:
 
 ```bash
-docker run --rm scratchnet/telego:v0.6.8 \
+docker run --rm scratchnet/telego:v0.6.9 \
   generate www.google.com --web-host proxy.example.com
 ```
 
@@ -84,7 +93,7 @@ docker run -d \
   --restart unless-stopped \
   -p 443:443 \
   -v "$PWD/config.toml:/config.toml:ro" \
-  scratchnet/telego:v0.6.8 \
+  scratchnet/telego:v0.6.9 \
   run -c /config.toml -l
 ```
 
@@ -99,7 +108,7 @@ docker logs telego
 ```yaml
 services:
   telego:
-    image: scratchnet/telego:v0.6.8
+    image: scratchnet/telego:v0.6.9
     restart: unless-stopped
     ports:
       - "443:443"
@@ -161,7 +170,7 @@ Replace `proxy.example.com` in these files:
 Generate the secret and WEB links:
 
 ```bash
-docker run --rm scratchnet/telego:v0.6.8 \
+docker run --rm scratchnet/telego:v0.6.9 \
   generate proxy.example.com --web-host proxy.example.com
 ```
 
@@ -204,7 +213,7 @@ Read the [complete WEB proxy guide](https://github.com/Scratch-net/telego/blob/m
 
 ## Update the container
 
-For a Compose installation, set the Telego image to `scratchnet/telego:v0.6.8` in the Compose file.
+For a Compose installation, set the Telego image to `scratchnet/telego:v0.6.9` in the Compose file.
 Then update the service:
 
 ```bash
