@@ -1337,26 +1337,6 @@ func TestDockerWebProxyOperationalContracts(t *testing.T) {
 			t.Fatalf("example logging setting %q count = %d, want %d", setting, got, want)
 		}
 	}
-
-	setupGuide, err := os.ReadFile("../../docs/web-proxy.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	setupText := string(setupGuide)
-	if !strings.Contains(setupText, "carrier = \"websocket\"") ||
-		!strings.Contains(setupText, "proxy_set_header Upgrade $http_upgrade;") {
-		t.Fatal("setup guide does not enable the recommended shared WebSocket carrier with upgrade forwarding")
-	}
-	if !strings.Contains(setupText, "legacy mode intentionally trusts PROXY headers") {
-		t.Fatal("setup guide does not qualify legacy public PROXY trust")
-	}
-	if !strings.Contains(setupText, "Send every TLS request to this listener") ||
-		strings.Count(setupText, "include /etc/nginx/snippets/telego-web-ingress.conf;") != 1 {
-		t.Fatal("setup guide does not route every TLS path through WEB classification")
-	}
-	if strings.Count(setupText, "docker compose up -d --force-recreate telego") < 2 {
-		t.Fatal("setup guide lacks explicit Telego recreation for configuration changes and rollback")
-	}
 }
 
 func TestDeployNginxOperationalContracts(t *testing.T) {

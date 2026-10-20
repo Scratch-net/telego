@@ -32,7 +32,7 @@ The example keeps Telego on public port 443. Nginx uses private ports for TLS an
 
 ## Installation
 
-Read the [Docker procedure](../../docs/web-proxy.md#docker) in the complete WEB proxy guide.
+The [Docker Hub description](../../docs/docker-hub.md#manual-compose-setup) contains the setup commands for this example.
 
 Replace all example hostnames and secrets before you start the services.
 

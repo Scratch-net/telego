@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/logo.jpg" alt="telEgo Logo" width="200">
+  <img src=".github/logo.jpg" alt="telEgo Logo" width="200">
 </p>
 
 <h1 align="center">telEgo</h1> <!-- Название проекта читается "ТелЕго", см https://ru.wikipedia.org/wiki/%D0%96%D0%B0%D1%80%D0%B3%D0%BE%D0%BD_%D0%BF%D0%B0%D0%B4%D0%BE%D0%BD%D0%BA%D0%BE%D0%B2 -->
@@ -231,8 +231,6 @@ Before ME is ready, the direct DC path stays available. If ME cannot accept a bi
 
 Each connection keeps its selected route until it closes.
 
-Read the [Middle-End operator guide](docs/middle-end.md) for topology, failure behavior, limits, metrics, and proxy configuration.
-
 ---
 
 ## Native Telegram WEB Proxy
@@ -298,7 +296,7 @@ The positional hostname is the FakeTLS mask hostname. The `--web-host` value is 
 
 The `--web-host` value must match `[web-proxy].hostname` and the TLS certificate in Nginx.
 
-Read the [native WEB proxy setup guide](docs/web-proxy.md) for the complete Nginx configuration, Docker setup, and rollback procedure.
+Read the [WEB proxy example](examples/web-proxy/README.md) for the Compose files and certificate renewal procedure.
 
 The optional `[web-proxy].base-path` serves WEB under a path on the existing HTTPS port.
 For example, `base-path = "telegram/test"` supports a separate instance at `/telegram/test/`.
@@ -311,8 +309,6 @@ Use `proxy_pass` without a URI suffix or trailing slash.
 Use `--web-base-path telegram/test` with `--web-host` to generate compatible links.
 The path must match the Telego configuration. A path change requires new client links and a Telego restart.
 An empty base path keeps existing root links unchanged. Path links require a Telegram client with WEB base-path support.
-
-See the [path setup instructions](docs/web-proxy.md#serve-web-under-a-path) for the complete procedure.
 
 For a new VPS, use the [quick managed install](#quick-managed-install). The installer can also disable WEB or select a separate MTProxy port.
 
@@ -447,8 +443,6 @@ telego version   Show version information
 telego doctor -c <config> [--timeout 10s] [--cert-source]
                              Verify the fallback TLS certificate and mask hostname
 ```
-
-See [TLS compatibility and diagnostics](docs/tls-fronting.md) for fragmented ClientHello support and optional Linux ServerHello segmentation.
 
 ---
 
@@ -805,7 +799,7 @@ Unauthenticated FakeTLS probes ─────────────▶ mask h
 
 ## Contributing
 
-Use the [release checklist](docs/releasing.md) for dependency updates, candidate testing, and release promotion.
+Release notes belong in `docs/releases/<tag>.md`. The release workflow passes this file to GoReleaser.
 
 Before a pull request, run `make test`.
 This command runs the local gnet patch regressions and the Telego tests in the three supported build modes.

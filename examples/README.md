@@ -18,4 +18,4 @@ Both examples keep the public TLS connection in Nginx. Telego does not terminate
 
 The managed gateway can keep WEB on port 443 and publish MTProxy on a different port.
 
-Read the [WEB proxy guide](../docs/web-proxy.md) before you change the private traffic flow.
+Read the [gateway traffic flow](gateway/README.md#traffic-flow) before you change the private traffic flow.

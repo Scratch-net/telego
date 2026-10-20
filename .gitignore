@@ -66,4 +66,9 @@ config.toml
 /.local/
 /tools/web-transfer/__pycache__/
 .build/
-/docs/superpowers/
+# Keep only public publishing inputs in docs.
+/docs/*
+!/docs/docker-hub.md
+!/docs/releases/
+/docs/releases/*
+!/docs/releases/*.md

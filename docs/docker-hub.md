@@ -4,8 +4,8 @@ High-performance Telegram MTProxy in Go with Telegram Middle-End, TLS fronting, 
 
 - Source: [github.com/Scratch-net/telego](https://github.com/Scratch-net/telego)
 - Releases: [github.com/Scratch-net/telego/releases](https://github.com/Scratch-net/telego/releases)
-- Middle-End guide: [docs/middle-end.md](https://github.com/Scratch-net/telego/blob/main/docs/middle-end.md)
-- WEB proxy guide: [docs/web-proxy.md](https://github.com/Scratch-net/telego/blob/main/docs/web-proxy.md)
+- Middle-End configuration: [README](https://github.com/Scratch-net/telego#telegram-middle-end)
+- WEB proxy example: [examples/web-proxy](https://github.com/Scratch-net/telego/tree/main/examples/web-proxy)
 - Docker examples: [examples](https://github.com/Scratch-net/telego/tree/main/examples)
 - License: Apache-2.0
 
@@ -37,7 +37,7 @@ Read the [v0.7.0 release notes](https://github.com/Scratch-net/telego/releases/t
 
 The optional `web-proxy.base-path` lets separate instances share one hostname and HTTPS port.
 The Telego path and Nginx route must match. The `generate` command accepts `--web-base-path` with `--web-host`.
-Read the [path guide](https://github.com/Scratch-net/telego/blob/v0.6.8/docs/web-proxy.md#serve-web-under-a-path) before deployment.
+The [WEB proxy section](https://github.com/Scratch-net/telego#native-telegram-web-proxy) describes the path configuration.
 
 The gateway installer and WEB examples now select `websocket`, which shares one connection across Telegram streams.
 Repeat installations preserve the saved carrier. Explicit carrier values remain unchanged, and an absent `carrier` still selects `https`.
@@ -209,7 +209,7 @@ Set `[web-proxy].carrier` to one of these values:
 - `websocket`;
 - `websocket-lanes`.
 
-Read the [complete WEB proxy guide](https://github.com/Scratch-net/telego/blob/main/docs/web-proxy.md) before you adapt the Nginx configuration or add an existing website.
+The [manual example](https://github.com/Scratch-net/telego/tree/main/examples/web-proxy) contains the Compose and Nginx configuration files.
 
 ## Update the container
 
