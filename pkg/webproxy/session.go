@@ -25,6 +25,10 @@ const (
 	pendingBackendInput
 )
 
+type uplinkApplicationReservation interface {
+	transferApplicationLocked(cost, items int) bool
+}
+
 type sessionOptions struct {
 	profile               Profile
 	carrier               CarrierMode
@@ -85,6 +89,7 @@ type carrierLane struct {
 	unackedCost     int
 	unackedItems    int
 	unackedBase     uint64
+	unackedOwner    *carrierBatchOwnership
 	downCursor      uint64
 	lastUpSequence  uint64
 	lastUpDigest    [sha256.Size]byte
@@ -128,26 +133,26 @@ type Session struct {
 	budget         func(int, int, pendingClass) bool
 	manager        *Manager
 
-	mu              sync.Mutex
-	streams         map[uint32]*streamState
-	backends        map[*backendStream]struct{}
-	usedStreams     streamIDHistory
-	tombstones      boundedSet[uint32]
-	carrierLanes    map[uint32]*carrierLane
-	websocketActive bool
-	httpUpLanes     map[uint32]*httpUpLane
-	httpInputCost   int
-	httpInputItems  int
-	pendingCost     int
-	pendingItems    int
-	closed          bool
-	closeReason     sessionCloseReason
-	lastActivity    time.Time
-	budgetNotify    chan struct{}
-	done            chan struct{}
-	finishNotified  chan struct{}
-	finishOnce      sync.Once
-	backendWG       sync.WaitGroup
+	mu                sync.Mutex
+	streams           map[uint32]*streamState
+	backends          map[*backendStream]struct{}
+	usedStreams       streamIDHistory
+	tombstones        boundedSet[uint32]
+	carrierLanes      map[uint32]*carrierLane
+	websocketActive   bool
+	httpUpLanes       map[uint32]*httpUpLane
+	carrierOwnedCost  int
+	carrierOwnedItems int
+	pendingCost       int
+	pendingItems      int
+	closed            bool
+	closeReason       sessionCloseReason
+	lastActivity      time.Time
+	budgetNotify      chan struct{}
+	done              chan struct{}
+	finishNotified    chan struct{}
+	finishOnce        sync.Once
+	backendWG         sync.WaitGroup
 
 	onFinished            func(*Session, sessionCloseReason)
 	onCarrierRetry        func(carrierOperation)
@@ -170,11 +175,12 @@ type WebSocketLaneLease struct {
 // WebSocket message against the same bounded session and manager budgets used
 // by carrier and backend queues.
 type webSocketInputReservation struct {
-	mu       sync.Mutex
-	session  *Session
-	cost     int
-	items    int
-	released bool
+	// Session.mu protects all reservation fields, including application transfer.
+	session                     *Session
+	cost, items                 int
+	size, copyCost              int
+	applyCost, applyItems       int
+	coalesced, sealed, released bool
 }
 
 func newSession(options sessionOptions) *Session {
@@ -225,21 +231,33 @@ func (s *Session) CarrierMode() CarrierMode { return s.carrier }
 
 func (s *Session) doneChannel() <-chan struct{} { return s.done }
 
+func (s *Session) webSocketInputPayloadBound(size int) int {
+	return min(size, s.limits.MaxBodyBytes, maxWebSocketMessageBytes)
+}
+
+func (s *Session) webSocketInputCharges(size int) (cost, items, copyCost, applyCost int) {
+	payload := s.webSocketInputPayloadBound(size)
+	applyItems := min(payload/FrameHeaderSize, MaxBatchFrames)
+	copyCost = payload
+	applyCost = payload + applyItems*queueItemCost
+	return size + queueItemCost + copyCost + applyCost, 1 + applyItems, copyCost, applyCost
+}
+
 func (s *Session) reserveWebSocketInput(size int) (*webSocketInputReservation, bool) {
 	maxOwned := 2 * min(s.limits.MaxBodyBytes, maxWebSocketMessageBytes)
 	if size < 0 || size > maxOwned {
 		return nil, false
 	}
-	cost, ok := checkedAddInt(size, queueItemCost)
-	if !ok {
-		return nil, false
-	}
+	cost, items, copyCost, applyCost := s.webSocketInputCharges(size)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || !s.reservePendingLocked(cost, 1, pendingUplink) {
+	if s.closed || !s.reservePendingLocked(cost, items, pendingUplink) {
 		return nil, false
 	}
-	return &webSocketInputReservation{session: s, cost: cost, items: 1}, true
+	s.carrierOwnedCost += cost
+	s.carrierOwnedItems += items
+	return &webSocketInputReservation{session: s, cost: cost, items: items, size: size,
+		copyCost: copyCost, applyCost: applyCost, applyItems: items - 1}, true
 }
 
 func (r *webSocketInputReservation) resize(size int) bool {
@@ -253,28 +271,86 @@ func (r *webSocketInputReservation) resize(size int) bool {
 	if size < 0 || size > maxOwned {
 		return false
 	}
-	newCost, ok := checkedAddInt(size, queueItemCost)
-	if !ok {
+	r.session.mu.Lock()
+	defer r.session.mu.Unlock()
+	if r.released || r.coalesced || r.sealed || r.session.closed {
 		return false
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.released {
+	newCost, newItems, copyCost, applyCost := r.session.webSocketInputCharges(size)
+	delta, deltaItems := newCost-r.cost, newItems-r.items
+	if delta > 0 && !r.session.reservePendingLocked(delta, deltaItems, pendingUplink) {
+		return false
+	}
+	if delta < 0 {
+		r.session.releasePendingLocked(-delta, -deltaItems)
+	}
+	r.session.carrierOwnedCost += delta
+	r.session.carrierOwnedItems += deltaItems
+	r.cost, r.items, r.size = newCost, newItems, size
+	r.copyCost, r.applyCost, r.applyItems = copyCost, applyCost, newItems-1
+	return true
+}
+
+func (r *webSocketInputReservation) sealApplication(cost, items int) bool {
+	r.session.mu.Lock()
+	defer r.session.mu.Unlock()
+	if r.released || r.sealed || r.session.closed || cost > r.applyCost || items > r.applyItems {
+		return false
+	}
+	unusedCost, unusedItems := r.applyCost-cost, r.applyItems-items
+	r.session.carrierOwnedCost -= unusedCost
+	r.session.carrierOwnedItems -= unusedItems
+	r.session.releasePendingLocked(unusedCost, unusedItems)
+	r.cost -= unusedCost
+	r.items -= unusedItems
+	r.applyCost, r.applyItems, r.sealed = cost, items, true
+	return true
+}
+
+// consumeCopy moves prepaid coalescing capacity to actual contiguous storage.
+// It must succeed without requiring capacity that queued messages could own.
+func (r *webSocketInputReservation) consumeCopy(size int) bool {
+	if r == nil || r.session == nil {
 		return false
 	}
 	r.session.mu.Lock()
 	defer r.session.mu.Unlock()
-	if r.session.closed {
+	if r.released || r.coalesced || r.session.closed || size < 0 || size > r.copyCost {
 		return false
 	}
-	delta := newCost - r.cost
-	if delta > 0 && !r.session.reservePendingLocked(delta, 0, pendingUplink) {
+	r.size += size
+	r.copyCost -= size
+	r.coalesced = true
+	return true
+}
+
+func (r *webSocketInputReservation) processUp(sequence uint64, body []byte, lane *WebSocketLaneLease) (uint64, error) {
+	if r == nil || r.session == nil {
+		return 0, ErrClosed
+	}
+	if lane != nil {
+		if lane.session != r.session || lane.lane == nil {
+			return 0, ErrClosed
+		}
+		return r.session.processUp(lane.laneID, sequence, body, true, lane.lane, r)
+	}
+	if r.session.carrier.usesLanes() {
+		return 0, ErrProtocol
+	}
+	return r.session.processUp(0, sequence, body, false, nil, r)
+}
+
+func (r *webSocketInputReservation) transferApplicationLocked(cost, items int) bool {
+	if r.released || cost > r.applyCost || items > r.applyItems {
 		return false
 	}
-	if delta < 0 {
-		r.session.releasePendingLocked(-delta, 0)
-	}
-	r.cost = newCost
+	s := r.session
+	s.carrierOwnedCost -= r.applyCost
+	s.carrierOwnedItems -= r.applyItems
+	s.releasePendingQuietLocked(r.applyCost-cost, r.applyItems-items)
+	r.cost -= r.applyCost
+	r.items -= r.applyItems
+	r.applyCost, r.applyItems = 0, 0
 	return true
 }
 
@@ -282,17 +358,15 @@ func (r *webSocketInputReservation) Release() {
 	if r == nil || r.session == nil {
 		return
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.session.mu.Lock()
+	defer r.session.mu.Unlock()
 	if r.released {
 		return
 	}
 	r.released = true
-	r.session.mu.Lock()
-	if !r.session.closed {
-		r.session.releasePendingLocked(r.cost, r.items)
-	}
-	r.session.mu.Unlock()
+	r.session.carrierOwnedCost -= r.cost
+	r.session.carrierOwnedItems -= r.items
+	r.session.releasePendingLocked(r.cost, r.items)
 	r.cost = 0
 	r.items = 0
 }
@@ -420,7 +494,7 @@ func (s *Session) processUp(
 	body []byte,
 	lanes bool,
 	expected *carrierLane,
-	prepaid *httpUpReservation,
+	prepaid uplinkApplicationReservation,
 ) (uint64, error) {
 	digest := sha256.Sum256(body)
 	s.mu.Lock()
@@ -520,6 +594,9 @@ func (s *Session) processUp(
 		lane.lastUpSequence = sequence
 		lane.lastUpDigest = digest
 		lane.upHistory[sequence%httpUpWindow] = upCommit{sequence: sequence, digest: digest}
+		if conveyor := s.httpUpLanes[laneID]; conveyor != nil {
+			s.releaseHTTPUpEscrowLocked(laneID, conveyor)
+		}
 	}
 	s.mu.Unlock()
 
@@ -575,11 +652,41 @@ func onlyLateLaneFrames(frames []Frame) bool {
 // PollLease keeps one completed carrier response as the active downlink poll
 // until the HTTP layer has drained that response. A newer poll supersedes it.
 type PollLease struct {
-	session  *Session
-	lane     *carrierLane
-	claim    chan struct{}
-	ownsSlot bool
-	once     sync.Once
+	session   *Session
+	lane      *carrierLane
+	claim     chan struct{}
+	ownsSlot  bool
+	once      sync.Once
+	bodyOwner *carrierBatchOwnership
+}
+
+// Replay storage and its serialized response share the established logical
+// batch charge. A response still owns that charge after replay is discarded.
+// Session.mu protects both the references and the carrier-owned ledger.
+type carrierBatchOwnership struct {
+	session     *Session
+	cost, items int
+	refs        int
+}
+
+func (o *carrierBatchOwnership) releaseLocked() {
+	if o == nil {
+		return
+	}
+	if o.refs <= 0 {
+		panic("invalid WEB carrier batch ownership release")
+	}
+	o.refs--
+	if o.refs == 0 {
+		o.session.carrierOwnedCost -= o.cost
+		o.session.carrierOwnedItems -= o.items
+		o.session.releasePendingLocked(o.cost, o.items)
+	}
+}
+
+func (l *PollLease) retainBodyLocked() {
+	l.bodyOwner = l.lane.unackedOwner
+	l.bodyOwner.refs++
 }
 
 // Superseded reports whether a newer downlink poll replaced this response.
@@ -611,6 +718,8 @@ func (l *PollLease) releaseLocked() {
 		return
 	}
 	l.once.Do(func() {
+		l.bodyOwner.releaseLocked()
+		l.bodyOwner = nil
 		if l.lane.superseded == l.claim {
 			l.lane.downActive = false
 			l.lane.superseded = nil
@@ -739,6 +848,7 @@ func (s *Session) pollCarrier(
 	if len(lane.unacked) != 0 {
 		if cursor == lane.unackedBase {
 			body := bytes.Clone(lane.unacked)
+			lease.retainBodyLocked()
 			next := lane.downCursor
 			s.mu.Unlock()
 			s.recordCarrierRetry(carrierOperationDownlink)
@@ -751,7 +861,8 @@ func (s *Session) pollCarrier(
 			requestBackendCloses(backends)
 			return nil, cursor, false, nil, ErrProtocol
 		}
-		s.releasePendingLocked(lane.unackedCost, lane.unackedItems)
+		lane.unackedOwner.releaseLocked()
+		lane.unackedOwner = nil
 		lane.unacked = nil
 		lane.unackedCost = 0
 		lane.unackedItems = 0
@@ -783,8 +894,12 @@ func (s *Session) pollCarrier(
 			lane.unacked = batch.body
 			lane.unackedCost = batch.cost
 			lane.unackedItems = batch.items
+			lane.unackedOwner = &carrierBatchOwnership{session: s, cost: batch.cost, items: batch.items, refs: 1}
+			s.carrierOwnedCost += batch.cost
+			s.carrierOwnedItems += batch.items
 			next := lane.downCursor
 			body := bytes.Clone(batch.body)
+			lease.retainBodyLocked()
 			s.mu.Unlock()
 			return body, next, false, lease, nil
 		}
@@ -1310,7 +1425,7 @@ func (s *Session) reserveBackendPendingLocked(backend *backendStream, cost, item
 		handoffCost, handoffItems := backendHandoffReserve(s.limits)
 		costLimit, itemLimit = subtractReserve(costLimit, itemLimit, reserveCost+handoffCost/2, reserveItems+handoffItems/2)
 	}
-	if cost <= 0 || items < 0 || cost > costLimit || items > itemLimit ||
+	if cost < 0 || items < 0 || cost > costLimit || items > itemLimit ||
 		s.pendingCost > costLimit-cost || s.pendingItems > itemLimit-items {
 		return false
 	}
@@ -1443,8 +1558,9 @@ func (s *Session) releaseCarrierLaneLocked(laneID uint32) {
 		conveyor.signal()
 	}
 	delete(s.carrierLanes, laneID)
-	cost := lane.unackedCost
-	items := lane.unackedItems
+	lane.unackedOwner.releaseLocked()
+	lane.unackedOwner = nil
+	cost, items := 0, 0
 	for index := range lane.pendingFrames {
 		cost += lane.pendingFrames[index].cost
 		items++
@@ -1505,9 +1621,13 @@ func (s *Session) closeLocked(reason sessionCloseReason) []*backendStream {
 		backends = append(backends, state.backend)
 	}
 	s.streams = nil
+	for _, lane := range s.carrierLanes {
+		lane.unackedOwner.releaseLocked()
+		lane.unackedOwner = nil
+	}
 	// Owner backends and HTTP handlers retain charges until they release the
 	// actual storage. Other sessions cannot reuse their capacity early.
-	retainedCost, retainedItems := s.httpInputCost, s.httpInputItems
+	retainedCost, retainedItems := s.carrierOwnedCost, s.carrierOwnedItems
 	for backend := range s.backends {
 		retainedCost += backend.inputCost + backend.outputCost
 		retainedItems += backend.inputItems + backend.outputItems

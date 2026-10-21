@@ -1175,7 +1175,7 @@ func TestHTTPServerWebSocketLargeFrameYieldsEventLoop(t *testing.T) {
 	eventually(t, time.Second, func() bool {
 		capacity := application.manager.Capacity()
 		return capacity.PendingBytes >= baseline.PendingBytes+int64(maxWebSocketMessageBytes+queueItemCost) &&
-			capacity.PendingItems == baseline.PendingItems+1
+			capacity.PendingItems == baseline.PendingItems+1+MaxBatchFrames
 	})
 	payload := bytes.Repeat([]byte{0x7f}, maxWebSocketMessageBytes)
 	ws.Cipher(payload, [4]byte{1, 2, 3, 4}, 0)
@@ -1230,8 +1230,9 @@ func TestWebSocketInputReservationUsesSessionAndGlobalBudgets(t *testing.T) {
 		t.Fatal("initial reservation failed")
 	}
 	afterReserve := manager.Capacity()
-	if afterReserve.PendingBytes-before.PendingBytes != 16+queueItemCost ||
-		afterReserve.PendingItems-before.PendingItems != 1 {
+	// Body, a possible contiguous copy, and application are all prepaid.
+	if afterReserve.PendingBytes-before.PendingBytes != 3*16+3*queueItemCost ||
+		afterReserve.PendingItems-before.PendingItems != 3 {
 		t.Fatalf("reservation delta = %d bytes, %d items", afterReserve.PendingBytes-before.PendingBytes,
 			afterReserve.PendingItems-before.PendingItems)
 	}
@@ -1239,7 +1240,7 @@ func TestWebSocketInputReservationUsesSessionAndGlobalBudgets(t *testing.T) {
 		t.Fatal("reservation resize failed")
 	}
 	afterResize := manager.Capacity()
-	if afterResize.PendingBytes-before.PendingBytes != 32+queueItemCost {
+	if afterResize.PendingBytes-before.PendingBytes != 3*32+5*queueItemCost {
 		t.Fatalf("resized delta = %d bytes", afterResize.PendingBytes-before.PendingBytes)
 	}
 	reservation.Release()
@@ -1346,7 +1347,7 @@ func TestWebSocketFragmentErrorReleasesAllInputBudgets(t *testing.T) {
 		t.Fatalf("fragment decode: emitted=%t err=%v", emitted, decodeErr)
 	}
 	reserved := manager.Capacity()
-	if reserved.PendingBytes <= baseline.PendingBytes || reserved.PendingItems != baseline.PendingItems+1 {
+	if reserved.PendingBytes <= baseline.PendingBytes || reserved.PendingItems <= baseline.PendingItems {
 		t.Fatalf("fragment did not reserve input capacity: before %#v, after %#v", baseline, reserved)
 	}
 	invalid := maskedClientFrame(t, ws.OpText, true, []byte("invalid"))
@@ -1376,7 +1377,7 @@ func TestWebSocketLaneLocalInputBudgetAndSiblingCapacity(t *testing.T) {
 	if _, ok := newWebSocketOwnedInput(created.Session, local, 1); ok {
 		t.Fatal("lane-local budget accepted a second input item")
 	}
-	if !firstReservation.resize(3*messageLimit) || firstReservation.resize(3*messageLimit+1) {
+	if !firstReservation.resize(2*messageLimit) || firstReservation.resize(2*messageLimit+1) {
 		t.Fatal("lane-local byte cap was not enforced")
 	}
 	firstReservation.Release()
@@ -1397,7 +1398,7 @@ func TestWebSocketLaneLocalInputBudgetAndSiblingCapacity(t *testing.T) {
 	eventually(t, time.Second, func() bool {
 		capacity := application.manager.Capacity()
 		return capacity.PendingBytes >= baseline.PendingBytes+int64(messageLimit+queueItemCost) &&
-			capacity.PendingItems == baseline.PendingItems+1
+			capacity.PendingItems == baseline.PendingItems+1+MaxBatchFrames
 	})
 
 	sibling, siblingResponse := dialWebSocketTest(t, application.address,

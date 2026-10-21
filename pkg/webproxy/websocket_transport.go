@@ -43,6 +43,60 @@ type webSocketInbound struct {
 	reservation  *webSocketOwnedInput
 }
 
+// applicationBound skips payloads without copying the message. Counting all
+// DATA frames covers application even when earlier OPEN/CLOSE frames change
+// which streams are live. The worker still validates the complete batch.
+func (input webSocketInbound) applicationBound() (cost, items int, ok bool) {
+	chunk, next := input.body, input.fragments
+	remaining := len(chunk)
+	for fragment := next; fragment != nil; fragment = fragment.next {
+		remaining += len(fragment.payload)
+	}
+	consume := func(size int, header []byte) bool {
+		for size != 0 {
+			if len(chunk) == 0 {
+				if next == nil {
+					return false
+				}
+				chunk, next = next.payload, next.next
+				continue
+			}
+			n := min(size, len(chunk))
+			if header != nil {
+				copy(header, chunk[:n])
+				header = header[n:]
+			}
+			chunk = chunk[n:]
+			size -= n
+		}
+		return true
+	}
+	for frames := 0; remaining != 0; frames++ {
+		if frames == MaxBatchFrames || remaining < FrameHeaderSize {
+			return 0, 0, false
+		}
+		var header [FrameHeaderSize]byte
+		if !consume(FrameHeaderSize, header[:]) {
+			return 0, 0, false
+		}
+		payloadSize := binary.BigEndian.Uint32(header[4:])
+		if payloadSize > MaxFramePayload {
+			return 0, 0, false
+		}
+		payload := int(payloadSize)
+		remaining -= FrameHeaderSize
+		if payload > remaining || !consume(payload, nil) {
+			return 0, 0, false
+		}
+		remaining -= payload
+		if FrameType(header[0]) == FrameData {
+			cost += payload + queueItemCost
+			items++
+		}
+	}
+	return cost, items, true
+}
+
 type webSocketUplinkResult struct {
 	code ws.StatusCode
 }
@@ -69,61 +123,88 @@ type webSocketInboundBuffer interface {
 type webSocketInboundBudget struct {
 	mu       sync.Mutex
 	bytes    int
+	rawBytes int
 	items    int
 	maxBytes int
 	maxItems int
+	copies   map[*webSocketOwnedInput]int
 }
 
 type webSocketOwnedInput struct {
-	mu       sync.Mutex
-	session  *webSocketInputReservation
-	local    *webSocketInboundBudget
-	size     int
-	released bool
+	mu        sync.Mutex
+	session   *webSocketInputReservation
+	local     *webSocketInboundBudget
+	size      int
+	localSize int
+	released  bool
 }
 
-func (b *webSocketInboundBudget) reserve(size int) bool {
+func (b *webSocketInboundBudget) reserve(owner *webSocketOwnedInput, size, copyBytes int) bool {
 	if b == nil || size < 0 {
 		return false
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.items >= b.maxItems || size > b.maxBytes-b.bytes {
+	copyLimit := b.copyLimit(nil)
+	if b.items >= b.maxItems || size+max(copyLimit, copyBytes) > b.maxBytes-b.rawBytes {
 		return false
 	}
-	b.bytes += size
+	if b.copies == nil {
+		b.copies = make(map[*webSocketOwnedInput]int)
+	}
+	b.copies[owner] = copyBytes
+	b.rawBytes += size
+	b.bytes = b.rawBytes + max(copyLimit, copyBytes)
 	b.items++
 	return true
 }
 
-func (b *webSocketInboundBudget) resize(previous, next int) bool {
+func (b *webSocketInboundBudget) resize(owner *webSocketOwnedInput, previous, next, copyBytes int) bool {
 	if b == nil || previous < 0 || next < 0 {
 		return false
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.items == 0 || previous > b.bytes {
+	if _, owned := b.copies[owner]; !owned || previous > b.rawBytes {
 		return false
 	}
-	delta := next - previous
-	if delta > 0 && delta > b.maxBytes-b.bytes {
+	copyLimit := max(b.copyLimit(owner), copyBytes)
+	rawBytes := b.rawBytes + next - previous
+	if rawBytes+copyLimit > b.maxBytes {
 		return false
 	}
-	b.bytes += delta
+	b.copies[owner] = copyBytes
+	b.rawBytes = rawBytes
+	b.bytes = rawBytes + copyLimit
 	return true
 }
 
-func (b *webSocketInboundBudget) release(size int) {
+func (b *webSocketInboundBudget) release(owner *webSocketOwnedInput, size int) {
 	if b == nil {
 		return
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if size < 0 || b.items == 0 || size > b.bytes {
+	_, owned := b.copies[owner]
+	if size < 0 || !owned || size > b.rawBytes {
 		panic("invalid WEB WebSocket local budget release")
 	}
-	b.bytes -= size
+	delete(b.copies, owner)
+	b.rawBytes -= size
+	b.bytes = b.rawBytes + b.copyLimit(nil)
 	b.items--
+}
+
+// Only the serial worker coalesces. All live inputs share one local spare
+// sized for the largest possible copy, while each prepays its global copy.
+func (b *webSocketInboundBudget) copyLimit(exclude *webSocketOwnedInput) int {
+	limit := 0
+	for owner, size := range b.copies {
+		if owner != exclude {
+			limit = max(limit, size)
+		}
+	}
+	return limit
 }
 
 func (b *webSocketInboundBudget) snapshot() (int, int) {
@@ -140,15 +221,17 @@ func newWebSocketOwnedInput(
 	local *webSocketInboundBudget,
 	size int,
 ) (*webSocketOwnedInput, bool) {
-	if !local.reserve(size) {
+	owner := &webSocketOwnedInput{local: local, size: size, localSize: size}
+	if !local.reserve(owner, size, session.webSocketInputPayloadBound(size)) {
 		return nil, false
 	}
 	reserved, ok := session.reserveWebSocketInput(size)
 	if !ok {
-		local.release(size)
+		local.release(owner, size)
 		return nil, false
 	}
-	return &webSocketOwnedInput{session: reserved, local: local, size: size}, true
+	owner.session = reserved
+	return owner, true
 }
 
 func (r *webSocketOwnedInput) resize(size int) bool {
@@ -167,27 +250,29 @@ func (r *webSocketOwnedInput) grow(delta int) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	size, ok := checkedAddInt(r.size, delta)
-	if !ok {
+	if !ok || r.released || !r.session.consumeCopy(delta) {
 		return false
 	}
-	return r.resizeLocked(size)
+	r.size = size
+	return true
 }
 
 func (r *webSocketOwnedInput) resizeLocked(size int) bool {
 	if r.released || size == r.size {
 		return !r.released
 	}
-	previous := r.size
-	if !r.local.resize(previous, size) {
+	previous := r.localSize
+	if !r.local.resize(r, previous, size, r.session.session.webSocketInputPayloadBound(size)) {
 		return false
 	}
 	if !r.session.resize(size) {
-		if !r.local.resize(size, previous) {
+		if !r.local.resize(r, size, previous, r.session.session.webSocketInputPayloadBound(previous)) {
 			panic("failed to roll back WEB WebSocket local budget")
 		}
 		return false
 	}
 	r.size = size
+	r.localSize = size
 	return true
 }
 
@@ -202,8 +287,9 @@ func (r *webSocketOwnedInput) Release() {
 	}
 	r.released = true
 	r.session.Release()
-	r.local.release(r.size)
+	r.local.release(r, r.localSize)
 	r.size = 0
+	r.localSize = 0
 }
 
 type webSocketConnection struct {
@@ -415,7 +501,11 @@ func (w *webSocketConnection) processUplink(
 	sequence uint64,
 	input webSocketInbound,
 ) ws.StatusCode {
-	defer input.reservation.Release()
+	defer func() {
+		input.body = nil
+		input.fragments = nil
+		input.reservation.Release()
+	}()
 	if input.chunked {
 		size := input.payloadBytes
 		if !input.reservation.grow(size) {
@@ -437,13 +527,7 @@ func (w *webSocketConnection) processUplink(
 	retry := time.NewTicker(w.backpressureRetry)
 	defer retry.Stop()
 	for {
-		var acknowledged uint64
-		var err error
-		if w.lane != nil {
-			acknowledged, err = w.lane.ProcessUp(sequence, input.body)
-		} else {
-			acknowledged, err = w.session.ProcessUp(sequence, input.body)
-		}
+		acknowledged, err := input.reservation.session.processUp(sequence, input.body, w.lane)
 		if err == nil && acknowledged == sequence {
 			return 0
 		}
@@ -868,6 +952,14 @@ uplinkResults:
 				reservation:  transport.fragmentReservation,
 			}
 			transport.fragmentReservation = nil
+			// Keep worst-case prepay while decoding. A complete, bounded frame
+			// walk returns surplus before this body joins the Desktop burst queue.
+			if cost, items, valid := input.applicationBound(); valid {
+				if !input.reservation.session.sealApplication(cost, items) {
+					input.reservation.Release()
+					return gnet.Close
+				}
+			}
 			select {
 			case transport.inbound <- input:
 				transport.uplinkPending++

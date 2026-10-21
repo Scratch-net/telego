@@ -129,12 +129,15 @@ func TestHTTPConveyorAdmissionBoundsAndWrap(t *testing.T) {
 		t.Fatalf("ahead window=%v", err)
 	}
 	leases := make([]*httpUpReservation, 0, 2*httpUpWindow)
-	for range 2 * httpUpWindow {
+	for range 2*httpUpWindow - 1 {
 		leases = append(leases, reserveHTTPTest(t, s, 0, 2, body))
 	}
 	if _, err := s.reserveHTTPUp(0, 2, len(body)); !errors.Is(err, ErrBackpressure) {
 		t.Fatalf("duplicate bound=%v", err)
 	}
+	// Duplicate future readers must leave a reader slot for the missing head.
+	head := reserveHTTPTest(t, s, 0, 1, body)
+	head.Release()
 	for _, r := range leases {
 		r.Release()
 	}

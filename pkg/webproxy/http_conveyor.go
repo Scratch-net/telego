@@ -15,9 +15,18 @@ type upCommit struct {
 }
 
 type httpUpBatch struct {
-	digest  [sha256.Size]byte
-	known   bool
-	readers int
+	digest                  [sha256.Size]byte
+	known                   bool
+	readers                 int
+	ownedCost, ownedItems   int
+	escrowCost, escrowItems int
+}
+
+type httpUpEscrow struct{ cost, items int }
+
+type httpUpEscrowPlan struct {
+	batches              map[uint64]httpUpEscrow
+	cost, items, missing int
 }
 
 type httpUpLane struct {
@@ -39,6 +48,7 @@ type httpUpReservation struct {
 	bodySize              int
 	cost, items           int
 	applyCost, applyItems int
+	batch                 *httpUpBatch
 	releaseOnce           func()
 }
 
@@ -74,7 +84,15 @@ func (s *Session) reserveHTTPUp(laneID uint32, sequence uint64, size int) (*http
 		}
 		lane = &httpUpLane{pending: make(map[uint64]*httpUpBatch), notify: make(chan struct{})}
 	}
-	if lane.readers >= 2*httpUpWindow || !s.reservePendingLocked(cost, items, pendingUplink) {
+	// A later request depends on every earlier sequence, even when an earlier
+	// reader cancels or its retry has a larger body. Prepay those obligations
+	// before admitting the later body, against both existing pending budgets.
+	s.releaseHTTPUpEscrowLocked(laneID, lane)
+	plan := s.httpUpEscrowPlanLocked(laneID, lane, sequence, cost, items)
+	escrowCost, escrowItems := lane.escrowCharge()
+	additionalCost, additionalItems := cost+plan.cost-escrowCost, items+plan.items-escrowItems
+	if lane.readers+1+plan.missing > 2*httpUpWindow ||
+		!s.reservePendingLocked(additionalCost, additionalItems, pendingUplink) {
 		return nil, ErrBackpressure
 	}
 	if s.httpUpLanes == nil {
@@ -82,20 +100,111 @@ func (s *Session) reserveHTTPUp(laneID uint32, sequence uint64, size int) (*http
 	}
 	s.httpUpLanes[laneID] = lane
 	lane.readers++
-	if sequence > committed {
-		batch := lane.pending[sequence]
-		if batch == nil {
-			batch = &httpUpBatch{}
-			lane.pending[sequence] = batch
-		}
-		batch.readers++
-	}
-	s.httpInputCost += cost
-	s.httpInputItems += items
+	lane.applyEscrow(plan)
+	s.carrierOwnedCost += additionalCost
+	s.carrierOwnedItems += additionalItems
 	reservation := &httpUpReservation{session: s, lane: lane, laneID: laneID, sequence: sequence, bodySize: size,
 		cost: cost, items: items, applyCost: applyCost, applyItems: applyItems}
+	if !retired && sequence > committed {
+		reservation.batch = lane.pending[sequence]
+		reservation.batch.readers++
+		reservation.batch.ownedCost += cost
+		reservation.batch.ownedItems += items
+	}
 	reservation.releaseOnce = sync.OnceFunc(reservation.releaseOwned)
 	return reservation, nil
+}
+
+// An uncommitted predecessor owns enough capacity for a maximum request,
+// shared by its live readers and escrow. Missing readers also retain a slot
+// in the lane's bounded reader count. The highest sequence needs no escrow.
+func (s *Session) httpUpEscrowPlanLocked(laneID uint32, lane *httpUpLane, incoming uint64, cost, items int) httpUpEscrowPlan {
+	plan := httpUpEscrowPlan{}
+	if s.closed || s.retiredHTTPUpLaneLocked(laneID) {
+		return plan
+	}
+	committed := uint64(0)
+	if carrier := s.carrierLanes[laneID]; carrier != nil {
+		committed = carrier.lastUpSequence
+	}
+	if incoming <= committed {
+		incoming = 0
+	}
+	highest := committed
+	for sequence, batch := range lane.pending {
+		if batch.readers != 0 && sequence > highest {
+			highest = sequence
+		}
+	}
+	highest = max(highest, incoming)
+	if highest == committed {
+		return plan
+	}
+	maxBody := min(s.limits.MaxBodyBytes, maxCarrierBatchBytes)
+	maxItems := 1 + min(maxBody/FrameHeaderSize, MaxBatchFrames)
+	maxCost := 2*maxBody + maxItems*queueItemCost
+	plan.batches = make(map[uint64]httpUpEscrow, httpUpWindow)
+	for sequence := committed; sequence < highest; {
+		sequence++ // highest can be MaxUint64; never increment past it.
+		ownedCost, ownedItems, readers := 0, 0, 0
+		if batch := lane.pending[sequence]; batch != nil {
+			ownedCost, ownedItems, readers = batch.ownedCost, batch.ownedItems, batch.readers
+		}
+		if sequence == incoming {
+			ownedCost += cost
+			ownedItems += items
+			readers++
+		}
+		escrow := httpUpEscrow{}
+		if sequence < highest {
+			escrow.cost = max(0, maxCost-ownedCost)
+			escrow.items = max(0, maxItems-ownedItems)
+		}
+		if readers == 0 {
+			plan.missing++
+		}
+		plan.batches[sequence] = escrow
+		plan.cost += escrow.cost
+		plan.items += escrow.items
+	}
+	return plan
+}
+
+func (l *httpUpLane) escrowCharge() (cost, items int) {
+	for _, batch := range l.pending {
+		cost += batch.escrowCost
+		items += batch.escrowItems
+	}
+	return cost, items
+}
+
+func (l *httpUpLane) applyEscrow(plan httpUpEscrowPlan) {
+	for sequence, batch := range l.pending {
+		if _, keep := plan.batches[sequence]; !keep {
+			batch.escrowCost, batch.escrowItems = 0, 0
+			delete(l.pending, sequence)
+		}
+	}
+	for sequence, escrow := range plan.batches {
+		batch := l.pending[sequence]
+		if batch == nil {
+			batch = &httpUpBatch{}
+			l.pending[sequence] = batch
+		}
+		batch.escrowCost, batch.escrowItems = escrow.cost, escrow.items
+	}
+}
+
+// Commit or lane retirement can discard unused escrow, never live body storage.
+func (s *Session) releaseHTTPUpEscrowLocked(laneID uint32, lane *httpUpLane) {
+	plan := s.httpUpEscrowPlanLocked(laneID, lane, 0, 0, 0)
+	cost, items := lane.escrowCharge()
+	cost -= plan.cost
+	items -= plan.items
+	lane.applyEscrow(plan)
+	s.carrierOwnedCost -= cost
+	s.carrierOwnedItems -= items
+	s.releasePendingLocked(cost, items)
 }
 
 func (r *httpUpReservation) Release() {
@@ -109,20 +218,28 @@ func (r *httpUpReservation) releaseOwned() {
 	s := r.session
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.httpInputCost -= r.cost
-	s.httpInputItems -= r.items
-	s.releasePendingLocked(r.cost, r.items)
+	escrowCost, escrowItems := r.lane.escrowCharge()
+	if r.batch != nil {
+		r.batch.readers--
+		r.batch.ownedCost -= r.cost
+		r.batch.ownedItems -= r.items
+		if r.batch.readers == 0 {
+			r.batch.known = false
+		}
+	}
+	plan := s.httpUpEscrowPlanLocked(r.laneID, r.lane, 0, 0, 0)
+	// Return a canceled predecessor's capacity to escrow while successors
+	// still depend on it. Only now has the handler released its actual body.
+	cost, items := r.cost+escrowCost-plan.cost, r.items+escrowItems-plan.items
+	r.lane.applyEscrow(plan)
+	s.carrierOwnedCost -= cost
+	s.carrierOwnedItems -= items
+	s.releasePendingLocked(cost, items)
 	r.cost = 0
 	r.items = 0
 	r.applyCost = 0
 	r.applyItems = 0
 	r.lane.readers--
-	if batch := r.lane.pending[r.sequence]; batch != nil {
-		batch.readers--
-		if batch.readers == 0 {
-			delete(r.lane.pending, r.sequence)
-		}
-	}
 	if r.lane.readers == 0 && s.httpUpLanes[r.laneID] == r.lane {
 		delete(s.httpUpLanes, r.laneID)
 	}
@@ -190,9 +307,6 @@ func (r *httpUpReservation) Process(ctx context.Context, body []byte) (uint64, e
 			ack, err := s.processUp(r.laneID, r.sequence, body, s.carrier == CarrierHTTPSLanes, nil, r)
 			s.mu.Lock()
 			r.lane.applying = false
-			if err == nil {
-				delete(r.lane.pending, r.sequence)
-			}
 			r.lane.signal()
 			s.mu.Unlock()
 			return ack, err
@@ -222,8 +336,12 @@ func (r *httpUpReservation) transferApplicationLocked(cost, items int) bool {
 		return false
 	}
 	s := r.session
-	s.httpInputCost -= r.applyCost
-	s.httpInputItems -= r.applyItems
+	s.carrierOwnedCost -= r.applyCost
+	s.carrierOwnedItems -= r.applyItems
+	if r.batch != nil {
+		r.batch.ownedCost -= r.applyCost
+		r.batch.ownedItems -= r.applyItems
+	}
 	s.releasePendingQuietLocked(r.applyCost-cost, r.applyItems-items)
 	r.cost -= r.applyCost
 	r.items -= r.applyItems

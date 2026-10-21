@@ -1,9 +1,6 @@
 FROM alpine:latest AS certificates
 
-FROM --platform=$BUILDPLATFORM golang:1.27.2-alpine AS builder
-
-# The Go 1.27.3 image tag is not published yet. Select the current compiler.
-ENV GOTOOLCHAIN=go1.27.3
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine AS builder
 
 ARG TARGETOS
 ARG TARGETARCH
