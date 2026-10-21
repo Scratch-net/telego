@@ -100,20 +100,23 @@ type Manager struct {
 	budgetActive   *backendBudgetWake
 	budgetTasks    map[*backendBudgetWake]struct{}
 
-	mu           sync.Mutex
-	bootstraps   map[[sha256.Size]byte]*bootstrap
-	sessions     map[[sha256.Size]byte]*Session
-	closedTokens map[[sha256.Size]byte]*closedToken
-	closedOrder  list.List
-	streams      int
-	dials        int
-	pendingBytes int64
-	pendingItems int64
-	closed       bool
-	stop         chan struct{}
-	cleanupDone  chan struct{}
-	shutdownDone chan struct{}
-	shutdownOnce sync.Once
+	mu                      sync.Mutex
+	bootstraps              map[[sha256.Size]byte]*bootstrap
+	sessions                map[[sha256.Size]byte]*Session
+	closedTokens            map[[sha256.Size]byte]*closedToken
+	closedOrder             list.List
+	streams                 int
+	dials                   int
+	pendingBytes            int64
+	pendingItems            int64
+	httpUpDiscards          int
+	httpUpDiscardLimit      int
+	httpUpDiscardPerSession int
+	closed                  bool
+	stop                    chan struct{}
+	cleanupDone             chan struct{}
+	shutdownDone            chan struct{}
+	shutdownOnce            sync.Once
 
 	sessionsCreated  atomic.Uint64
 	sessionsClosed   [sessionCloseReasonCount]atomic.Uint64
@@ -131,6 +134,7 @@ func NewManager(config ManagerConfig) (*Manager, error) {
 		return nil, err
 	}
 	backendNetwork, backendAddress, _ := parseLocalBackend(config.Backend)
+	discardLocal, discardLimit, _ := httpUpDiscardLimits(config.Limits)
 	dialBackend := config.BackendDialContext
 	if dialBackend == nil {
 		dialContext := config.DialContext
@@ -146,21 +150,23 @@ func NewManager(config ManagerConfig) (*Manager, error) {
 
 		capabilityPrefixes: make(map[uint64]struct{}, len(config.Profiles)),
 
-		profiles:       slices.Clone(config.Profiles),
-		carrier:        config.Carrier,
-		backendNet:     backendNetwork,
-		backend:        backendAddress,
-		limits:         config.Limits,
-		timeouts:       config.Timeouts,
-		dialBackend:    dialBackend,
-		backendFactory: config.BackendFactory,
-		budgetWake:     make(chan struct{}, 1),
-		bootstraps:     make(map[[sha256.Size]byte]*bootstrap),
-		sessions:       make(map[[sha256.Size]byte]*Session),
-		closedTokens:   make(map[[sha256.Size]byte]*closedToken),
-		stop:           make(chan struct{}),
-		cleanupDone:    make(chan struct{}),
-		shutdownDone:   make(chan struct{}),
+		profiles:                slices.Clone(config.Profiles),
+		carrier:                 config.Carrier,
+		backendNet:              backendNetwork,
+		backend:                 backendAddress,
+		limits:                  config.Limits,
+		httpUpDiscardLimit:      discardLimit,
+		httpUpDiscardPerSession: discardLocal,
+		timeouts:                config.Timeouts,
+		dialBackend:             dialBackend,
+		backendFactory:          config.BackendFactory,
+		budgetWake:              make(chan struct{}, 1),
+		bootstraps:              make(map[[sha256.Size]byte]*bootstrap),
+		sessions:                make(map[[sha256.Size]byte]*Session),
+		closedTokens:            make(map[[sha256.Size]byte]*closedToken),
+		stop:                    make(chan struct{}),
+		cleanupDone:             make(chan struct{}),
+		shutdownDone:            make(chan struct{}),
 	}
 	for _, profile := range manager.profiles {
 		capability := profile.Capability()

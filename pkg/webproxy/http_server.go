@@ -404,6 +404,9 @@ func (h *httpEventHandler) OnTraffic(connection gnet.Conn) gnet.Action {
 	if transport := state.webSocketTransport(); transport != nil {
 		return h.onWebSocketTraffic(connection, state, transport)
 	}
+	if state.rejected != nil {
+		return h.discardRejectedUpload(connection, state)
+	}
 	if state.isDraining() {
 		if connection.InboundBuffered() > maxPipelineBytes {
 			state.requestClose()
@@ -491,6 +494,9 @@ func (h *httpEventHandler) OnTraffic(connection gnet.Conn) gnet.Action {
 			if err != nil {
 				if errors.Is(err, ErrBackpressure) {
 					prepared.session.recordBackpressure(carrierOperationUplink)
+					if discard := prepared.session.reserveHTTPUpDiscard(); discard != nil {
+						return h.rejectUpload(connection, state, discard, size)
+					}
 					return h.writeImmediate(connection, state, retryResponse())
 				}
 				prepared.session.laneProtocolFailure(prepared.laneID, nil)
@@ -517,6 +523,12 @@ type httpConnectionState struct {
 	pending    *preparedRequest
 	input      []byte
 	websocket  *webSocketConnection
+	rejected   *rejectedHTTPUpload
+}
+
+type rejectedHTTPUpload struct {
+	reservation *httpUpDiscardReservation
+	remaining   int
 }
 
 func (s *httpConnectionState) readHeader(connection gnet.Conn) bool {
@@ -738,7 +750,9 @@ func (s *httpConnectionState) close() {
 	lease := s.lease
 	transport := s.websocket
 	pending := s.pending
+	rejected := s.rejected
 	s.pending = nil
+	s.rejected = nil
 	s.input = nil
 	s.cancel = nil
 	s.lease = nil
@@ -756,6 +770,9 @@ func (s *httpConnectionState) close() {
 	// before handing ownership to its worker, which releases after use.
 	if pending != nil {
 		pending.httpUp.Release()
+	}
+	if rejected != nil {
+		rejected.reservation.Release()
 	}
 	if transport != nil {
 		transport.close()
@@ -1440,6 +1457,54 @@ func rejectResponse(status int) carrierResponse {
 		headers: []responseHeader{{"Cache-Control", "no-store"}},
 		close:   true,
 	}
+}
+
+// A buffered reverse proxy may still be sending the rejected body when it
+// receives 503. Closing with unread data can turn that response into a reset
+// and a proxy-generated 502. Return 503 now, then discard only the validated
+// Content-Length before closing. No rejected body storage is allocated.
+func (h *httpEventHandler) rejectUpload(connection gnet.Conn, state *httpConnectionState, reservation *httpUpDiscardReservation, size int) gnet.Action {
+	deadline := min(h.server.config.BodyTimeout, h.server.config.WriteTimeout)
+	if !state.startRequest(connection, func() {}, deadline) {
+		reservation.Release()
+		return gnet.Close
+	}
+	state.rejected = &rejectedHTTPUpload{reservation: reservation, remaining: size}
+	response := retryResponse()
+	response.close = true
+	if _, err := connection.Write(response.encoded()); err != nil {
+		return gnet.Close
+	}
+	state.mu.Lock()
+	state.cancel = nil
+	state.draining = true
+	state.closeAfter = true
+	state.mu.Unlock()
+	return h.discardRejectedUpload(connection, state)
+}
+
+func (h *httpEventHandler) discardRejectedUpload(connection gnet.Conn, state *httpConnectionState) gnet.Action {
+	rejected := state.rejected
+	buffered := connection.InboundBuffered()
+	if buffered > rejected.remaining+maxPipelineBytes {
+		return gnet.Close
+	}
+	if take := min(buffered, rejected.remaining); take > 0 {
+		n, err := connection.Discard(take)
+		rejected.remaining -= n
+		if err != nil {
+			return gnet.Close
+		}
+	}
+	if connection.OutboundBuffered() != 0 {
+		state.armDrainWake(connection)
+		return gnet.None
+	}
+	if rejected.remaining != 0 {
+		return gnet.None
+	}
+	state.finishResponse()
+	return gnet.Close
 }
 
 func (h *httpEventHandler) writeImmediate(connection gnet.Conn, state *httpConnectionState, response carrierResponse) gnet.Action {

@@ -9,6 +9,67 @@ import (
 
 const httpUpWindow = 4
 
+// Rejected bodies are streamed to Discard, never queued. These independent
+// permits bound connection metadata without consuming protected queue budgets.
+func httpUpDiscardLimits(limits Limits) (local, global int, ok bool) {
+	localLanes, ok := checkedAddInt(limits.MaxStreamsPerSession, 1)
+	if !ok {
+		return 0, 0, false
+	}
+	globalLanes, ok := checkedAddInt(limits.MaxStreams, limits.MaxSessions)
+	if !ok {
+		return 0, 0, false
+	}
+	local, ok = checkedMulInt(localLanes, httpUpWindow)
+	if !ok {
+		return 0, 0, false
+	}
+	global, ok = checkedMulInt(globalLanes, httpUpWindow)
+	return max(2*httpUpWindow, local), max(2*httpUpWindow, global), ok
+}
+
+type httpUpDiscardReservation struct{ releaseOnce func() }
+
+func (s *Session) reserveHTTPUpDiscard() *httpUpDiscardReservation {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	limit, ok := 0, true
+	if s.manager != nil {
+		limit = s.manager.httpUpDiscardPerSession
+	} else {
+		limit, _, ok = httpUpDiscardLimits(s.limits)
+	}
+	if !ok || s.closed || s.httpUpDiscards >= limit {
+		return nil
+	}
+	if manager := s.manager; manager != nil {
+		manager.mu.Lock()
+		if manager.closed || manager.httpUpDiscards >= manager.httpUpDiscardLimit {
+			manager.mu.Unlock()
+			return nil
+		}
+		manager.httpUpDiscards++
+		manager.mu.Unlock()
+	}
+	s.httpUpDiscards++
+	return &httpUpDiscardReservation{releaseOnce: sync.OnceFunc(func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.httpUpDiscards--
+		if manager := s.manager; manager != nil {
+			manager.mu.Lock()
+			manager.httpUpDiscards--
+			manager.mu.Unlock()
+		}
+	})}
+}
+
+func (r *httpUpDiscardReservation) Release() {
+	if r != nil {
+		r.releaseOnce()
+	}
+}
+
 type upCommit struct {
 	sequence uint64
 	digest   [sha256.Size]byte

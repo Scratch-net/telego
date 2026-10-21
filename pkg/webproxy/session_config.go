@@ -163,6 +163,9 @@ func validateManagerConfig(config ManagerConfig) error {
 		limits.MaxStreams < limits.MaxBackendDialsInFlight {
 		return fmt.Errorf("%w: global limits must not be smaller than their local limits", ErrInvalidManagerConfig)
 	}
+	if _, _, ok := httpUpDiscardLimits(limits); !ok {
+		return fmt.Errorf("%w: HTTP upload discard limits overflow", ErrInvalidManagerConfig)
+	}
 	reserveCost, reserveItems, ok := pendingControlReserve(limits)
 	if !ok || reserveCost > limits.MaxPendingPerSession || reserveItems > limits.MaxPendingItemsPerSession {
 		return fmt.Errorf("%w: per-session pending limits cannot hold control-frame reserve", ErrInvalidManagerConfig)

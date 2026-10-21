@@ -38,9 +38,9 @@ def block(source, directive):
     return source[start:end]
 
 
-def run(*args, **kwargs):
+def run(*args, timeout=60, **kwargs):
     return subprocess.run(args, check=True, text=True, capture_output=True,
-                          timeout=60, **kwargs)
+                          timeout=timeout, **kwargs)
 
 
 def check_template(label, http_path, server_path):
@@ -145,8 +145,32 @@ http {
                            timeout=30)
 
 
+def check_upload_rejection():
+    # Build a static child: the normal race binary requires glibc, while the
+    # isolated Nginx image uses musl. Ordinary Go tests skip this Docker gate.
+    with tempfile.TemporaryDirectory(prefix="telego-nginx-upload-") as directory:
+        os.chmod(directory, 0o755)
+        binary = Path(directory) / "webproxy.test"
+        environment = dict(os.environ, CGO_ENABLED="0", GOOS="linux")
+        environment.setdefault("GOMAXPROCS", "2")
+        environment.setdefault("GOMEMLIMIT", "512MiB")
+        run("go", "test", "-c", "-o", str(binary), "./pkg/webproxy",
+            cwd=ROOT, env=environment, timeout=180)
+        binary.chmod(0o755)
+        run("docker", "run", "--rm", "--network", "none", "--read-only",
+            "--cap-drop", "ALL", "--user", "101:101", "--tmpfs",
+            "/tmp:rw,nosuid,nodev", "--mount",
+            f"type=bind,src={binary},dst=/test,readonly", "--env",
+            "TELEGO_TEST_NGINX_UPLOAD_REJECTION=1", "--env", "GOMAXPROCS=2",
+            "--env", "GOMEMLIMIT=512MiB", "--entrypoint", "/test", IMAGE,
+            "-test.run=^TestHTTPNginxBufferedAdmissionRejection$", "-test.count=1",
+            "-test.timeout=45s")
+        print("buffered uploads: 12 authenticated admission rejections kept HTTP 503")
+
+
 if __name__ == "__main__":
     check_template("manual", "examples/web-proxy/nginx/nginx.conf",
                    "examples/web-proxy/nginx/nginx.conf")
     check_template("gateway", "examples/gateway/templates/nginx.conf",
                    "examples/gateway/templates/nginx-web-server.conf")
+    check_upload_rejection()

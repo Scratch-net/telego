@@ -141,6 +141,7 @@ type Session struct {
 	carrierLanes      map[uint32]*carrierLane
 	websocketActive   bool
 	httpUpLanes       map[uint32]*httpUpLane
+	httpUpDiscards    int
 	carrierOwnedCost  int
 	carrierOwnedItems int
 	pendingCost       int
