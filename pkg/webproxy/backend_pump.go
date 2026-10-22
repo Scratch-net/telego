@@ -303,7 +303,7 @@ func (b *backendStream) pumpWrite(backend Backend) (bool, error) {
 		state.writeOffset = 0
 		state.pendingWriteCost -= cost
 		state.pendingWriteItems--
-		s.releasePendingLocked(cost, 1)
+		s.releaseUplinkPendingLocked(cost, 1)
 	}
 	payload, windowErr := WindowPayload(uint32(written))
 	if windowErr != nil || !s.queueFrameLocked(FrameWindow, b.id, payload) {

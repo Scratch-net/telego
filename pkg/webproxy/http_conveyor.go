@@ -3,7 +3,9 @@ package webproxy
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"math"
+	"slices"
 	"sync"
 )
 
@@ -97,10 +99,18 @@ type httpUpLane struct {
 	applying bool
 }
 
-// httpUpReservation owns the complete request body and prepaid application
-// capacity. HTTP acquires it after authentication and before allocating a body.
-// Application transfers the exact backend charge without releasing capacity
-// that another session could consume between reservation and application.
+// One reusable application reserve serves the session's ordered HTTP heads.
+// Occupied credit follows backend copies; only original uplink releases can
+// replenish the free reserve. Other sessions cannot steal progress capacity.
+type httpApplicationPool struct {
+	cost, items             int
+	targetCost, targetItems int
+	waiters                 []*httpUpReservation
+	applying                bool
+}
+
+// httpUpReservation owns body storage before allocation. A complete head can
+// borrow exact DATA capacity from the session pool before application.
 type httpUpReservation struct {
 	session               *Session
 	lane                  *httpUpLane
@@ -113,6 +123,41 @@ type httpUpReservation struct {
 	releaseOnce           func()
 }
 
+func (s *Session) releaseHTTPApplicationPoolLocked() {
+	pool := &s.httpApplication
+	cost, items := pool.cost, pool.items
+	pool.cost, pool.items, pool.targetCost, pool.targetItems = 0, 0, 0, 0
+	s.carrierOwnedCost -= cost
+	s.carrierOwnedItems -= items
+	s.releasePendingLocked(cost, items)
+}
+
+// Only HTTP bodies/escrow and backend source writes were acquired from the
+// ordinary uplink partition. Never recycle control, downlink, or core handoff
+// releases here: those have their own protected capacity.
+func (s *Session) releaseUplinkPendingLocked(cost, items int) {
+	s.releaseUplinkPendingQuietLocked(cost, items)
+	s.scheduleBackendPumpLocked()
+}
+
+func (s *Session) releaseUplinkPendingQuietLocked(cost, items int) {
+	pool := &s.httpApplication
+	refillCost, refillItems := 0, 0
+	if !s.closed {
+		refillCost = min(cost, pool.targetCost-pool.cost)
+		refillItems = min(items, pool.targetItems-pool.items)
+	}
+	pool.cost += refillCost
+	pool.items += refillItems
+	s.carrierOwnedCost += refillCost
+	s.carrierOwnedItems += refillItems
+	s.releasePendingQuietLocked(cost-refillCost, items-refillItems)
+	if refillCost != 0 || refillItems != 0 {
+		close(s.budgetNotify)
+		s.budgetNotify = make(chan struct{})
+	}
+}
+
 func (s *Session) reserveHTTPUp(laneID uint32, sequence uint64, size int) (*httpUpReservation, error) {
 	if sequence == 0 || size < FrameHeaderSize || size > min(s.limits.MaxBodyBytes, maxCarrierBatchBytes) ||
 		(s.carrier != CarrierHTTPS && s.carrier != CarrierHTTPSLanes) || laneID > MaxStreamID ||
@@ -121,7 +166,7 @@ func (s *Session) reserveHTTPUp(laneID uint32, sequence uint64, size int) (*http
 	}
 	applyItems := min(size/FrameHeaderSize, MaxBatchFrames)
 	applyCost := size + applyItems*queueItemCost
-	cost, items := size+queueItemCost+applyCost, 1+applyItems
+	cost, items := size+queueItemCost, 1
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -152,6 +197,19 @@ func (s *Session) reserveHTTPUp(laneID uint32, sequence uint64, size int) (*http
 	plan := s.httpUpEscrowPlanLocked(laneID, lane, sequence, cost, items)
 	escrowCost, escrowItems := lane.escrowCharge()
 	additionalCost, additionalItems := cost+plan.cost-escrowCost, items+plan.items-escrowItems
+	pool := &s.httpApplication
+	targetCost, targetItems := pool.targetCost, pool.targetItems
+	if !retired && sequence > committed {
+		if sequence-committed > 1 {
+			maxBody := min(s.limits.MaxBodyBytes, maxCarrierBatchBytes)
+			applyItems = min(maxBody/FrameHeaderSize, MaxBatchFrames)
+			applyCost = maxBody + applyItems*queueItemCost
+		}
+		targetCost, targetItems = max(targetCost, applyCost), max(targetItems, applyItems)
+	}
+	poolCost, poolItems := targetCost-pool.targetCost, targetItems-pool.targetItems
+	additionalCost += poolCost
+	additionalItems += poolItems
 	if lane.readers+1+plan.missing > 2*httpUpWindow ||
 		!s.reservePendingLocked(additionalCost, additionalItems, pendingUplink) {
 		return nil, ErrBackpressure
@@ -162,10 +220,13 @@ func (s *Session) reserveHTTPUp(laneID uint32, sequence uint64, size int) (*http
 	s.httpUpLanes[laneID] = lane
 	lane.readers++
 	lane.applyEscrow(plan)
+	pool.targetCost, pool.targetItems = targetCost, targetItems
+	pool.cost += poolCost
+	pool.items += poolItems
 	s.carrierOwnedCost += additionalCost
 	s.carrierOwnedItems += additionalItems
 	reservation := &httpUpReservation{session: s, lane: lane, laneID: laneID, sequence: sequence, bodySize: size,
-		cost: cost, items: items, applyCost: applyCost, applyItems: applyItems}
+		cost: cost, items: items}
 	if !retired && sequence > committed {
 		reservation.batch = lane.pending[sequence]
 		reservation.batch.readers++
@@ -176,9 +237,9 @@ func (s *Session) reserveHTTPUp(laneID uint32, sequence uint64, size int) (*http
 	return reservation, nil
 }
 
-// An uncommitted predecessor owns enough capacity for a maximum request,
-// shared by its live readers and escrow. Missing readers also retain a slot
-// in the lane's bounded reader count. The highest sequence needs no escrow.
+// An uncommitted predecessor owns enough storage for a maximum body, shared
+// by its live readers and escrow. Application credit is shared by the session.
+// Missing readers also retain a slot; the highest sequence needs no escrow.
 func (s *Session) httpUpEscrowPlanLocked(laneID uint32, lane *httpUpLane, incoming uint64, cost, items int) httpUpEscrowPlan {
 	plan := httpUpEscrowPlan{}
 	if s.closed || s.retiredHTTPUpLaneLocked(laneID) {
@@ -202,8 +263,8 @@ func (s *Session) httpUpEscrowPlanLocked(laneID uint32, lane *httpUpLane, incomi
 		return plan
 	}
 	maxBody := min(s.limits.MaxBodyBytes, maxCarrierBatchBytes)
-	maxItems := 1 + min(maxBody/FrameHeaderSize, MaxBatchFrames)
-	maxCost := 2*maxBody + maxItems*queueItemCost
+	maxItems := 1
+	maxCost := maxBody + queueItemCost
 	plan.batches = make(map[uint64]httpUpEscrow, httpUpWindow)
 	for sequence := committed; sequence < highest; {
 		sequence++ // highest can be MaxUint64; never increment past it.
@@ -265,7 +326,7 @@ func (s *Session) releaseHTTPUpEscrowLocked(laneID uint32, lane *httpUpLane) {
 	lane.applyEscrow(plan)
 	s.carrierOwnedCost -= cost
 	s.carrierOwnedItems -= items
-	s.releasePendingLocked(cost, items)
+	s.releaseUplinkPendingLocked(cost, items)
 }
 
 func (r *httpUpReservation) Release() {
@@ -282,8 +343,8 @@ func (r *httpUpReservation) releaseOwned() {
 	escrowCost, escrowItems := r.lane.escrowCharge()
 	if r.batch != nil {
 		r.batch.readers--
-		r.batch.ownedCost -= r.cost
-		r.batch.ownedItems -= r.items
+		r.batch.ownedCost -= r.bodySize + queueItemCost
+		r.batch.ownedItems--
 		if r.batch.readers == 0 {
 			r.batch.known = false
 		}
@@ -295,7 +356,7 @@ func (r *httpUpReservation) releaseOwned() {
 	r.lane.applyEscrow(plan)
 	s.carrierOwnedCost -= cost
 	s.carrierOwnedItems -= items
-	s.releasePendingLocked(cost, items)
+	s.releaseUplinkPendingLocked(cost, items)
 	r.cost = 0
 	r.items = 0
 	r.applyCost = 0
@@ -304,10 +365,94 @@ func (r *httpUpReservation) releaseOwned() {
 	if r.lane.readers == 0 && s.httpUpLanes[r.laneID] == r.lane {
 		delete(s.httpUpLanes, r.laneID)
 	}
+	if len(s.httpUpLanes) == 0 {
+		s.releaseHTTPApplicationPoolLocked()
+	}
 	r.lane.signal()
 }
 
 func (l *httpUpLane) signal() { close(l.notify); l.notify = make(chan struct{}) }
+
+func (r *httpUpReservation) leaveApplicationQueueLocked() {
+	s := r.session
+	pool := &s.httpApplication
+	if index := slices.Index(pool.waiters, r); index >= 0 {
+		pool.waiters = slices.Delete(pool.waiters, index, index+1)
+		close(s.budgetNotify)
+		s.budgetNotify = make(chan struct{})
+	}
+}
+
+func (r *httpUpReservation) borrowApplicationLocked(cost, items int) bool {
+	s := r.session
+	pool := &s.httpApplication
+	if cost == 0 && items == 0 {
+		return true // WINDOW/CLOSE must not wait behind blocked DATA heads.
+	}
+	if !slices.Contains(pool.waiters, r) {
+		pool.waiters = append(pool.waiters, r)
+	}
+	if pool.waiters[0] != r || pool.cost < cost || pool.items < items {
+		return false
+	}
+	pool.cost -= cost
+	pool.items -= items
+	r.cost += cost
+	r.items += items
+	r.applyCost, r.applyItems = cost, items
+	r.leaveApplicationQueueLocked()
+	return true
+}
+
+// The structural cursor has already bounded the body. Track OPEN/CLOSE
+// transitions without retaining a parsed frame array while waiting for credit.
+// This matches backendWriteReservationLocked, including harmless late DATA.
+func (s *Session) httpApplicationBoundLocked(body []byte) (cost, items int) {
+	var changed map[uint32]bool
+	for len(body) != 0 {
+		payload := int(binary.BigEndian.Uint32(body[4:FrameHeaderSize]))
+		streamID := uint32(body[1])<<16 | uint32(body[2])<<8 | uint32(body[3])
+		if streamID != 0 {
+			switch FrameType(body[0]) {
+			case FrameOpen, FrameClose:
+				if changed == nil {
+					changed = make(map[uint32]bool)
+				}
+				changed[streamID] = FrameType(body[0]) == FrameOpen
+			case FrameData:
+				live, overridden := changed[streamID]
+				if !overridden {
+					live = s.streams[streamID] != nil
+				}
+				if live {
+					cost += payload + queueItemCost
+					items++
+				}
+			}
+		}
+		body = body[FrameHeaderSize+payload:]
+	}
+	return cost, items
+}
+
+// Retired lanes have no application work. After the structural cursor checks
+// the body, validate one frame view at a time without a parsed frame workspace.
+func validRetiredHTTPUp(body []byte, laneID uint32) bool {
+	for len(body) != 0 {
+		payload := int(binary.BigEndian.Uint32(body[4:FrameHeaderSize]))
+		frame := Frame{
+			Type:     FrameType(body[0]),
+			StreamID: uint32(body[1])<<16 | uint32(body[2])<<8 | uint32(body[3]),
+			Payload:  body[FrameHeaderSize : FrameHeaderSize+payload],
+		}
+		if frame.StreamID != laneID || ValidateClientFrame(frame) != nil ||
+			(frame.Type != FrameData && frame.Type != FrameWindow && frame.Type != FrameClose) {
+			return false
+		}
+		body = body[FrameHeaderSize+payload:]
+	}
+	return true
+}
 
 func (r *httpUpReservation) Process(ctx context.Context, body []byte) (uint64, error) {
 	s := r.session
@@ -315,6 +460,18 @@ func (r *httpUpReservation) Process(ctx context.Context, body []byte) (uint64, e
 		s.laneProtocolFailure(r.laneID, nil)
 		return 0, ErrProtocol
 	}
+	// The existing cursor bounds frame count and skips payloads without a
+	// second body allocation. Session application still validates live streams.
+	_, dataItems, valid := (webSocketInbound{body: body}).applicationBound()
+	if !valid {
+		s.laneProtocolFailure(r.laneID, nil)
+		return 0, ErrProtocol
+	}
+	defer func() {
+		s.mu.Lock()
+		r.leaveApplicationQueueLocked()
+		s.mu.Unlock()
+	}()
 	digest := sha256.Sum256(body)
 	for {
 		s.mu.Lock()
@@ -330,8 +487,7 @@ func (r *httpUpReservation) Process(ctx context.Context, body []byte) (uint64, e
 		// accepts only harmless late stream frames after that retirement.
 		if s.retiredHTTPUpLaneLocked(r.laneID) {
 			s.mu.Unlock()
-			frames, err := parseUplinkBatch(body, r.laneID, true)
-			if err != nil || !onlyLateLaneFrames(frames) {
+			if !validRetiredHTTPUp(body, r.laneID) {
 				s.laneProtocolFailure(r.laneID, nil)
 				return 0, ErrProtocol
 			}
@@ -362,20 +518,35 @@ func (r *httpUpReservation) Process(ctx context.Context, body []byte) (uint64, e
 		}
 		batch.digest = digest
 		batch.known = true
-		if committed != math.MaxUint64 && r.sequence == committed+1 && !r.lane.applying {
+		ready := committed != math.MaxUint64 && r.sequence == committed+1 &&
+			!r.lane.applying && !s.httpApplication.applying
+		if ready {
+			applyCost, applyItems := 0, 0
+			if dataItems != 0 {
+				applyCost, applyItems = s.httpApplicationBoundLocked(body)
+			}
+			ready = r.borrowApplicationLocked(applyCost, applyItems)
+		}
+		if ready {
 			r.lane.applying = true
+			s.httpApplication.applying = true
 			s.mu.Unlock()
 			ack, err := s.processUp(r.laneID, r.sequence, body, s.carrier == CarrierHTTPSLanes, nil, r)
 			s.mu.Lock()
 			r.lane.applying = false
+			s.httpApplication.applying = false
 			r.lane.signal()
+			close(s.budgetNotify)
+			s.budgetNotify = make(chan struct{})
 			s.mu.Unlock()
 			return ack, err
 		}
 		changed := r.lane.notify
+		budgetChanged := s.budgetNotify
 		s.mu.Unlock()
 		select {
 		case <-changed:
+		case <-budgetChanged:
 		case <-ctx.Done():
 			return 0, ctx.Err()
 		case <-s.done:
@@ -399,11 +570,7 @@ func (r *httpUpReservation) transferApplicationLocked(cost, items int) bool {
 	s := r.session
 	s.carrierOwnedCost -= r.applyCost
 	s.carrierOwnedItems -= r.applyItems
-	if r.batch != nil {
-		r.batch.ownedCost -= r.applyCost
-		r.batch.ownedItems -= r.applyItems
-	}
-	s.releasePendingQuietLocked(r.applyCost-cost, r.applyItems-items)
+	s.releaseUplinkPendingQuietLocked(r.applyCost-cost, r.applyItems-items)
 	r.cost -= r.applyCost
 	r.items -= r.applyItems
 	r.applyCost = 0

@@ -184,8 +184,9 @@ func TestHTTPConveyorCloseRetainsBodiesWithEscrow(t *testing.T) {
 	future := reserveHTTPTest(t, session, 0, 2, body)
 	head := reserveHTTPTest(t, session, 0, 1, body)
 	before := manager.Capacity()
+	freeCost, freeItems := session.httpApplication.cost, session.httpApplication.items
 	session.Close()
-	if after := manager.Capacity(); after.PendingBytes != before.PendingBytes || after.PendingItems != before.PendingItems {
+	if after := manager.Capacity(); after.PendingBytes != before.PendingBytes-int64(freeCost) || after.PendingItems != before.PendingItems-int64(freeItems) {
 		t.Fatalf("close released owned request storage: before=%+v after=%+v", before, after)
 	}
 	head.Release()
@@ -202,7 +203,8 @@ func TestHTTPConveyorCloseRetainsBodiesWithEscrow(t *testing.T) {
 func TestHTTPConveyorEscrowAdmissionRollback(t *testing.T) {
 	profiles := testProfiles(t)
 	manager := testManager(t, profiles, func(config *ManagerConfig) {
-		config.Limits.MaxPendingItemsPerSession = 2 * (MaxBatchFrames + 1)
+		_, protectedItems, _ := pendingControlReserve(config.Limits)
+		config.Limits.MaxPendingItemsPerSession = MaxBatchFrames + 1 + protectedItems
 	}, nil)
 	session := createTestSession(t, manager, profiles[0]).Session
 	body := bytes.Repeat(testFrameBatch(t, Frame{Type: FramePong}), MaxBatchFrames)

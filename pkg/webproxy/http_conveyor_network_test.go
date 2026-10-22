@@ -74,16 +74,24 @@ func TestHTTPConveyorReorderedRetryAtGlobalLimit(t *testing.T) {
 	conveyorWaitKnown(t, created.Session, 2)
 	third := conveyorHTTPUp(t, app, created.Token, 3, len(body), body)
 	conveyorWaitKnown(t, created.Session, 3)
-	// The fourth body cannot fit all predecessor obligations. Its headers
-	// receive the retry response before the client sends any body bytes.
-	rejected := conveyorHTTPUp(t, app, created.Token, 4, len(body), nil)
-	conveyorHTTPAck(t, rejected, http.StatusServiceUnavailable, 0)
+	// All four bodies fit while sharing one application reserve. The last
+	// body can finish even after another session consumes global headroom.
+	fourth := conveyorHTTPUp(t, app, created.Token, 4, len(body), body[:1])
+	eventually(t, time.Second, func() bool {
+		created.Session.mu.Lock()
+		defer created.Session.mu.Unlock()
+		return created.Session.httpUpLanes[0].pending[4] != nil
+	})
 	fillHTTPProgressBudget(t, app.manager, app.profiles[0])
+	if _, err := fourth.Write(body[1:]); err != nil {
+		t.Fatal(err)
+	}
 	headBody := maximumHTTPProgressBody(t)
 	head := conveyorHTTPUp(t, app, created.Token, 1, len(headBody), headBody)
 	conveyorHTTPAck(t, head, http.StatusNoContent, 1)
 	conveyorHTTPAck(t, second, http.StatusNoContent, 2)
 	conveyorHTTPAck(t, third, http.StatusNoContent, 3)
+	conveyorHTTPAck(t, fourth, http.StatusNoContent, 4)
 	retry := conveyorHTTPUp(t, app, created.Token, 4, len(body), body)
 	conveyorHTTPAck(t, retry, http.StatusNoContent, 4)
 	eventually(t, time.Second, func() bool {

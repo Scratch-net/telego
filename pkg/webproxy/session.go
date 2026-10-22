@@ -142,6 +142,7 @@ type Session struct {
 	websocketActive   bool
 	httpUpLanes       map[uint32]*httpUpLane
 	httpUpDiscards    int
+	httpApplication   httpApplicationPool
 	carrierOwnedCost  int
 	carrierOwnedItems int
 	pendingCost       int
@@ -588,7 +589,7 @@ func (s *Session) processUp(
 		reservedItems,
 	)
 	if unusedCost != 0 || unusedItems != 0 {
-		s.releasePendingLocked(unusedCost, unusedItems)
+		s.releaseUplinkPendingLocked(unusedCost, unusedItems)
 	}
 	s.backendWG.Add(len(opened))
 	if applied {
@@ -1212,7 +1213,7 @@ func (s *Session) backendDrained(streamID uint32, amount int) bool {
 	}
 	state.pendingWriteBytes -= amount
 	state.pendingWriteCost -= amount
-	s.releasePendingLocked(amount, 0)
+	s.releaseUplinkPendingLocked(amount, 0)
 	state.receiveWindow += uint32(amount)
 	payload, err := WindowPayload(uint32(amount))
 	return err == nil && s.queueFrameLocked(FrameWindow, streamID, payload)
@@ -1227,7 +1228,7 @@ func (s *Session) backendWriteFinished(streamID uint32) bool {
 	}
 	state.pendingWriteItems--
 	state.pendingWriteCost -= queueItemCost
-	s.releasePendingLocked(queueItemCost, 1)
+	s.releaseUplinkPendingLocked(queueItemCost, 1)
 	return true
 }
 
@@ -1583,7 +1584,7 @@ func (s *Session) releaseStreamWritesLocked(state *streamState) {
 		return
 	}
 	if state.pendingWriteCost != 0 || state.pendingWriteItems != 0 {
-		s.releasePendingLocked(state.pendingWriteCost, state.pendingWriteItems)
+		s.releaseUplinkPendingLocked(state.pendingWriteCost, state.pendingWriteItems)
 	}
 	state.pendingWriteBytes = 0
 	state.pendingWriteCost = 0
@@ -1616,6 +1617,7 @@ func (s *Session) closeLocked(reason sessionCloseReason) []*backendStream {
 	s.closed = true
 	s.closeReason = reason
 	close(s.done)
+	s.releaseHTTPApplicationPoolLocked()
 	backends := make([]*backendStream, 0, len(s.streams))
 	for _, state := range s.streams {
 		state.backend.cancelContext()
