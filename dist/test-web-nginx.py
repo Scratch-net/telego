@@ -163,9 +163,10 @@ def check_upload_rejection():
             f"type=bind,src={binary},dst=/test,readonly", "--env",
             "TELEGO_TEST_NGINX_UPLOAD_REJECTION=1", "--env", "GOMAXPROCS=2",
             "--env", "GOMEMLIMIT=512MiB", "--entrypoint", "/test", IMAGE,
-            "-test.run=^TestHTTPNginxBufferedAdmissionRejection$", "-test.count=1",
+            "-test.run=^TestHTTPNginx(BufferedAdmissionRejection|SupersededDownlinkRetiresStalledWriter)$", "-test.count=1",
             "-test.timeout=45s")
         print("buffered uploads: 12 authenticated admission rejections kept HTTP 503")
+        print("downlink replay: superseded stalled writers retired through Nginx for both HTTPS carriers")
 
 
 if __name__ == "__main__":

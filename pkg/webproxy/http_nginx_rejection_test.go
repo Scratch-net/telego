@@ -13,16 +13,16 @@ import (
 	"time"
 )
 
-func TestHTTPNginxBufferedAdmissionRejection(t *testing.T) {
+func startHTTPNginxTestProxy(t *testing.T, app *httpTestApplication) (string, string) {
+	t.Helper()
 	if os.Getenv("TELEGO_TEST_NGINX_UPLOAD_REJECTION") != "1" {
 		t.Skip("run make test-web-nginx for the isolated Nginx integration gate")
 	}
-	app := newHTTPTestApplicationWithConfig(t, 100*time.Millisecond, func(config *ManagerConfig) {
-		config.Limits.MaxPendingPerSession = 200 * 1024
-	}, nil)
-	created := createTestSession(t, app.manager, app.profiles[0])
 	address := unusedTCPAddress(t)
 	directory := t.TempDir()
+	// Bound the test proxy's send buffer so an unread client also stalls its
+	// upstream response. Production Nginx templates retain their own settings.
+	// https://nginx.org/en/docs/http/ngx_http_core_module.html#listen
 	config := fmt.Sprintf(`worker_processes 1;
 pid %s/nginx.pid;
 error_log %s/errors.log warn;
@@ -35,7 +35,7 @@ http {
  uwsgi_temp_path %s/uwsgi;
  scgi_temp_path %s/scgi;
  server {
-  listen %s;
+  listen %s sndbuf=4k;
   client_max_body_size 16m;
   location = /ready { return 204; }
   location / {
@@ -70,6 +70,19 @@ http {
 		_ = response.Body.Close()
 		return response.StatusCode == 204
 	})
+	return address, directory
+}
+
+func TestHTTPNginxBufferedAdmissionRejection(t *testing.T) {
+	if os.Getenv("TELEGO_TEST_NGINX_UPLOAD_REJECTION") != "1" {
+		t.Skip("run make test-web-nginx for the isolated Nginx integration gate")
+	}
+	app := newHTTPTestApplicationWithConfig(t, 100*time.Millisecond, func(config *ManagerConfig) {
+		config.Limits.MaxPendingPerSession = 200 * 1024
+	}, nil)
+	created := createTestSession(t, app.manager, app.profiles[0])
+	address, directory := startHTTPNginxTestProxy(t, app)
+	client := &http.Client{Timeout: 10 * time.Second}
 	body := bytes.Repeat([]byte{0xff}, maxCarrierBatchBytes)
 	statuses := make(map[int]int)
 	for range 12 {

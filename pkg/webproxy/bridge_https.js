@@ -67,13 +67,18 @@ async function readDownlink(response,lane,signal,deadline){
   if(!Number.isSafeInteger(declared)||declared>limit||declared===0)throw new Error('response body exceeds its limit');
  }
  let owner=state.transaction;
- if(owner&&(owner.base!==base||owner.next!==next||owner.declared!==declared))throw new Error('invalid downlink response');
+ if(owner&&(owner.base!==base||owner.next!==next||(owner.declared!==null&&declared!==null&&owner.declared!==declared)))throw new Error('invalid downlink response');
+ if(owner&&declared!==null){
+  if(declared<owner.retained)throw new Error('invalid response length');
+  owner.declared=declared;
+ }
  if(!response.body)throw new Error('missing response body');
  if(!owner){
   const capacity=declared===null?limit:declared;await reserveDown(capacity,signal);
   try{ensureOpen(signal);owner={base,next,declared,bytes:new Uint8Array(capacity),retained:0,delivered:0};state.transaction=owner}
   catch(error){downRetainedBytes-=capacity;for(const wake of [...downWaiters])wake();throw error}
  }
+ const bodyLimit=owner.declared===null?owner.bytes.byteLength:owner.declared;
  const reader=response.body.getReader();let position=0,offset=0,frames=0,chunks=0,complete=false;
  const cancel=()=>{try{reader.cancel().catch(()=>{})}catch(error){}};signal.addEventListener('abort',cancel,{once:true});
  try{
@@ -82,14 +87,14 @@ async function readDownlink(response,lane,signal,deadline){
    const part=await reader.read();ensureOpen(signal);if(Date.now()>=deadline)throw new Error('response deadline reached');
    if(part.done)break;
    const bytes=part.value;
-   if(!(bytes instanceof Uint8Array)||++chunks>65536||bytes.byteLength>owner.bytes.byteLength-position)throw new Error('response body exceeds its limit');
+   if(!(bytes instanceof Uint8Array)||++chunks>65536||bytes.byteLength>bodyLimit-position)throw new Error('response body exceeds its limit');
    const overlap=Math.min(bytes.byteLength,Math.max(0,owner.retained-position));
    for(let i=0;i<overlap;i++)if(bytes[i]!==owner.bytes[position+i])throw new Error('invalid downlink response');
    owner.bytes.set(bytes,position);position+=bytes.byteLength;owner.retained=Math.max(owner.retained,position);
    const view=new DataView(owner.bytes.buffer);
    while(position-offset>=8){
     const size=view.getUint32(offset+4),end=offset+8+size;
-    if(size>maxPayload||end>owner.bytes.byteLength)throw new Error('invalid frame');
+    if(size>maxPayload||end>bodyLimit)throw new Error('invalid frame');
     if(end>position)break;
     if(++frames>maxFrames)throw new Error('invalid frame batch');
     if(frames>1&&end>batchLimit)throw new Error('response batch exceeds its limit');
@@ -101,7 +106,7 @@ async function readDownlink(response,lane,signal,deadline){
     offset=end;
    }
   }
-  if(declared!==null&&position!==declared)throw new Error('invalid response length');
+  if(owner.declared!==null&&position!==owner.declared)throw new Error('invalid response length');
   if(!frames||offset!==position||position<owner.retained)throw new Error('invalid frame batch');
   if(lane)lane.cursor=next;else downCursor=next;
   complete=true;releaseDown(state);return new ArrayBuffer(0);

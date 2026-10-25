@@ -533,7 +533,7 @@ async function request(path,makeOptions,onHeaders,onBody){
   try{
    response=await fetch(relayOrigin+path,requestOptions);
    if(generation!==epoch)throw new DOMException('retired carrier','AbortError');
-   if(response.status!==503&&!(recovering&&[408,429,502,504].includes(response.status))){
+   if(![408,429,502,503,504].includes(response.status)){
     if(onHeaders)onHeaders(response);
     ensureOpen(controller.signal);
     if(Date.now()>=deadline)throw new Error('response deadline reached');

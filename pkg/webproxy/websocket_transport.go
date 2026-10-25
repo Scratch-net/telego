@@ -107,6 +107,7 @@ type webSocketOutbound struct {
 	done       chan error
 	writeBatch [][]byte
 	control    bool
+	heartbeat  bool
 	closeAfter bool
 }
 
@@ -319,6 +320,10 @@ type webSocketConnection struct {
 	failures            chan webSocketFailure
 	liveness            *time.Timer
 	livenessID          uint64
+	heartbeat           *time.Timer
+	heartbeatID         uint64
+	heartbeatDue        bool
+	heartbeatPending    bool
 	workers             sync.WaitGroup
 	closeOnce           sync.Once
 	queueMu             sync.Mutex
@@ -461,6 +466,7 @@ func (w *webSocketConnection) start(connection gnet.Conn) {
 		w.metricsActive = true
 	}
 	w.touchLiveness(connection)
+	w.armHeartbeat(connection)
 	w.workers.Go(func() { w.uplinkLoop(connection) })
 	w.workers.Go(func() { w.downlinkLoop(connection) })
 	w.workers.Go(func() {
@@ -567,11 +573,12 @@ func (w *webSocketConnection) downlinkLoop(connection gnet.Conn) {
 			w.fail(connection, ws.StatusNormalClosure, "lane_closed")
 			return
 		}
-		message := webSocketMessage{typeID: webSocketMessagePing}
-		if len(body) != 0 {
-			message = webSocketMessage{typeID: webSocketMessageBinary, payload: body}
-			cursor = next
+		if len(body) == 0 {
+			lease.Release()
+			continue
 		}
+		message := webSocketMessage{typeID: webSocketMessageBinary, payload: body}
+		cursor = next
 		item := &webSocketOutbound{message: message, lease: lease, done: make(chan error, 1)}
 		if !w.sendOutbound(connection, item) {
 			return
@@ -648,6 +655,51 @@ func (w *webSocketConnection) touchLiveness(connection gnet.Conn) {
 	})
 }
 
+func (w *webSocketConnection) armHeartbeat(connection gnet.Conn) {
+	if w.phase != webSocketOpen {
+		return
+	}
+	if w.heartbeat != nil {
+		w.heartbeat.Stop()
+	}
+	w.heartbeatID++
+	id := w.heartbeatID
+	w.heartbeat = time.AfterFunc(w.session.timeouts.LongPoll, func() {
+		_ = connection.EventLoop().Execute(context.Background(), gnet.RunnableFunc(func(context.Context) error {
+			if w.phase != webSocketOpen || w.heartbeatID != id {
+				return nil
+			}
+			if !w.heartbeatPending {
+				w.heartbeatDue = true
+				w.enqueueHeartbeat(connection)
+			}
+			w.armHeartbeat(connection)
+			return nil
+		}))
+	})
+}
+
+func (w *webSocketConnection) enqueueHeartbeat(connection gnet.Conn) {
+	if w.phase != webSocketOpen || !w.heartbeatDue || w.heartbeatPending {
+		return
+	}
+	item := &webSocketOutbound{message: webSocketMessage{typeID: webSocketMessagePing}, heartbeat: true}
+	if w.enqueueOutbound(item) {
+		w.heartbeatDue = false
+		w.heartbeatPending = true
+		_ = connection.Wake(nil)
+	}
+}
+
+func (w *webSocketConnection) stopHeartbeat() {
+	w.heartbeatID++
+	w.heartbeatDue = false
+	if w.heartbeat != nil {
+		w.heartbeat.Stop()
+		w.heartbeat = nil
+	}
+}
+
 func (w *webSocketConnection) beginClose(
 	connection gnet.Conn,
 	code ws.StatusCode,
@@ -659,6 +711,7 @@ func (w *webSocketConnection) beginClose(
 	w.noteClose("server_close", code)
 	w.phase = webSocketClosing
 	w.cancel()
+	w.stopHeartbeat()
 	w.livenessID++
 	if w.liveness != nil {
 		w.liveness.Stop()
@@ -710,6 +763,7 @@ func (w *webSocketConnection) close() {
 		w.queueMu.Lock()
 		w.closed = true
 		w.cancel()
+		w.stopHeartbeat()
 		w.livenessID++
 		if w.liveness != nil {
 			w.liveness.Stop()
@@ -719,6 +773,9 @@ func (w *webSocketConnection) close() {
 		for {
 			select {
 			case item := <-w.outbound:
+				if item.heartbeat {
+					w.heartbeatPending = false
+				}
 				item.lease.Release()
 				select {
 				case item.done <- ErrClosed:
@@ -745,6 +802,9 @@ func (w *webSocketConnection) finishCurrent(err error) bool {
 	w.current = nil
 	w.asyncWritePending = false
 	item.writeBatch = nil
+	if item.heartbeat {
+		w.heartbeatPending = false
+	}
 	if item.control {
 		if w.controlOutputItems <= 0 {
 			panic("invalid WEB WebSocket control output count")
@@ -1052,8 +1112,13 @@ func (h *httpEventHandler) pumpWebSocketWrites(
 	default:
 		return gnet.None
 	}
+	// A full queue defers heartbeat admission until the writer frees a slot.
+	transport.enqueueHeartbeat(connection)
 	header, payload, err := encodeWebSocketServerParts(item.message)
 	if err != nil {
+		if item.heartbeat {
+			transport.heartbeatPending = false
+		}
 		item.lease.Release()
 		transport.noteClose("encode_error", 0)
 		select {

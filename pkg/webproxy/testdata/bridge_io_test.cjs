@@ -134,7 +134,7 @@ function parked(options) {
   });
 }
 
-async function liveBridge(carrier, diagnostics = false) {
+async function liveBridge(carrier, diagnostics = false, configure) {
   const h = harness(carrier, false, diagnostics);
   let sessions = 0;
   h.recoveryResponse = () => new Response(JSON.stringify({ version: 1, bootstrap: 'B'.repeat(43), carrier, batch: batchLimit, streams: 128 }), {
@@ -149,6 +149,7 @@ async function liveBridge(carrier, diagnostics = false) {
     if (url.endsWith('/api/v1/up')) return new Response(null, { status: 204, headers: { 'X-Up-Ack': options.headers['X-Up-Seq'] } });
     return parked(options);
   };
+  if (configure) configure(h);
   h.api.activatePort(h.sandbox.testPort);
   const hello = new ArrayBuffer(9); new DataView(hello).setUint32(0, 0x10000000); new DataView(hello).setUint32(4, 1);
   h.sandbox.testPort.onmessage({ data: hello }); await flush();
@@ -469,26 +470,145 @@ for (const scenario of [
   });
 }
 
-test('503 discards its body and preserves Retry-After and the total retry budget', async () => {
-  const h = harness('https'), first = streamResponse({ status: 503, headers: { 'Retry-After': '2' }, end: false });
-  const second = streamResponse({ end: false });
-  h.sandbox.respond = async () => h.requests.length === 1 ? first.response : second.response;
-  const result = observe(h.api.request('/api/v1/session', () => h.api.options('POST', 'bootstrap', null)));
-  await flush();
-  assert.equal(first.cancelled(), true);
-  await h.advance(1999); assert.equal(h.requests.length, 1);
-  await h.advance(1); assert.equal(h.requests.length, 2);
-  await h.advance(budget - 2000);
-  assert.ok(result.error);
-  assert.equal(second.cancelled(), true);
-  assertClean(h);
-});
+for (const carrier of ['https', 'https-lanes']) {
+  for (const diagnostics of [false, true]) {
+    for (const status of [408, 429, 502, 503, 504]) {
+      test(carrier + ': session creation retries HTTP ' + status + '; diagnostics=' + diagnostics, async t => {
+        const h = harness(carrier, false, diagnostics);
+        t.after(async () => { h.pagehide(); await flush(); assertClean(h); });
+        const first = streamResponse({ status, headers: { 'Retry-After': '1' }, end: false });
+        const welcome = new Uint8Array([17, 0, 0, 0, 0, 0, 0, 0]);
+        let attempts = 0;
+        h.sandbox.respond = async (url, options) => {
+          if (!url.endsWith('/api/v1/session')) return parked(options);
+          if (++attempts === 1) return first.response;
+          return new Response(welcome, { headers: { 'X-Carrier-Mode': carrier, 'X-Session-Token': 'issued-token' } });
+        };
+        h.api.activatePort(h.sandbox.testPort);
+        const hello = new ArrayBuffer(8), result = observe(h.api.createSession(hello));
+        await flush();
+        assert.equal(h.api.state().closed, false, 'temporary status must not close initial session creation');
+        assert.equal(first.cancelled(), true, 'temporary response body is cancelled before retry');
+        await h.advance(999); assert.equal(attempts, 1);
+        await h.advance(1); await result.done;
+        assert.equal(result.error, undefined);
+        assert.equal(attempts, 2);
+        const requests = h.requests.filter(request => request.url.endsWith('/api/v1/session'));
+        assert.deepEqual(requests[1].options.headers, requests[0].options.headers);
+        assert.equal(requests[1].options.body, hello, 'retry retains the original HELLO');
+        assert.equal(h.api.state().sessionToken, 'issued-token');
+        assert.equal(h.api.state().welcomed, true);
+        assert.equal(h.messages.filter(value => value instanceof ArrayBuffer && new DataView(value).getUint8(0) === 17).length, 1);
+        assert.equal(h.messages.some(value => value.t === 'close' || value.state === 'failed'), false);
+      });
+
+      for (const operation of ['up', 'down']) {
+        test(carrier + ': established ' + operation + ' retries HTTP ' + status + ' without retiring streams; diagnostics=' + diagnostics, async t => {
+          const failure = streamResponse({ status, headers: { 'Retry-After': '1' }, end: false });
+          const frame = dataFrame(1);
+          const attempts = [];
+          let armed = false, resumeDown;
+          const h = await liveBridge(carrier, diagnostics, fixture => {
+            const respond = fixture.sandbox.respond;
+            fixture.sandbox.respond = (url, options) => {
+              const target = operation === 'up' ? armed && url.endsWith('/api/v1/up') :
+                url.endsWith('/api/v1/down') && (carrier === 'https' || options.headers['X-Lane-ID'] === '1');
+              if (!target) return respond(url, options);
+              attempts.push(options);
+              if (attempts.length === 1) {
+                if (operation === 'up') return Promise.resolve(failure.response);
+                return new Promise(resolve => { resumeDown = resolve; });
+              }
+              if (operation === 'up') return Promise.resolve(new Response(null, { status: 204, headers: { 'X-Up-Ack': options.headers['X-Up-Seq'] } }));
+              if (attempts.length === 2) return Promise.resolve(new Response(frame, { headers: { 'X-Down-Cursor': '1' } }));
+              return parked(options);
+            };
+          });
+          t.after(async () => { h.pagehide(); await flush(); assertClean(h); });
+          nativeFrame(h, 1); await flush();
+          assert.equal(h.api.state().activeStreams.has(1), true);
+          const token = h.api.state().sessionToken, epoch = h.api.state().epoch;
+          if (operation === 'up') { armed = true; nativeFrame(h, 1, 2); }
+          else resumeDown(failure.response);
+          await flush();
+          assert.equal(h.api.state().epoch, epoch, 'temporary status must not start recovery');
+          assert.equal(h.api.state().activeStreams.has(1), true, 'temporary status must keep the stream');
+          assert.equal(failure.cancelled(), true);
+          await h.advance(999); assert.equal(attempts.length, 1);
+          await h.advance(1);
+          assert.ok(attempts.length >= 2, 'logical operation retries');
+          assert.deepEqual(attempts[1].headers, attempts[0].headers, 'retry keeps authorization, sequence, lane, and cursor');
+          assert.equal(attempts[1].body, attempts[0].body, 'retry keeps its exact body');
+          assert.equal(h.api.state().sessionToken, token);
+          assert.equal(h.api.state().epoch, epoch);
+          assert.equal(h.api.state().recovering, false);
+          assert.equal(h.api.state().activeStreams.has(1), true);
+          assert.equal(h.api.state().queuedBytes, 0);
+          assert.equal(h.requests.filter(request => request.url.endsWith('/api/v1/session')).length, 1);
+          assert.equal(h.requests.some(request => request.url.includes('/?bridge=')), false);
+          const frames = h.messages.filter(value => value instanceof ArrayBuffer);
+          assert.equal(frames.filter(value => new DataView(value).getUint8(0) === 17).length, 1);
+          assert.equal(frames.some(value => new DataView(value).getUint8(0) === 3), false);
+          if (operation === 'down') {
+            const received = frames.filter(value => new DataView(value).getUint8(0) === 2);
+            assert.equal(received.length, 1);
+            assert.deepEqual(new Uint8Array(received[0]), frame);
+            assert.equal(attempts[2].headers['X-Down-Cursor'], '1', 'successful retry advances the cursor once');
+          } else {
+            const acknowledgments = h.messages.filter(value => value.t === 'traffic' && value.up === frame.byteLength);
+            assert.equal(acknowledgments.length, 1, 'logical batch settles only once');
+          }
+          assert.equal(h.messages.some(value => value.t === 'close' || value.state === 'failed'), false);
+        });
+      }
+    }
+  }
+}
+
+for (const status of [408, 429, 502, 503, 504]) {
+  test('HTTP ' + status + ' discards its body and preserves Retry-After and the total retry budget', async () => {
+    const h = harness('https'), first = streamResponse({ status, headers: { 'Retry-After': '2' }, end: false });
+    const second = streamResponse({ end: false });
+    h.sandbox.respond = async () => h.requests.length === 1 ? first.response : second.response;
+    const result = observe(h.api.request('/api/v1/session', () => h.api.options('POST', 'bootstrap', null)));
+    await flush();
+    assert.equal(first.cancelled(), true);
+    await h.advance(1999); assert.equal(h.requests.length, 1);
+    await h.advance(1); assert.equal(h.requests.length, 2);
+    await h.advance(budget - 2000);
+    assert.ok(result.error);
+    assert.equal(second.cancelled(), true);
+    assertClean(h);
+  });
+}
+
+for (const carrier of ['https', 'https-lanes']) {
+  for (const cancellation of ['page closure', 'epoch retirement']) {
+    test(carrier + ': ' + cancellation + ' cancels an ordinary temporary-status retry delay', async t => {
+      const h = await liveBridge(carrier), respond = h.sandbox.respond;
+      t.after(async () => { h.pagehide(); await flush(); assertClean(h); });
+      nativeFrame(h, 1); await flush();
+      const failure = streamResponse({ status: 429, headers: { 'Retry-After': '1' }, end: false });
+      h.sandbox.respond = (url, options) => url.endsWith('/api/v1/up') ? Promise.resolve(failure.response) : respond(url, options);
+      const epoch = h.api.state().epoch;
+      nativeFrame(h, 1, 2); await flush();
+      assert.equal(h.api.state().epoch, epoch);
+      assert.equal(h.api.state().recovering, false);
+      assert.equal(failure.cancelled(), true);
+      const before = h.requests.filter(request => request.url.endsWith('/api/v1/up')).length;
+      if (cancellation === 'page closure') h.pagehide(); else h.api.beginRecovery();
+      await flush(); await h.advance(1000);
+      assert.equal(h.requests.filter(request => request.url.endsWith('/api/v1/up')).length, before, 'retired request must not retry');
+      assert.equal(h.api.state().queuedBytes, 0);
+    });
+  }
+}
 
 test('unexpected HTTP status discards its body without waiting for it', async () => {
-  const h = harness('https'), response = streamResponse({ status: 502, end: false });
+  const h = harness('https'), response = streamResponse({ status: 400, end: false });
   h.sandbox.respond = async () => response.response;
   const result = await h.api.request('/api/v1/down', () => h.api.options('POST', 'token', null));
-  assert.equal(result.status, 502);
+  assert.equal(result.status, 400);
   assert.equal(response.cancelled(), true);
   assert.equal(h.requests.length, 1);
   assertClean(h);
@@ -997,6 +1117,115 @@ test('concurrent downlinks share a bounded replay budget and shutdown releases e
  h.pagehide();await Promise.all(pending.map(result=>result.done));
  assert.equal(h.api.state().downRetainedBytes,0);assert.equal(h.api.state().downWaiters,0);
  for(const response of responses){assert.equal(response.cancelled(),true);assert.equal(response.body.locked,false)}
+ assertClean(h);
+});
+
+for (const carrier of ['https', 'https-lanes']) {
+ for (const scenario of [
+  { name: 'known to absent', first: 'known', replay: 'absent' },
+  { name: 'absent to known', first: 'absent', replay: 'known' },
+  { name: 'known to encoded', first: 'known', replay: 'encoded' },
+  { name: 'encoded to known', first: 'encoded', replay: 'known' },
+  { name: 'encoded to encoded', first: 'encoded', replay: 'encoded' },
+ ]) {
+  test(carrier + ': replay length metadata ' + scenario.name + ' preserves bytes and allocation', async () => {
+   const h = harness(carrier), one = dataFrame(1), two = dataFrame(1, 2), length = one.byteLength + two.byteLength;
+   const headers = (kind, encodedLength) => ({ 'X-Down-Cursor': '1', ...(kind === 'absent' ? {} : {
+    'Content-Length': String(kind === 'known' ? length : encodedLength),
+    'Content-Encoding': kind === 'known' ? 'identity' : 'gzip',
+   }) });
+   const first = streamResponse({ end: false, headers: headers(scenario.first, 41), chunks: [one] });
+   const replay = streamResponse({ end: false, headers: headers(scenario.replay, 57), chunks: [one] });
+   let calls = 0;
+   h.api.setSession(); const lane = carrier === 'https-lanes' ? h.api.ensureLane(1) : null;
+   h.sandbox.respond = async (url, options) => ++calls === 1 ? first.response : calls === 2 ? replay.response : parked(options);
+   const pending = observe(lane ? h.api.pollLane(lane) : h.api.poll()); await flush();
+   const capacity = scenario.first === 'known' ? length : batchLimit;
+   assert.equal(h.api.state().downRetainedBytes, capacity);
+   assert.equal(h.messages.filter(value => value instanceof ArrayBuffer).length, 1);
+   first.controller.error(new TypeError('network lost')); await flush(); await h.advance(500);
+   assert.equal(h.api.state().closed, false, 'metadata variation must not close the carrier');
+   assert.equal(h.api.state().downRetainedBytes, capacity, 'replay keeps the original allocation charge');
+   assert.equal(lane ? lane.cursor : h.api.state().downCursor, '0', 'headers and prefix cannot advance the cursor');
+   assert.equal(h.messages.filter(value => value instanceof ArrayBuffer).length, 1, 'replayed prefix is not delivered twice');
+   replay.controller.enqueue(two); replay.controller.close(); await flush();
+   const frames = h.messages.filter(value => value instanceof ArrayBuffer);
+   assert.equal(frames.length, 2); assert.deepEqual(new Uint8Array(frames[0]), one); assert.deepEqual(new Uint8Array(frames[1]), two);
+   assert.equal(lane ? lane.cursor : h.api.state().downCursor, '1');
+   assert.equal(h.api.state().downRetainedBytes, 0);
+   assert.equal(first.body.locked, false); assert.equal(replay.body.locked, false);
+   h.pagehide(); await pending.done; assertClean(h);
+  });
+ }
+ for (const outcome of ['complete', 'truncated', 'oversized']) {
+  test(carrier + ': learned replay length survives another absent header with ' + outcome + ' body', async () => {
+   const h = harness(carrier), one = dataFrame(1), two = dataFrame(1, 2), length = one.byteLength + two.byteLength;
+   const first = streamResponse({ end: false, headers: { 'X-Down-Cursor': '1' }, chunks: [one] });
+   const learned = streamResponse({ end: false, headers: { 'X-Down-Cursor': '1', 'Content-Length': String(length) }, chunks: [one] });
+   const final = streamResponse({ end: false, headers: { 'X-Down-Cursor': '1' }, chunks: [one] });
+   const responses = [first, learned, final]; let calls = 0;
+   h.api.setSession(); const lane = carrier === 'https-lanes' ? h.api.ensureLane(1) : null;
+   h.sandbox.respond = async (url, options) => ++calls <= responses.length ? responses[calls - 1].response : parked(options);
+   const pending = observe(lane ? h.api.pollLane(lane) : h.api.poll()); await flush();
+   first.controller.error(new TypeError('network lost')); await flush(); await h.advance(500);
+   assert.equal(h.api.state().closed, false, 'a valid first declaration must be accepted');
+   assert.equal(h.api.state().downRetainedBytes, batchLimit, 'learning a length cannot refund live allocation');
+   learned.controller.error(new TypeError('network lost again')); await flush(); await h.advance(1000);
+   assert.equal(h.api.state().closed, false, 'an absent header must retain the learned declaration');
+   if (outcome === 'complete') { final.controller.enqueue(two); final.controller.close(); }
+   else if (outcome === 'truncated') final.controller.close();
+   else final.controller.enqueue(Uint8Array.from([...two, ...dataFrame(1, 3)]));
+   await flush();
+   assert.equal(h.api.state().closed, outcome !== 'complete');
+   assert.equal(lane ? lane.cursor : h.api.state().downCursor, outcome === 'complete' ? '1' : '0');
+   const frames = h.messages.filter(value => value instanceof ArrayBuffer);
+   assert.equal(frames.length, outcome === 'complete' ? 2 : 1, 'invalid extra bytes cannot produce another frame');
+   if (outcome === 'complete') assert.deepEqual(new Uint8Array(frames[1]), two);
+   if (outcome === 'oversized') assert.equal(final.cancelled(), true, 'reject oversized chunks before EOF');
+   assert.equal(h.api.state().downRetainedBytes, 0);
+   for (const response of responses) assert.equal(response.body.locked, false);
+   h.pagehide(); await pending.done; assertClean(h);
+  });
+ }
+ test(carrier + ': newly declared replay length cannot be shorter than the retained prefix', async () => {
+  const h = harness(carrier), one = dataFrame(1), prefix = Uint8Array.from([...one, 2]);
+  const first = streamResponse({ end: false, headers: { 'X-Down-Cursor': '1' }, chunks: [prefix] });
+  const replay = streamResponse({ end: false, headers: { 'X-Down-Cursor': '1', 'Content-Length': String(one.byteLength) } });
+  let calls = 0;
+  h.api.setSession(); const lane = carrier === 'https-lanes' ? h.api.ensureLane(1) : null;
+  h.sandbox.respond = async () => ++calls === 1 ? first.response : replay.response;
+  const pending = observe(lane ? h.api.pollLane(lane) : h.api.poll()); await flush();
+  first.controller.error(new TypeError('network lost')); await flush(); await h.advance(500); await pending.done;
+  assert.equal(h.api.state().closed, true); assert.equal(lane ? lane.cursor : h.api.state().downCursor, '0');
+  assert.equal(h.messages.filter(value => value instanceof ArrayBuffer).length, 1);
+  assert.equal(replay.cancelled(), true, 'reject the invalid declaration without waiting for body bytes');
+  assert.equal(replay.body.locked, false); assert.equal(h.api.state().downRetainedBytes, 0); assertClean(h);
+ });
+}
+
+test('learning a replay length keeps its reservation while other lanes wait and shutdown cancels every reader', async () => {
+ const h = harness('https-lanes'), responses = [], pending = [], attempts = new Map(), frame = dataFrame(1);
+ h.api.setSession();
+ h.sandbox.respond = async (url, options) => {
+  const id = options.headers['X-Lane-ID'], attempt = (attempts.get(id) || 0) + 1;
+  attempts.set(id, attempt);
+  const headers = { 'X-Down-Cursor': '1' };
+  if (id === '1' && attempt === 2) headers['Content-Length'] = String(frame.byteLength * 2);
+  const response = streamResponse({ end: false, headers, chunks: id === '1' ? [frame] : [] });
+  responses.push(response); return response.response;
+ };
+ for (let id = 1; id <= 17; id++) pending.push(observe(h.api.pollLane(h.api.ensureLane(id))));
+ await flush(); assert.equal(h.api.state().downRetainedBytes, 33554432); assert.equal(h.api.state().downWaiters, 1);
+ responses[0].controller.error(new TypeError('network lost')); await flush(); await h.advance(500);
+ assert.equal(h.api.state().closed, false); assert.equal(attempts.get('1'), 2);
+ assert.equal(h.api.state().downRetainedBytes, 33554432, 'a learned length does not release its larger allocation');
+ assert.equal(h.api.state().downWaiters, 1, 'the waiting lane cannot spend capacity still owned by the replay');
+ h.pagehide(); await Promise.all(pending.map(result => result.done));
+ assert.equal(h.api.state().downRetainedBytes, 0); assert.equal(h.api.state().downWaiters, 0);
+ for (const [index, response] of responses.entries()) {
+  assert.equal(response.body.locked, false);
+  if (index !== 0) assert.equal(response.cancelled(), true);
+ }
  assertClean(h);
 });
 

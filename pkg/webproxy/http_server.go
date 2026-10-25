@@ -524,6 +524,8 @@ type httpConnectionState struct {
 	input      []byte
 	websocket  *webSocketConnection
 	rejected   *rejectedHTTPUpload
+
+	responseStop chan struct{}
 }
 
 type rejectedHTTPUpload struct {
@@ -662,6 +664,7 @@ func (s *httpConnectionState) finishResponse() bool {
 	// queued on the event loop can no longer close the next keep-alive phase or
 	// race with releasing the session's carrier slot.
 	s.invalidateDeadlineLocked()
+	s.stopResponseWatchLocked()
 	lease := s.lease
 	closeAfter := s.closeAfter
 	s.lease = nil
@@ -675,6 +678,52 @@ func (s *httpConnectionState) finishResponse() bool {
 	s.mu.Unlock()
 	lease.Release()
 	return closeAfter
+}
+
+func (s *httpConnectionState) watchResponse(connection gnet.Conn, lease *PollLease) {
+	if lease == nil || lease.claim == nil {
+		return
+	}
+	s.mu.Lock()
+	if !s.draining || s.lease != lease || s.responseStop != nil {
+		s.mu.Unlock()
+		return
+	}
+	stop := make(chan struct{})
+	s.responseStop = stop
+	s.mu.Unlock()
+	owner := connection.EventLoop()
+	go func() {
+		select {
+		case <-lease.claim:
+		case <-stop:
+			return
+		}
+		// Queue even an already-superseded lease. The write callback must
+		// return before retirement can discard its outstanding write references.
+		_ = owner.Execute(context.Background(), gnet.RunnableFunc(func(context.Context) error {
+			s.mu.Lock()
+			if !s.draining || s.lease != lease {
+				s.mu.Unlock()
+				return nil
+			}
+			s.lease = nil
+			s.stopResponseWatchLocked()
+			s.mu.Unlock()
+			// gnet calls OnClose before it clears outbound storage. Detach the
+			// lease so that OnClose cannot return the carrier slot too early.
+			err := owner.Close(connection)
+			lease.Release()
+			return err
+		}))
+	}()
+}
+
+func (s *httpConnectionState) stopResponseWatchLocked() {
+	if s.responseStop != nil {
+		close(s.responseStop)
+		s.responseStop = nil
+	}
 }
 
 func (s *httpConnectionState) cancelRequest() {
@@ -758,6 +807,7 @@ func (s *httpConnectionState) close() {
 	s.lease = nil
 	s.websocket = nil
 	s.invalidateDeadlineLocked()
+	s.stopResponseWatchLocked()
 	if s.drainWake != nil {
 		s.drainWake.Stop()
 	}
@@ -1241,6 +1291,7 @@ func (h *httpEventHandler) dispatch(
 			}
 			state.beginResponse(current, cancel, response.lease, closeAfter, h.server.config.WriteTimeout)
 			if current.OutboundBuffered() != 0 {
+				state.watchResponse(current, response.lease)
 				state.armDrainWake(current)
 				return nil
 			}
