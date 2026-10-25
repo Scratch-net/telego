@@ -3,7 +3,6 @@ package webproxy
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	"github.com/panjf2000/gnet/v2"
+	"github.com/zeebo/xxh3"
 )
 
 type pendingClass uint8
@@ -92,7 +92,7 @@ type carrierLane struct {
 	unackedOwner    *carrierBatchOwnership
 	downCursor      uint64
 	lastUpSequence  uint64
-	lastUpDigest    [sha256.Size]byte
+	lastUpDigest    [16]byte
 	upHistory       [httpUpWindow]upCommit
 	upActive        bool
 	downActive      bool
@@ -115,6 +115,7 @@ func newCarrierLane() *carrierLane {
 // Session is one authenticated HTTPS carrier session. The serialized carrier
 // permits one uplink and downlink. The lanes carrier permits one pair per lane.
 type Session struct {
+	token          sessionBearer // immutable after manager publication
 	diagnostic     *bridgeDiagnosticState
 	profile        Profile
 	carrier        CarrierMode
@@ -498,7 +499,20 @@ func (s *Session) processUp(
 	expected *carrierLane,
 	prepaid uplinkApplicationReservation,
 ) (uint64, error) {
-	digest := sha256.Sum256(body)
+	return s.processUpWithDigest(laneID, sequence, body, lanes, expected, prepaid, xxh3.Hash128(body).Bytes())
+}
+
+// processUpWithDigest reuses the digest of a body owned by the caller until
+// this call returns. Each received retry must still hash its own body.
+func (s *Session) processUpWithDigest(
+	laneID uint32,
+	sequence uint64,
+	body []byte,
+	lanes bool,
+	expected *carrierLane,
+	prepaid uplinkApplicationReservation,
+	digest [16]byte,
+) (uint64, error) {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()

@@ -314,12 +314,12 @@ func TestHTTPServerTrustedForwardedIPIsSingleCanonicalAddress(t *testing.T) {
 	client := &http.Client{Timeout: time.Second}
 	response := trusted.do(t, client, "GET", "/?bridge="+trusted.profiles[0].Capability().String(), nil, map[string]string{"X-Forwarded-For": "192.0.2.44"})
 	token := extractBridgeBootstrap(t, readHTTPBody(t, response))
-	hash, err := parseTokenHash(token)
+	hash, err := parseToken(token)
 	if err != nil {
 		t.Fatal(err)
 	}
 	trusted.manager.mu.Lock()
-	issuanceIP := trusted.manager.bootstraps[hash].issuanceIP
+	issuanceIP := trusted.manager.bootstraps[hash.prefix()].issuanceIP
 	trusted.manager.mu.Unlock()
 	if response.StatusCode != 200 || issuanceIP != "192.0.2.44" {
 		t.Fatalf("forwarded response = %d, issuance IP %q", response.StatusCode, issuanceIP)

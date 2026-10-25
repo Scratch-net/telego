@@ -21,7 +21,7 @@ func (m *Manager) issueRecovery(capability Capability, oldToken, clientIP string
 	}
 	var previous *Session
 	if oldToken != "" {
-		if _, err := parseTokenHash(oldToken); err != nil {
+		if _, err := parseToken(oldToken); err != nil {
 			return "", ErrAuthentication
 		}
 		previous, _ = m.Get(oldToken)

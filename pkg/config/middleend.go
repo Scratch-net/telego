@@ -1,7 +1,6 @@
 package config
 
 import (
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/scratch-net/telego/pkg/gproxy"
 	"github.com/scratch-net/telego/pkg/transport/middleend"
+	"github.com/zeebo/xxh3"
 )
 
 const (
@@ -371,7 +371,7 @@ func (c *Config) middleEndFingerprint() string {
 	if c == nil || !c.MiddleEnd.Enabled {
 		return "enabled=false"
 	}
-	digest := sha256.New()
+	digest := xxh3.New128()
 	_, _ = fmt.Fprintf(
 		digest,
 		"enabled=%t\x00tag=%s\x00socks=%s\x00user=%s\x00password=%s\x00artifact=%s\x00nat=%s\x00max=%d\x00budget=%d\x00loops=%d\x00upstream=%s",
@@ -387,5 +387,5 @@ func (c *Config) middleEndFingerprint() string {
 		c.Performance.NumEventLoops,
 		c.Upstream.Socks5,
 	)
-	return "enabled=true;sha256=" + hex.EncodeToString(digest.Sum(nil))
+	return "enabled=true;xxh3-128=" + hex.EncodeToString(digest.Sum(nil))
 }

@@ -5,7 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/zeebo/blake3"
+	"github.com/zeebo/xxh3"
 )
 
 const (
@@ -14,13 +14,13 @@ const (
 	limiterShards    = 64
 	limiterShardMask = limiterShards - 1
 
-	// Key size: 8 bytes is enough for uniqueness (birthday paradox threshold ~4B entries)
-	limiterKeySize = 8
+	// Internal connection keys use the full XXH3-128 digest.
+	limiterKeySize = 16
 )
 
-// Pool of blake3 hashers to avoid allocation per TryAcquire
+// Pool of XXH3 hashers to avoid allocation per TryAcquire
 var hasherPool = sync.Pool{
-	New: func() any { return blake3.New() },
+	New: func() any { return xxh3.New128() },
 }
 
 // ConnLimiter limits concurrent connections per IP+secret combination.
@@ -53,8 +53,7 @@ func (l *ConnLimiter) TryAcquire(ip net.IP, secret []byte) (key string, ok bool)
 		return "", true
 	}
 
-	// Compute key: blake3(ip || secret), truncated to limiterKeySize bytes
-	// Blake3 is ~3x faster than SHA256 and highly optimized
+	// Compute the process-local XXH3-128 key for ip || secret.
 	keyArr := l.hashKey(ip, secret)
 	return l.tryAcquire(keyArr)
 }
@@ -71,15 +70,13 @@ func (l *ConnLimiter) TryAcquireIP(ip net.IP) (key string, ok bool) {
 }
 
 func (l *ConnLimiter) hashKey(ip net.IP, secret []byte) [limiterKeySize]byte {
-	var keyArr [limiterKeySize]byte
-	h := hasherPool.Get().(*blake3.Hasher)
+	h := hasherPool.Get().(*xxh3.Hasher128)
 	h.Reset()
 	h.Write(ip)
 	if len(secret) > 0 {
 		h.Write(secret)
 	}
-	hash := h.Sum(nil)
-	copy(keyArr[:], hash[:limiterKeySize])
+	keyArr := h.Sum128().Bytes()
 	hasherPool.Put(h)
 	return keyArr
 }

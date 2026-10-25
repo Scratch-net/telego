@@ -2,7 +2,6 @@ package middleend
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -14,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/zeebo/xxh3"
 )
 
 var (
@@ -433,7 +434,7 @@ const (
 type preparedRequest struct {
 	binding     *clientBinding
 	size        int
-	fingerprint [sha256.Size]byte
+	fingerprint [16]byte
 	ticket      uint64
 	epoch       uint64
 	phase       preparedRequestPhase
@@ -1847,26 +1848,28 @@ func proxyRequestEncodedSize(request ProxyRequest) (int, error) {
 	return headerSize + len(request.Packet), nil
 }
 
-func proxyRequestIdentity(request ProxyRequest) (int, [sha256.Size]byte, error) {
+// proxyRequestIdentity fingerprints a request for in-memory reservation checks.
+// The digest is not part of the Middle-End wire format.
+func proxyRequestIdentity(request ProxyRequest) (int, [16]byte, error) {
 	size, err := proxyRequestEncodedSize(request)
 	if err != nil {
-		return 0, [sha256.Size]byte{}, err
+		return 0, [16]byte{}, err
 	}
-	var canonical [4 + 20 + 20 + 1 + len(ProxyTag{}) + sha256.Size]byte
+	var canonical [4 + 20 + 20 + 1 + len(ProxyTag{}) + 16]byte
 	binary.LittleEndian.PutUint32(canonical[0:4], uint32(request.Flags))
 	if err := putProxyAddress(canonical[4:24], request.RemoteAddr, true); err != nil {
-		return 0, [sha256.Size]byte{}, fmt.Errorf("encode remote address: %w", err)
+		return 0, [16]byte{}, fmt.Errorf("encode remote address: %w", err)
 	}
 	if err := putProxyAddress(canonical[24:44], request.ProxyAddr, false); err != nil {
-		return 0, [sha256.Size]byte{}, fmt.Errorf("encode proxy address: %w", err)
+		return 0, [16]byte{}, fmt.Errorf("encode proxy address: %w", err)
 	}
 	if request.Tag != nil {
 		canonical[44] = 1
 		copy(canonical[45:61], request.Tag[:])
 	}
-	packetDigest := sha256.Sum256(request.Packet)
+	packetDigest := xxh3.Hash128(request.Packet).Bytes()
 	copy(canonical[61:], packetDigest[:])
-	return size, sha256.Sum256(canonical[:]), nil
+	return size, xxh3.Hash128(canonical[:]).Bytes(), nil
 }
 
 func (m *fixedBindingManager) canReserveRequestLocked(slot *fixedBindingSlot, size int) bool {

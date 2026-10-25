@@ -4,7 +4,6 @@ import (
 	"container/list"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/binary"
@@ -17,6 +16,7 @@ import (
 	"time"
 
 	"github.com/panjf2000/gnet/v2"
+	"github.com/zeebo/xxh3"
 )
 
 var (
@@ -43,7 +43,7 @@ type BootstrapAuthorization struct {
 
 type bootstrapAuthorization struct {
 	manager *Manager
-	hash    [sha256.Size]byte
+	token   sessionBearer
 }
 
 func (*BootstrapAuthorization) String() string { return "WEB bootstrap authorization" }
@@ -51,17 +51,19 @@ func (*BootstrapAuthorization) String() string { return "WEB bootstrap authoriza
 func (*BootstrapAuthorization) GoString() string { return "WEB bootstrap authorization" }
 
 type bootstrap struct {
+	token        sessionBearer
 	diagnostic   *bridgeDiagnosticState
 	expires      time.Time
 	profile      Profile
 	issuanceIP   string
-	bodyDigest   [sha256.Size]byte
+	bodyDigest   [16]byte
 	sessionToken string
 	session      *Session
 	used         bool
 }
 
 type closedToken struct {
+	token      sessionBearer
 	diagnostic *bridgeDiagnosticState
 	expires    time.Time
 	order      *list.Element
@@ -101,9 +103,9 @@ type Manager struct {
 	budgetTasks    map[*backendBudgetWake]struct{}
 
 	mu                      sync.Mutex
-	bootstraps              map[[sha256.Size]byte]*bootstrap
-	sessions                map[[sha256.Size]byte]*Session
-	closedTokens            map[[sha256.Size]byte]*closedToken
+	bootstraps              map[uint64]*bootstrap
+	sessions                map[uint64]*Session
+	closedTokens            map[uint64]*closedToken
 	closedOrder             list.List
 	streams                 int
 	dials                   int
@@ -161,9 +163,9 @@ func NewManager(config ManagerConfig) (*Manager, error) {
 		dialBackend:             dialBackend,
 		backendFactory:          config.BackendFactory,
 		budgetWake:              make(chan struct{}, 1),
-		bootstraps:              make(map[[sha256.Size]byte]*bootstrap),
-		sessions:                make(map[[sha256.Size]byte]*Session),
-		closedTokens:            make(map[[sha256.Size]byte]*closedToken),
+		bootstraps:              make(map[uint64]*bootstrap),
+		sessions:                make(map[uint64]*Session),
+		closedTokens:            make(map[uint64]*closedToken),
 		stop:                    make(chan struct{}),
 		cleanupDone:             make(chan struct{}),
 		shutdownDone:            make(chan struct{}),
@@ -203,7 +205,7 @@ func (m *Manager) IssueBootstrap(capability Capability, clientIP string) (string
 	if !matched {
 		return "", ErrAuthentication
 	}
-	token, hash, err := newToken()
+	token, key, err := newToken()
 	if err != nil {
 		return "", err
 	}
@@ -219,8 +221,8 @@ func (m *Manager) IssueBootstrap(capability Capability, clientIP string) (string
 		m.recordBackpressure(carrierOperationBridge)
 		return "", ErrLimit
 	}
-	for m.tokenHashUsedLocked(hash) {
-		token, hash, err = newToken()
+	for m.tokenPrefixUsedLocked(key) {
+		token, key, err = newToken()
 		if err != nil {
 			return "", err
 		}
@@ -229,7 +231,8 @@ func (m *Manager) IssueBootstrap(capability Capability, clientIP string) (string
 	if m.debugDiagnostics {
 		diagnostic = &bridgeDiagnosticState{id: bridgeDiagnosticIDs.Add(1), user: profile.Name()}
 	}
-	m.bootstraps[hash] = &bootstrap{
+	m.bootstraps[key.prefix()] = &bootstrap{
+		token:      key,
 		diagnostic: diagnostic,
 		expires:    now.Add(m.timeouts.BootstrapLifetime),
 		profile:    profile,
@@ -242,14 +245,14 @@ func (m *Manager) IssueBootstrap(capability Capability, clientIP string) (string
 // reading or parsing a request body. Unknown and malformed bearers return the
 // same authentication error.
 func (m *Manager) AuthenticateBootstrap(token string) (*BootstrapAuthorization, error) {
-	tokenDigest, err := parseTokenHash(token)
+	bearer, err := parseToken(token)
 	if err != nil {
 		return nil, ErrAuthentication
 	}
-	if !m.bootstrapAuthenticated(tokenDigest, time.Now()) {
+	if !m.bootstrapAuthenticated(bearer, time.Now()) {
 		return nil, ErrAuthentication
 	}
-	return &BootstrapAuthorization{state: &bootstrapAuthorization{manager: m, hash: tokenDigest}}, nil
+	return &BootstrapAuthorization{state: &bootstrapAuthorization{manager: m, token: bearer}}, nil
 }
 
 // Create atomically consumes a bootstrap for one exact HELLO body. Retrying the
@@ -273,20 +276,20 @@ func (a *BootstrapAuthorization) create(clientIP string, body []byte, owner gnet
 	if a == nil || a.state == nil || a.state.manager == nil {
 		return CreateResult{}, ErrAuthentication
 	}
-	if !a.state.manager.bootstrapAuthenticated(a.state.hash, time.Now()) {
+	if !a.state.manager.bootstrapAuthenticated(a.state.token, time.Now()) {
 		return CreateResult{}, ErrAuthentication
 	}
 	if err := ParseHello(body); err != nil {
 		return CreateResult{}, ErrProtocol
 	}
-	bodyDigest := sha256.Sum256(body)
+	bodyDigest := xxh3.Hash128(body).Bytes()
 	now := time.Now()
 	m := a.state.manager
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	entry := m.bootstraps[a.state.hash]
-	if entry == nil || !now.Before(entry.expires) {
+	entry := m.bootstraps[a.state.token.prefix()]
+	if entry == nil || !entry.token.equal(a.state.token) || !now.Before(entry.expires) {
 		return CreateResult{}, ErrAuthentication
 	}
 	if entry.used {
@@ -311,12 +314,12 @@ func (a *BootstrapAuthorization) create(clientIP string, body []byte, owner gnet
 		return CreateResult{}, ErrLimit
 	}
 
-	sessionToken, sessionHash, err := newToken()
+	sessionToken, sessionKey, err := newToken()
 	if err != nil {
 		return CreateResult{}, err
 	}
-	for m.tokenHashUsedLocked(sessionHash) {
-		sessionToken, sessionHash, err = newToken()
+	for m.tokenPrefixUsedLocked(sessionKey) {
+		sessionToken, sessionKey, err = newToken()
 		if err != nil {
 			return CreateResult{}, err
 		}
@@ -340,11 +343,12 @@ func (a *BootstrapAuthorization) create(clientIP string, body []byte, owner gnet
 		onBackendDialFinished: m.backendDialFinished,
 		onStreamFinished:      m.streamFinished,
 	})
+	created.token = sessionKey
 	created.diagnostic = entry.diagnostic
 	created.onFinished = func(session *Session, reason sessionCloseReason) {
-		m.sessionFinished(sessionHash, session, reason)
+		m.sessionFinished(sessionKey, session, reason)
 	}
-	m.sessions[sessionHash] = created
+	m.sessions[sessionKey.prefix()] = created
 	m.sessionsCreated.Add(1)
 	entry.used = true
 	entry.bodyDigest = bodyDigest
@@ -360,15 +364,15 @@ func (a *BootstrapAuthorization) create(clientIP string, body []byte, owner gnet
 // CarrierMode returns the transport used for newly created sessions.
 func (m *Manager) CarrierMode() CarrierMode { return m.carrier }
 
-func (m *Manager) bootstrapAuthenticated(hash [sha256.Size]byte, now time.Time) bool {
+func (m *Manager) bootstrapAuthenticated(key sessionBearer, now time.Time) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	entry := m.bootstraps[hash]
-	if entry == nil {
+	entry := m.bootstraps[key.prefix()]
+	if entry == nil || !entry.token.equal(key) {
 		return false
 	}
 	if !now.Before(entry.expires) {
-		delete(m.bootstraps, hash)
+		delete(m.bootstraps, key.prefix())
 		return false
 	}
 	return true
@@ -376,12 +380,15 @@ func (m *Manager) bootstrapAuthenticated(hash [sha256.Size]byte, now time.Time) 
 
 // Get authenticates a canonical session bearer.
 func (m *Manager) Get(token string) (*Session, error) {
-	hash, err := parseTokenHash(token)
+	key, err := parseToken(token)
 	if err != nil {
 		return nil, ErrAuthentication
 	}
 	m.mu.Lock()
-	session := m.sessions[hash]
+	session := m.sessions[key.prefix()]
+	if session != nil && !session.token.equal(key) {
+		session = nil
+	}
 	m.mu.Unlock()
 	if session == nil {
 		return nil, ErrAuthentication
@@ -396,16 +403,26 @@ func (m *Manager) recognizesToken(token string) bool {
 	if !ok {
 		return false
 	}
-	hash := sha256.Sum256(raw[:])
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.tokenHashUsedLocked(hash)
+	return m.recognizesTokenLocked(raw)
+}
+
+func (m *Manager) recognizesTokenLocked(token sessionBearer) bool {
+	key := token.prefix()
+	if entry := m.bootstraps[key]; entry != nil && entry.token.equal(token) {
+		return true
+	}
+	if session := m.sessions[key]; session != nil && session.token.equal(token) {
+		return true
+	}
+	return m.closedTokens[key] != nil && m.closedTokens[key].token.equal(token)
 }
 
 // decodeFallbackCredential recognizes equivalent base64 spellings only for
 // fallback sanitization. Authentication continues to use canonical parsers.
-func decodeFallbackCredential(value string) ([sha256.Size]byte, bool) {
-	var raw [sha256.Size]byte
+func decodeFallbackCredential(value string) (sessionBearer, bool) {
+	var raw sessionBearer
 	if len(value) == capabilityLength+1 && value[len(value)-1] == '=' {
 		value = value[:len(value)-1]
 	}
@@ -426,13 +443,17 @@ func decodeFallbackCredential(value string) ([sha256.Size]byte, bool) {
 // Close terminates the authenticated session. A recently closed valid token is
 // idempotent; an unknown token remains indistinguishable from bad authentication.
 func (m *Manager) Close(token string) error {
-	hash, err := parseTokenHash(token)
+	key, err := parseToken(token)
 	if err != nil {
 		return ErrAuthentication
 	}
 	m.mu.Lock()
-	session := m.sessions[hash]
-	_, recentlyClosed := m.closedTokens[hash]
+	session := m.sessions[key.prefix()]
+	if session != nil && !session.token.equal(key) {
+		session = nil
+	}
+	closed := m.closedTokens[key.prefix()]
+	recentlyClosed := closed != nil && closed.token.equal(key)
 	m.mu.Unlock()
 	if session == nil {
 		if recentlyClosed {
@@ -584,16 +605,16 @@ func (m *Manager) changePendingBudgetLocked(byteDelta, itemDelta int, class pend
 	return true
 }
 
-func (m *Manager) sessionFinished(hash [sha256.Size]byte, session *Session, reason sessionCloseReason) {
+func (m *Manager) sessionFinished(key sessionBearer, session *Session, reason sessionCloseReason) {
 	m.mu.Lock()
-	if m.sessions[hash] == session {
-		delete(m.sessions, hash)
-		m.rememberClosedTokenLocked(hash, time.Now().Add(m.timeouts.BootstrapLifetime))
-		m.closedTokens[hash].diagnostic = session.diagnostic
+	if m.sessions[key.prefix()] == session {
+		delete(m.sessions, key.prefix())
+		m.rememberClosedTokenLocked(key, time.Now().Add(m.timeouts.BootstrapLifetime))
+		m.closedTokens[key.prefix()].diagnostic = session.diagnostic
 	}
-	for bootstrapHash, entry := range m.bootstraps {
+	for bootstrapKey, entry := range m.bootstraps {
 		if entry.session == session {
-			delete(m.bootstraps, bootstrapHash)
+			delete(m.bootstraps, bootstrapKey)
 		}
 	}
 	m.mu.Unlock()
@@ -602,47 +623,47 @@ func (m *Manager) sessionFinished(hash [sha256.Size]byte, session *Session, reas
 	}
 }
 
-func (m *Manager) rememberClosedTokenLocked(hash [sha256.Size]byte, expires time.Time) {
-	if existing := m.closedTokens[hash]; existing != nil {
+func (m *Manager) rememberClosedTokenLocked(key sessionBearer, expires time.Time) {
+	if existing := m.closedTokens[key.prefix()]; existing != nil {
 		existing.expires = expires
 		m.closedOrder.MoveToBack(existing.order)
 		return
 	}
 	if len(m.closedTokens) >= m.limits.MaxClosedTokens {
 		oldest := m.closedOrder.Front()
-		delete(m.closedTokens, oldest.Value.([sha256.Size]byte))
+		delete(m.closedTokens, oldest.Value.(uint64))
 		m.closedOrder.Remove(oldest)
 	}
-	entry := &closedToken{expires: expires}
-	entry.order = m.closedOrder.PushBack(hash)
-	m.closedTokens[hash] = entry
+	entry := &closedToken{token: key, expires: expires}
+	entry.order = m.closedOrder.PushBack(key.prefix())
+	m.closedTokens[key.prefix()] = entry
 }
 
-func (m *Manager) tokenHashUsedLocked(hash [sha256.Size]byte) bool {
-	if _, exists := m.bootstraps[hash]; exists {
+func (m *Manager) tokenPrefixUsedLocked(key sessionBearer) bool {
+	if _, exists := m.bootstraps[key.prefix()]; exists {
 		return true
 	}
-	if _, exists := m.sessions[hash]; exists {
+	if _, exists := m.sessions[key.prefix()]; exists {
 		return true
 	}
-	_, exists := m.closedTokens[hash]
+	_, exists := m.closedTokens[key.prefix()]
 	return exists
 }
 
 func (m *Manager) evictOldestUnusedBootstrapLocked() bool {
-	var oldestHash [sha256.Size]byte
+	var oldestKey uint64
 	var oldest *bootstrap
-	for hash, entry := range m.bootstraps {
+	for key, entry := range m.bootstraps {
 		if entry.used || (oldest != nil && !entry.expires.Before(oldest.expires)) {
 			continue
 		}
-		oldestHash = hash
+		oldestKey = key
 		oldest = entry
 	}
 	if oldest == nil {
 		return false
 	}
-	delete(m.bootstraps, oldestHash)
+	delete(m.bootstraps, oldestKey)
 	return true
 }
 
@@ -680,14 +701,14 @@ func (m *Manager) cleanupLoop() {
 }
 
 func (m *Manager) removeExpiredLocked(now time.Time) {
-	for hash, entry := range m.bootstraps {
+	for key, entry := range m.bootstraps {
 		if !now.Before(entry.expires) {
-			delete(m.bootstraps, hash)
+			delete(m.bootstraps, key)
 		}
 	}
-	for hash, entry := range m.closedTokens {
+	for key, entry := range m.closedTokens {
 		if !now.Before(entry.expires) {
-			delete(m.closedTokens, hash)
+			delete(m.closedTokens, key)
 			m.closedOrder.Remove(entry.order)
 		}
 	}
@@ -701,18 +722,30 @@ func welcomeFrame() []byte {
 	return encoded
 }
 
-func newToken() (string, [sha256.Size]byte, error) {
-	var raw [32]byte
-	if _, err := rand.Read(raw[:]); err != nil {
-		return "", [sha256.Size]byte{}, fmt.Errorf("generate WEB bearer: %w", err)
-	}
-	return base64.RawURLEncoding.EncodeToString(raw[:]), sha256.Sum256(raw[:]), nil
+// sessionBearer retains the full random bearer. The prefix only selects a map
+// entry; authentication always compares all 32 bytes in constant time.
+type sessionBearer [32]byte
+
+func (t sessionBearer) prefix() uint64 { return binary.LittleEndian.Uint64(t[:8]) }
+
+func (t sessionBearer) equal(other sessionBearer) bool {
+	return subtle.ConstantTimeCompare(t[:], other[:]) == 1
 }
 
-func parseTokenHash(token string) ([sha256.Size]byte, error) {
-	raw, err := base64.RawURLEncoding.DecodeString(token)
-	if err != nil || len(raw) != 32 || base64.RawURLEncoding.EncodeToString(raw) != token {
-		return [sha256.Size]byte{}, ErrAuthentication
+func newToken() (string, sessionBearer, error) {
+	var raw sessionBearer
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", sessionBearer{}, fmt.Errorf("generate WEB bearer: %w", err)
 	}
-	return sha256.Sum256(raw), nil
+	return base64.RawURLEncoding.EncodeToString(raw[:]), raw, nil
+}
+
+func parseToken(token string) (sessionBearer, error) {
+	var raw sessionBearer
+	decoded, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil || len(decoded) != len(raw) || base64.RawURLEncoding.EncodeToString(decoded) != token {
+		return raw, ErrAuthentication
+	}
+	copy(raw[:], decoded)
+	return raw, nil
 }

@@ -15,7 +15,7 @@ require (
 	github.com/pion/stun/v3 v3.1.7
 	github.com/prometheus/client_golang v1.25.0
 	github.com/rs/zerolog v1.35.1
-	github.com/zeebo/blake3 v0.2.4
+	github.com/zeebo/xxh3 v1.1.0
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/exporters/prometheus v0.69.0
 	go.opentelemetry.io/otel/metric v1.47.0

@@ -79,6 +79,80 @@ func TestManagerCapabilityTokensAndIdempotentCreate(t *testing.T) {
 	}
 }
 
+func TestManagerTokenPrefixCollisionDoesNotAuthenticate(t *testing.T) {
+	profiles := testProfiles(t)
+	manager := testManager(t, profiles, func(config *ManagerConfig) {
+		config.DebugDiagnostics = true
+	}, nil)
+	bootstrap, err := manager.IssueBootstrap(profiles[0].Capability(), "192.0.2.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedSuffix := func(token string, offset int) string {
+		t.Helper()
+		raw, parseErr := parseToken(token)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		raw[offset] ^= 1
+		manager.mu.Lock()
+		used := manager.tokenPrefixUsedLocked(raw)
+		manager.mu.Unlock()
+		if !used {
+			t.Fatal("issuance did not reserve the existing token prefix")
+		}
+		return base64.RawURLEncoding.EncodeToString(raw[:])
+	}
+	checkUnknown := func(token string) {
+		t.Helper()
+		if _, getErr := manager.Get(token); !errors.Is(getErr, ErrAuthentication) {
+			t.Fatalf("colliding token Get error = %v", getErr)
+		}
+		if closeErr := manager.Close(token); !errors.Is(closeErr, ErrAuthentication) {
+			t.Fatalf("colliding token Close error = %v", closeErr)
+		}
+		if manager.authenticateBridgeDiagnostic(token) != nil || manager.recognizesToken(token) {
+			t.Fatal("colliding token recognized as a retained credential")
+		}
+	}
+	hello := testFrameBatch(t, Frame{Type: FrameHello, Payload: []byte{1}})
+	for _, offset := range []int{8, 15, 16, 31} {
+		other := changedSuffix(bootstrap, offset)
+		if _, authErr := manager.AuthenticateBootstrap(other); !errors.Is(authErr, ErrAuthentication) {
+			t.Fatalf("colliding bootstrap error = %v", authErr)
+		}
+		if _, createErr := manager.Create(other, "192.0.2.1", hello); !errors.Is(createErr, ErrAuthentication) {
+			t.Fatalf("colliding bootstrap Create error = %v", createErr)
+		}
+		checkUnknown(other)
+	}
+	created, err := manager.Create(bootstrap, "192.0.2.1", hello)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, offset := range []int{8, 15, 16, 31} {
+		checkUnknown(changedSuffix(created.Token, offset))
+	}
+	if got, getErr := manager.Get(created.Token); getErr != nil || got != created.Session {
+		t.Fatal("colliding close attempts affected the real session")
+	}
+	if manager.authenticateBridgeDiagnostic(created.Token) == nil || !manager.recognizesToken(created.Token) {
+		t.Fatal("real session credential was not recognized")
+	}
+	if err := manager.Close(created.Token); err != nil {
+		t.Fatal(err)
+	}
+	for _, offset := range []int{8, 15, 16, 31} {
+		checkUnknown(changedSuffix(created.Token, offset))
+	}
+	if err := manager.Close(created.Token); err != nil {
+		t.Fatalf("real token idempotent close: %v", err)
+	}
+	if manager.authenticateBridgeDiagnostic(created.Token) == nil || !manager.recognizesToken(created.Token) {
+		t.Fatal("real closed-session credential was not retained")
+	}
+}
+
 func TestBootstrapAuthenticationPrecedesBodyParsing(t *testing.T) {
 	profiles := testProfiles(t)
 	manager := testManager(t, profiles, nil, nil)
@@ -98,7 +172,7 @@ func TestBootstrapAuthenticationPrecedesBodyParsing(t *testing.T) {
 			t.Fatal(tokenErr)
 		}
 		manager.mu.Lock()
-		used := manager.tokenHashUsedLocked(hash)
+		used := manager.tokenPrefixUsedLocked(hash)
 		manager.mu.Unlock()
 		if !used {
 			unknown = candidate

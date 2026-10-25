@@ -65,7 +65,7 @@ func renderBridgeAtPath(hostname, bootstrapToken string, batchBytes int, carrier
 	if err != nil {
 		return BridgePage{}, err
 	}
-	if _, err := parseTokenHash(bootstrapToken); err != nil {
+	if _, err := parseToken(bootstrapToken); err != nil {
 		return BridgePage{}, ErrAuthentication
 	}
 	if batchBytes <= 0 || batchBytes > maxCarrierBatchBytes {

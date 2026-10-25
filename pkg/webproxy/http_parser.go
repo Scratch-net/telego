@@ -249,7 +249,7 @@ func bearerToken(value string) (string, bool) {
 		return "", false
 	}
 	token := value[len(prefix):]
-	if _, err := parseTokenHash(token); err != nil {
+	if _, err := parseToken(token); err != nil {
 		return "", false
 	}
 	return token, true

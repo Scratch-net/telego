@@ -295,7 +295,7 @@ func TestMiddleEndFrontendPolicyAndFingerprint(t *testing.T) {
 		t.Fatalf("expert reductions = %+v", runtimeConfig.Service.BindingLimits)
 	}
 	fingerprint := config.middleEndFingerprint()
-	if strings.Contains(fingerprint, config.MiddleEnd.ProxyTag) || !strings.HasPrefix(fingerprint, "enabled=true;sha256=") {
+	if strings.Contains(fingerprint, config.MiddleEnd.ProxyTag) || !strings.HasPrefix(fingerprint, "enabled=true;xxh3-128=") {
 		t.Fatalf("fingerprint = %q", fingerprint)
 	}
 	copyConfig := *config

@@ -52,6 +52,10 @@ func TestHTTPConveyorOrderedApplyAndDigestReplay(t *testing.T) {
 		}
 		r.Release()
 	}
+	// The direct session entry must agree with the digest committed by HTTP.
+	if ack, err := s.ProcessUp(4, bytes.Clone(second)); err != nil || ack != 4 {
+		t.Fatalf("session replay of HTTP commit=%d,%v", ack, err)
+	}
 	retry := reserveHTTPTest(t, s, 0, 1, first)
 	if ack, err := retry.Process(t.Context(), bytes.Clone(first)); err != nil || ack != 1 {
 		t.Fatalf("oldest replay=%d,%v", ack, err)

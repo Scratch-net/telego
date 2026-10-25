@@ -167,7 +167,7 @@ func FuzzParseWebSocketSubprotocol(f *testing.F) {
 		if strings.ContainsAny(value, ", \t") {
 			t.Fatalf("accepted multi-value protocol %q", value)
 		}
-		if _, err := parseTokenHash(token); err != nil {
+		if _, err := parseToken(token); err != nil {
 			t.Fatalf("accepted invalid token %q", token)
 		}
 		if lanes && (laneID == 0 || laneID > MaxStreamID) || !lanes && laneID != 0 {

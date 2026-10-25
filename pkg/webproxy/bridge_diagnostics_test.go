@@ -179,9 +179,9 @@ func TestBridgeDiagnosticAllowanceSurvivesSessionLifecycle(t *testing.T) {
 			if len(reports) != 1 {
 				t.Fatalf("reports = %d, want one", len(reports))
 			}
-			hash, _ := parseTokenHash(created.Token)
+			hash, _ := parseToken(created.Token)
 			app.manager.mu.Lock()
-			app.manager.closedTokens[hash].expires = time.Now().Add(-time.Second)
+			app.manager.closedTokens[hash.prefix()].expires = time.Now().Add(-time.Second)
 			app.manager.mu.Unlock()
 			if app.manager.authenticateBridgeDiagnostic(created.Token) != nil {
 				t.Fatal("expired closed token authenticated")

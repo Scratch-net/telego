@@ -84,7 +84,7 @@ func (d *bridgeDiagnosticState) claimLane(lane uint32, source int, now time.Time
 }
 
 func (m *Manager) authenticateBridgeDiagnostic(token string) *bridgeDiagnosticState {
-	hash, err := parseTokenHash(token)
+	bearer, err := parseToken(token)
 	if err != nil {
 		return nil
 	}
@@ -93,14 +93,14 @@ func (m *Manager) authenticateBridgeDiagnostic(token string) *bridgeDiagnosticSt
 	if m.closed {
 		return nil
 	}
-	if session := m.sessions[hash]; session != nil {
+	if session := m.sessions[bearer.prefix()]; session != nil && session.token.equal(bearer) {
 		return session.diagnostic
 	}
 	now := time.Now()
-	if entry := m.bootstraps[hash]; entry != nil && now.Before(entry.expires) {
+	if entry := m.bootstraps[bearer.prefix()]; entry != nil && entry.token.equal(bearer) && now.Before(entry.expires) {
 		return entry.diagnostic
 	}
-	if entry := m.closedTokens[hash]; entry != nil && now.Before(entry.expires) {
+	if entry := m.closedTokens[bearer.prefix()]; entry != nil && entry.token.equal(bearer) && now.Before(entry.expires) {
 		return entry.diagnostic
 	}
 	return nil

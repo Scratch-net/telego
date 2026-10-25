@@ -2,11 +2,12 @@ package webproxy
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/binary"
 	"math"
 	"slices"
 	"sync"
+
+	"github.com/zeebo/xxh3"
 )
 
 const httpUpWindow = 4
@@ -74,11 +75,11 @@ func (r *httpUpDiscardReservation) Release() {
 
 type upCommit struct {
 	sequence uint64
-	digest   [sha256.Size]byte
+	digest   [16]byte
 }
 
 type httpUpBatch struct {
-	digest                  [sha256.Size]byte
+	digest                  [16]byte
 	known                   bool
 	readers                 int
 	ownedCost, ownedItems   int
@@ -472,7 +473,7 @@ func (r *httpUpReservation) Process(ctx context.Context, body []byte) (uint64, e
 		r.leaveApplicationQueueLocked()
 		s.mu.Unlock()
 	}()
-	digest := sha256.Sum256(body)
+	digest := xxh3.Hash128(body).Bytes()
 	for {
 		s.mu.Lock()
 		if s.closed {
@@ -531,7 +532,7 @@ func (r *httpUpReservation) Process(ctx context.Context, body []byte) (uint64, e
 			r.lane.applying = true
 			s.httpApplication.applying = true
 			s.mu.Unlock()
-			ack, err := s.processUp(r.laneID, r.sequence, body, s.carrier == CarrierHTTPSLanes, nil, r)
+			ack, err := s.processUpWithDigest(r.laneID, r.sequence, body, s.carrier == CarrierHTTPSLanes, nil, r, digest)
 			s.mu.Lock()
 			r.lane.applying = false
 			s.httpApplication.applying = false

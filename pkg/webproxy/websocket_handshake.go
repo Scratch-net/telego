@@ -62,7 +62,7 @@ func parseWebSocketSubprotocol(protocol string) (token string, laneID uint32, la
 		return "", 0, false, false
 	}
 	if token, matched := strings.CutPrefix(protocol, webSocketProtocolPrefix); matched {
-		if _, err := parseTokenHash(token); err != nil {
+		if _, err := parseToken(token); err != nil {
 			return "", 0, false, false
 		}
 		return token, 0, false, true
@@ -76,7 +76,7 @@ func parseWebSocketSubprotocol(protocol string) (token string, laneID uint32, la
 	if !found {
 		return "", 0, false, false
 	}
-	if _, err := parseTokenHash(token); err != nil {
+	if _, err := parseToken(token); err != nil {
 		return "", 0, false, false
 	}
 	lane, canonical := canonicalDecimal(laneText)
