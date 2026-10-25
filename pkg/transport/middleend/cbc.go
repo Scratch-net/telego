@@ -46,6 +46,16 @@ func NewCBCEncrypter(key []byte, iv []byte) (*CBCEncrypter, error) {
 // no-op frames, matching tcp_rpc_flush in Telegram's net-tcp-rpc-common.c. A
 // batch is limited to the same local plaintext budget as CBCDecrypter.Feed.
 func (e *CBCEncrypter) Encrypt(plaintext []byte) ([]byte, error) {
+	return e.encrypt(plaintext, false)
+}
+
+// encryptOwned consumes a private frame allocation. The returned ciphertext
+// remains owned by the caller and never enters a shared pool.
+func (e *CBCEncrypter) encryptOwned(plaintext []byte) ([]byte, error) {
+	return e.encrypt(plaintext, true)
+}
+
+func (e *CBCEncrypter) encrypt(plaintext []byte, owned bool) ([]byte, error) {
 	if len(plaintext) == 0 || len(plaintext)%NoopFrameSize != 0 {
 		return nil, fmt.Errorf("%w: length %d", ErrInvalidPlaintext, len(plaintext))
 	}
@@ -61,8 +71,11 @@ func (e *CBCEncrypter) Encrypt(plaintext []byte) ([]byte, error) {
 		return nil, fmt.Errorf("%w: padded length overflows int", ErrInvalidPlaintext)
 	}
 	paddedSize := len(plaintext) + paddingSize
-	padded := make([]byte, len(plaintext), paddedSize)
-	copy(padded, plaintext)
+	padded := plaintext
+	if !owned {
+		padded = make([]byte, len(plaintext), paddedSize)
+		copy(padded, plaintext)
+	}
 	for range paddingSize / NoopFrameSize {
 		padded = binary.LittleEndian.AppendUint32(padded, NoopFrameSize)
 	}

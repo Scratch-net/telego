@@ -1,6 +1,7 @@
 package middleend
 
 import (
+	"crypto/aes"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -68,6 +69,16 @@ func EncodeFrame(sequence int32, payload []byte, mode ChecksumMode) ([]byte, err
 // start with CRC32. A caller may apply the validated peer handshake exactly
 // once between sequence -1 and sequence 0 to negotiate CRC32C.
 func (e *FrameEncoder) Encode(payload []byte) ([]byte, error) {
+	return e.encode(payload, false)
+}
+
+// encodeForCBC reserves only the block padding needed by the link's private
+// in-place encrypter. Public frames retain their exact-sized allocation.
+func (e *FrameEncoder) encodeForCBC(payload []byte) ([]byte, error) {
+	return e.encode(payload, true)
+}
+
+func (e *FrameEncoder) encode(payload []byte, padCBC bool) ([]byte, error) {
 	if e.err != nil {
 		return nil, e.err
 	}
@@ -76,7 +87,7 @@ func (e *FrameEncoder) Encode(payload []byte) ([]byte, error) {
 	}
 
 	sequence := e.nextSequence
-	wire, err := encodeFrame(sequence, payload, e.mode, e.maxFrameSize)
+	wire, err := encodeFrameBuffer(sequence, payload, e.mode, e.maxFrameSize, padCBC)
 	if err != nil {
 		return nil, err
 	}
@@ -130,6 +141,10 @@ func (e *FrameEncoder) Exhausted() bool {
 }
 
 func encodeFrame(sequence int32, payload []byte, mode ChecksumMode, maxFrameSize int) ([]byte, error) {
+	return encodeFrameBuffer(sequence, payload, mode, maxFrameSize, false)
+}
+
+func encodeFrameBuffer(sequence int32, payload []byte, mode ChecksumMode, maxFrameSize int, padCBC bool) ([]byte, error) {
 	if err := validateChecksumMode(mode); err != nil {
 		return nil, err
 	}
@@ -142,7 +157,11 @@ func encodeFrame(sequence int32, payload []byte, mode ChecksumMode, maxFrameSize
 	}
 	frameSize := len(payload) + FullFrameOverhead
 
-	frame := make([]byte, frameSize)
+	capacity := frameSize
+	if padCBC {
+		capacity = (capacity + aes.BlockSize - 1) &^ (aes.BlockSize - 1)
+	}
+	frame := make([]byte, frameSize, capacity)
 	binary.LittleEndian.PutUint32(frame[0:4], uint32(frameSize))
 	binary.LittleEndian.PutUint32(frame[4:8], uint32(sequence))
 	copy(frame[8:frameSize-4], payload)

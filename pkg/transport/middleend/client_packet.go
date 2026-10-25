@@ -35,6 +35,8 @@ type ClientPacketDecoder struct {
 	connectionType obfuscated2.ConnectionType
 	maxPacketSize  int
 	buffer         []byte
+	bufferPool     *clientPacketBufferPool
+	pooledBuffer   *clientPacketBuffer
 	head           int
 	err            error
 }
@@ -50,6 +52,7 @@ func NewClientPacketDecoder(
 	return &ClientPacketDecoder{
 		connectionType: connectionType,
 		maxPacketSize:  maxPacketSize,
+		bufferPool:     &clientPacketBuffers,
 	}, nil
 }
 
@@ -161,10 +164,18 @@ func (d *ClientPacketDecoder) ensureBufferCapacity(required int) {
 		capacity = grown
 	}
 	capacity = min(capacity, maximumBuffered)
-	replacement := make([]byte, len(d.buffer), capacity)
+	pooled := d.bufferPool.get(capacity, maximumBuffered)
+	var replacement []byte
+	if pooled != nil {
+		replacement = pooled.data[:len(d.buffer)]
+	} else {
+		replacement = make([]byte, len(d.buffer), capacity)
+	}
 	copy(replacement, d.buffer)
 	clear(d.buffer)
+	d.bufferPool.put(d.pooledBuffer)
 	d.buffer = replacement
+	d.pooledBuffer = pooled
 }
 
 func (d *ClientPacketDecoder) retainedPlaintext() []byte {
@@ -176,6 +187,10 @@ func (d *ClientPacketDecoder) consumePlaintext(size int) {
 	d.head += size
 	if d.head == len(d.buffer) {
 		if cap(d.buffer) > maxRetainedClientPacketBuffer {
+			// Every consumed byte is already clear. Returned packets own
+			// independent storage, so nothing can still read this buffer.
+			d.bufferPool.put(d.pooledBuffer)
+			d.pooledBuffer = nil
 			d.buffer = nil
 			d.head = 0
 			return
@@ -195,6 +210,8 @@ func (d *ClientPacketDecoder) fail(err error) error {
 
 func (d *ClientPacketDecoder) clearPlaintext() {
 	clear(d.buffer)
+	d.bufferPool.put(d.pooledBuffer)
+	d.pooledBuffer = nil
 	d.buffer = nil
 	d.head = 0
 }

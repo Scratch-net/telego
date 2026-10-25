@@ -277,11 +277,11 @@ func (b *ClientBootstrap) feedServerNonce(data []byte) (int, BootstrapUpdate, er
 	if err != nil {
 		return consumed, update, b.fail(err)
 	}
-	handshakeFrame, err := b.encoder.Encode(handshakePayload)
+	handshakeFrame, err := b.encoder.encodeForCBC(handshakePayload)
 	if err != nil {
 		return consumed, update, b.fail(err)
 	}
-	update.Outbound, err = b.encrypter.Encrypt(handshakeFrame)
+	update.Outbound, err = b.encrypter.encryptOwned(handshakeFrame)
 	if err != nil {
 		return consumed, BootstrapUpdate{}, b.fail(err)
 	}
@@ -362,11 +362,11 @@ func (b *ClientBootstrap) Encode(payload []byte) ([]byte, error) {
 	if b.stage != clientBootstrapReady {
 		return nil, fmt.Errorf("%w: link is not ready", ErrBootstrapState)
 	}
-	frame, err := b.encoder.Encode(payload)
+	frame, err := b.encoder.encodeForCBC(payload)
 	if err != nil {
 		return nil, b.fail(err)
 	}
-	wire, err := b.encrypter.Encrypt(frame)
+	wire, err := b.encrypter.encryptOwned(frame)
 	if err != nil {
 		return nil, b.fail(err)
 	}
