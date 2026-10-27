@@ -2,11 +2,14 @@ package dc
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net"
 	"sort"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/proxy"
@@ -178,7 +181,14 @@ func probeAddr(addr Addr) ProbeResult {
 		}
 	}
 	defer conn.Close()
+	rtt, err := probeConnection(conn, ProbeTimeout)
+	if err != nil {
+		return ProbeResult{Addr: addr, Error: err.Error()}
+	}
+	return ProbeResult{Addr: addr, RTT: rtt, Success: true}
+}
 
+func probeConnection(conn net.Conn, timeout time.Duration) (time.Duration, error) {
 	// Measure actual data RTT by sending garbage handshake and waiting for DC response.
 	// This is more reliable than TCP handshake time, especially through proxies.
 	// Telegram DC will reject invalid handshake quickly, giving us real latency.
@@ -186,26 +196,29 @@ func probeAddr(addr Addr) ProbeResult {
 
 	// Send 64 bytes of garbage (looks like obfuscated2 handshake)
 	garbage := make([]byte, 64)
-	conn.SetWriteDeadline(time.Now().Add(ProbeTimeout))
-	if _, err := conn.Write(garbage); err != nil {
-		return ProbeResult{
-			Addr:    addr,
-			Success: false,
-			Error:   "write: " + err.Error(),
-		}
+	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		return 0, fmt.Errorf("set write deadline: %w", err)
+	}
+	if n, err := conn.Write(garbage); err != nil {
+		return 0, fmt.Errorf("write: %w", err)
+	} else if n != len(garbage) {
+		return 0, fmt.Errorf("write: %w", io.ErrShortWrite)
 	}
 
 	// Wait for DC to respond or close connection.
 	// DC will either send error response or close - either gives us RTT.
-	conn.SetReadDeadline(time.Now().Add(ProbeTimeout))
-	buf := make([]byte, 1)
-	conn.Read(buf) // ignore error - we just want to measure time until response/close
-
-	return ProbeResult{
-		Addr:    addr,
-		RTT:     time.Since(rttStart),
-		Success: true,
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return 0, fmt.Errorf("set read deadline: %w", err)
 	}
+	buf := make([]byte, 1)
+	n, err := conn.Read(buf)
+	if n > 0 || errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET) {
+		return time.Since(rttStart), nil
+	}
+	if err == nil {
+		err = io.ErrNoProgress
+	}
+	return 0, fmt.Errorf("read: %w", err)
 }
 
 // printProbeResults prints probe results in telemt style.

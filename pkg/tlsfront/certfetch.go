@@ -3,6 +3,7 @@
 package tlsfront
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -39,6 +40,7 @@ type CertFetcher struct {
 	timeout  time.Duration
 	refreshH int    // refresh interval in hours (with jitter)
 	sni      string // SNI to send (may differ from connection host)
+	worker   refreshWorker
 }
 
 // NewCertFetcher creates a new certificate fetcher.
@@ -59,6 +61,12 @@ func NewCertFetcher(refreshHours int, sni string) *CertFetcher {
 // FetchCert fetches a real certificate from the mask host.
 // Uses cache if available and not expired.
 func (f *CertFetcher) FetchCert(host string, port int) (*CachedCert, error) {
+	return f.FetchCertContext(context.Background(), host, port)
+}
+
+// FetchCertContext bounds network refreshes by the caller's lifetime while
+// preserving the last successful certificate if a refresh fails.
+func (f *CertFetcher) FetchCertContext(ctx context.Context, host string, port int) (*CachedCert, error) {
 	key := fmt.Sprintf("%s:%d", host, port)
 
 	// Check cache first
@@ -69,7 +77,7 @@ func (f *CertFetcher) FetchCert(host string, port int) (*CachedCert, error) {
 	}
 
 	// Fetch new certificate
-	cert, err := f.fetchFromHost(host, port)
+	cert, err := f.fetchFromHostContext(ctx, host, port)
 	if err != nil {
 		// Return stale cache on fetch error
 		if cached != nil {
@@ -96,9 +104,11 @@ func (f *CertFetcher) CachedCert(host string, port int) *CachedCert {
 	return f.cache[key]
 }
 
-// fetchFromHost connects to the host and extracts its certificate.
+// fetchFromHostContext connects to the host and extracts its certificate.
 // Uses the fetcher's SNI field for ServerName (allows connecting to different host than SNI).
-func (f *CertFetcher) fetchFromHost(host string, port int) (*CachedCert, error) {
+func (f *CertFetcher) fetchFromHostContext(ctx context.Context, host string, port int) (*CachedCert, error) {
+	ctx, cancel := context.WithTimeout(ctx, f.timeout)
+	defer cancel()
 	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 
 	// Use configured SNI, or fall back to host
@@ -108,17 +118,18 @@ func (f *CertFetcher) fetchFromHost(host string, port int) (*CachedCert, error) 
 	}
 
 	// Connect with TLS
-	conn, err := tls.DialWithDialer(f.dialer, "tcp", addr, &tls.Config{
+	dialer := tls.Dialer{NetDialer: f.dialer, Config: &tls.Config{
 		ServerName:         sni,
 		InsecureSkipVerify: true, // We just want to get the cert
-	})
+	}}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to %s: %w", addr, err)
 	}
 	defer conn.Close()
 
 	// Get peer certificates
-	state := conn.ConnectionState()
+	state := conn.(*tls.Conn).ConnectionState()
 	if len(state.PeerCertificates) == 0 {
 		return nil, fmt.Errorf("no certificates from %s", addr)
 	}
@@ -155,16 +166,10 @@ func (f *CertFetcher) fetchFromHost(host string, port int) (*CachedCert, error) 
 
 // StartBackgroundRefresh starts a goroutine to refresh certificates before expiry.
 func (f *CertFetcher) StartBackgroundRefresh(host string, port int) {
-	go func() {
-		// Initial fetch
-		f.FetchCert(host, port)
-
-		// Refresh periodically
-		ticker := time.NewTicker(time.Duration(f.refreshH) * time.Hour / 2)
-		defer ticker.Stop()
-
-		for range ticker.C {
-			f.FetchCert(host, port)
-		}
-	}()
+	f.worker.start(time.Duration(f.refreshH)*time.Hour/2, func(ctx context.Context) {
+		_, _ = f.FetchCertContext(ctx, host, port)
+	})
 }
+
+// StopBackgroundRefresh cancels and joins the worker. Repeated calls are safe.
+func (f *CertFetcher) StopBackgroundRefresh() { f.worker.stop() }

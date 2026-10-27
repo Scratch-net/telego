@@ -125,7 +125,7 @@ func TestResponseParticipantRegistryBoundAndEmptyVictims(t *testing.T) {
 	if _, ok := b.registerParticipant(4, &responsePolicyTarget{budget: b}); ok {
 		t.Fatal("registry escaped its charged metadata limit")
 	}
-	if victim := selectPolicyVictim(b, time.Now(), 1); victim.Participant != nil || victim.Scanned != 3 {
+	if victim := selectPolicyVictim(b, time.Now(), 1); victim.Participant != nil || victim.Scanned != 0 {
 		t.Fatal("selected an empty healthy binding")
 	}
 	if snapshot := b.Snapshot(); snapshot.UsedBytes != 3*ResponseParticipantBytes || snapshot.StageBytes[ResponseMemoryOwnerMetadata] != snapshot.UsedBytes {
@@ -134,7 +134,7 @@ func TestResponseParticipantRegistryBoundAndEmptyVictims(t *testing.T) {
 	for _, p := range owners {
 		p.Detach()
 	}
-	if b.Snapshot().UsedBytes != 0 || b.participants != nil {
+	if b.Snapshot().UsedBytes != 0 || b.pressureCandidates != nil {
 		t.Fatal("registry retained detached empty bindings")
 	}
 }

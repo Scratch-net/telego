@@ -141,7 +141,7 @@ type ConnContext struct {
 	// client owner before dialing so cancellation always has an owner.
 	splice atomic.Pointer[spliceConnContext]
 
-	// Splice shutdown is requested by the upstream event loop after a
+	// Direct and splice shutdown is requested by the upstream event loop after a
 	// clean EOF, then owned by the client connection's event loop until every
 	// queued byte has left gnet's outbound buffer.
 	spliceDrainRequested atomic.Bool

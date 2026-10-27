@@ -231,10 +231,7 @@ func runWithPreparedHandler(
 	dcHandler := &dcEventHandler{proxy: handler}
 	dcClient, err := gnet.NewClient(
 		dcHandler,
-		gnet.WithMulticore(cfg.Multicore),
-		gnet.WithLockOSThread(cfg.LockOSThread),
-		gnet.WithReadBufferCap(128*1024),
-		gnet.WithWriteBufferCap(256*1024),
+		upstreamGnetOptions(cfg)...,
 	)
 	if err != nil {
 		handler.cancelUpstream()
@@ -316,6 +313,19 @@ func runWithPreparedHandler(
 	}
 
 	return shutdownFn, ch
+}
+
+func upstreamGnetOptions(cfg *Config) []gnet.Option {
+	opts := []gnet.Option{
+		gnet.WithMulticore(cfg.Multicore),
+		gnet.WithLockOSThread(cfg.LockOSThread),
+		gnet.WithReadBufferCap(128 * 1024),
+		gnet.WithWriteBufferCap(256 * 1024),
+	}
+	if cfg.NumEventLoop > 0 {
+		opts = append(opts, gnet.WithNumEventLoop(cfg.NumEventLoop))
+	}
+	return opts
 }
 
 func publicGnetOptions(cfg *Config) []gnet.Option {

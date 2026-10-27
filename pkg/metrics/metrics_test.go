@@ -218,13 +218,14 @@ func TestMetricsIntegration(t *testing.T) {
 		t.Fatalf("expected status 200, got %d: %s", resp.StatusCode, content)
 	}
 
-	// Should have called Stats() at least 7 times (once per metric type)
-	if callCount < 7 {
-		t.Errorf("expected at least 7 Stats() calls from callbacks, got %d", callCount)
+	// All user instruments share one snapshot within this scrape.
+	if callCount != 1 {
+		t.Errorf("expected one Stats() call per scrape, got %d", callCount)
 	}
 
 	// Verify all expected metrics are present
 	expectedMetrics := []string{
+		"telego_log_dropped_messages_total",
 		"telego_connections_active",
 		"telego_ips_active",
 		"telego_ips_tracked",

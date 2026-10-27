@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"slices"
@@ -640,48 +641,107 @@ func probeOneSTUNServer(ctx context.Context, family AddressFamily, server string
 	if err != nil {
 		return netip.Addr{}, fmt.Errorf("dial %s: %w", server, err)
 	}
-	stopCancellation := context.AfterFunc(ctx, func() {
-		_ = connection.SetDeadline(time.Now())
-	})
-	defer stopCancellation()
-	if deadline, ok := ctx.Deadline(); ok {
-		if err := connection.SetDeadline(deadline); err != nil {
-			_ = connection.Close()
-			return netip.Addr{}, fmt.Errorf("set %s deadline: %w", server, err)
-		}
-	}
+	return probeSTUNConnection(ctx, family, server, connection)
+}
 
-	client, err := stun.NewClient(connection)
-	if err != nil {
-		_ = connection.Close()
-		return netip.Addr{}, fmt.Errorf("initialize %s STUN client: %w", server, err)
-	}
-	defer client.Close()
+// Keep Pion's existing retry schedule: one initial request and seven retries,
+// waiting 300, 600, ... 2400 ms, bounded by the resolver's context deadline.
+const stunProbeAttempts = 8
+const stunProbeRTO = 300 * time.Millisecond
+
+// probeSTUNConnection owns the datagram exchange and its connection. Pion is
+// used only for the codec: its concurrent retransmission and response callbacks
+// can return the same transaction to the pool while a retry write is failing.
+func probeSTUNConnection(ctx context.Context, family AddressFamily, server string, connection net.Conn) (netip.Addr, error) {
+	closeConnection := sync.OnceFunc(func() { _ = connection.Close() })
+	cancelDone := make(chan struct{})
+	stopCancellation := context.AfterFunc(ctx, func() {
+		closeConnection()
+		close(cancelDone)
+	})
+	defer func() {
+		if !stopCancellation() {
+			<-cancelDone
+		}
+		closeConnection()
+	}()
 	message, err := stun.Build(stun.TransactionID, stun.BindingRequest)
 	if err != nil {
 		return netip.Addr{}, fmt.Errorf("build %s STUN request: %w", server, err)
 	}
-	var responseErr error
-	var reflected stun.XORMappedAddress
-	if err := client.Do(message, func(event stun.Event) {
-		if event.Error != nil {
-			responseErr = event.Error
-			return
+	var buffer [1024]byte
+	var response stun.Message
+	for attempt := range stunProbeAttempts {
+		if cause := stunProbeContextError(ctx); cause != nil {
+			return netip.Addr{}, fmt.Errorf("query %s: %w", server, cause)
 		}
-		responseErr = reflected.GetFrom(event.Message)
-	}); err != nil {
-		return netip.Addr{}, fmt.Errorf("query %s: %w", server, err)
+		deadline := time.Now().Add(time.Duration(attempt+1) * stunProbeRTO)
+		if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+			deadline = contextDeadline
+		}
+		if err := connection.SetDeadline(deadline); err != nil {
+			if cause := stunProbeContextError(ctx); cause != nil {
+				err = cause
+			}
+			return netip.Addr{}, fmt.Errorf("set %s deadline: %w", server, err)
+		}
+		if n, err := connection.Write(message.Raw); err != nil || n != len(message.Raw) {
+			if cause := stunProbeContextError(ctx); cause != nil {
+				err = cause
+			} else if err == nil {
+				err = io.ErrShortWrite
+			}
+			return netip.Addr{}, fmt.Errorf("query %s: %w", server, err)
+		}
+		for {
+			n, err := connection.Read(buffer[:])
+			if err != nil {
+				if cause := stunProbeContextError(ctx); cause != nil {
+					return netip.Addr{}, fmt.Errorf("query %s: %w", server, cause)
+				}
+				if timeout, ok := errors.AsType[net.Error](err); ok && timeout.Timeout() {
+					break
+				}
+				return netip.Addr{}, fmt.Errorf("read %s response: %w", server, err)
+			}
+			response.Raw = buffer[:n]
+			if response.Decode() != nil || response.TransactionID != message.TransactionID {
+				continue
+			}
+			address, err := decodeSTUNResponse(&response, family)
+			if err != nil {
+				return netip.Addr{}, fmt.Errorf("read %s response: %w", server, err)
+			}
+			return address, nil
+		}
 	}
-	if responseErr != nil {
-		return netip.Addr{}, fmt.Errorf("read %s response: %w", server, responseErr)
+	return netip.Addr{}, fmt.Errorf("query %s: %w", server, stun.ErrTransactionTimeOut)
+}
+
+func stunProbeContextError(ctx context.Context) error {
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	// The socket deadline can fire before the context timer is scheduled.
+	if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+// Decode while the caller owns the receive buffer; netip.Addr retains no slice.
+func decodeSTUNResponse(message *stun.Message, family AddressFamily) (netip.Addr, error) {
+	var reflected stun.XORMappedAddress
+	if err := reflected.GetFrom(message); err != nil {
+		return netip.Addr{}, err
 	}
 	address, ok := netip.AddrFromSlice(reflected.IP)
 	if !ok {
-		return netip.Addr{}, fmt.Errorf("read %s response: invalid reflected IP", server)
+		return netip.Addr{}, errors.New("invalid reflected IP")
 	}
 	result := natProbeResult{address: address.Unmap(), respondingServers: 1, agreeingServers: 1}
 	if err := validateNATProbeResult(result, family); err != nil {
-		return netip.Addr{}, fmt.Errorf("read %s response: %w", server, err)
+		return netip.Addr{}, err
 	}
 	return result.address, nil
 }

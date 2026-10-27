@@ -179,6 +179,61 @@ func TestSpliceGnetCleanEOFDrainsBufferedTail(t *testing.T) {
 	awaitSpliceCondition(t, "splice cleanup", func() bool { return client.ctx.State() == StateClosed })
 }
 
+func TestSpliceGnetCleanEOFWithPendingUplinkPreservesResponse(t *testing.T) {
+	backend, socket := directTCPPair(t)
+	server := newSpliceTestServer(t, Config{MaxWriteBuffer: 2 << 20},
+		func(context.Context, string) (net.Conn, error) { return socket, nil }, nil)
+	client := server.connect(t)
+	awaitSpliceCondition(t, "splice activation", func() bool {
+		splice := client.ctx.splice.Load()
+		return splice != nil && splice.active.Load()
+	})
+	if err := backend.SetReadBuffer(4096); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.peer.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.peer.Write(make([]byte, 512<<10)); err != nil {
+		t.Fatal(err)
+	}
+	upstream := client.ctx.splice.Load().upstream.Load().conn
+	awaitSpliceCondition(t, "pending splice uplink at EOF", func() bool {
+		var pending bool
+		runLogicalOwner(t, upstream.EventLoop(), func() { pending = upstream.OutboundBuffered() > 0 })
+		return pending
+	})
+	if err := client.peer.SetReadBuffer(64 << 10); err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("response"), 65536)
+	if err := backend.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backend.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	awaitSpliceCondition(t, "splice EOF or premature close", func() bool {
+		return client.ctx.spliceDrainRequested.Load() || client.ctx.State() == StateClosed
+	})
+	if err := client.peer.SetReadBuffer(256 << 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.peer.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(client.peer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("splice EOF with pending uplink delivered %d/%d bytes", len(got), len(payload))
+	}
+}
+
 func TestSpliceGnetProxyHeaderPrecedesBufferedClientBytes(t *testing.T) {
 	for _, version := range []int{1, 2} {
 		t.Run(string(rune('0'+version)), func(t *testing.T) {

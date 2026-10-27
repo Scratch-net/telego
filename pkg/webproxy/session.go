@@ -66,6 +66,8 @@ type streamState struct {
 type streamSnapshot struct {
 	receiveWindow uint32
 	sendCredit    uint64
+	live          bool
+	used          bool
 }
 
 type queuedFrame struct {
@@ -999,14 +1001,9 @@ func (s *Session) wait() {
 }
 
 func (s *Session) validateBatchLocked(frames []Frame) bool {
-	live := make(map[uint32]streamSnapshot, len(s.streams))
-	for id, state := range s.streams {
-		live[id] = streamSnapshot{
-			receiveWindow: state.receiveWindow,
-			sendCredit:    state.sendCredit,
-		}
-	}
-	var usedInBatch map[uint32]struct{}
+	// Simulate only streams touched by this batch. Closed entries stay in the
+	// overlay so later frames cannot fall back to the original live state.
+	changed := make(map[uint32]streamSnapshot)
 	for _, frame := range frames {
 		if frame.StreamID == 0 {
 			if frame.Type != FramePong {
@@ -1014,25 +1011,29 @@ func (s *Session) validateBatchLocked(frames []Frame) bool {
 			}
 			continue
 		}
-		state, isLive := live[frame.StreamID]
-		_, usedEarlierInBatch := usedInBatch[frame.StreamID]
-		wasUsed := usedEarlierInBatch || s.usedStreams.Contains(frame.StreamID)
+		state, overridden := changed[frame.StreamID]
+		if !overridden {
+			state.used = s.usedStreams.Contains(frame.StreamID)
+			if current := s.streams[frame.StreamID]; current != nil {
+				state.receiveWindow = current.receiveWindow
+				state.sendCredit = current.sendCredit
+				state.live = true
+			}
+		}
 		switch frame.Type {
 		case FrameOpen:
-			if isLive || wasUsed {
+			if state.live || state.used {
 				return false
 			}
-			if usedInBatch == nil {
-				usedInBatch = make(map[uint32]struct{}, min(len(frames), s.limits.MaxStreamsPerSession))
-			}
-			usedInBatch[frame.StreamID] = struct{}{}
-			live[frame.StreamID] = streamSnapshot{
+			state = streamSnapshot{
 				receiveWindow: InitialStreamWindow,
 				sendCredit:    InitialStreamWindow,
+				live:          true,
+				used:          true,
 			}
 		case FrameData:
-			if !isLive {
-				if wasUsed {
+			if !state.live {
+				if state.used {
 					continue
 				}
 				return false
@@ -1041,37 +1042,33 @@ func (s *Session) validateBatchLocked(frames []Frame) bool {
 				return false
 			}
 			state.receiveWindow -= uint32(len(frame.Payload))
-			live[frame.StreamID] = state
 		case FrameWindow:
-			if !isLive {
-				if wasUsed {
+			if !state.live {
+				if state.used {
 					continue
 				}
 				return false
 			}
 			delta, _ := WindowDelta(frame.Payload)
 			state.sendCredit = min(uint64(math.MaxUint32), state.sendCredit+uint64(delta))
-			live[frame.StreamID] = state
 		case FrameClose:
-			if !isLive {
-				if wasUsed {
+			if !state.live {
+				if state.used {
 					continue
 				}
 				return false
 			}
-			delete(live, frame.StreamID)
+			state.live = false
 		default:
 			return false
 		}
+		changed[frame.StreamID] = state
 	}
 	return true
 }
 
 func (s *Session) backendWriteReservationLocked(frames []Frame) (int, int, bool) {
-	live := make(map[uint32]bool, len(s.streams))
-	for id := range s.streams {
-		live[id] = true
-	}
+	var changed map[uint32]bool
 	cost := 0
 	items := 0
 	for _, frame := range frames {
@@ -1079,10 +1076,17 @@ func (s *Session) backendWriteReservationLocked(frames []Frame) (int, int, bool)
 			continue
 		}
 		switch frame.Type {
-		case FrameOpen:
-			live[frame.StreamID] = true
+		case FrameOpen, FrameClose:
+			if changed == nil {
+				changed = make(map[uint32]bool)
+			}
+			changed[frame.StreamID] = frame.Type == FrameOpen
 		case FrameData:
-			if !live[frame.StreamID] {
+			live, overridden := changed[frame.StreamID]
+			if !overridden {
+				live = s.streams[frame.StreamID] != nil
+			}
+			if !live {
 				continue
 			}
 			itemCost, ok := checkedAddInt(len(frame.Payload), queueItemCost)
@@ -1094,8 +1098,6 @@ func (s *Session) backendWriteReservationLocked(frames []Frame) (int, int, bool)
 				return 0, 0, false
 			}
 			items++
-		case FrameClose:
-			delete(live, frame.StreamID)
 		}
 	}
 	return cost, items, true
@@ -1546,6 +1548,7 @@ func (s *Session) dropPendingStreamFramesLocked(streamID uint32) {
 		}
 		kept = append(kept, frame)
 	}
+	clear(lane.pendingFrames[len(kept):])
 	lane.pendingFrames = kept
 	clear(lane.pendingWindows)
 	for index := range lane.pendingFrames {

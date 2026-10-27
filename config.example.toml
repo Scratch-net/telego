@@ -221,6 +221,9 @@ carrier = "websocket"
 
 # Performance tuning (all optional)
 [performance]
+# Legacy compatibility setting. Nonnegative values are accepted but have no effect.
+# tcp-buffer-kb = 0
+
 # IP preference for DC connections: prefer-ipv4, prefer-ipv6, only-ipv4, only-ipv6
 prefer-ip = "prefer-ipv4"
 

@@ -138,7 +138,7 @@ func TestGnetResponseSinkBorrowedPacketsAndRejection(t *testing.T) {
 	}
 }
 
-func responseSinkWireManager(t *testing.T, budget *ResponseBudget, config fakePeerConfig) (*FixedBindingManager, *GnetClientLink) {
+func responseSinkWireManager(t *testing.T, budget *ResponseBudget, config fakePeerConfig) (*FixedBindingManager, *GnetClientLink, *fakeMiddleEndPeer) {
 	t.Helper()
 	runtime := newTestGnetRuntime(t)
 	conn, peer := dialFakeMiddleEnd(t, config)
@@ -172,7 +172,7 @@ func responseSinkWireManager(t *testing.T, budget *ResponseBudget, config fakePe
 	if err := manager.Start(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	return manager, link
+	return manager, link, peer
 }
 
 func responseSinkSubmitPacket(t *testing.T, link ClientLink, binding *ClientBinding, size int, marker byte) {
@@ -200,7 +200,7 @@ func responseSinkSubmitPacket(t *testing.T, link ClientLink, binding *ClientBind
 
 func TestGnetResponseSinkEncryptedBurstExceedsLinkQueue(t *testing.T) {
 	budget := responseBudgetForTest(t, ResponseBudgetConfig{LimitBytes: 16 << 20})
-	manager, link := responseSinkWireManager(t, budget, fakePeerConfig{})
+	manager, link, _ := responseSinkWireManager(t, budget, fakePeerConfig{})
 	binding, err := manager.Bind(2)
 	if err != nil {
 		t.Fatal(err)
@@ -246,7 +246,7 @@ func TestGnetResponseSinkSharedPressurePreservesHealthyBinding(t *testing.T) {
 func runResponseSinkSharedPressure(t *testing.T, existingHealthy bool) {
 	t.Helper()
 	budget := responseBudgetForTest(t, ResponseBudgetConfig{LimitBytes: 2 << 20})
-	manager, link := responseSinkWireManager(t, budget, fakePeerConfig{maxRecords: 128})
+	manager, link, peer := responseSinkWireManager(t, budget, fakePeerConfig{maxRecords: 128})
 	slow, err := manager.Bind(2)
 	if err != nil {
 		t.Fatal(err)
@@ -280,7 +280,24 @@ func runResponseSinkSharedPressure(t *testing.T, existingHealthy bool) {
 	}
 	answer.Release()
 	ack := nextFixedBindingEvent(t, fast)
+	if ack.Kind != LinkEventSimpleAck || ack.ConfirmKey != uint32(fast.ConnectionID()) {
+		t.Fatalf("healthy acknowledgement: %v", ack)
+	}
 	ack.Release()
+	// Eviction also queues CloseConnection controls. The healthy reply does
+	// not prove their CloseExternal responses reached the client. Fence that
+	// traffic with an ordered ping/pong before intentionally closing the link;
+	// closing with unread peer bytes can reset an otherwise healthy TCP socket.
+	probeContext, cancelProbe := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancelProbe()
+	if err := manager.Probe(probeContext, 2); err != nil {
+		t.Fatalf("shared link probe after pressure: %v", err)
+	}
+	records := peer.snapshotRecords()
+	if len(records) == 0 || records[len(records)-1].operation != OperationPing ||
+		!peerRecordedConnectionOperation(records[:len(records)-1], OperationCloseConnection, slow.ConnectionID()) {
+		t.Fatalf("probe did not follow the evicted binding's close control: %+v", records)
+	}
 	if snapshot := manager.Snapshot(); snapshot.SlotFailures != 0 || snapshot.ResponseBackpressureEvents == 0 {
 		t.Fatalf("pressure failed physical slot or was not exercised: %+v", snapshot)
 	}

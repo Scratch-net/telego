@@ -90,7 +90,7 @@ type TLSFrontingConfig struct {
 
 // PerformanceConfig configures performance settings.
 type PerformanceConfig struct {
-	TCPBufferKB      int      `toml:"tcp-buffer-kb"`
+	TCPBufferKB      int      `toml:"tcp-buffer-kb"`   // Legacy compatibility field; validated but has no effect.
 	NumEventLoops    int      `toml:"num-event-loops"` // gnet event loops (0 = auto, uses all cores)
 	PreferIP         string   `toml:"prefer-ip"`
 	IdleTimeout      Duration `toml:"idle-timeout"`

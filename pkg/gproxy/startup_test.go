@@ -2,6 +2,7 @@ package gproxy
 
 import (
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -145,5 +146,51 @@ func TestPreparedMiddleEndHasOneConsumerAndStopsOnPublicStartupFailure(t *testin
 	}
 	if handler.upstreamContext.Err() == nil {
 		t.Fatal("failed public startup did not reject further logical admission")
+	}
+}
+
+func TestPublicStartupFailureJoinsTLSRefreshers(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	addr := listener.Addr().(*net.TCPAddr)
+	h := NewProxyHandler(&Config{}, &testLogger{})
+	h.certFetcher = tlsfront.NewCertFetcher(5, "example.com")
+	h.serverHelloFetcher = tlsfront.NewServerHelloFetcher(addr.IP.String(), addr.Port)
+	t.Cleanup(func() { _ = h.stopServing() })
+	h.certFetcher.StartBackgroundRefresh(addr.IP.String(), addr.Port)
+	h.serverHelloFetcher.StartBackgroundRefresh()
+	var peers []net.Conn
+	for range 2 {
+		if err := listener.(*net.TCPListener).SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		conn, err := listener.Accept()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = conn.Close() })
+		peers = append(peers, conn)
+	}
+	stopped := make(chan error, 1)
+	go func() { stopped <- h.runPublicEngine(h, "tulip://howdy") }()
+	select {
+	case err := <-stopped:
+		if !errors.Is(err, errorx.ErrUnsupportedProtocol) {
+			t.Fatalf("startup error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("startup failure did not cancel TLS refreshes")
+	}
+	for _, conn := range peers {
+		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+		if _, err := io.Copy(io.Discard, conn); err != nil {
+			t.Fatalf("refresh socket remained open after startup failure: %v", err)
+		}
+	}
+	if err := h.stopServing(); err != nil {
+		t.Fatal(err)
 	}
 }

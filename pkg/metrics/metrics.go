@@ -17,6 +17,7 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 
 	"github.com/scratch-net/telego/pkg/gproxy"
+	"github.com/scratch-net/telego/pkg/log"
 	"github.com/scratch-net/telego/pkg/transport/middleend"
 	"github.com/scratch-net/telego/pkg/webproxy"
 )
@@ -80,6 +81,7 @@ func NewServer(cfg Config, limiter StatsProvider) (*Server, error) {
 	meter := provider.Meter("telego")
 
 	// Register observable instruments
+	registerLogMetrics(meter, log.DroppedMessages)
 	if limiter != nil {
 		registerMetrics(meter, limiter)
 	}
@@ -124,166 +126,156 @@ func NewServer(cfg Config, limiter StatsProvider) (*Server, error) {
 }
 
 func registerMiddleEndMetrics(meter metric.Meter, provider MiddleEndStatsProvider) {
-	meter.Int64ObservableGauge("telego_middleend_runtime_links",
+	group := &snapshotMetricGroup[middleend.ServiceSnapshot]{meter: meter}
+	defer group.register(provider.Snapshot)
+
+	runtimeLinks, _ := meter.Int64ObservableGauge("telego_middleend_runtime_links",
 		metric.WithDescription("Currently registered physical ME links, including unpublished generation and refresh candidates until link finalization"),
-		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			observer.Observe(int64(provider.Snapshot().RuntimeLinks))
-			return nil
-		}),
 	)
-	meter.Int64ObservableGauge("telego_middleend_capacity",
+	group.add(func(observer metric.Observer, collected middleend.ServiceSnapshot) {
+		observer.ObserveInt64(runtimeLinks, int64(collected.RuntimeLinks))
+	}, runtimeLinks)
+	capacityGauge, _ := meter.Int64ObservableGauge("telego_middleend_capacity",
 		metric.WithDescription("Configured Middle-End topology and bounded-queue capacities"),
-		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			capacity := provider.Snapshot().Capacity
-			for resource, value := range map[string]int{
-				"refresh_candidates_per_manager":   capacity.MaxRefreshCandidatesPerManager,
-				"event_loops":                      capacity.EventLoops,
-				"links_per_dc":                     capacity.LinksPerDC,
-				"resident_bindings":                capacity.MaxResidentBindings,
-				"link_submission_items":            capacity.LinkSubmissionItems,
-				"link_submission_bytes":            capacity.LinkSubmissionBytes,
-				"link_event_items":                 capacity.LinkEventItems,
-				"link_event_bytes":                 capacity.LinkEventBytes,
-				"manager_request_items":            capacity.ManagerRequestItems,
-				"manager_request_bytes":            capacity.ManagerRequestBytes,
-				"manager_control_items":            capacity.ManagerControlItems,
-				"manager_control_bytes":            capacity.ManagerControlBytes,
-				"manager_response_items":           capacity.ManagerResponseItems,
-				"manager_response_bytes":           capacity.ManagerResponseBytes,
-				"binding_response_items":           capacity.BindingResponseItems,
-				"binding_response_bytes":           capacity.BindingResponseBytes,
-				"response_budget_bytes":            capacity.ResponseBudgetBytes,
-				"decoder_bytes_per_link":           capacity.DecoderBytesPerLink,
-				"decoder_growth_bytes_per_owner":   capacity.DecoderGrowthBytesPerOwner,
-				"decode_plaintext_bytes_per_owner": capacity.DecodePlaintextBytesPerOwner,
-			} {
-				if capacity.ResponseBudgetBytes > 0 {
-					switch resource {
-					case "manager_response_items", "manager_response_bytes", "binding_response_items", "binding_response_bytes":
-						continue
-					}
+	)
+	group.add(func(observer metric.Observer, collected middleend.ServiceSnapshot) {
+		capacity := collected.Capacity
+		for resource, value := range map[string]int{
+			"refresh_candidates_per_manager":   capacity.MaxRefreshCandidatesPerManager,
+			"event_loops":                      capacity.EventLoops,
+			"links_per_dc":                     capacity.LinksPerDC,
+			"resident_bindings":                capacity.MaxResidentBindings,
+			"link_submission_items":            capacity.LinkSubmissionItems,
+			"link_submission_bytes":            capacity.LinkSubmissionBytes,
+			"link_event_items":                 capacity.LinkEventItems,
+			"link_event_bytes":                 capacity.LinkEventBytes,
+			"manager_request_items":            capacity.ManagerRequestItems,
+			"manager_request_bytes":            capacity.ManagerRequestBytes,
+			"manager_control_items":            capacity.ManagerControlItems,
+			"manager_control_bytes":            capacity.ManagerControlBytes,
+			"manager_response_items":           capacity.ManagerResponseItems,
+			"manager_response_bytes":           capacity.ManagerResponseBytes,
+			"binding_response_items":           capacity.BindingResponseItems,
+			"binding_response_bytes":           capacity.BindingResponseBytes,
+			"response_budget_bytes":            capacity.ResponseBudgetBytes,
+			"decoder_bytes_per_link":           capacity.DecoderBytesPerLink,
+			"decoder_growth_bytes_per_owner":   capacity.DecoderGrowthBytesPerOwner,
+			"decode_plaintext_bytes_per_owner": capacity.DecodePlaintextBytesPerOwner,
+		} {
+			if capacity.ResponseBudgetBytes > 0 {
+				switch resource {
+				case "manager_response_items", "manager_response_bytes", "binding_response_items", "binding_response_bytes":
+					continue
 				}
-				observer.Observe(int64(value), metric.WithAttributes(attribute.String("resource", resource)))
 			}
-			return nil
-		}),
-	)
-	meter.Int64ObservableGauge("telego_middleend_admitting",
+			observer.ObserveInt64(capacityGauge, int64(value), metric.WithAttributes(attribute.String("resource", resource)))
+		}
+	}, capacityGauge)
+	admitting, _ := meter.Int64ObservableGauge("telego_middleend_admitting",
 		metric.WithDescription("Whether a healthy active ME generation admits new bindings"),
-		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			observer.Observe(boolMetric(provider.Snapshot().Supervisor.Admitting))
-			return nil
-		}),
 	)
-	meter.Int64ObservableGauge("telego_middleend_repairing",
+	group.add(func(observer metric.Observer, collected middleend.ServiceSnapshot) {
+		observer.ObserveInt64(admitting, boolMetric(collected.Supervisor.Admitting))
+	}, admitting)
+	repairing, _ := meter.Int64ObservableGauge("telego_middleend_repairing",
 		metric.WithDescription("Whether the ME generation supervisor is repairing protection"),
-		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			observer.Observe(boolMetric(provider.Snapshot().Supervisor.Repairing))
-			return nil
-		}),
 	)
-	meter.Int64ObservableGauge("telego_middleend_slot_repairs_active",
+	group.add(func(observer metric.Observer, collected middleend.ServiceSnapshot) {
+		observer.ObserveInt64(repairing, boolMetric(collected.Supervisor.Repairing))
+	}, repairing)
+	slotRepairs, _ := meter.Int64ObservableGauge("telego_middleend_slot_repairs_active",
 		metric.WithDescription("ME physical-link slots currently being replaced by generation role"),
-		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			forEachMiddleEndRole(provider.Snapshot().Supervisor, func(role string, manager *middleend.FixedBindingManagerSnapshot) {
-				observer.Observe(int64(manager.RepairingSlots), metric.WithAttributes(attribute.String("role", role)))
-			})
-			return nil
-		}),
 	)
-	meter.Int64ObservableCounter("telego_middleend_slot_repair_total",
+	group.add(func(observer metric.Observer, collected middleend.ServiceSnapshot) {
+		forEachMiddleEndRole(collected.Supervisor, func(role string, manager *middleend.FixedBindingManagerSnapshot) {
+			observer.ObserveInt64(slotRepairs, int64(manager.RepairingSlots), metric.WithAttributes(attribute.String("role", role)))
+		})
+	}, slotRepairs)
+	slotRepairTotal, _ := meter.Int64ObservableCounter("telego_middleend_slot_repair_total",
 		metric.WithDescription("ME physical-link replacement outcomes for the service lifetime"),
-		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			snapshot := provider.Snapshot().Supervisor
-			observer.Observe(metricValue(snapshot.SlotRepairSuccesses), metric.WithAttributes(attribute.String("result", "success")))
-			observer.Observe(metricValue(snapshot.SlotRepairFailures), metric.WithAttributes(attribute.String("result", "failure")))
-			return nil
-		}),
 	)
-	meter.Int64ObservableCounter("telego_middleend_slot_failure_total",
+	group.add(func(observer metric.Observer, collected middleend.ServiceSnapshot) {
+		snapshot := collected.Supervisor
+		observer.ObserveInt64(slotRepairTotal, metricValue(snapshot.SlotRepairSuccesses), metric.WithAttributes(attribute.String("result", "success")))
+		observer.ObserveInt64(slotRepairTotal, metricValue(snapshot.SlotRepairFailures), metric.WithAttributes(attribute.String("result", "failure")))
+	}, slotRepairTotal)
+	slotFailures, _ := meter.Int64ObservableCounter("telego_middleend_slot_failure_total",
 		metric.WithDescription("ME physical-link failures for the service lifetime"),
-		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			observer.Observe(metricValue(provider.Snapshot().Supervisor.SlotFailures))
-			return nil
-		}),
 	)
-	meter.Int64ObservableCounter("telego_middleend_slot_failure_affected_bindings_total",
+	group.add(func(observer metric.Observer, collected middleend.ServiceSnapshot) {
+		observer.ObserveInt64(slotFailures, metricValue(collected.Supervisor.SlotFailures))
+	}, slotFailures)
+	affectedBindings, _ := meter.Int64ObservableCounter("telego_middleend_slot_failure_affected_bindings_total",
 		metric.WithDescription("ME bindings terminated by physical-link failures for the service lifetime"),
-		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			observer.Observe(metricValue(provider.Snapshot().Supervisor.SlotFailureAffectedBindings))
-			return nil
-		}),
 	)
-	meter.Int64ObservableGauge("telego_middleend_artifact_state",
+	group.add(func(observer metric.Observer, collected middleend.ServiceSnapshot) {
+		observer.ObserveInt64(affectedBindings, metricValue(collected.Supervisor.SlotFailureAffectedBindings))
+	}, affectedBindings)
+	artifactState, _ := meter.Int64ObservableGauge("telego_middleend_artifact_state",
 		metric.WithDescription("Current Telegram ME artifact application state"),
-		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			snapshot := provider.Snapshot().Coordinator
-			observer.Observe(boolMetric(snapshot.Applied), metric.WithAttributes(attribute.String("state", "applied")))
-			observer.Observe(boolMetric(snapshot.Pending), metric.WithAttributes(attribute.String("state", "pending")))
-			return nil
-		}),
 	)
-	meter.Int64ObservableCounter("telego_middleend_artifact_refresh_total",
+	group.add(func(observer metric.Observer, collected middleend.ServiceSnapshot) {
+		snapshot := collected.Coordinator
+		observer.ObserveInt64(artifactState, boolMetric(snapshot.Applied), metric.WithAttributes(attribute.String("state", "applied")))
+		observer.ObserveInt64(artifactState, boolMetric(snapshot.Pending), metric.WithAttributes(attribute.String("state", "pending")))
+	}, artifactState)
+	artifactRefreshes, _ := meter.Int64ObservableCounter("telego_middleend_artifact_refresh_total",
 		metric.WithDescription("Telegram ME artifact refresh outcomes"),
-		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			snapshot := provider.Snapshot().Coordinator
-			observer.Observe(metricValue(snapshot.RefreshSuccesses), metric.WithAttributes(attribute.String("result", "success")))
-			observer.Observe(metricValue(snapshot.RefreshFailures), metric.WithAttributes(attribute.String("result", "failure")))
-			return nil
-		}),
 	)
-	meter.Int64ObservableCounter("telego_middleend_generation_apply_total",
+	group.add(func(observer metric.Observer, collected middleend.ServiceSnapshot) {
+		snapshot := collected.Coordinator
+		observer.ObserveInt64(artifactRefreshes, metricValue(snapshot.RefreshSuccesses), metric.WithAttributes(attribute.String("result", "success")))
+		observer.ObserveInt64(artifactRefreshes, metricValue(snapshot.RefreshFailures), metric.WithAttributes(attribute.String("result", "failure")))
+	}, artifactRefreshes)
+	generationApplies, _ := meter.Int64ObservableCounter("telego_middleend_generation_apply_total",
 		metric.WithDescription("Telegram ME generation application outcomes"),
-		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			snapshot := provider.Snapshot().Coordinator
-			observer.Observe(metricValue(snapshot.GenerationSuccesses), metric.WithAttributes(attribute.String("result", "success")))
-			observer.Observe(metricValue(snapshot.GenerationFailures), metric.WithAttributes(attribute.String("result", "failure")))
-			return nil
-		}),
 	)
-	meter.Int64ObservableGauge("telego_middleend_links",
+	group.add(func(observer metric.Observer, collected middleend.ServiceSnapshot) {
+		snapshot := collected.Coordinator
+		observer.ObserveInt64(generationApplies, metricValue(snapshot.GenerationSuccesses), metric.WithAttributes(attribute.String("result", "success")))
+		observer.ObserveInt64(generationApplies, metricValue(snapshot.GenerationFailures), metric.WithAttributes(attribute.String("result", "failure")))
+	}, generationApplies)
+	links, _ := meter.Int64ObservableGauge("telego_middleend_links",
 		metric.WithDescription("ME physical links by generation role, signed DC, and state"),
-		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			forEachMiddleEndRole(provider.Snapshot().Supervisor, func(role string, manager *middleend.FixedBindingManagerSnapshot) {
-				counts := make(map[middleEndLinkMetricKey]int64)
-				for _, slot := range manager.Slots {
-					key := middleEndLinkMetricKey{dc: slot.DCID, state: middleEndLinkState(slot)}
-					counts[key]++
-				}
-				for key, count := range counts {
-					observer.Observe(count, metric.WithAttributes(
-						attribute.String("role", role),
-						attribute.String("dc", strconv.Itoa(int(key.dc))),
-						attribute.String("state", key.state),
-					))
-				}
-			})
-			return nil
-		}),
 	)
-	meter.Int64ObservableGauge("telego_middleend_bindings_active",
+	group.add(func(observer metric.Observer, collected middleend.ServiceSnapshot) {
+		forEachMiddleEndRole(collected.Supervisor, func(role string, manager *middleend.FixedBindingManagerSnapshot) {
+			counts := make(map[middleEndLinkMetricKey]int64)
+			for _, slot := range manager.Slots {
+				key := middleEndLinkMetricKey{dc: slot.DCID, state: middleEndLinkState(slot)}
+				counts[key]++
+			}
+			for key, count := range counts {
+				observer.ObserveInt64(links, count, metric.WithAttributes(
+					attribute.String("role", role),
+					attribute.String("dc", strconv.Itoa(int(key.dc))),
+					attribute.String("state", key.state),
+				))
+			}
+		})
+	}, links)
+	activeBindings, _ := meter.Int64ObservableGauge("telego_middleend_bindings_active",
 		metric.WithDescription("ME client bindings by generation role and signed DC"),
-		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			forEachMiddleEndRole(provider.Snapshot().Supervisor, func(role string, manager *middleend.FixedBindingManagerSnapshot) {
-				byDC := make(map[middleend.DCID]int64)
-				for _, slot := range manager.Slots {
-					byDC[slot.DCID] += int64(slot.ResidentBindings)
-				}
-				for dcID, bindings := range byDC {
-					observer.Observe(bindings, metric.WithAttributes(
-						attribute.String("role", role),
-						attribute.String("dc", strconv.Itoa(int(dcID))),
-					))
-				}
-			})
-			return nil
-		}),
 	)
-	registerMiddleEndManagerQueueMetrics(meter, provider)
-	registerMiddleEndLinkQueueMetrics(meter, provider)
-	registerMiddleEndRefreshMetrics(meter, provider)
-	registerMiddleEndDiagnosticMetrics(meter, provider)
-	registerMiddleEndResponseMemoryMetrics(meter, provider)
+	group.add(func(observer metric.Observer, collected middleend.ServiceSnapshot) {
+		forEachMiddleEndRole(collected.Supervisor, func(role string, manager *middleend.FixedBindingManagerSnapshot) {
+			byDC := make(map[middleend.DCID]int64)
+			for _, slot := range manager.Slots {
+				byDC[slot.DCID] += int64(slot.ResidentBindings)
+			}
+			for dcID, bindings := range byDC {
+				observer.ObserveInt64(activeBindings, bindings, metric.WithAttributes(
+					attribute.String("role", role),
+					attribute.String("dc", strconv.Itoa(int(dcID))),
+				))
+			}
+		})
+	}, activeBindings)
+	registerMiddleEndManagerQueueMetrics(group)
+	registerMiddleEndLinkQueueMetrics(group)
+	registerMiddleEndRefreshMetrics(group)
+	registerMiddleEndDiagnosticMetrics(group)
+	registerMiddleEndResponseMemoryMetrics(group)
 }
 
 type middleEndLinkMetricKey struct {
@@ -328,55 +320,57 @@ func forEachMiddleEndRole(snapshot middleend.GenerationSupervisorSnapshot, visit
 	}
 }
 
-func registerMiddleEndManagerQueueMetrics(meter metric.Meter, provider MiddleEndStatsProvider) {
-	registerMiddleEndManagerQueueMetric(meter, provider, "telego_middleend_manager_queue_items", "Items retained by ME generation-manager queues", false, false)
-	registerMiddleEndManagerQueueMetric(meter, provider, "telego_middleend_manager_queue_bytes", "Logical bytes queued by ME generation managers; response bytes exclude reserved headroom and allocation metadata", true, false)
-	registerMiddleEndManagerQueueMetric(meter, provider, "telego_middleend_manager_queue_high_water_items", "Lifetime high-water items retained by ME generation-manager queues", false, true)
-	registerMiddleEndManagerQueueMetric(meter, provider, "telego_middleend_manager_queue_high_water_bytes", "Generation high-water logical queue bytes; response bytes exclude reserved headroom and allocation metadata", true, true)
-	meter.Int64ObservableGauge("telego_middleend_manager_backpressure_events",
+func registerMiddleEndManagerQueueMetrics(group *snapshotMetricGroup[middleend.ServiceSnapshot]) {
+	meter := group.meter
+
+	registerMiddleEndManagerQueueMetric(group, "telego_middleend_manager_queue_items", "Items retained by ME generation-manager queues", false, false)
+	registerMiddleEndManagerQueueMetric(group, "telego_middleend_manager_queue_bytes", "Logical bytes queued by ME generation managers; response bytes exclude reserved headroom and allocation metadata", true, false)
+	registerMiddleEndManagerQueueMetric(group, "telego_middleend_manager_queue_high_water_items", "Lifetime high-water items retained by ME generation-manager queues", false, true)
+	registerMiddleEndManagerQueueMetric(group, "telego_middleend_manager_queue_high_water_bytes", "Generation high-water logical queue bytes; response bytes exclude reserved headroom and allocation metadata", true, true)
+	backpressureEvents, _ := meter.Int64ObservableGauge("telego_middleend_manager_backpressure_events",
 		metric.WithDescription("Lifetime bounded-queue rejections in the current ME generation manager"),
-		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			forEachMiddleEndRole(provider.Snapshot().Supervisor, func(role string, manager *middleend.FixedBindingManagerSnapshot) {
-				observer.Observe(metricValue(manager.ResponseBackpressureEvents), metric.WithAttributes(
-					attribute.String("role", role),
-					attribute.String("kind", "response"),
-				))
-				observer.Observe(metricValue(manager.ControlBackpressureEvents), metric.WithAttributes(
-					attribute.String("role", role),
-					attribute.String("kind", "control"),
-				))
-			})
-			return nil
-		}),
 	)
+	group.add(func(observer metric.Observer, collected middleend.ServiceSnapshot) {
+		forEachMiddleEndRole(collected.Supervisor, func(role string, manager *middleend.FixedBindingManagerSnapshot) {
+			observer.ObserveInt64(backpressureEvents, metricValue(manager.ResponseBackpressureEvents), metric.WithAttributes(
+				attribute.String("role", role),
+				attribute.String("kind", "response"),
+			))
+			observer.ObserveInt64(backpressureEvents, metricValue(manager.ControlBackpressureEvents), metric.WithAttributes(
+				attribute.String("role", role),
+				attribute.String("kind", "control"),
+			))
+		})
+	}, backpressureEvents)
 }
 
 func registerMiddleEndManagerQueueMetric(
-	meter metric.Meter,
-	provider MiddleEndStatsProvider,
+	group *snapshotMetricGroup[middleend.ServiceSnapshot],
 	name string,
 	description string,
 	bytes bool,
 	highWater bool,
 ) {
+	meter := group.meter
+
 	options := []metric.Int64ObservableGaugeOption{metric.WithDescription(description)}
 	if bytes {
 		options = append(options, metric.WithUnit("By"))
 	}
-	options = append(options, metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-		forEachMiddleEndRole(provider.Snapshot().Supervisor, func(role string, manager *middleend.FixedBindingManagerSnapshot) {
+
+	queueGauge, _ := meter.Int64ObservableGauge(name, options...)
+	group.add(func(observer metric.Observer, collected middleend.ServiceSnapshot) {
+		forEachMiddleEndRole(collected.Supervisor, func(role string, manager *middleend.FixedBindingManagerSnapshot) {
 			request, control, response := middleEndManagerQueueValues(manager, bytes, highWater)
 			for queue, value := range map[string]int{
 				"request":  request,
 				"control":  control,
 				"response": response,
 			} {
-				observer.Observe(int64(value), metric.WithAttributes(attribute.String("role", role), attribute.String("queue", queue)))
+				observer.ObserveInt64(queueGauge, int64(value), metric.WithAttributes(attribute.String("role", role), attribute.String("queue", queue)))
 			}
 		})
-		return nil
-	}))
-	meter.Int64ObservableGauge(name, options...)
+	}, queueGauge)
 }
 
 func middleEndManagerQueueValues(snapshot *middleend.FixedBindingManagerSnapshot, bytes, highWater bool) (request, control, response int) {
@@ -392,28 +386,31 @@ func middleEndManagerQueueValues(snapshot *middleend.FixedBindingManagerSnapshot
 	}
 }
 
-func registerMiddleEndLinkQueueMetrics(meter metric.Meter, provider MiddleEndStatsProvider) {
-	registerMiddleEndLinkQueueMetric(meter, provider, "telego_middleend_link_queue_items", "Items pending in ME gnet link queues", false, false)
-	registerMiddleEndLinkQueueMetric(meter, provider, "telego_middleend_link_queue_bytes", "Bytes pending in ME gnet link queues", true, false)
-	registerMiddleEndLinkQueueMetric(meter, provider, "telego_middleend_link_queue_high_water_items", "Lifetime high-water items in ME gnet link queues", false, true)
-	registerMiddleEndLinkQueueMetric(meter, provider, "telego_middleend_link_queue_high_water_bytes", "Lifetime high-water bytes in ME gnet link queues", true, true)
-	registerMiddleEndLinkQueueCapacityMetric(meter, provider, "telego_middleend_link_queue_capacity_items", "Configured item capacity of each ME gnet link queue", false)
-	registerMiddleEndLinkQueueCapacityMetric(meter, provider, "telego_middleend_link_queue_capacity_bytes", "Configured byte capacity of each ME gnet link queue", true)
+func registerMiddleEndLinkQueueMetrics(group *snapshotMetricGroup[middleend.ServiceSnapshot]) {
+	registerMiddleEndLinkQueueMetric(group, "telego_middleend_link_queue_items", "Items pending in ME gnet link queues", false, false)
+	registerMiddleEndLinkQueueMetric(group, "telego_middleend_link_queue_bytes", "Bytes pending in ME gnet link queues", true, false)
+	registerMiddleEndLinkQueueMetric(group, "telego_middleend_link_queue_high_water_items", "Lifetime high-water items in ME gnet link queues", false, true)
+	registerMiddleEndLinkQueueMetric(group, "telego_middleend_link_queue_high_water_bytes", "Lifetime high-water bytes in ME gnet link queues", true, true)
+	registerMiddleEndLinkQueueCapacityMetric(group, "telego_middleend_link_queue_capacity_items", "Configured item capacity of each ME gnet link queue", false)
+	registerMiddleEndLinkQueueCapacityMetric(group, "telego_middleend_link_queue_capacity_bytes", "Configured byte capacity of each ME gnet link queue", true)
 }
 
 func registerMiddleEndLinkQueueCapacityMetric(
-	meter metric.Meter,
-	provider MiddleEndStatsProvider,
+	group *snapshotMetricGroup[middleend.ServiceSnapshot],
 	name string,
 	description string,
 	bytes bool,
 ) {
+	meter := group.meter
+
 	options := []metric.Int64ObservableGaugeOption{metric.WithDescription(description)}
 	if bytes {
 		options = append(options, metric.WithUnit("By"))
 	}
-	options = append(options, metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-		snapshot := provider.Snapshot()
+
+	queueGauge, _ := meter.Int64ObservableGauge(name, options...)
+	group.add(func(observer metric.Observer, collected middleend.ServiceSnapshot) {
+		snapshot := collected
 		forEachMiddleEndRole(snapshot.Supervisor, func(role string, manager *middleend.FixedBindingManagerSnapshot) {
 			linksByDC := make(map[middleend.DCID]int)
 			for _, slot := range manager.Slots {
@@ -428,7 +425,7 @@ func registerMiddleEndLinkQueueCapacityMetric(
 					event = snapshot.Capacity.LinkEventItems
 				}
 				for queue, value := range map[string]int{"submission": submission, "event": event} {
-					observer.Observe(int64(value), metric.WithAttributes(
+					observer.ObserveInt64(queueGauge, int64(value), metric.WithAttributes(
 						attribute.String("role", role),
 						attribute.String("dc", strconv.Itoa(int(slot.DCID))),
 						attribute.Int("link", link),
@@ -437,25 +434,26 @@ func registerMiddleEndLinkQueueCapacityMetric(
 				}
 			}
 		})
-		return nil
-	}))
-	meter.Int64ObservableGauge(name, options...)
+	}, queueGauge)
 }
 
 func registerMiddleEndLinkQueueMetric(
-	meter metric.Meter,
-	provider MiddleEndStatsProvider,
+	group *snapshotMetricGroup[middleend.ServiceSnapshot],
 	name string,
 	description string,
 	bytes bool,
 	highWater bool,
 ) {
+	meter := group.meter
+
 	options := []metric.Int64ObservableGaugeOption{metric.WithDescription(description)}
 	if bytes {
 		options = append(options, metric.WithUnit("By"))
 	}
-	options = append(options, metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-		forEachMiddleEndRole(provider.Snapshot().Supervisor, func(role string, manager *middleend.FixedBindingManagerSnapshot) {
+
+	queueGauge, _ := meter.Int64ObservableGauge(name, options...)
+	group.add(func(observer metric.Observer, collected middleend.ServiceSnapshot) {
+		forEachMiddleEndRole(collected.Supervisor, func(role string, manager *middleend.FixedBindingManagerSnapshot) {
 			values := make(map[middleEndLinkQueueMetricKey]int64)
 			linksByDC := make(map[middleend.DCID]int)
 			for _, slot := range manager.Slots {
@@ -466,7 +464,7 @@ func registerMiddleEndLinkQueueMetric(
 				values[middleEndLinkQueueMetricKey{dc: slot.DCID, link: link, queue: "event"}] = int64(event)
 			}
 			for key, value := range values {
-				observer.Observe(value, metric.WithAttributes(
+				observer.ObserveInt64(queueGauge, value, metric.WithAttributes(
 					attribute.String("role", role),
 					attribute.String("dc", strconv.Itoa(int(key.dc))),
 					attribute.Int("link", key.link),
@@ -474,9 +472,7 @@ func registerMiddleEndLinkQueueMetric(
 				))
 			}
 		})
-		return nil
-	}))
-	meter.Int64ObservableGauge(name, options...)
+	}, queueGauge)
 }
 
 type middleEndLinkQueueMetricKey struct {
@@ -523,25 +519,26 @@ func registerProxyMetrics(meter metric.Meter, provider ProxyStatsProvider) {
 }
 
 func registerMiddleEndFrontendMetrics(meter metric.Meter, provider middleEndFrontendStatsProvider) {
-	registerMiddleEndResponseWaitMetrics(meter, provider)
-	meter.Int64ObservableGauge("telego_middleend_frontend_routes_active",
+	group := &snapshotMetricGroup[gproxy.MiddleEndFrontendStats]{meter: meter}
+	defer group.register(provider.MiddleEndFrontendStats)
+
+	registerMiddleEndResponseWaitMetrics(group)
+	routesActive, _ := meter.Int64ObservableGauge("telego_middleend_frontend_routes_active",
 		metric.WithDescription("Active public connections committed to ME or direct fallback"),
-		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			stats := provider.MiddleEndFrontendStats()
-			observer.Observe(stats.MiddleEndBindingsActive, metric.WithAttributes(attribute.String("route", "middleend")))
-			observer.Observe(stats.DirectFallbacksActive, metric.WithAttributes(attribute.String("route", "direct_fallback")))
-			return nil
-		}),
 	)
-	meter.Int64ObservableCounter("telego_middleend_frontend_route_commits_total",
+	group.add(func(observer metric.Observer, collected gproxy.MiddleEndFrontendStats) {
+		stats := collected
+		observer.ObserveInt64(routesActive, stats.MiddleEndBindingsActive, metric.WithAttributes(attribute.String("route", "middleend")))
+		observer.ObserveInt64(routesActive, stats.DirectFallbacksActive, metric.WithAttributes(attribute.String("route", "direct_fallback")))
+	}, routesActive)
+	routeCommits, _ := meter.Int64ObservableCounter("telego_middleend_frontend_route_commits_total",
 		metric.WithDescription("Public connections committed to ME or direct fallback"),
-		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			stats := provider.MiddleEndFrontendStats()
-			observer.Observe(metricValue(stats.MiddleEndBindingsTotal), metric.WithAttributes(attribute.String("route", "middleend")))
-			observer.Observe(metricValue(stats.DirectFallbacksTotal), metric.WithAttributes(attribute.String("route", "direct_fallback")))
-			return nil
-		}),
 	)
+	group.add(func(observer metric.Observer, collected gproxy.MiddleEndFrontendStats) {
+		stats := collected
+		observer.ObserveInt64(routeCommits, metricValue(stats.MiddleEndBindingsTotal), metric.WithAttributes(attribute.String("route", "middleend")))
+		observer.ObserveInt64(routeCommits, metricValue(stats.DirectFallbacksTotal), metric.WithAttributes(attribute.String("route", "direct_fallback")))
+	}, routeCommits)
 	for _, instrument := range []struct {
 		name        string
 		description string
@@ -578,117 +575,107 @@ func registerMiddleEndFrontendMetrics(meter metric.Meter, provider middleEndFron
 			},
 		},
 	} {
-		meter.Int64ObservableGauge(instrument.name,
+		bufferGauge, _ := meter.Int64ObservableGauge(instrument.name,
 			metric.WithDescription(instrument.description),
 			metric.WithUnit("By"),
-			metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-				stats := provider.MiddleEndFrontendStats()
-				for _, direction := range []string{"input", "output"} {
-					if stats.SharedResponseBudget && direction == "output" && instrument.name == "telego_middleend_frontend_buffer_capacity_bytes" {
-						continue
-					}
-					observer.Observe(instrument.value(stats, direction), metric.WithAttributes(attribute.String("direction", direction)))
-				}
-				return nil
-			}),
 		)
+		group.add(func(observer metric.Observer, collected gproxy.MiddleEndFrontendStats) {
+			stats := collected
+			for _, direction := range []string{"input", "output"} {
+				if stats.SharedResponseBudget && direction == "output" && instrument.name == "telego_middleend_frontend_buffer_capacity_bytes" {
+					continue
+				}
+				observer.ObserveInt64(bufferGauge, instrument.value(stats, direction), metric.WithAttributes(attribute.String("direction", direction)))
+			}
+		}, bufferGauge)
 	}
-	meter.Int64ObservableCounter("telego_middleend_frontend_backpressure_events_total",
+	backpressureEvents, _ := meter.Int64ObservableCounter("telego_middleend_frontend_backpressure_events_total",
 		metric.WithDescription("ME public frontend aggregate byte-budget rejections"),
-		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			stats := provider.MiddleEndFrontendStats()
-			observer.Observe(metricValue(stats.InputBackpressureEvents), metric.WithAttributes(attribute.String("direction", "input")))
-			observer.Observe(metricValue(stats.OutputBackpressureEvents), metric.WithAttributes(attribute.String("direction", "output")))
-			return nil
-		}),
 	)
-	meter.Int64ObservableCounter("telego_middleend_frontend_output_evictions_total",
+	group.add(func(observer metric.Observer, collected gproxy.MiddleEndFrontendStats) {
+		stats := collected
+		observer.ObserveInt64(backpressureEvents, metricValue(stats.InputBackpressureEvents), metric.WithAttributes(attribute.String("direction", "input")))
+		observer.ObserveInt64(backpressureEvents, metricValue(stats.OutputBackpressureEvents), metric.WithAttributes(attribute.String("direction", "output")))
+	}, backpressureEvents)
+	outputEvictions, _ := meter.Int64ObservableCounter("telego_middleend_frontend_output_evictions_total",
 		metric.WithDescription("ME public clients evicted to release aggregate output pressure"),
-		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			observer.Observe(metricValue(provider.MiddleEndFrontendStats().OutputEvictions))
-			return nil
-		}),
 	)
+	group.add(func(observer metric.Observer, collected gproxy.MiddleEndFrontendStats) {
+		observer.ObserveInt64(outputEvictions, metricValue(collected.OutputEvictions))
+	}, outputEvictions)
 }
 
 func registerWebMetrics(meter metric.Meter, provider WebStatsProvider) {
-	meter.Int64ObservableGauge("telego_web_websocket_connections_active",
+	group := &snapshotMetricGroup[webproxy.RuntimeStats]{meter: meter}
+	defer group.register(provider.RuntimeStats)
+
+	webSockets, _ := meter.Int64ObservableGauge("telego_web_websocket_connections_active",
 		metric.WithDescription("Active WEB WebSocket carrier connections"),
-		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			observer.Observe(provider.RuntimeStats().WebSocketsActive)
-			return nil
-		}),
 	)
-	meter.Int64ObservableGauge("telego_web_sessions_active",
+	group.add(func(observer metric.Observer, collected webproxy.RuntimeStats) {
+		observer.ObserveInt64(webSockets, collected.WebSocketsActive)
+	}, webSockets)
+	sessions, _ := meter.Int64ObservableGauge("telego_web_sessions_active",
 		metric.WithDescription("Active WEB relay sessions"),
-		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			observer.Observe(int64(provider.RuntimeStats().Capacity.Sessions))
-			return nil
-		}),
 	)
-	meter.Int64ObservableGauge("telego_web_streams_active",
+	group.add(func(observer metric.Observer, collected webproxy.RuntimeStats) {
+		observer.ObserveInt64(sessions, int64(collected.Capacity.Sessions))
+	}, sessions)
+	streams, _ := meter.Int64ObservableGauge("telego_web_streams_active",
 		metric.WithDescription("Active WEB backend streams"),
-		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			observer.Observe(int64(provider.RuntimeStats().Capacity.Streams))
-			return nil
-		}),
 	)
-	meter.Int64ObservableGauge("telego_web_backend_dials_active",
+	group.add(func(observer metric.Observer, collected webproxy.RuntimeStats) {
+		observer.ObserveInt64(streams, int64(collected.Capacity.Streams))
+	}, streams)
+	backendDials, _ := meter.Int64ObservableGauge("telego_web_backend_dials_active",
 		metric.WithDescription("WEB backend dials in progress"),
-		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			observer.Observe(int64(provider.RuntimeStats().Capacity.BackendDials))
-			return nil
-		}),
 	)
-	meter.Int64ObservableGauge("telego_web_pending_bytes",
+	group.add(func(observer metric.Observer, collected webproxy.RuntimeStats) {
+		observer.ObserveInt64(backendDials, int64(collected.Capacity.BackendDials))
+	}, backendDials)
+	pendingBytes, _ := meter.Int64ObservableGauge("telego_web_pending_bytes",
 		metric.WithDescription("Bytes charged to WEB pending queues"),
 		metric.WithUnit("By"),
-		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			observer.Observe(provider.RuntimeStats().Capacity.PendingBytes)
-			return nil
-		}),
 	)
-	meter.Int64ObservableGauge("telego_web_pending_items",
+	group.add(func(observer metric.Observer, collected webproxy.RuntimeStats) {
+		observer.ObserveInt64(pendingBytes, collected.Capacity.PendingBytes)
+	}, pendingBytes)
+	pendingItems, _ := meter.Int64ObservableGauge("telego_web_pending_items",
 		metric.WithDescription("Items charged to WEB pending queues"),
-		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			observer.Observe(provider.RuntimeStats().Capacity.PendingItems)
-			return nil
-		}),
 	)
-	meter.Int64ObservableCounter("telego_web_sessions_created_total",
+	group.add(func(observer metric.Observer, collected webproxy.RuntimeStats) {
+		observer.ObserveInt64(pendingItems, collected.Capacity.PendingItems)
+	}, pendingItems)
+	sessionsCreated, _ := meter.Int64ObservableCounter("telego_web_sessions_created_total",
 		metric.WithDescription("WEB relay sessions created"),
-		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			observer.Observe(metricValue(provider.RuntimeStats().SessionsCreated))
-			return nil
-		}),
 	)
-	meter.Int64ObservableCounter("telego_web_sessions_closed_total",
+	group.add(func(observer metric.Observer, collected webproxy.RuntimeStats) {
+		observer.ObserveInt64(sessionsCreated, metricValue(collected.SessionsCreated))
+	}, sessionsCreated)
+	sessionsClosed, _ := meter.Int64ObservableCounter("telego_web_sessions_closed_total",
 		metric.WithDescription("WEB relay sessions closed by reason"),
-		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			for _, counter := range provider.RuntimeStats().SessionsClosed {
-				observer.Observe(metricValue(counter.Total), metric.WithAttributes(attribute.String("reason", counter.Label)))
-			}
-			return nil
-		}),
 	)
-	meter.Int64ObservableCounter("telego_web_carrier_retries_total",
+	group.add(func(observer metric.Observer, collected webproxy.RuntimeStats) {
+		for _, counter := range collected.SessionsClosed {
+			observer.ObserveInt64(sessionsClosed, metricValue(counter.Total), metric.WithAttributes(attribute.String("reason", counter.Label)))
+		}
+	}, sessionsClosed)
+	carrierRetries, _ := meter.Int64ObservableCounter("telego_web_carrier_retries_total",
 		metric.WithDescription("Authenticated WEB carrier retries and replays"),
-		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			for _, counter := range provider.RuntimeStats().CarrierRetries {
-				observer.Observe(metricValue(counter.Total), metric.WithAttributes(attribute.String("operation", counter.Label)))
-			}
-			return nil
-		}),
 	)
-	meter.Int64ObservableCounter("telego_web_backpressure_total",
+	group.add(func(observer metric.Observer, collected webproxy.RuntimeStats) {
+		for _, counter := range collected.CarrierRetries {
+			observer.ObserveInt64(carrierRetries, metricValue(counter.Total), metric.WithAttributes(attribute.String("operation", counter.Label)))
+		}
+	}, carrierRetries)
+	backpressure, _ := meter.Int64ObservableCounter("telego_web_backpressure_total",
 		metric.WithDescription("WEB carrier requests delayed by resource backpressure"),
-		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			for _, counter := range provider.RuntimeStats().Backpressure {
-				observer.Observe(metricValue(counter.Total), metric.WithAttributes(attribute.String("operation", counter.Label)))
-			}
-			return nil
-		}),
 	)
+	group.add(func(observer metric.Observer, collected webproxy.RuntimeStats) {
+		for _, counter := range collected.Backpressure {
+			observer.ObserveInt64(backpressure, metricValue(counter.Total), metric.WithAttributes(attribute.String("operation", counter.Label)))
+		}
+	}, backpressure)
 }
 
 func metricValue(value uint64) int64 {
@@ -696,112 +683,108 @@ func metricValue(value uint64) int64 {
 }
 
 func registerMetrics(meter metric.Meter, limiter StatsProvider) {
+	group := &snapshotMetricGroup[[]gproxy.UserIPStats]{meter: meter}
+	defer group.register(limiter.Stats)
+
 	// Active connections gauge
-	meter.Int64ObservableGauge("telego_connections_active",
+	connections, _ := meter.Int64ObservableGauge("telego_connections_active",
 		metric.WithDescription("Active connections per user"),
-		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
-			for _, s := range limiter.Stats() {
-				name := s.SecretName
-				if name == "" {
-					name = "unknown"
-				}
-				o.Observe(s.Connections, metric.WithAttributes(attribute.String("user", name)))
-			}
-			return nil
-		}),
 	)
+	group.add(func(o metric.Observer, collected []gproxy.UserIPStats) {
+		for _, s := range collected {
+			name := s.SecretName
+			if name == "" {
+				name = "unknown"
+			}
+			o.ObserveInt64(connections, s.Connections, metric.WithAttributes(attribute.String("user", name)))
+		}
+	}, connections)
 
 	// Active IPs gauge (IPs with at least one connection right now)
-	meter.Int64ObservableGauge("telego_ips_active",
+	activeIPs, _ := meter.Int64ObservableGauge("telego_ips_active",
 		metric.WithDescription("IPs with active connections per user"),
-		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
-			for _, s := range limiter.Stats() {
-				name := s.SecretName
-				if name == "" {
-					name = "unknown"
-				}
-				o.Observe(int64(s.ActiveIPs), metric.WithAttributes(attribute.String("user", name)))
-			}
-			return nil
-		}),
 	)
+	group.add(func(o metric.Observer, collected []gproxy.UserIPStats) {
+		for _, s := range collected {
+			name := s.SecretName
+			if name == "" {
+				name = "unknown"
+			}
+			o.ObserveInt64(activeIPs, int64(s.ActiveIPs), metric.WithAttributes(attribute.String("user", name)))
+		}
+	}, activeIPs)
 
 	// Tracked IPs gauge (unique IPs in LRU cache, may include disconnected)
-	meter.Int64ObservableGauge("telego_ips_tracked",
+	trackedIPs, _ := meter.Int64ObservableGauge("telego_ips_tracked",
 		metric.WithDescription("Unique IPs tracked in LRU cache per user"),
-		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
-			for _, s := range limiter.Stats() {
-				name := s.SecretName
-				if name == "" {
-					name = "unknown"
-				}
-				o.Observe(int64(s.TrackedIPs), metric.WithAttributes(attribute.String("user", name)))
-			}
-			return nil
-		}),
 	)
+	group.add(func(o metric.Observer, collected []gproxy.UserIPStats) {
+		for _, s := range collected {
+			name := s.SecretName
+			if name == "" {
+				name = "unknown"
+			}
+			o.ObserveInt64(trackedIPs, int64(s.TrackedIPs), metric.WithAttributes(attribute.String("user", name)))
+		}
+	}, trackedIPs)
 
 	// Blocked IPs gauge
-	meter.Int64ObservableGauge("telego_ips_blocked",
+	blockedIPs, _ := meter.Int64ObservableGauge("telego_ips_blocked",
 		metric.WithDescription("Currently blocked IPs per user"),
-		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
-			for _, s := range limiter.Stats() {
-				name := s.SecretName
-				if name == "" {
-					name = "unknown"
-				}
-				o.Observe(int64(s.BlockedIPs), metric.WithAttributes(attribute.String("user", name)))
-			}
-			return nil
-		}),
 	)
+	group.add(func(o metric.Observer, collected []gproxy.UserIPStats) {
+		for _, s := range collected {
+			name := s.SecretName
+			if name == "" {
+				name = "unknown"
+			}
+			o.ObserveInt64(blockedIPs, int64(s.BlockedIPs), metric.WithAttributes(attribute.String("user", name)))
+		}
+	}, blockedIPs)
 
 	// Blocked total counter
-	meter.Int64ObservableCounter("telego_blocked_total",
+	blockedTotal, _ := meter.Int64ObservableCounter("telego_blocked_total",
 		metric.WithDescription("Total IP block events per user"),
-		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
-			for _, s := range limiter.Stats() {
-				name := s.SecretName
-				if name == "" {
-					name = "unknown"
-				}
-				o.Observe(s.BlockedTotal, metric.WithAttributes(attribute.String("user", name)))
-			}
-			return nil
-		}),
 	)
+	group.add(func(o metric.Observer, collected []gproxy.UserIPStats) {
+		for _, s := range collected {
+			name := s.SecretName
+			if name == "" {
+				name = "unknown"
+			}
+			o.ObserveInt64(blockedTotal, s.BlockedTotal, metric.WithAttributes(attribute.String("user", name)))
+		}
+	}, blockedTotal)
 
 	// Traffic in counter
-	meter.Int64ObservableCounter("telego_traffic_in_bytes_total",
+	trafficIn, _ := meter.Int64ObservableCounter("telego_traffic_in_bytes_total",
 		metric.WithDescription("Total bytes received from clients per user"),
 		metric.WithUnit("By"),
-		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
-			for _, s := range limiter.Stats() {
-				name := s.SecretName
-				if name == "" {
-					name = "unknown"
-				}
-				o.Observe(s.BytesIn, metric.WithAttributes(attribute.String("user", name)))
-			}
-			return nil
-		}),
 	)
+	group.add(func(o metric.Observer, collected []gproxy.UserIPStats) {
+		for _, s := range collected {
+			name := s.SecretName
+			if name == "" {
+				name = "unknown"
+			}
+			o.ObserveInt64(trafficIn, s.BytesIn, metric.WithAttributes(attribute.String("user", name)))
+		}
+	}, trafficIn)
 
 	// Traffic out counter
-	meter.Int64ObservableCounter("telego_traffic_out_bytes_total",
+	trafficOut, _ := meter.Int64ObservableCounter("telego_traffic_out_bytes_total",
 		metric.WithDescription("Total bytes sent to clients per user"),
 		metric.WithUnit("By"),
-		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
-			for _, s := range limiter.Stats() {
-				name := s.SecretName
-				if name == "" {
-					name = "unknown"
-				}
-				o.Observe(s.BytesOut, metric.WithAttributes(attribute.String("user", name)))
-			}
-			return nil
-		}),
 	)
+	group.add(func(o metric.Observer, collected []gproxy.UserIPStats) {
+		for _, s := range collected {
+			name := s.SecretName
+			if name == "" {
+				name = "unknown"
+			}
+			o.ObserveInt64(trafficOut, s.BytesOut, metric.WithAttributes(attribute.String("user", name)))
+		}
+	}, trafficOut)
 }
 
 // Start opens the metrics listener and serves HTTP in a goroutine.

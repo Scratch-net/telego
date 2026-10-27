@@ -1214,11 +1214,10 @@ func (c *middleEndClient) nextPacket(connection clientEndpoint) (middleend.Clien
 }
 
 func (c *middleEndClient) decryptIntoPending(ciphertext []byte) {
-	plaintext := make([]byte, len(ciphertext))
-	c.decryptor.XORKeyStream(plaintext, ciphertext)
-	c.pendingPlain = append(c.pendingPlain, plaintext...)
+	// nextPacket consumes and clears the previous chunk before reaching here.
+	c.pendingPlain = make([]byte, len(ciphertext))
+	c.decryptor.XORKeyStream(c.pendingPlain, ciphertext)
 	c.pendingPlainRetained = cap(c.pendingPlain)
-	clear(plaintext)
 }
 
 func (c *middleEndClient) clearWaitingRequest() {

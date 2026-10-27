@@ -409,6 +409,7 @@ carrier = "websocket"                    # Installer default. Requires upgrade f
 prefer-ip = "prefer-ipv4"    # prefer-ipv4, prefer-ipv6, only-ipv4, only-ipv6
 idle-timeout = "5m"          # Connection idle timeout (hot-reloadable)
 num-event-loops = 0          # 0 = auto (all CPU cores)
+# tcp-buffer-kb = 0          # Legacy setting; accepted but has no effect
 # client-silence-close = "12s"  # Close relays whose server reply stays unanswered (fixes iOS "Updating"); 0 = off
 
 # Upstream (DC connection) settings
@@ -660,6 +661,12 @@ Tested on Intel i9-12900K, Linux 6.6:
 
 ## Logging
 
+Log producers queue JSON events; one consumer formats and writes them to stderr.
+The queue holds 4,096 events, including one reserved slot for a fatal event.
+When the normal queue is full, new events are dropped and counted by `telego_log_dropped_messages_total`.
+Events submitted after shutdown starts are also dropped and counted.
+Shutdown and fatal exit allow up to two seconds to drain queued events. A stalled sink can leave events unwritten at exit.
+
 Connections are tracked with unique IDs for easy correlation:
 
 ```
@@ -740,6 +747,7 @@ To disable diagnostics, set `diagnostics = false`. Then restart Telego.
 | `telego_traffic_in_bytes_total` | Counter | Bytes received from clients |
 | `telego_traffic_out_bytes_total` | Counter | Bytes sent to clients |
 | `telego_handshake_failures_total` | Counter | MTProxy handshake failures by `stage` |
+| `telego_log_dropped_messages_total` | Counter | Log events dropped when the queue is full or shutdown has started. This metric has no labels. |
 | `telego_web_websocket_connections_active` | Gauge | Active WEB WebSocket carrier connections. This metric has no labels. |
 | `telego_web_sessions_active` | Gauge | Active WEB sessions |
 | `telego_web_streams_active` | Gauge | Active WEB backend streams |

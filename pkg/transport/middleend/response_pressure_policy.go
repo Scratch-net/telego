@@ -20,23 +20,24 @@ type responsePressureTarget interface {
 // of manager residency. Its target points to an existing binding, not a closure.
 // Detach clears that reference before historical output can retain the record.
 type ResponseParticipant struct {
-	budget         *ResponseBudget
-	previous, next *ResponseParticipant
-	target         responsePressureTarget
-	id             int64
-	stages         [responseMemoryStageCount]int
-	ordinaryBytes  int
-	allocations    int
-	observedAt     time.Time
-	lastProgressAt time.Time
-	unreadBytes    int
-	wait           ResponseOutputWait
-	registered     bool
-	detached       bool
-	pending        bool
-	asyncPending   bool
-	selection      uint64
-	invoked        bool
+	budget          *ResponseBudget
+	previous, next  *ResponseParticipant
+	target          responsePressureTarget
+	id              int64
+	stages          [responseMemoryStageCount]int
+	ordinaryBytes   int
+	allocations     int
+	observedAt      time.Time
+	lastProgressAt  time.Time
+	unreadBytes     int
+	wait            ResponseOutputWait
+	registered      bool
+	detached        bool
+	pending         bool
+	pressureIndexed bool
+	asyncPending    bool
+	selection       uint64
+	invoked         bool
 }
 
 const ResponseParticipantBytes = int(unsafe.Sizeof(ResponseParticipant{}))
@@ -56,12 +57,8 @@ func (b *ResponseBudget) registerParticipant(id int64, target responsePressureTa
 	if ResponseParticipantBytes > b.classLimits[ResponseMemoryOrdinary]-b.classes[ResponseMemoryOrdinary] {
 		return nil, false
 	}
-	p := &ResponseParticipant{budget: b, target: target, id: id, registered: true, next: b.participants, ordinaryBytes: ResponseParticipantBytes}
+	p := &ResponseParticipant{budget: b, target: target, id: id, registered: true, ordinaryBytes: ResponseParticipantBytes}
 	p.stages[ResponseMemoryOwnerMetadata] = ResponseParticipantBytes
-	if b.participants != nil {
-		b.participants.previous = p
-	}
-	b.participants = p
 	b.participantCount++
 	b.classes[ResponseMemoryOrdinary] += ResponseParticipantBytes
 	b.stages[ResponseMemoryOwnerMetadata] += ResponseParticipantBytes
@@ -92,15 +89,7 @@ func (p *ResponseParticipant) detachBytes() int {
 	}
 	p.detached = true
 	p.target = nil
-	if p.previous == nil {
-		b.participants = p.next
-	} else {
-		p.previous.next = p.next
-	}
-	if p.next != nil {
-		p.next.previous = p.previous
-	}
-	p.previous, p.next = nil, nil
+	p.refreshPressureIndexLocked()
 	before := b.used
 	p.retireLocked()
 	return before - b.used
@@ -149,11 +138,43 @@ func (p *ResponseParticipant) adjustLocked(class ResponseMemoryClass, stage Resp
 			p.budget.backloggedParticipants--
 		}
 	}
+	p.refreshPressureIndexLocked()
 }
 
 func (p *ResponseParticipant) backloggedLocked() bool {
 	return p.registered && !p.detached && (p.stages[ResponseMemoryQueuePayload] > 0 ||
 		p.stages[ResponseMemoryInflight] > 0 || p.stages[ResponseMemoryOutput] > 0)
+}
+
+// The intrusive index contains only attached, unselected owners that can
+// supply queued or output capacity. Its links are charged in the participant
+// record; maintaining it never allocates. Inflight-only owners still count in
+// backloggedParticipants for fair-share policy but cannot supply a victim.
+func (p *ResponseParticipant) refreshPressureIndexLocked() {
+	eligible := p.registered && !p.detached && !p.pending && p.target != nil &&
+		(p.stages[ResponseMemoryQueuePayload] > 0 || p.stages[ResponseMemoryOutput] > 0)
+	if eligible == p.pressureIndexed {
+		return
+	}
+	b := p.budget
+	if eligible {
+		p.next = b.pressureCandidates
+		if p.next != nil {
+			p.next.previous = p
+		}
+		b.pressureCandidates = p
+	} else {
+		if p.previous == nil {
+			b.pressureCandidates = p.next
+		} else {
+			p.previous.next = p.next
+		}
+		if p.next != nil {
+			p.next.previous = p.previous
+		}
+		p.previous, p.next = nil, nil
+	}
+	p.pressureIndexed = eligible
 }
 
 // ReportProgress records owner observations, never accepted-write timestamps.
@@ -266,9 +287,10 @@ type ResponsePressureVictim struct {
 // SelectPressureVictim first rechecks ordinary capacity under the budget lock.
 // requiredAdditional is the complete additional charge for incoming admission,
 // before subtracting currently free capacity. If it fits, no owner is selected.
-// Otherwise it scans active charged participants once. Detached records remain
-// charged until release but leave the scan list immediately. Its maximum size is
-// OrdinaryLimitBytes/ResponseParticipantBytes, independent of historical churn.
+// Otherwise it scans the eligible owner index once. Empty, inflight-only,
+// detached, and already selected owners are not scanned. Detached records remain
+// charged until release. The maximum index size remains bounded by ordinary
+// capacity, independent of historical churn; an entirely eligible pool is O(N).
 // A queue that can cover the deficit ranks before one that cannot. Within that
 // group, fresh stalled output precedes consumers above their soft fair share.
 func (b *ResponseBudget) SelectPressureVictim(now time.Time, requiredAdditional int) ResponsePressureVictim {
@@ -288,22 +310,16 @@ func (b *ResponseBudget) SelectPressureVictim(now time.Time, requiredAdditional 
 	result.RequiredReclaimBytes = requiredAdditional - available
 	result.FairShareBytes = b.classLimits[ResponseMemoryOrdinary] / max(1, b.backloggedParticipants)
 	bestFit, bestQueued := false, false
-	for p := b.participants; p != nil; p = p.next {
+	for p := b.pressureCandidates; p != nil; p = p.next {
 		result.Scanned++
-		if !p.backloggedLocked() || p.pending || p.target == nil {
-			continue
-		}
-		snapshot := p.snapshotLocked()
 		queued := p.stages[ResponseMemoryQueuePayload] > 0
-		if !queued && snapshot.OutputBytes == 0 {
-			continue
-		}
 		if !queued && b.asyncPressureEvictions != 0 {
 			continue
 		}
-		fits := queued && snapshot.QueuedBytes >= result.RequiredReclaimBytes
+		queuedBytes := p.stages[ResponseMemoryQueuePayload] + p.stages[ResponseMemoryQueueMetadata]
+		fits := queued && queuedBytes >= result.RequiredReclaimBytes
 		reason := ResponsePressureLargestBacklog
-		if snapshot.OrdinaryBytes > result.FairShareBytes {
+		if p.ordinaryBytes > result.FairShareBytes {
 			reason = ResponsePressureAboveFairShare
 		}
 		if p.unreadBytes > 0 && !p.observedAt.IsZero() && !p.observedAt.After(now) &&
@@ -318,23 +334,24 @@ func (b *ResponseBudget) SelectPressureVictim(now time.Time, requiredAdditional 
 			better = queued
 		} else if !better && fits == bestFit && queued == bestQueued {
 			better = reason > result.Reason || (reason == result.Reason &&
-				(snapshot.OrdinaryBytes > result.Snapshot.OrdinaryBytes ||
-					(snapshot.OrdinaryBytes == result.Snapshot.OrdinaryBytes && snapshot.ConnectionID < result.Snapshot.ConnectionID)))
+				(p.ordinaryBytes > result.Participant.ordinaryBytes ||
+					(p.ordinaryBytes == result.Participant.ordinaryBytes && p.id < result.Participant.id)))
 		}
 		if better {
-			result.Participant, result.Snapshot, result.Reason = p, snapshot, reason
+			result.Participant, result.Reason = p, reason
 			bestFit, bestQueued = fits, queued
 		}
 	}
 	if p := result.Participant; p != nil {
 		p.selection++
 		p.pending = true
+		p.refreshPressureIndexLocked()
 		p.invoked = false
 		p.asyncPending = !bestQueued
 		if p.asyncPending {
 			b.asyncPressureEvictions++
 		}
-		result.Snapshot.PendingEviction = true
+		result.Snapshot = p.snapshotLocked()
 		result.selection = p.selection
 	}
 	return result
@@ -395,4 +412,5 @@ func (p *ResponseParticipant) clearPendingLocked() {
 		p.budget.asyncPressureEvictions--
 	}
 	p.pending, p.asyncPending, p.invoked = false, false, false
+	p.refreshPressureIndexLocked()
 }

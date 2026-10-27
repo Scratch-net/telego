@@ -44,6 +44,8 @@ func TestSetLevel(t *testing.T) {
 }
 
 func TestSetJSON(t *testing.T) {
+	wasJSON := output.json.Load()
+	defer output.json.Store(wasJSON)
 	// Capture original logger
 	originalLogger := getLogger()
 	defer logger.Store(originalLogger)
@@ -132,6 +134,8 @@ func TestConcurrentAccess(t *testing.T) {
 }
 
 func TestLoggingOutput(t *testing.T) {
+	originalLogger := getLogger()
+	t.Cleanup(func() { logger.Store(originalLogger) })
 	// Capture output
 	var buf bytes.Buffer
 
@@ -161,6 +165,8 @@ func TestLoggingOutput(t *testing.T) {
 }
 
 func TestLevelFiltering(t *testing.T) {
+	originalLogger := getLogger()
+	t.Cleanup(func() { logger.Store(originalLogger) })
 	// Capture output
 	var buf bytes.Buffer
 	testLogger := zerolog.New(&buf).With().Timestamp().Logger().Level(zerolog.InfoLevel)
@@ -230,6 +236,8 @@ func BenchmarkInfo(b *testing.B) {
 
 // BenchmarkInfoEnabled benchmarks info logging when enabled
 func BenchmarkInfoEnabled(b *testing.B) {
+	originalLogger := getLogger()
+	b.Cleanup(func() { logger.Store(originalLogger) })
 	// Create logger that discards output but still processes
 	testLogger := zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, NoColor: true}).
 		Level(zerolog.InfoLevel)

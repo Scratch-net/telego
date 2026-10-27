@@ -42,6 +42,12 @@ func (h *ProxyHandler) prepareFrontends() {
 }
 
 func (h *ProxyHandler) stopServing() error {
+	if h.certFetcher != nil {
+		h.certFetcher.StopBackgroundRefresh()
+	}
+	if h.serverHelloFetcher != nil {
+		h.serverHelloFetcher.StopBackgroundRefresh()
+	}
 	if h.middleEnd != nil {
 		h.middleEnd.stop()
 	}

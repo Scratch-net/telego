@@ -32,6 +32,7 @@ type relayOutput struct {
 	timer           *time.Timer
 	closed          bool
 	destinationGone bool
+	sourceDraining  bool // Expected upstream EOF disposal must not abort its response drain.
 	chargedBytes    int
 	chargedItems    int
 	pendingWrites   map[*relayPendingWrite]struct{}
@@ -323,8 +324,23 @@ func (o *relayOutput) close() {
 	o.mu.Unlock()
 }
 
+func (o *relayOutput) closeForEOF() {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	o.sourceDraining = true
+	o.stopLocked()
+	o.mu.Unlock()
+}
+
 func (o *relayOutput) fail() {
-	o.close()
-	_ = o.source.Close()
+	o.mu.Lock()
+	o.stopLocked()
+	draining := o.sourceDraining
+	o.mu.Unlock()
+	if !draining {
+		_ = o.source.Close()
+	}
 	_ = o.destination.Close()
 }

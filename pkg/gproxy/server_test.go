@@ -118,6 +118,23 @@ func TestPublicGnetOptionsPinAuditedBufferCaps(t *testing.T) {
 	}
 }
 
+func TestUpstreamGnetOptionsHonorWorkerCount(t *testing.T) {
+	for _, workers := range []int{0, 1, 3} {
+		cfg := DefaultConfig()
+		cfg.NumEventLoop = workers
+		var options gnet.Options
+		for _, option := range upstreamGnetOptions(&cfg) {
+			option(&options)
+		}
+		if options.NumEventLoop != workers || options.Multicore != cfg.Multicore || options.LockOSThread != cfg.LockOSThread {
+			t.Fatalf("upstream workers=%d: %+v", workers, options)
+		}
+		if options.ReadBufferCap != 128<<10 || options.WriteBufferCap != 256<<10 {
+			t.Fatalf("upstream buffer caps changed: %+v", options)
+		}
+	}
+}
+
 func TestPublicGnetOptionsLeaveOptionalOverridesDisabled(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.NumEventLoop = 0

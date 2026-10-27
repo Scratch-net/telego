@@ -2,6 +2,8 @@
 package log
 
 import (
+	"context"
+	"io"
 	"os"
 	"sync/atomic"
 	"time"
@@ -14,9 +16,35 @@ import (
 // the pointer-method-on-value issue with zerolog.Logger.
 var logger atomic.Pointer[zerolog.Logger]
 
+var (
+	dropped atomic.Uint64
+	output  = &formatWriter{
+		raw:     os.Stderr,
+		console: zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339},
+	}
+	writer = newAsyncWriter(output, 4096, countDropped)
+)
+
+func countDropped(missed int) { dropped.Add(uint64(missed)) }
+
+// formatWriter runs only on the consumer, after the JSON event has been queued.
+// It deliberately implements only io.Writer: stderr belongs to the process.
+type formatWriter struct {
+	raw     io.Writer
+	console zerolog.ConsoleWriter
+	json    atomic.Bool
+}
+
+func (w *formatWriter) Write(p []byte) (int, error) {
+	if w.json.Load() {
+		return w.raw.Write(p)
+	}
+	return w.console.Write(p)
+}
+
 func init() {
 	// Default to info level with console output
-	l := zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339}).
+	l := zerolog.New(writer).
 		With().Timestamp().Logger().
 		Level(zerolog.InfoLevel)
 	logger.Store(&l)
@@ -53,10 +81,19 @@ func SetLevel(level string) {
 
 // SetJSON switches to JSON output format.
 func SetJSON() {
-	l := getLogger()
-	newL := zerolog.New(os.Stderr).With().Timestamp().Logger().Level(l.GetLevel())
-	logger.Store(&newL)
+	output.json.Store(true)
 }
+
+// DroppedMessages returns the lifetime number of events dropped because the
+// queue is full or shutdown has started. Producers update the count on rejection.
+func DroppedMessages() uint64 { return dropped.Load() }
+
+// Shutdown stops admitting events and drains the queue until ctx expires.
+// A blocked sink can outlive the deadline; subsequent calls join the same drain.
+func Shutdown(ctx context.Context) error { return writer.Shutdown(ctx) }
+
+// Close drains the logger with the same bounded timeout used by Fatal.
+func Close() error { return writer.Close() }
 
 // Convenience functions
 func Trace() *zerolog.Event { return getLogger().Trace() }

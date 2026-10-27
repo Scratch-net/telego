@@ -3,6 +3,7 @@ package tlsfront
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
@@ -25,6 +26,7 @@ type ServerHelloFetcher struct {
 	certRecordLen int    // Payload length of the backend's first ApplicationData (cert) record
 	lastFetch     time.Time
 	refreshPeriod time.Duration
+	worker        refreshWorker
 }
 
 // CertRecordLen returns the payload length of the mask backend's first
@@ -83,8 +85,17 @@ func (f *ServerHelloFetcher) GetServerHelloTemplate() (response []byte, randomOf
 // Refresh fetches an expired or missing template. Call it only during startup
 // or in a background worker, never from a connection event loop.
 func (f *ServerHelloFetcher) Refresh() error {
+	return f.RefreshContext(context.Background())
+}
+
+// RefreshContext cancels connection establishment and the TLS handshake when
+// its caller stops. Cache readers continue to use the last valid template.
+func (f *ServerHelloFetcher) RefreshContext(ctx context.Context) error {
 	f.refreshMu.Lock()
 	defer f.refreshMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	f.mu.RLock()
 	fresh := f.cachedFull != nil && time.Since(f.lastFetch) < f.refreshPeriod
@@ -95,13 +106,17 @@ func (f *ServerHelloFetcher) Refresh() error {
 
 	// One deadline covers both connection establishment and the TLS handshake.
 	addr := net.JoinHostPort(f.host, fmt.Sprintf("%d", f.port))
-	deadline := time.Now().Add(f.timeout)
-	dialer := net.Dialer{Deadline: deadline}
-	rawConn, err := dialer.Dial("tcp", addr)
+	ctx, cancel := context.WithTimeout(ctx, f.timeout)
+	defer cancel()
+	deadline, _ := ctx.Deadline()
+	dialer := net.Dialer{}
+	rawConn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", addr, err)
 	}
 	defer rawConn.Close()
+	stopCancellation := context.AfterFunc(ctx, func() { _ = rawConn.Close() })
+	defer stopCancellation()
 
 	if err := rawConn.SetDeadline(deadline); err != nil {
 		return fmt.Errorf("set fetch deadline: %w", err)
@@ -120,7 +135,7 @@ func (f *ServerHelloFetcher) Refresh() error {
 	})
 
 	// Perform handshake - this will cause server to send ServerHello
-	if err := tlsConn.Handshake(); err != nil {
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		return fmt.Errorf("fetch ServerHello handshake: %w", err)
 	}
 	_ = tlsConn.Close()
@@ -274,15 +289,8 @@ func findServerHelloRandomOffset(data []byte) (int, error) {
 
 // StartBackgroundRefresh starts periodic refresh of the cached ServerHello.
 func (f *ServerHelloFetcher) StartBackgroundRefresh() {
-	go func() {
-		// Initial fetch
-		_ = f.Refresh()
-
-		ticker := time.NewTicker(f.refreshPeriod)
-		defer ticker.Stop()
-
-		for range ticker.C {
-			_ = f.Refresh()
-		}
-	}()
+	f.worker.start(f.refreshPeriod, func(ctx context.Context) { _ = f.RefreshContext(ctx) })
 }
+
+// StopBackgroundRefresh cancels and joins the worker. Repeated calls are safe.
+func (f *ServerHelloFetcher) StopBackgroundRefresh() { f.worker.stop() }

@@ -598,6 +598,7 @@ func TestStartBackgroundRefresh(t *testing.T) {
 
 	// Start background refresh
 	fetcher.StartBackgroundRefresh("127.0.0.1", port)
+	t.Cleanup(fetcher.StopBackgroundRefresh)
 
 	// Wait for initial fetch
 	time.Sleep(100 * time.Millisecond)

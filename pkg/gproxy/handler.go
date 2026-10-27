@@ -411,6 +411,9 @@ func (h *ProxyHandler) OnTraffic(c gnet.Conn) gnet.Action {
 }
 
 func (h *ProxyHandler) clientTraffic(c clientEndpoint, ctx *ConnContext) gnet.Action {
+	if ctx.spliceDrainRequested.Load() && ctx.State() != StateClosed {
+		return h.handleSpliceDrain(c, ctx)
+	}
 	// Lock-free state read
 	switch ctx.State() {
 	case StateDetectProtocol:

@@ -215,16 +215,21 @@ func relaySpliceBytes(source clientEndpoint, output *relayOutput, ctx *ConnConte
 func (splice *spliceConnContext) onClose(conn gnet.Conn, err error) gnet.Action {
 	var output *relayOutput
 	splice.closed.Store(true)
+	orderly := errors.Is(err, io.EOF) && splice.clientCtx.State() != StateClosed
 	if target := splice.upstream.Load(); target != nil {
 		output = target.output
-		output.close()
+		if orderly {
+			output.closeForEOF()
+		} else {
+			output.close()
+		}
 	}
 	defer splice.proxy.completeUpstreamClose(conn, splice.client, output, splice.onClosed)
 	splice.toClient.close()
 	if splice.clientCtx.State() == StateClosed {
 		return gnet.None
 	}
-	if !errors.Is(err, io.EOF) {
+	if !orderly {
 		_ = splice.client.Close()
 		return gnet.None
 	}
@@ -270,6 +275,12 @@ func (h *ProxyHandler) beginSpliceClientDrain(client clientEndpoint, ctx *ConnCo
 	if len(releases) > 0 {
 		release = releases[0]
 	}
+	h.beginClientDrain(client, ctx, h.spliceIdleTimeout(), tail, release)
+}
+
+// Direct and splice EOFs share the bounded client-owner drain. The supplied
+// tail is already encoded for the client and owned until drain or disposal.
+func (h *ProxyHandler) beginClientDrain(client clientEndpoint, ctx *ConnContext, timeout time.Duration, tail []byte, release func()) {
 	ctx.spliceDrainRequested.Store(true)
 	err := executeAfterClientOutput(client, gnet.RunnableFunc(func(context.Context) error {
 		if ctx.State() == StateClosed {
@@ -280,7 +291,7 @@ func (h *ProxyHandler) beginSpliceClientDrain(client clientEndpoint, ctx *ConnCo
 			return nil
 		}
 		ctx.stopConnectionTimers()
-		ctx.beginSpliceDrain(client, h.spliceIdleTimeout(), tail, release)
+		ctx.beginSpliceDrain(client, timeout, tail, release)
 		if h.handleSpliceDrain(client, ctx) == gnet.Close {
 			return client.Close()
 		}

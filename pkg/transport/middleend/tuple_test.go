@@ -655,10 +655,10 @@ func TestProbeOneSTUNServerHonorsContextDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	if _, err := probeOneSTUNServer(ctx, AddressFamilyIPv4, server.LocalAddr().String()); err == nil {
-		t.Fatal("silent STUN server returned no error")
+	if _, err := probeOneSTUNServer(ctx, AddressFamilyIPv4, server.LocalAddr().String()); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("silent STUN server error = %v, want context deadline", err)
 	}
-	if elapsed := time.Since(started); elapsed > time.Second {
+	if elapsed := time.Since(started); elapsed > 200*time.Millisecond {
 		t.Fatalf("STUN deadline took %v", elapsed)
 	}
 }

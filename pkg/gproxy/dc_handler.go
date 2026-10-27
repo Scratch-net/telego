@@ -97,6 +97,9 @@ func (h *ProxyHandler) dialDC(clientConn clientEndpoint, ctx *ConnContext) {
 	dcGnetConn, err := h.dcClient.EnrollContext(ddc.Conn, dcCtx)
 	if err != nil {
 		dcCtx.onClosed()
+		if dcCtx.orderlyEOF.Load() {
+			return
+		}
 		if h.upstreamContext.Err() != nil {
 			_ = clientConn.Close()
 		}
@@ -125,6 +128,8 @@ func (h *ProxyHandler) dialDC(clientConn clientEndpoint, ctx *ConnContext) {
 	// that same loop before publishing StateRelaying so newer bytes cannot
 	// overtake them or advance either cipher concurrently.
 	err = executeClient(clientConn, gnet.RunnableFunc(func(context.Context) error {
+		dcCtx.activationMu.Lock()
+		defer dcCtx.activationMu.Unlock()
 		if ctx.State() == StateClosed || dcCtx.closed.Load() {
 			_ = dcGnetConn.Close()
 			return nil

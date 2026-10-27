@@ -210,6 +210,56 @@ func TestUserIPLimiter_BlockExpires(t *testing.T) {
 	})
 }
 
+func TestUserIPLimiterStaleReleaseAfterReentry(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		l := NewUserIPLimiter(1, time.Minute)
+		t.Cleanup(l.Close)
+		secret := []byte("0123456789abcdef")
+		ip := net.ParseIP("192.0.2.1")
+		old1, _ := l.TryAcquire(ip, secret, "test")
+		old2, _ := l.TryAcquire(ip, secret, "test")
+		l.TryAcquire(net.ParseIP("192.0.2.2"), secret, "test")
+		time.Sleep(time.Minute)
+		current, ok := l.TryAcquire(ip, secret, "test")
+		if !ok {
+			t.Fatal("expired block prevented reentry")
+		}
+		l.Release(old1)
+		l.Release(old2)
+		if stats := l.Stats()[0]; stats.Connections != 1 || stats.ActiveIPs != 1 {
+			t.Fatalf("stale releases changed replacement entry: %+v", stats)
+		}
+		l.TryAcquire(net.ParseIP("192.0.2.3"), secret, "test")
+		if !slices.Contains(l.Stats()[0].BlockedIPList, ip.String()) {
+			t.Fatal("replacement with a live connection was not blocked at eviction")
+		}
+		l.Release(current)
+	})
+}
+
+func TestUserIPLimiterStatsOnlyStaleRelease(t *testing.T) {
+	l := NewUserIPLimiter(0, 0)
+	t.Cleanup(l.Close)
+	secret := []byte("0123456789abcdef")
+	ip := net.ParseIP("192.0.2.1")
+	old1, _ := l.TryAcquire(ip, secret, "test")
+	old2, _ := l.TryAcquire(ip, secret, "test")
+	for i := range statsOnlyMaxIPs {
+		key, _ := l.TryAcquire(net.IPv4(198, 51, byte(i>>8), byte(i)), secret, "test")
+		l.Release(key)
+	}
+	current, _ := l.TryAcquire(ip, secret, "test")
+	l.Release(old1)
+	l.Release(old2)
+	if stats := l.Stats()[0]; stats.Connections != 1 || stats.ActiveIPs != 1 {
+		t.Fatalf("stats-only reentry changed by stale release: %+v", stats)
+	}
+	l.Release(current)
+	if stats := l.Stats()[0]; stats.Connections != 0 || stats.ActiveIPs != 0 {
+		t.Fatal("current entry release did not remove its active connection")
+	}
+}
+
 func TestUserIPLimiter_BlockTimeoutRefresh(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const timeout = time.Minute

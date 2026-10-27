@@ -1,15 +1,16 @@
 package metrics
 
 import (
-	"context"
-
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 
+	"github.com/scratch-net/telego/pkg/gproxy"
 	"github.com/scratch-net/telego/pkg/transport/middleend"
 )
 
-func registerMiddleEndResponseMemoryMetrics(meter metric.Meter, provider MiddleEndStatsProvider) {
+func registerMiddleEndResponseMemoryMetrics(group *snapshotMetricGroup[middleend.ServiceSnapshot]) {
+	meter := group.meter
+
 	used, _ := meter.Int64ObservableGauge("telego_middleend_response_memory_used_bytes",
 		metric.WithDescription("Shared ME response charge, including reserved output headroom, allocation handles, and owner metadata; not process RSS"), metric.WithUnit("By"))
 	limit, _ := meter.Int64ObservableGauge("telego_middleend_response_memory_limit_bytes",
@@ -24,10 +25,10 @@ func registerMiddleEndResponseMemoryMetrics(meter metric.Meter, provider MiddleE
 		metric.WithDescription("Shared ME response charge by ownership stage, including reserved headroom, allocation handles, and owner metadata"), metric.WithUnit("By"))
 
 	// One snapshot keeps totals, classes, and stages consistent during a scrape.
-	meter.RegisterCallback(func(_ context.Context, observer metric.Observer) error {
-		snapshot := provider.Snapshot().ResponseBudget
+	group.add(func(observer metric.Observer, collected middleend.ServiceSnapshot) {
+		snapshot := collected.ResponseBudget
 		if snapshot.LimitBytes == 0 {
-			return nil
+			return
 		}
 		observer.ObserveInt64(used, int64(snapshot.UsedBytes))
 		observer.ObserveInt64(limit, int64(snapshot.LimitBytes))
@@ -59,11 +60,12 @@ func registerMiddleEndResponseMemoryMetrics(meter metric.Meter, provider MiddleE
 		} {
 			observer.ObserveInt64(stageUsed, int64(snapshot.StageBytes[stage.stage]), metric.WithAttributes(attribute.String("stage", stage.name)))
 		}
-		return nil
 	}, used, limit, highWater, classUsed, classLimit, stageUsed)
 }
 
-func registerMiddleEndResponseWaitMetrics(meter metric.Meter, provider middleEndFrontendStatsProvider) {
+func registerMiddleEndResponseWaitMetrics(group *snapshotMetricGroup[gproxy.MiddleEndFrontendStats]) {
+	meter := group.meter
+
 	entered, _ := meter.Int64ObservableCounter("telego_middleend_response_admission_waits_total",
 		metric.WithDescription("ME frontend response admission wait intervals entered during the frontend lifetime"))
 	completed, _ := meter.Int64ObservableCounter("telego_middleend_response_admission_waits_completed_total",
@@ -75,8 +77,8 @@ func registerMiddleEndResponseWaitMetrics(meter metric.Meter, provider middleEnd
 	stalls, _ := meter.Int64ObservableCounter("telego_middleend_response_output_stall_closures_total",
 		metric.WithDescription("ME frontend clients closed after the independent output no-progress deadline expired"))
 
-	meter.RegisterCallback(func(_ context.Context, observer metric.Observer) error {
-		stats := provider.MiddleEndFrontendStats()
+	group.add(func(observer metric.Observer, collected gproxy.MiddleEndFrontendStats) {
+		stats := collected
 		for reason := middleend.ResponseOutputClientBuffer; reason < middleend.ResponseOutputWaitCount; reason++ {
 			attributes := metric.WithAttributes(attribute.String("reason", reason.String()))
 			observer.ObserveInt64(entered, metricValue(stats.ResponseWaitsTotal[reason]), attributes)
@@ -85,6 +87,5 @@ func registerMiddleEndResponseWaitMetrics(meter metric.Meter, provider middleEnd
 			observer.ObserveInt64(active, stats.ResponseWaitsActive[reason], attributes)
 		}
 		observer.ObserveInt64(stalls, metricValue(stats.ResponseStallClosures))
-		return nil
 	}, entered, completed, duration, active, stalls)
 }

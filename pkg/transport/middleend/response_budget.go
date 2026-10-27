@@ -73,7 +73,7 @@ type ResponseBudget struct {
 	used                   int
 	highWater              int
 	allocations            int
-	participants           *ResponseParticipant
+	pressureCandidates     *ResponseParticipant
 	participantCount       int
 	backloggedParticipants int
 	asyncPressureEvictions int

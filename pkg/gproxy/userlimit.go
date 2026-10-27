@@ -1,6 +1,7 @@
 package gproxy
 
 import (
+	"encoding/binary"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -15,7 +16,8 @@ const (
 	userLimiterShardMask = userLimiterShards - 1
 
 	// Secret key size (16 bytes)
-	secretKeySize = 16
+	secretKeySize         = 16
+	userReleasePrefixSize = secretKeySize + 8
 
 	// Max IPs to track per user when limiting is disabled (for stats only)
 	statsOnlyMaxIPs = 10000
@@ -41,7 +43,8 @@ type userIPState struct {
 	secretName string
 
 	// Active IPs with connection count (LRU)
-	activeIPs *lru.Cache[string, *int64]
+	activeIPs      *lru.Cache[string, *userIPEntry]
+	nextGeneration uint64
 
 	// Blocked IPs with TTL, protected by the user shard lock.
 	// Nil when limiting is disabled.
@@ -57,6 +60,13 @@ type userIPState struct {
 	// Whether this user state has limiting enabled
 	limitingEnabled bool
 	blockTimeout    time.Duration
+}
+
+// An opaque release key identifies this entry, not a later incarnation of
+// the same IP after eviction. The user shard serializes all entry access.
+type userIPEntry struct {
+	key   string
+	count int64
 }
 
 // UserIPStats contains statistics for a single user.
@@ -123,11 +133,11 @@ func (l *UserIPLimiter) getOrCreateUserState(shard *userLimiterShard, secretKey 
 
 	if l.limitingEnabled {
 		// Limiting mode: use configured max with eviction callback
-		activeIPs, _ := lru.NewWithEvict[string, *int64](l.maxIPsPerUser, func(ip string, countPtr *int64) {
+		activeIPs, _ := lru.NewWithEvict[string, *userIPEntry](l.maxIPsPerUser, func(ip string, entry *userIPEntry) {
 			// Only block IPs that still have active connections when evicted.
 			// IPs that had legitimately disconnected (count=0) should not be blocked -
 			// they're just being removed to make room for new IPs.
-			if state.blockedIPs != nil && atomic.LoadInt64(countPtr) > 0 {
+			if state.blockedIPs != nil && entry.count > 0 {
 				state.blockedIPs.add(ip)
 				state.blockedTotal.Add(1)
 			}
@@ -140,7 +150,7 @@ func (l *UserIPLimiter) getOrCreateUserState(shard *userLimiterShard, secretKey 
 		)
 	} else {
 		// Stats-only mode: large LRU for tracking, no blocking
-		activeIPs, _ := lru.New[string, *int64](statsOnlyMaxIPs)
+		activeIPs, _ := lru.New[string, *userIPEntry](statsOnlyMaxIPs)
 		state.activeIPs = activeIPs
 		// blockedIPs stays nil - no blocking in stats-only mode
 	}
@@ -181,29 +191,31 @@ func (l *UserIPLimiter) TryAcquire(ip net.IP, secret []byte, secretName string) 
 	}
 
 	// Check if IP is already active
-	if countPtr, exists := state.activeIPs.Get(ipStr); exists {
+	if entry, exists := state.activeIPs.Get(ipStr); exists {
 		// Increment connection count
-		atomic.AddInt64(countPtr, 1)
-		// Build key: secret + IP
-		return string(secretKey[:]) + ipStr, true
+		entry.count++
+		return entry.key, true
 	}
 
 	// New IP - add to active (may trigger eviction of oldest when limiting)
-	var count int64 = 1
-	state.activeIPs.Add(ipStr, &count)
-
-	return string(secretKey[:]) + ipStr, true
+	state.nextGeneration++
+	var prefix [userReleasePrefixSize]byte
+	copy(prefix[:], secretKey[:])
+	binary.LittleEndian.PutUint64(prefix[secretKeySize:], state.nextGeneration)
+	key = string(prefix[:]) + ipStr
+	state.activeIPs.Add(ipStr, &userIPEntry{key: key, count: 1})
+	return key, true
 }
 
 // Release releases a connection slot.
 func (l *UserIPLimiter) Release(key string) {
-	if l == nil || len(key) <= secretKeySize {
+	if l == nil || len(key) <= userReleasePrefixSize {
 		return
 	}
 
 	var secretKey [secretKeySize]byte
 	copy(secretKey[:], key[:secretKeySize])
-	ipStr := key[secretKeySize:]
+	ipStr := key[userReleasePrefixSize:]
 
 	shardIdx := getShardIdx(secretKey[:])
 	shard := &l.shards[shardIdx]
@@ -218,15 +230,15 @@ func (l *UserIPLimiter) Release(key string) {
 
 	// Use Peek instead of Get to avoid moving the IP to front of LRU.
 	// Releasing a connection shouldn't affect eviction order.
-	countPtr, exists := state.activeIPs.Peek(ipStr)
-	if !exists {
+	entry, exists := state.activeIPs.Peek(ipStr)
+	if !exists || entry.key != key {
 		return
 	}
 
 	// Decrement connection count.
 	// Keep IP in LRU even at 0 connections - preserves LRU ordering.
 	// Will be evicted naturally when other IPs need the slot.
-	atomic.AddInt64(countPtr, -1)
+	entry.count--
 }
 
 // TrafficCounters returns pointers to traffic counters for a user.
@@ -270,8 +282,8 @@ func (l *UserIPLimiter) Stats() []UserIPStats {
 			var activeIPs int
 			trackedKeys := state.activeIPs.Keys()
 			for _, ip := range trackedKeys {
-				if countPtr, ok := state.activeIPs.Peek(ip); ok {
-					count := atomic.LoadInt64(countPtr)
+				if entry, ok := state.activeIPs.Peek(ip); ok {
+					count := entry.count
 					totalConns += count
 					if count > 0 {
 						activeIPs++

@@ -1,15 +1,15 @@
 package metrics
 
 import (
-	"context"
-
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 
 	"github.com/scratch-net/telego/pkg/transport/middleend"
 )
 
-func registerMiddleEndResponsePressureMetrics(meter metric.Meter, provider MiddleEndStatsProvider) {
+func registerMiddleEndResponsePressureMetrics(group *snapshotMetricGroup[middleend.ServiceSnapshot]) {
+	meter := group.meter
+
 	evictions, _ := meter.Int64ObservableCounter("telego_middleend_response_pressure_evictions_total",
 		metric.WithDescription("ME client bindings evicted by response pressure during the service lifetime"))
 	discarded, _ := meter.Int64ObservableCounter("telego_middleend_response_pressure_discarded_bytes_total",
@@ -19,8 +19,8 @@ func registerMiddleEndResponsePressureMetrics(meter metric.Meter, provider Middl
 	selections, _ := meter.Int64ObservableCounter("telego_middleend_response_pressure_selections_total",
 		metric.WithDescription("Shared ME response-pressure closures by selection rule during the service lifetime; excludes failed or canceled selections"))
 
-	meter.RegisterCallback(func(_ context.Context, observer metric.Observer) error {
-		snapshot := provider.Snapshot().Supervisor
+	group.add(func(observer metric.Observer, collected middleend.ServiceSnapshot) {
+		snapshot := collected.Supervisor
 		for limit := middleend.ResponsePressureBindingItems; limit < middleend.ResponsePressureLimitCount; limit++ {
 			attributes := metric.WithAttributes(attribute.String("limit", limit.String()))
 			observer.ObserveInt64(evictions, metricValue(snapshot.ResponsePressureEvictions[limit]), attributes)
@@ -30,6 +30,5 @@ func registerMiddleEndResponsePressureMetrics(meter metric.Meter, provider Middl
 		for rule := middleend.ResponsePressureLargestBacklog; rule < middleend.ResponsePressureSelectionReasonCount; rule++ {
 			observer.ObserveInt64(selections, metricValue(snapshot.ResponsePressureSelections[rule]), metric.WithAttributes(attribute.String("rule", rule.String())))
 		}
-		return nil
 	}, evictions, discarded, reclaimed, selections)
 }

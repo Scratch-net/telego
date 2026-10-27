@@ -504,10 +504,15 @@ func (c *VersionCmd) Run() error {
 }
 
 func main() {
+	defer log.Close()
 	ctx := kong.Parse(&CLI,
 		kong.Name("telego"),
 		kong.Description("Production-grade Telegram MTProxy"),
 		kong.UsageOnError(),
+		kong.Exit(func(code int) {
+			_ = log.Close()
+			os.Exit(code)
+		}),
 	)
 	err := ctx.Run()
 	ctx.FatalIfErrorf(err)
