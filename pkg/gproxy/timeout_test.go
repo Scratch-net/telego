@@ -2,8 +2,6 @@ package gproxy
 
 import (
 	"context"
-	"fmt"
-	"math/rand"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -13,9 +11,16 @@ import (
 )
 
 func TestHandshakeTimeout_SilentConnection(t *testing.T) {
-	port := fmt.Sprintf("%d", 30000+rand.Intn(10000))
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve test address: %v", err)
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatalf("release test address: %v", err)
+	}
 	cfg := &Config{
-		BindAddr:         "127.0.0.1:" + port,
+		BindAddr:         address,
 		HandshakeTimeout: 2 * time.Second,
 		Secrets: []Secret{
 			{Name: "test", Key: []byte("0123456789abcdef"), Host: "example.com"},
@@ -35,7 +40,7 @@ func TestHandshakeTimeout_SilentConnection(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- gnet.Run(wrapper, "tcp://127.0.0.1:"+port,
+		errCh <- gnet.Run(wrapper, "tcp://"+address,
 			gnet.WithNumEventLoop(1),
 		)
 	}()
@@ -57,7 +62,7 @@ func TestHandshakeTimeout_SilentConnection(t *testing.T) {
 	}()
 
 	// Open a silent connection (no data sent)
-	conn, err := net.Dial("tcp", "127.0.0.1:"+port)
+	conn, err := net.Dial("tcp", address)
 	if err != nil {
 		t.Fatalf("failed to connect: %v", err)
 	}
