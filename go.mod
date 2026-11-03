@@ -5,7 +5,7 @@ replace github.com/panjf2000/gnet/v2 => ./third_party/gnet
 go 1.27.3
 
 require (
-	github.com/alecthomas/kong v1.16.1
+	github.com/alecthomas/kong v1.17.0
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/gobwas/ws v1.4.0
 	github.com/gotd/td v0.162.0
