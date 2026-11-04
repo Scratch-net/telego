@@ -111,7 +111,7 @@ func (cli *Client) start() error {
 	}
 
 	var el0 *eventloop
-	for i := 0; i < numEventLoop; i++ {
+	for range numEventLoop {
 		p, err := netpoll.OpenPoller()
 		if err != nil {
 			return err

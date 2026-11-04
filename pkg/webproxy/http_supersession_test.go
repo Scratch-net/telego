@@ -161,8 +161,8 @@ func newSupersessionHTTPFixture(t *testing.T) *supersessionHTTPFixture {
 		t.Fatal("cannot queue response")
 	}
 	owner := &supersessionHTTPOwner{
-		budgetTestOwner: budgetTestOwner{queue: make(chan gnet.Runnable, 4)},
-		submitted:       make(chan error, 4),
+		queue:     make(chan gnet.Runnable, 4),
+		submitted: make(chan error, 4),
 	}
 	connection := &supersessionHTTPConn{owner: owner, writes: make(chan supersessionHTTPWrite, 1), buffered: 1}
 	state := &httpConnectionState{}

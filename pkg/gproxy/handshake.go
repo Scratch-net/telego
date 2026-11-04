@@ -265,8 +265,10 @@ func (h *ProxyHandler) handleTLSPayload(c clientEndpoint, ctx *ConnContext) gnet
 		defer release()
 	}
 
-	// Check replay
-	if h.replayCache.Seen(hello.SessionID) {
+	// Session IDs can be empty or reused. The first 28 random bytes are the
+	// verified HMAC; exclude the timestamp encoding so changing only the
+	// timestamp cannot bypass replay detection.
+	if h.replayCache.Seen(hello.Random[:28]) {
 		h.logger.Debug("[#%d] replay attack detected", ctx.id)
 		return h.startSplice(c, ctx)
 	}

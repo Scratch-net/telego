@@ -78,18 +78,16 @@ func (rb *Buffer) Peek(n int) (head []byte, tail []byte) {
 	}
 
 	if rb.w > rb.r {
-		m := rb.w - rb.r // length of ring-buffer
-		if m > n {
-			m = n
-		}
+		m := min(
+			// length of ring-buffer
+			rb.w-rb.r, n)
 		head = rb.buf[rb.r : rb.r+m]
 		return
 	}
 
-	m := rb.size - rb.r + rb.w // length of ring-buffer
-	if m > n {
-		m = n
-	}
+	m := min(
+		// length of ring-buffer
+		rb.size-rb.r+rb.w, n)
 
 	if rb.r+m <= rb.size {
 		head = rb.buf[rb.r : rb.r+m]
@@ -158,10 +156,7 @@ func (rb *Buffer) Read(p []byte) (n int, err error) {
 	}
 
 	if rb.w > rb.r {
-		n = rb.w - rb.r
-		if n > len(p) {
-			n = len(p)
-		}
+		n = min(rb.w-rb.r, len(p))
 		copy(p, rb.buf[rb.r:rb.r+n])
 		rb.r += n
 		if rb.r == rb.w {
@@ -170,10 +165,7 @@ func (rb *Buffer) Read(p []byte) (n int, err error) {
 		return
 	}
 
-	n = rb.size - rb.r + rb.w
-	if n > len(p) {
-		n = len(p)
-	}
+	n = min(rb.size-rb.r+rb.w, len(p))
 
 	if rb.r+n <= rb.size {
 		copy(p, rb.buf[rb.r:rb.r+n])

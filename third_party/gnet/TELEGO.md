@@ -12,12 +12,18 @@ This directory contains the local Telego copy of [gnet v2.10.0](https://github.c
 The root module uses this directory through a local `replace` directive.
 The upstream copyright notices, license, and tests remain in this copy.
 The local module files use Go 1.27.3 and updated dependencies, including the test dependencies.
+Reviewed Go 1.27 `go fix` updates use integer-range loops, typed atomics, and standard-library helpers.
+The updates cover both the default and optimized build variants.
 
 ## Local changes
 
 Telego maintains local changes for client shutdown completion, enrollment ownership, and registration errors.
 Poller changes serialize notifications with descriptor closure and discard queued tasks after the owner stops.
 Modified source files identify the Telego changes. The upstream copyright notices remain.
+
+Linux TCP listeners recover from pending-connection network errors without stopping the engine.
+Resource exhaustion and permanent listener errors retain their existing shutdown behavior.
+The accept regression gate injects errors through temporary source overlays; production syscalls have no test hooks.
 
 The optional `OwnedWriter` API retains caller-owned output slices until socket drain or disposal.
 Telego charges each complete allocation until its release callback runs. Partial writes do not release that charge.

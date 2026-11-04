@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/alecthomas/kong"
-	"github.com/pion/stun/v3"
+	"github.com/pion/stun/v4"
 
 	"github.com/scratch-net/telego/pkg/config"
 	"github.com/scratch-net/telego/pkg/gproxy"

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand/v2"
 	"slices"
 	"sync"
@@ -1130,9 +1131,7 @@ func (s *FixedBindingGenerationSupervisor) Snapshot() GenerationSupervisorSnapsh
 	}
 	var activeManager, retiringManager *FixedBindingManager
 	counters := make(map[DCID]FixedBindingDCSnapshot, len(state.dcCounters))
-	for dcID, dc := range state.dcCounters {
-		counters[dcID] = dc
-	}
+	maps.Copy(counters, state.dcCounters)
 	if state.active != nil {
 		result.ActiveDCIDs = slices.Clone(state.active.dcIDs)
 		activeManager = state.active.manager

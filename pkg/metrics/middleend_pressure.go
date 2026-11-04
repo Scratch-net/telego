@@ -21,13 +21,13 @@ func registerMiddleEndResponsePressureMetrics(group *snapshotMetricGroup[middlee
 
 	group.add(func(observer metric.Observer, collected middleend.ServiceSnapshot) {
 		snapshot := collected.Supervisor
-		for limit := middleend.ResponsePressureBindingItems; limit < middleend.ResponsePressureLimitCount; limit++ {
+		for limit := range middleend.ResponsePressureLimitCount {
 			attributes := metric.WithAttributes(attribute.String("limit", limit.String()))
 			observer.ObserveInt64(evictions, metricValue(snapshot.ResponsePressureEvictions[limit]), attributes)
 			observer.ObserveInt64(discarded, metricValue(snapshot.ResponsePressureDiscardedBytes[limit]), attributes)
 			observer.ObserveInt64(reclaimed, metricValue(snapshot.ResponsePressureReclaimedBytes[limit]), attributes)
 		}
-		for rule := middleend.ResponsePressureLargestBacklog; rule < middleend.ResponsePressureSelectionReasonCount; rule++ {
+		for rule := range middleend.ResponsePressureSelectionReasonCount {
 			observer.ObserveInt64(selections, metricValue(snapshot.ResponsePressureSelections[rule]), metric.WithAttributes(attribute.String("rule", rule.String())))
 		}
 	}, evictions, discarded, reclaimed, selections)

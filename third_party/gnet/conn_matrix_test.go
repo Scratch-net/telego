@@ -66,7 +66,7 @@ func testConnMatrix(t *testing.T, n int) {
 	})
 	require.NoError(t, err)
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		c := newStreamConn("tcp", i, &el, &unix.SockaddrInet4{}, &net.TCPAddr{}, &net.TCPAddr{})
 		handleConns <- &handleConn{c, actionAdd}
 		if i%2 == 0 {
@@ -82,7 +82,7 @@ func testConnMatrix(t *testing.T, n int) {
 		t.Fatalf("unexpected conn count %d, expected %d", count, int32(n)/2)
 	}
 
-	for i := 0; i < len(connections.table); i++ {
+	for i := range len(connections.table) {
 		if connections.connCounts[i] == 0 {
 			continue
 		}

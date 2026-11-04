@@ -106,14 +106,12 @@ func TestTelegoClientConcurrentStopAndAutomaticDone(t *testing.T) {
 	lifecycleWait(t, c.Done())
 	lifecyclePeerEOF(t, peer)
 	var wait sync.WaitGroup
-	for i := 0; i < 16; i++ {
-		wait.Add(1)
-		go func() {
-			defer wait.Done()
+	for range 16 {
+		wait.Go(func() {
 			if stopErr := c.Stop(); stopErr != c.Err() {
 				t.Errorf("Stop = %v, Err = %v", stopErr, c.Err())
 			}
-		}()
+		})
 	}
 	wait.Wait()
 	if got := h.shutdowns.Load(); got != 1 {

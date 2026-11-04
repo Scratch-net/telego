@@ -136,7 +136,7 @@ func (p *Poller) Polling(callback PollEventHandler) error {
 		}
 		msec = 0
 
-		for i := 0; i < n; i++ {
+		for i := range n {
 			ev := &el.events[i]
 			if fd := int(ev.Fd); fd == p.efd { // poller is awakened to run tasks in queues.
 				doChores = true
@@ -158,7 +158,7 @@ func (p *Poller) Polling(callback PollEventHandler) error {
 					return err
 				}
 			}
-			for i := 0; i < MaxAsyncTasksAtOneTime; i++ {
+			for range MaxAsyncTasksAtOneTime {
 				if task = p.asyncTaskQueue.Dequeue(); task == nil {
 					break
 				}

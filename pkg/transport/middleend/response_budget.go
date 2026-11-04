@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sync"
 	"unsafe"
 )
@@ -405,10 +406,8 @@ func (a *ResponseAllocation) tryMoveReplacing(capacity int, class ResponseMemory
 			}
 			owner = other.owner
 		}
-		for _, earlier := range consumed[:index] {
-			if earlier == other {
-				return false
-			}
+		if slices.Contains(consumed[:index], other) {
+			return false
 		}
 		if other.class == class {
 			available += other.bytes

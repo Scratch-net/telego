@@ -57,8 +57,7 @@ func TestOwnedWriteBoundedDescriptorsPreserveReentry(t *testing.T) {
 			expected := make([]byte, 1+4*count)
 			expected[0] = 'P'
 			_, _ = c.outboundBuffer.Write(expected[:1])
-			for index := 0; index < count; index++ {
-				index := index
+			for index := range count {
 				data := make([]byte, 4)
 				binary.LittleEndian.PutUint32(data, uint32(index))
 				copy(expected[1+4*index:], data)

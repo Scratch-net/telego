@@ -94,7 +94,7 @@ func (eng *engine) runEventLoops(ctx context.Context, numEventLoop int) error {
 	var el0 *eventloop
 	lns := eng.listeners
 	// Create loops locally and bind the listeners.
-	for i := 0; i < numEventLoop; i++ {
+	for i := range numEventLoop {
 		if i > 0 {
 			lns = make(map[int]*listener, len(eng.listeners))
 			for _, l := range eng.listeners {
@@ -154,7 +154,7 @@ func (eng *engine) runEventLoops(ctx context.Context, numEventLoop int) error {
 }
 
 func (eng *engine) activateReactors(ctx context.Context, numEventLoop int) error {
-	for i := 0; i < numEventLoop; i++ {
+	for range numEventLoop {
 		p, err := netpoll.OpenPoller()
 		if err != nil {
 			return err

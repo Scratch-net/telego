@@ -1,6 +1,6 @@
 services:
   nginx:
-    image: nginx:alpine
+    image: nginx:1.31.8-alpine@sha256:785835ea65db4bba6f021acc0f3be91b0fef76a53fe41f8588c6698d2aed0606
     restart: unless-stopped
     logging:
       driver: local
@@ -38,7 +38,7 @@ services:
     command: ["run", "-c", "/config.toml"]
 
   certbot:
-    image: certbot/certbot:latest
+    image: certbot/certbot:v5.9.0@sha256:bc93cb710b413e6b456d622f9b0133b3e109c0a78c2ed9976af43d209b0a1805
     restart: unless-stopped
     logging:
       driver: local
@@ -65,7 +65,7 @@ services:
         done
 
   certbot-init:
-    image: certbot/certbot:latest
+    image: certbot/certbot:v5.9.0@sha256:bc93cb710b413e6b456d622f9b0133b3e109c0a78c2ed9976af43d209b0a1805
     profiles: ["setup"]
     volumes:
       - ./state/letsencrypt/conf:/etc/letsencrypt

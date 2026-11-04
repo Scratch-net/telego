@@ -89,7 +89,7 @@ func TestPollerCloseRejectsLateTriggerAndPreservesReusedFDs(t *testing.T) {
 			_ = unix.Close(descriptor)
 		}
 	}()
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		descriptor, err := unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
 		if err != nil {
 			t.Fatal(err)
@@ -100,11 +100,9 @@ func TestPollerCloseRejectsLateTriggerAndPreservesReusedFDs(t *testing.T) {
 		t.Skip("another runtime operation reused a closed descriptor before this test")
 	}
 	var workers sync.WaitGroup
-	for i := 0; i < 32; i++ {
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
-			for j := 0; j < 32; j++ {
+	for range 32 {
+		workers.Go(func() {
+			for range 32 {
 				if err := poller.Trigger(queue.LowPriority, func(any) error { panic("late callback") }, nil); !errors.Is(err, os.ErrClosed) {
 					t.Errorf("late Trigger = %v, want closed", err)
 				}
@@ -112,7 +110,7 @@ func TestPollerCloseRejectsLateTriggerAndPreservesReusedFDs(t *testing.T) {
 					t.Errorf("repeated Close = %v", err)
 				}
 			}
-		}()
+		})
 	}
 	workers.Wait()
 	for _, descriptor := range replacements {

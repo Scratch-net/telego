@@ -12,8 +12,48 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pion/stun/v3"
+	"github.com/pion/stun/v4"
 )
+
+func TestSTUNResponseIntegrityAttributeOrdering(t *testing.T) {
+	mapped := &stun.XORMappedAddress{IP: net.IPv4(8, 8, 8, 8), Port: 12345}
+	integrity := stun.NewShortTermIntegrity("synthetic-stun-password")
+	for _, test := range []struct {
+		name    string
+		setters []stun.Setter
+		accept  bool
+	}{
+		{name: "address before integrity", setters: []stun.Setter{mapped, integrity}, accept: true},
+		{name: "address after integrity", setters: []stun.Setter{integrity, mapped}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			setters := append([]stun.Setter{stun.TransactionID, stun.BindingSuccess}, test.setters...)
+			encoded, err := stun.Build(setters...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !encoded.Contains(stun.AttrXORMappedAddress) || !encoded.Contains(stun.AttrMessageIntegrity) {
+				t.Fatal("test response does not contain both address and integrity attributes")
+			}
+			response := &stun.Message{Raw: encoded.Raw}
+			if err := response.Decode(); err != nil {
+				t.Fatal(err)
+			}
+			if err := integrity.Check(response); err != nil {
+				t.Fatalf("test response integrity = %v", err)
+			}
+			address, err := decodeSTUNResponse(response, AddressFamilyIPv4)
+			if test.accept {
+				if err != nil || address != netip.MustParseAddr("8.8.8.8") {
+					t.Fatalf("canonical STUN response = %s, %v", address, err)
+				}
+			} else if !errors.Is(err, stun.ErrAttributeNotFound) || address.IsValid() {
+				// An address after MESSAGE-INTEGRITY is outside its authenticated prefix.
+				t.Fatalf("STUN response with unauthenticated address = %s, %v", address, err)
+			}
+		})
+	}
+}
 
 type observedSTUNConn struct {
 	net.Conn

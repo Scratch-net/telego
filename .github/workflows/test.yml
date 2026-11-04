@@ -11,7 +11,7 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
       - name: Test RPM workflow
         run: make test-rpm
@@ -20,7 +20,7 @@ jobs:
         run: make test-synlimit
 
       - name: Set up Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@v7.0.0
         with:
           go-version-file: 'go.mod'
 
@@ -31,9 +31,9 @@ jobs:
         run: make test-web-nginx
 
       - name: Set up Node for bridge behavior tests
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@v7.1.0
         with:
-          node-version: '24'
+          node-version: '26.13.0'
           package-manager-cache: false
 
       - name: Build
@@ -55,7 +55,7 @@ jobs:
         run: sh dist/test-go.sh -coverprofile=coverage.out -covermode=atomic ./pkg/...
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v7
+        uses: codecov/codecov-action@v7.1.1
         with:
           files: coverage.out
           fail_ci_if_error: false
@@ -65,10 +65,10 @@ jobs:
     name: Local gnet patch regressions
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
       - name: Set up Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@v7.0.0
         with:
           go-version-file: 'go.mod'
           cache-dependency-path: |
@@ -84,16 +84,16 @@ jobs:
     needs: [test, test-gnet]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@v4.4.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@v4.4.1
 
       - name: Login to Docker Hub
-        uses: docker/login-action@v4
+        uses: docker/login-action@v4.7.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -106,7 +106,7 @@ jobs:
           echo "date=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
 
       - name: Build and push
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@v7.4.0
         with:
           context: .
           file: dist/Dockerfile.ci

@@ -810,7 +810,7 @@ func TestClientSafeContext(t *testing.T) {
 	defer ln.Close() //nolint:errcheck
 
 	err = goPool.DefaultWorkerPool.Submit(func() {
-		for i := 0; i < 5; i++ {
+		for range 5 {
 			conn, err := ln.Accept()
 			if err != nil {
 				return

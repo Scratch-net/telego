@@ -14,7 +14,7 @@
 
 //go:build darwin || dragonfly || freebsd || linux || netbsd || openbsd
 
-// Telego local modification: queued accepts retain explicit descriptor ownership. See TELEGO.md.
+// Telego local modification: explicit accept ownership and pending TCP error recovery. See TELEGO.md.
 package gnet
 
 import (
@@ -41,6 +41,12 @@ func (el *eventloop) accept0(fd int, _ netpoll.IOEvent, _ netpoll.IOFlags) error
 			// It's a silly error, let's retry it.
 			continue
 		default:
+			if isPendingTCPAcceptError(el.listeners[fd].network, err) {
+				if el.engine.isStopping() {
+					return errors.ErrEngineShutdown
+				}
+				continue
+			}
 			el.getLogger().Errorf("Accept() failed due to error: %v", err)
 			return errors.ErrAcceptSocket
 		}
@@ -88,6 +94,12 @@ func (el *eventloop) accept(fd int, ev netpoll.IOEvent, flags netpoll.IOFlags) e
 		// It's a silly error, let's retry it.
 		return nil
 	default:
+		if isPendingTCPAcceptError(network, err) {
+			if el.engine.isStopping() {
+				return errors.ErrEngineShutdown
+			}
+			return nil
+		}
 		el.getLogger().Errorf("Accept() failed due to error: %v", err)
 		return errors.ErrAcceptSocket
 	}

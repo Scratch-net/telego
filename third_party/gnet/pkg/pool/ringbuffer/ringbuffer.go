@@ -48,10 +48,10 @@ type RingBuffer = ring.Buffer
 // memory waste.
 type Pool struct {
 	calls       [steps]uint64
-	calibrating uint64
+	calibrating atomic.Uint64
 
-	defaultSize uint64
-	maxSize     uint64
+	defaultSize atomic.Uint64
+	maxSize     atomic.Uint64
 
 	pool sync.Pool
 }
@@ -74,7 +74,7 @@ func (p *Pool) Get() *RingBuffer {
 	if v != nil {
 		return v.(*RingBuffer)
 	}
-	return ring.New(int(atomic.LoadUint64(&p.defaultSize)))
+	return ring.New(int(p.defaultSize.Load()))
 }
 
 // Put returns byte buffer to the pool.
@@ -93,7 +93,7 @@ func (p *Pool) Put(b *RingBuffer) {
 		p.calibrate()
 	}
 
-	maxSize := int(atomic.LoadUint64(&p.maxSize))
+	maxSize := int(p.maxSize.Load())
 	if maxSize == 0 || b.Cap() <= maxSize {
 		b.Reset()
 		p.pool.Put(b)
@@ -101,13 +101,13 @@ func (p *Pool) Put(b *RingBuffer) {
 }
 
 func (p *Pool) calibrate() {
-	if !atomic.CompareAndSwapUint64(&p.calibrating, 0, 1) {
+	if !p.calibrating.CompareAndSwap(0, 1) {
 		return
 	}
 
 	a := make(callSizes, 0, steps)
 	var callsSum uint64
-	for i := uint64(0); i < steps; i++ {
+	for i := range uint64(steps) {
 		calls := atomic.SwapUint64(&p.calls[i], 0)
 		callsSum += calls
 		a = append(a, callSize{
@@ -122,7 +122,7 @@ func (p *Pool) calibrate() {
 
 	maxSum := uint64(float64(callsSum) * maxPercentile)
 	callsSum = 0
-	for i := 0; i < steps; i++ {
+	for i := range steps {
 		if callsSum > maxSum {
 			break
 		}
@@ -133,10 +133,10 @@ func (p *Pool) calibrate() {
 		}
 	}
 
-	atomic.StoreUint64(&p.defaultSize, defaultSize)
-	atomic.StoreUint64(&p.maxSize, maxSize)
+	p.defaultSize.Store(defaultSize)
+	p.maxSize.Store(maxSize)
 
-	atomic.StoreUint64(&p.calibrating, 0)
+	p.calibrating.Store(0)
 }
 
 type callSize struct {

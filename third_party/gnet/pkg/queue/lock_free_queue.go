@@ -86,7 +86,7 @@ import (
 type lockFreeQueue struct {
 	head   unsafe.Pointer
 	tail   unsafe.Pointer
-	length int32
+	length atomic.Int32
 }
 
 type node struct {
@@ -113,7 +113,7 @@ retry:
 			if cas(&tail.next, next, n) { // enqueue is done.
 				// Try to swing tail to the inserted node.
 				cas(&q.tail, tail, n)
-				atomic.AddInt32(&q.length, 1)
+				q.length.Add(1)
 				return
 			}
 		} else { // tail was not pointing to the last node
@@ -144,7 +144,7 @@ retry:
 			// Read value before CAS, otherwise another dequeue might free the next node.
 			task := next.value
 			if cas(&q.head, head, next) { // dequeue is done, return value.
-				atomic.AddInt32(&q.length, -1)
+				q.length.Add(-1)
 				return task
 			}
 		}
@@ -154,12 +154,12 @@ retry:
 
 // IsEmpty indicates whether this queue is empty or not.
 func (q *lockFreeQueue) IsEmpty() bool {
-	return atomic.LoadInt32(&q.length) == 0
+	return q.length.Load() == 0
 }
 
 // Length returns the number of elements in the queue.
 func (q *lockFreeQueue) Length() int32 {
-	return atomic.LoadInt32(&q.length)
+	return q.length.Load()
 }
 
 func load(p *unsafe.Pointer) (n *node) {

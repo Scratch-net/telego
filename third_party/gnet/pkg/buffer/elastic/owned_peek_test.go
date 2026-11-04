@@ -17,8 +17,7 @@ func TestOwnedBufferPeekIntoBoundsTinyBacklog(t *testing.T) {
 	const count = 100000
 	released := make([]int, count)
 	_, _ = buffer.Write([]byte("P"))
-	for index := 0; index < count; index++ {
-		index := index
+	for index := range count {
 		data := make([]byte, 4)
 		binary.LittleEndian.PutUint32(data, uint32(index))
 		buffer.AppendOwned(data, func(err error) {

@@ -2003,7 +2003,7 @@ func batchSendAndRecv(t *testing.T, c net.Conn, rd *bufio.Reader, packetSize, ba
 		buf       []byte
 		packetLen int
 	)
-	for i := 0; i < batch; i++ {
+	for range batch {
 		req := make([]byte, packetSize)
 		_, err := crand.Read(req)
 		assert.NoError(t, err)
@@ -2774,7 +2774,7 @@ func (s *testSafeContextServer) OnBoot(Engine) (action Action) {
 		assert.NoError(s.tester, err)
 		defer c.Close() //nolint:errcheck
 
-		for i := 0; i < 5; i++ {
+		for range 5 {
 			_, err = c.Write([]byte("ping"))
 			assert.NoError(s.tester, err)
 			buf := make([]byte, 4)

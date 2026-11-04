@@ -16,7 +16,7 @@ func TestLinkedListBuffer_Basic(t *testing.T) {
 		cum int
 		buf bytes.Buffer
 	)
-	for i := 0; i < maxBlocks; i++ {
+	for range maxBlocks {
 		n := rand.Intn(1024) + 128
 		cum += n
 		data := make([]byte, n)
@@ -108,7 +108,7 @@ func TestLinkedListBuffer_WriteTo(t *testing.T) {
 		cum int
 		buf bytes.Buffer
 	)
-	for i := 0; i < maxBlocks; i++ {
+	for range maxBlocks {
 		n := rand.Intn(1024) + 128
 		cum += n
 		data := make([]byte, n)
@@ -130,7 +130,7 @@ func TestLinkedListBuffer_WriteTo(t *testing.T) {
 	buf.Reset()
 	newBuf.Reset()
 	cum = 0
-	for i := 0; i < maxBlocks; i++ {
+	for range maxBlocks {
 		n := rand.Intn(1024) + 128
 		cum += n
 		data := make([]byte, n)

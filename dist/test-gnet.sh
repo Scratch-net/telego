@@ -22,6 +22,7 @@ cd "$test_root/third_party/gnet"
 
 # Run only the regressions for Telego's local patches, not the upstream suite.
 test_names='TestTelegoClientStartFailureCompletesOnce
+TestTelegoPendingTCPAcceptErrors
 TestTelegoServerPartialStartFailureClosesPreparedPoller
 TestTelegoClientConcurrentStopAndAutomaticDone
 TestTelegoClientStopBeforeAndDuringStart
@@ -52,3 +53,7 @@ sh "$test_root/dist/test-go.sh" "$@" -race . ./pkg/netpoll ./pkg/buffer/elastic
 sh "$test_root/dist/test-go.sh" "$@" -race -tags=gc_opt . ./pkg/netpoll ./pkg/buffer/elastic
 # poll_opt uses unsafe attachments that are incompatible with race checkptr.
 sh "$test_root/dist/test-go.sh" "$@" -tags=poll_opt,gc_opt . ./pkg/netpoll ./pkg/buffer/elastic
+
+# Inject accept failures only through temporary source overlays, never a hook
+# or indirect syscall call in production. Covers both listener polling modes.
+python3 "$test_root/dist/test-gnet-accept.py"

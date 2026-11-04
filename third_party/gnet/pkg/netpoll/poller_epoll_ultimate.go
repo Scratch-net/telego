@@ -137,7 +137,7 @@ func (p *Poller) Polling() error {
 		}
 		msec = 0
 
-		for i := 0; i < n; i++ {
+		for i := range n {
 			ev := &el.events[i]
 			pollAttachment := restorePollAttachment(unsafe.Pointer(&ev.data))
 			if pollAttachment.FD == p.epa.FD { // poller is awakened to run tasks in queues.
@@ -160,7 +160,7 @@ func (p *Poller) Polling() error {
 					return err
 				}
 			}
-			for i := 0; i < MaxAsyncTasksAtOneTime; i++ {
+			for range MaxAsyncTasksAtOneTime {
 				if task = p.asyncTaskQueue.Dequeue(); task == nil {
 					break
 				}

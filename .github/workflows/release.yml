@@ -13,17 +13,17 @@ jobs:
     name: Release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@v7.0.0
         with:
           go-version-file: 'go.mod'
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@v4.4.0
 
       - name: Run local gnet patch regressions
         run: make test-gnet
@@ -35,30 +35,30 @@ jobs:
         run: make test-synlimit
 
       - name: Set up Node for bridge behavior tests
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@v7.1.0
         with:
-          node-version: '24'
+          node-version: '26.13.0'
           package-manager-cache: false
 
       - name: Run 32-bit production-tag tests
         run: make test-32
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@v4.4.1
         with:
           driver: docker-container
 
       - name: Login to Docker Hub
-        uses: docker/login-action@v4
+        uses: docker/login-action@v4.7.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v7
+        uses: goreleaser/goreleaser-action@v7.3.0
         with:
           distribution: goreleaser
-          version: latest
+          version: v2.20.0
           args: release --clean -f dist/.goreleaser.yml --release-notes="docs/releases/${{ github.ref_name }}.md"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -54,7 +54,7 @@ func (cm *connMatrix) incCount(row int, delta int32) {
 }
 
 func (cm *connMatrix) loadCount() (n int32) {
-	for i := 0; i < len(cm.connCounts); i++ {
+	for i := range len(cm.connCounts) {
 		n += atomic.LoadInt32(&cm.connCounts[i])
 	}
 	return
