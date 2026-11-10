@@ -27,9 +27,10 @@ import (
 
 func (c *conn) processIO(_ int, ev netpoll.IOEvent, _ netpoll.IOFlags) error {
 	el := c.loop
+	// Telego: defer peer EOF while paused so unread socket bytes survive.
 	// First check for any unexpected non-IO events.
 	// For these events we just close the connection directly.
-	if ev&(netpoll.ErrEvents|unix.EPOLLRDHUP) != 0 && ev&netpoll.ReadWriteEvents == 0 {
+	if !c.readPaused && ev&(netpoll.ErrEvents|unix.EPOLLRDHUP) != 0 && ev&netpoll.ReadWriteEvents == 0 {
 		c.outboundBuffer.Release() // don't bother to write to a connection that is already broken
 		return el.close(c, io.EOF)
 	}
@@ -57,7 +58,7 @@ func (c *conn) processIO(_ int, ev netpoll.IOEvent, _ netpoll.IOFlags) error {
 	}
 	// Ultimately, check for EPOLLRDHUP, this event indicates that the remote has
 	// either closed connection or shut down the writing half of the connection.
-	if ev&unix.EPOLLRDHUP != 0 && c.opened {
+	if ev&unix.EPOLLRDHUP != 0 && c.opened && !c.readPaused {
 		if ev&unix.EPOLLIN == 0 { // unreadable EPOLLRDHUP, close the connection directly
 			return el.close(c, io.EOF)
 		}

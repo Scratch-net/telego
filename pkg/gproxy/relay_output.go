@@ -2,6 +2,7 @@ package gproxy
 
 import (
 	"context"
+	"errors"
 	"net"
 	"sync"
 	"time"
@@ -65,14 +66,12 @@ func (o *relayOutput) reserve(want, minimum int) int {
 	}
 	n := min(want, o.limit-o.queued-o.buffered)
 	if n < minimum || o.inflight >= relayMaxPendingWrites {
-		o.waiting = max(o.waiting, minimum)
-		o.scheduleLocked()
+		o.waitForCapacityLocked(minimum)
 		return 0
 	}
 	if stream, ok := o.source.(*LogicalStream); ok {
 		if !stream.reserveAuxInput(n, 1) {
-			o.waiting = max(o.waiting, minimum)
-			o.scheduleLocked()
+			o.waitForCapacityLocked(minimum)
 			return 0
 		}
 		o.chargedBytes += n
@@ -85,14 +84,43 @@ func (o *relayOutput) reserve(want, minimum int) int {
 			o.chargedBytes -= n
 			o.chargedItems--
 		}
-		o.waiting = max(o.waiting, minimum)
-		o.scheduleLocked()
+		o.waitForCapacityLocked(minimum)
 		return 0
 	}
 	n = granted
 	o.queued += n
 	o.inflight++
 	return n
+}
+
+// waitForCapacityLocked runs on the source owner before any cipher advances.
+func (o *relayOutput) waitForCapacityLocked(minimum int) {
+	o.waiting = max(o.waiting, minimum)
+	if controller, ok := o.source.(gnet.ReadController); ok {
+		if err := controller.PauseRead(); err != nil {
+			// Closing is asynchronous. Do not reenter a relay callback under o.mu.
+			_ = o.source.Close()
+		}
+	}
+	o.scheduleLocked()
+}
+
+func (o *relayOutput) resumeSource() error {
+	if controller, ok := o.source.(gnet.ReadController); ok {
+		return executeClient(o.source, gnet.RunnableFunc(func(context.Context) error {
+			o.mu.Lock()
+			closed := o.closed
+			o.mu.Unlock()
+			if closed {
+				return nil
+			}
+			if err := controller.ResumeRead(); err != nil && !errors.Is(err, net.ErrClosed) {
+				o.fail()
+			}
+			return nil
+		}))
+	}
+	return wakeClient(o.source)
 }
 
 func (o *relayOutput) releaseReservation(n int) {
@@ -183,7 +211,7 @@ func (o *relayOutput) refresh(completed int) {
 	}
 	o.mu.Unlock()
 	if wake {
-		if err := wakeClient(o.source); err != nil {
+		if err := o.resumeSource(); err != nil {
 			o.fail()
 		}
 	}

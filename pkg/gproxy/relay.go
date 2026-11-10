@@ -18,8 +18,8 @@ func (h *ProxyHandler) handleRelay(c clientEndpoint, ctx *ConnContext) gnet.Acti
 		return gnet.None
 	}
 	data, _ := c.Peek(-1)
-	// gnet does not expose a read-pause operation. A peer that keeps sending
-	// while the destination is stalled must not grow its input without bound.
+	// Retain the hard input bound as a protocol/resource guard. Unix streams
+	// suspend socket reads while retained relay input waits for output capacity.
 	if len(data) > max(h.maxWriteBuffer, relayBatchSize) {
 		return gnet.Close
 	}
@@ -103,7 +103,7 @@ func (h *ProxyHandler) handleRelay(c clientEndpoint, ctx *ConnContext) gnet.Acti
 	ctx.recordClientActivity()
 	_, _ = c.Discard(consumed)
 	if len(data)-consumed >= faketls.RecordHeaderSize {
-		if err := wakeClient(c); err != nil {
+		if err := continueRelayInput(c); err != nil {
 			return gnet.Close
 		}
 	}
@@ -142,7 +142,7 @@ func (h *ProxyHandler) handleRelayDD(c clientEndpoint, ctx *ConnContext) gnet.Ac
 	ctx.recordClientActivity()
 	_, _ = c.Discard(n)
 	if len(data) > n {
-		if err := wakeClient(c); err != nil {
+		if err := continueRelayInput(c); err != nil {
 			return gnet.Close
 		}
 	}

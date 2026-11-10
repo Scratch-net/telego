@@ -460,23 +460,34 @@ func (s *LogicalStream) TryRead(dst []byte) (int, error) {
 		s.outputMu.Unlock()
 		return 0, nil
 	}
-	entry := s.output
-	n := copy(dst[:min(len(dst), 64*1024)], entry.data[s.outputOffset:])
-	s.outputOffset += n
-	s.outputBytes -= n
-	drained := s.outputOffset == len(entry.data)
-	if drained {
-		s.output = entry.next
-		if s.output == nil {
-			s.outputLast = nil
+	first := s.output
+	dst = dst[:min(len(dst), 64*1024)]
+	n := 0
+	for s.output != nil && n < len(dst) {
+		entry := s.output
+		copied := copy(dst[n:], entry.data[s.outputOffset:])
+		n += copied
+		s.outputOffset += copied
+		s.outputBytes -= copied
+		if s.outputOffset != len(entry.data) {
+			break
 		}
+		s.output = entry.next
 		s.outputOffset = 0
 		s.outputCapacity -= cap(entry.data)
 		s.outputItems--
 	}
+	remaining := s.output
+	if remaining == nil {
+		s.outputLast = nil
+	}
 	s.outputMu.Unlock()
-	if drained {
+	// A short first entry must not leave most of the WEB destination unused.
+	// Detached entries keep their allocation charge until this copy completes.
+	for entry := first; entry != remaining; {
+		next := entry.next
 		s.releaseOutputEntry(entry, nil)
+		entry = next
 	}
 	_ = s.schedule()
 	return n, nil

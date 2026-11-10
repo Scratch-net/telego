@@ -37,23 +37,25 @@ import (
 )
 
 type conn struct {
-	fd             int                    // file descriptor
-	gfd            gfd.GFD                // gnet file descriptor
-	ctx            any                    // user-defined context
-	safeCtx        atomic.Pointer[any]    // safe user-defined context
-	remote         unix.Sockaddr          // remote socket address
-	proto          string                 // protocol name: "tcp", "udp", or "unix".
-	localAddr      net.Addr               // local addr
-	remoteAddr     net.Addr               // remote addr
-	loop           *eventloop             // connected event-loop
-	outboundBuffer elastic.Buffer         // buffer for data that is eligible to be sent to the remote
-	pollAttachment netpoll.PollAttachment // connection attachment for poller
-	inboundBuffer  elastic.RingBuffer     // buffer for leftover data from the remote
-	buffer         []byte                 // buffer for the latest bytes
-	cache          []byte                 // temporary cache for the inbound data
-	isDatagram     bool                   // UDP protocol
-	opened         bool                   // connection opened event fired
-	isEOF          bool                   // whether the connection has reached EOF
+	fd               int                    // file descriptor
+	gfd              gfd.GFD                // gnet file descriptor
+	ctx              any                    // user-defined context
+	safeCtx          atomic.Pointer[any]    // safe user-defined context
+	remote           unix.Sockaddr          // remote socket address
+	proto            string                 // protocol name: "tcp", "udp", or "unix".
+	localAddr        net.Addr               // local addr
+	remoteAddr       net.Addr               // remote addr
+	loop             *eventloop             // connected event-loop
+	outboundBuffer   elastic.Buffer         // buffer for data that is eligible to be sent to the remote
+	pollAttachment   netpoll.PollAttachment // connection attachment for poller
+	inboundBuffer    elastic.RingBuffer     // buffer for leftover data from the remote
+	buffer           []byte                 // buffer for the latest bytes
+	cache            []byte                 // temporary cache for the inbound data
+	isDatagram       bool                   // UDP protocol
+	opened           bool                   // connection opened event fired
+	readPauseVersion uint64                 // Telego: records a consumer pause during a resume callback
+	readPaused       bool                   // Telego: owner-only socket read suspension
+	isEOF            bool                   // whether the connection has reached EOF
 }
 
 func newStreamConn(proto string, fd int, el *eventloop, sa unix.Sockaddr, localAddr, remoteAddr net.Addr) (c *conn) {
@@ -92,6 +94,8 @@ func newUDPConn(fd int, el *eventloop, localAddr net.Addr, sa unix.Sockaddr, con
 func (c *conn) release() {
 	c.opened = false
 	c.isEOF = false
+	c.readPaused = false
+	c.readPauseVersion = 0
 	c.ctx = nil
 	c.safeCtx.Store(nil)
 	c.buffer = nil
@@ -165,7 +169,7 @@ loop:
 		if err == unix.EAGAIN {
 			_, err = c.outboundBuffer.Write(data)
 			if !isET {
-				err = c.loop.poller.ModReadWrite(&c.pollAttachment, isET)
+				err = c.modReadWrite()
 			}
 			return
 		}
@@ -178,7 +182,7 @@ loop:
 	// Failed to send all data back to the remote, buffer the leftover data for the next round.
 	if len(data) > 0 {
 		_, _ = c.outboundBuffer.Write(data)
-		err = c.loop.poller.ModReadWrite(&c.pollAttachment, isET)
+		err = c.modReadWrite()
 	}
 
 	return
@@ -215,7 +219,7 @@ loop:
 		if err == unix.EAGAIN {
 			_, err = c.outboundBuffer.Writev(bs)
 			if !isET {
-				err = c.loop.poller.ModReadWrite(&c.pollAttachment, isET)
+				err = c.modReadWrite()
 			}
 			return
 		}
@@ -241,7 +245,7 @@ loop:
 	// Failed to send all data back to the remote, buffer the leftover data for the next round.
 	if remaining > 0 {
 		_, _ = c.outboundBuffer.Writev(bs)
-		err = c.loop.poller.ModReadWrite(&c.pollAttachment, isET)
+		err = c.modReadWrite()
 	}
 
 	return

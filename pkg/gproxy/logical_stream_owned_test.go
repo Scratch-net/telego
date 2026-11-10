@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"slices"
 	"sync"
 	"testing"
 
@@ -266,4 +267,43 @@ func assertLogicalOutputBudget(t *testing.T, budget *logicalTestBudget, wantByte
 	if budget.bytes != wantBytes || budget.items != wantItems {
 		t.Fatalf("logical output budget = %d bytes, %d items; want %d bytes, %d items", budget.bytes, budget.items, wantBytes, wantItems)
 	}
+}
+
+func TestLogicalStreamReadFillsAcrossOutputEntries(t *testing.T) {
+	stream, _, budget, _ := newQueuedLogicalOutput(t)
+	stream.options.MaxOutputBytes = 128 << 10
+	stream.scheduled.Store(true)
+	defer stream.OwnerStopped()
+	first := []byte{42}
+	second := bytes.Repeat([]byte{43}, 64<<10)
+	var releases []int
+	for i, data := range [][]byte{first, second} {
+		if _, err := stream.writeMiddleEndOwned(data, func(err error) {
+			if err != nil {
+				t.Errorf("output release: %v", err)
+			}
+			releases = append(releases, i)
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	destination := make([]byte, 128<<10)
+	n, err := stream.TryRead(destination)
+	if err != nil || n != 64<<10 {
+		t.Fatalf("first read=%d,%v", n, err)
+	}
+	if destination[0] != 42 || !bytes.Equal(destination[1:n], second[:len(second)-1]) {
+		t.Fatal("payload order changed")
+	}
+	if len(releases) != 1 || releases[0] != 0 {
+		t.Fatalf("partial entry release: %v", releases)
+	}
+	assertLogicalOutputBudget(t, budget, cap(second), 1)
+	if n, err = stream.TryRead(destination); err != nil || n != 1 || destination[0] != 43 {
+		t.Fatalf("tail read=%d,%v", n, err)
+	}
+	if !slices.Equal(releases, []int{0, 1}) {
+		t.Fatalf("release order=%v", releases)
+	}
+	budget.assertEmpty(t)
 }

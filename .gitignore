@@ -65,6 +65,7 @@ config.toml
 /.codex-stage/
 /.local/
 /tools/web-transfer/__pycache__/
+/tools/socket-autotune/__pycache__/
 .build/
 # Keep only public publishing inputs in docs.
 /docs/*

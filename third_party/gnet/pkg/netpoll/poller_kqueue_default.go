@@ -229,3 +229,26 @@ func (p *Poller) ModReadWrite(pa *PollAttachment, edgeTriggered bool) error {
 func (*Poller) Delete(_ int) error {
 	return nil
 }
+
+// ModReadPaused changes read interest and keeps only requested write interest.
+// Telego: EV_ADD|EV_DISABLE also handles a write filter that does not exist yet.
+func (p *Poller) ModReadPaused(pa *PollAttachment, paused, writable, edgeTriggered bool) error {
+	var evs [2]unix.Kevent_t
+	evs[0].Ident = keventIdent(pa.FD)
+	evs[0].Filter = unix.EVFILT_READ
+	evs[0].Flags = unix.EV_ENABLE
+	if paused {
+		evs[0].Flags = unix.EV_DISABLE
+	}
+	evs[1].Ident = keventIdent(pa.FD)
+	evs[1].Filter = unix.EVFILT_WRITE
+	evs[1].Flags = unix.EV_ADD | unix.EV_DISABLE
+	if writable {
+		evs[1].Flags = unix.EV_ADD | unix.EV_ENABLE
+	}
+	if edgeTriggered {
+		evs[1].Flags |= unix.EV_CLEAR
+	}
+	_, err := unix.Kevent(p.fd, evs[:], nil, nil)
+	return os.NewSyscallError("kevent read control", err)
+}

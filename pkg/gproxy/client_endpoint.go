@@ -41,6 +41,19 @@ func wakeClient(c clientEndpoint) error {
 	return c.(gnet.Conn).Wake(nil)
 }
 
+// continueRelayInput retries a retained prefix before admitting another socket
+// read. A queued Wake alone lets an ET/EOF read loop accumulate more input first.
+// Call only on the source owner after forwarding part of its available input.
+func continueRelayInput(c clientEndpoint) error {
+	if controller, ok := c.(gnet.ReadController); ok {
+		if err := controller.PauseRead(); err != nil {
+			return err
+		}
+		return controller.ResumeRead()
+	}
+	return wakeClient(c)
+}
+
 func asyncWriteClient(c clientEndpoint, data []byte, callback func(error) error) error {
 	if stream, ok := c.(*LogicalStream); ok {
 		err := stream.executeOrderedOutput(gnet.RunnableFunc(func(context.Context) error {

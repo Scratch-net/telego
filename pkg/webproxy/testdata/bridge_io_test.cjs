@@ -364,6 +364,69 @@ for (const status of [408, 429, 502, 503, 504]) {
   });
 }
 
+test('brief WEB overload waits one second even when capacity clears after 250 ms', async () => {
+  const h = harness('https');
+  let available = false;
+  h.sandbox.respond = async () => available
+    ? new Response(null, { status: 204 })
+    : new Response(null, { status: 503, headers: {
+      'Retry-After': '1', 'X-Telego-Retry-After-Ms': '250',
+    } });
+  const result = observe(h.api.request('/api/v1/session', () => h.api.options('POST', 'bootstrap', null)));
+  await flush();
+  assert.equal(h.requests.length, 1);
+  await h.advance(250);
+  available = true;
+  assert.equal(h.requests.length, 1, 'bridge did not retry when capacity became free');
+  await h.advance(749);
+  assert.equal(h.requests.length, 1);
+  await h.advance(1);
+  assert.equal(h.requests.length, 2);
+  assert.equal(result.value?.status, 204);
+  assertClean(h);
+});
+
+test('sustained WEB overload retries once per second', async () => {
+  const h = harness('https');
+  h.sandbox.respond = async () => new Response(null, {
+    status: 503, headers: { 'Retry-After': '1' },
+  });
+  const result = observe(h.api.request('/api/v1/session', () => h.api.options('POST', 'bootstrap', null)));
+  await flush();
+  for (let elapsed = 1; elapsed <= 3; elapsed++) {
+    await h.advance(1000);
+    assert.equal(h.requests.length, elapsed + 1);
+  }
+  assert.equal(result.settled, false);
+  h.pagehide();
+  await flush();
+  await result.done;
+  assertClean(h);
+});
+
+test('synthetic 250 ms hint trades earlier recovery for four times as many sustained retries', async () => {
+  const h = harness('https');
+  let available = false;
+  // A fractional standard header exercises the candidate delay with the
+  // current parser; production would use a dedicated millisecond header.
+  h.sandbox.respond = async () => available
+    ? new Response(null, { status: 204 })
+    : new Response(null, { status: 503, headers: { 'Retry-After': '0.25' } });
+  const result = observe(h.api.request('/api/v1/session', () => h.api.options('POST', 'bootstrap', null)));
+  await flush();
+  await h.advance(250);
+  assert.equal(h.requests.length, 2);
+  await h.advance(250);
+  assert.equal(h.requests.length, 3);
+  await h.advance(250);
+  assert.equal(h.requests.length, 4);
+  available = true;
+  await h.advance(250);
+  assert.equal(h.requests.length, 5);
+  assert.equal(result.value?.status, 204);
+  assertClean(h);
+});
+
 for (const carrier of carriers) {
   test(carrier + ': response deadline includes a stalled body', async () => {
     const h = harness(carrier), response = streamResponse({ end: false });

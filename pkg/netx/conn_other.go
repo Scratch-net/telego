@@ -14,13 +14,7 @@ func tuneSocket(fd int) (err error) {
 		return
 	}
 
-	// Large socket buffers for high throughput
-	if err = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, TCPBufferSize); err != nil {
-		return
-	}
-	if err = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, TCPBufferSize); err != nil {
-		return
-	}
+	// Preserve the operating system's receive and send buffer sizing.
 
 	return
 }

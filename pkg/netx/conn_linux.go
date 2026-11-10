@@ -14,13 +14,7 @@ func tuneSocket(fd int) (err error) {
 		return
 	}
 
-	// Large socket buffers for high throughput
-	if err = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, TCPBufferSize); err != nil {
-		return
-	}
-	if err = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, TCPBufferSize); err != nil {
-		return
-	}
+	// Leave receive and send buffers under kernel TCP autotuning.
 
 	// TCP_QUICKACK to disable delayed ACKs (Linux-specific)
 	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)

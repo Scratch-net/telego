@@ -165,7 +165,21 @@ func TestDirectEOFLogicalResponseAndEarlyActivation(t *testing.T) {
 				if err := peer.CloseWrite(); err != nil {
 					t.Fatal(err)
 				}
-				awaitSpliceCondition(t, "logical direct EOF", x.stream.ctx.spliceDrainRequested.Load)
+				if early {
+					awaitSpliceCondition(t, "logical direct EOF", x.stream.ctx.spliceDrainRequested.Load)
+				} else {
+					relay := awaitDirectRelay(t, x.stream.ctx)
+					awaitSpliceCondition(t, "paused logical download", func() bool {
+						waiting := false
+						runLogicalOwner(t, relay.DCConn.EventLoop(), func() {
+							output := relay.DCConn.Context().(*DCConnContext).ToClient
+							output.mu.Lock()
+							waiting = output.waiting > 0
+							output.mu.Unlock()
+						})
+						return waiting
+					})
+				}
 				if early && x.stream.ctx.State() != StateDialingDC {
 					t.Fatal("fixture activated before upstream EOF")
 				}
@@ -174,7 +188,7 @@ func TestDirectEOFLogicalResponseAndEarlyActivation(t *testing.T) {
 				x.input.mu.Lock()
 				charged := x.input.bytes
 				x.input.mu.Unlock()
-				if charged < len(want)-prefix {
+				if early && charged < len(want)-prefix {
 					t.Fatalf("EOF tail has only %d charged bytes", charged)
 				}
 				x.output.blocked.Store(false)

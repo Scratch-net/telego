@@ -1,0 +1,778 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json/v2"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/scratch-net/telego/pkg/config"
+	"github.com/scratch-net/telego/pkg/dc"
+	"github.com/scratch-net/telego/pkg/gproxy"
+	"github.com/scratch-net/telego/pkg/transport/obfuscated2"
+	"github.com/scratch-net/telego/pkg/webproxy"
+	"golang.org/x/sys/unix"
+)
+
+var labSecret = []byte("0123456789abcdef")
+var labRoot string
+
+type labLogger struct{}
+
+func (labLogger) Debug(string, ...any) {}
+func (labLogger) Info(string, ...any)  {}
+func (labLogger) Warn(string, ...any)  {}
+func (labLogger) Error(string, ...any) {}
+func (labLogger) DebugEnabled() bool   { return false }
+func labWrite(name string, v any) {
+	b, e := json.Marshal(v)
+	if e != nil {
+		panic(e)
+	}
+	if e = os.WriteFile(filepath.Join(labRoot, name), b, 0600); e != nil {
+		panic(e)
+	}
+}
+func labWait(ctx context.Context, name string) error {
+	for {
+		if _, e := os.Stat(filepath.Join(labRoot, name)); e == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+func labReadFull(r io.Reader, n int) ([]byte, error) {
+	b := make([]byte, n)
+	_, e := io.ReadFull(r, b)
+	return b, e
+}
+func labPattern(seed byte, n int) []byte {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = byte(i*73 + int(seed))
+	}
+	return b
+}
+func labBlockWrite(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, e := w.Write(data)
+		if e != nil {
+			return e
+		}
+		if n == 0 {
+			return io.ErrNoProgress
+		}
+		data = data[n:]
+	}
+	return nil
+}
+func labTransfer(w io.Writer, r io.Reader, upload bool, amount int64, seed byte) (string, error) {
+	h := sha256.New()
+	block := labPattern(seed, 64<<10)
+	for done := int64(0); done < amount; {
+		n := int(min(int64(len(block)), amount-done))
+		if upload {
+			if e := labBlockWrite(w, block[:n]); e != nil {
+				return "", e
+			}
+			h.Write(block[:n])
+		} else {
+			got, e := labReadFull(r, n)
+			if e != nil {
+				return "", e
+			}
+			if !bytes.Equal(got, block[:n]) {
+				return "", fmt.Errorf("payload mismatch at %d", done)
+			}
+			h.Write(got)
+		}
+		done += int64(n)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+func labPeer(ctx context.Context) error {
+	l, e := net.Listen("tcp4", "10.74.2.2:9000")
+	if e != nil {
+		return e
+	}
+	defer l.Close()
+	labWrite("peer.ready", map[string]any{"pid": os.Getpid()})
+	var wg sync.WaitGroup
+	var failed atomic.Int64
+	go func() { <-ctx.Done(); l.Close() }()
+	for {
+		c, e := l.Accept()
+		if e != nil {
+			break
+		}
+		wg.Go(func() {
+			defer c.Close()
+			c.SetDeadline(time.Now().Add(90 * time.Second))
+			wire, e := labReadFull(c, 64)
+			if e != nil {
+				return
+			}
+			if bytes.Equal(wire, make([]byte, 64)) {
+				return
+			}
+			dec, e := obfuscated2.NewAESCTR(wire[8:40], wire[40:56])
+			if e != nil {
+				failed.Add(1)
+				return
+			}
+			plain := make([]byte, 64)
+			dec.XORKeyStream(plain, wire)
+			reversed := append([]byte(nil), wire[8:56]...)
+			for i := range 24 {
+				reversed[i], reversed[47-i] = reversed[47-i], reversed[i]
+			}
+			enc, e := obfuscated2.NewAESCTR(reversed[:32], reversed[32:48])
+			if e != nil {
+				failed.Add(1)
+				return
+			}
+			reader := &cipher.StreamReader{S: dec, R: c}
+			writer := &cipher.StreamWriter{S: enc, W: c}
+			command, e := labReadFull(reader, 24)
+			if e != nil {
+				failed.Add(1)
+				return
+			}
+			if string(command[:4]) != "LAB3" {
+				failed.Add(1)
+				return
+			}
+			upload := command[4] == 1
+			seed := command[5]
+			amount := int64(binary.BigEndian.Uint64(command[8:16]))
+			warm := int64(binary.BigEndian.Uint64(command[16:24]))
+			for _, size := range []int64{warm, amount} {
+				if _, e = labReadFull(reader, 1); e != nil {
+					failed.Add(1)
+					return
+				}
+				digest, e := labTransfer(writer, reader, !upload, size, seed)
+				if e != nil {
+					failed.Add(1)
+					return
+				}
+				if upload {
+					if e = labBlockWrite(writer, []byte(digest)); e != nil {
+						failed.Add(1)
+						return
+					}
+				} else {
+					ack, e := labReadFull(reader, 64)
+					if e != nil || string(ack) != digest {
+						failed.Add(1)
+						return
+					}
+					if e = labBlockWrite(writer, []byte{0x7f}); e != nil {
+						failed.Add(1)
+						return
+					}
+				}
+			}
+			// Keep the fully verified socket alive until client session cleanup.
+			_, _ = io.Copy(io.Discard, reader)
+		})
+	}
+	wg.Wait()
+	labWrite("peer.closed", map[string]any{"failed": failed.Load()})
+	return nil
+}
+func labRelay(ctx context.Context) error {
+	dc.DefaultDCs = map[int][]dc.Addr{2: {{Network: "tcp4", Address: "10.74.2.2:9000"}}}
+	dc.CDNDCs = map[int][]dc.Addr{}
+	cfg := gproxy.DefaultConfig()
+	cfg.BindAddr = "127.0.0.1:19000"
+	cfg.Secrets = []gproxy.Secret{{Name: "lab", Key: labSecret, RawHex: hex.EncodeToString(labSecret)}}
+	cfg.NumEventLoop = 2
+	cfg.FetchRealCert = false
+	cfg.SpliceUnrecognized = false
+	cfg.SpliceHost = ""
+	cfg.ClockSyncURL = ""
+	cfg.IPPreference = dc.OnlyIPv4
+	stop, handler, errs := gproxy.RunWithHandler(&cfg, labLogger{})
+	defer stop()
+	profiles, e := webproxy.DeriveProfiles("lab", "lab.example", labSecret)
+	if e != nil {
+		return e
+	}
+	w, e := newWebProxyRuntime(config.WebProxyRuntimeConfig{Enabled: true, BindAddr: "127.0.0.1:19001", Hostname: "lab.example", Profiles: profiles[:], Carrier: webproxy.CarrierHTTPS, LogicalBackend: true, MTProxyAddr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 19000}, NumEventLoops: 2}, nil, handler)
+	if e != nil {
+		return e
+	}
+	if e = w.Start(ctx); e != nil {
+		return e
+	}
+	labWrite("relay.ready", map[string]any{"pid": os.Getpid(), "capability": profiles[1].Capability().String()})
+	select {
+	case <-ctx.Done():
+	case e := <-errs:
+		if e != nil {
+			return e
+		}
+	}
+	shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if e = w.Shutdown(shutdown); e != nil {
+		return e
+	}
+	c := w.manager.Capacity()
+	labWrite("relay.closed", c)
+	if c.Sessions != 0 || c.Streams != 0 || c.BackendDials != 0 || c.PendingBytes != 0 || c.PendingItems != 0 {
+		return fmt.Errorf("retained resources: %+v", c)
+	}
+	return nil
+}
+
+type labClientStream struct {
+	enc    cipher.Stream
+	dec    cipher.Stream
+	reader *io.PipeReader
+	writer *io.PipeWriter
+	credit int64
+}
+type labClient struct {
+	ctx            context.Context
+	cancel         context.CancelCauseFunc
+	http           *http.Client
+	token          string
+	streams        []*labClientStream
+	up             chan webproxy.Frame
+	mu             sync.Mutex
+	cond           *sync.Cond
+	wg             sync.WaitGroup
+	upBatches      atomic.Int64
+	downBatches    atomic.Int64
+	closed         atomic.Bool
+	pendingWindows map[uint32]uint32 // guarded by mu, one aggregate per stream
+	downPoll       time.Duration
+	controlWake    chan struct{}
+	retries        atomic.Int64
+}
+
+func (c *labClient) request(method, path string, body []byte, headers map[string]string) ([]byte, http.Header, error) {
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		req, e := http.NewRequestWithContext(c.ctx, method, "http://127.0.0.1:19001"+path, bytes.NewReader(body))
+		if e != nil {
+			return nil, nil, e
+		}
+		req.Host = "lab.example"
+		if c.token != "" {
+			req.Header.Set("Authorization", "Bearer "+c.token)
+		}
+		if len(body) > 0 {
+			req.Header.Set("Content-Type", "application/octet-stream")
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		res, e := c.http.Do(req)
+		if e != nil {
+			return nil, nil, e
+		}
+		data, e := io.ReadAll(io.LimitReader(res.Body, 8<<20))
+		res.Body.Close()
+		if e != nil {
+			return nil, nil, e
+		}
+		// Match bridge.go retry semantics for explicit admission/backpressure responses.
+		if res.StatusCode == 408 || res.StatusCode == 429 || res.StatusCode == 502 || res.StatusCode == 503 || res.StatusCode == 504 {
+			if time.Now().After(deadline) {
+				return nil, res.Header, fmt.Errorf("retry deadline: %s %s status %d", method, path, res.StatusCode)
+			}
+			c.retries.Add(1)
+			delay := 250 * time.Millisecond
+			if seconds, err := strconv.ParseFloat(res.Header.Get("Retry-After"), 64); err == nil && seconds >= 0 {
+				delay = min(time.Duration(seconds*float64(time.Second)), 30*time.Second)
+			}
+			select {
+			case <-time.After(delay):
+				continue
+			case <-c.ctx.Done():
+				return nil, nil, context.Cause(c.ctx)
+			}
+		}
+		if res.StatusCode != 200 && res.StatusCode != 204 {
+			return nil, res.Header, fmt.Errorf("%s %s status %d", method, path, res.StatusCode)
+		}
+		return data, res.Header, nil
+	}
+}
+func (c *labClient) fail(e error) {
+	if e == nil || c.closed.Load() {
+		return
+	}
+	c.cancel(e)
+	c.mu.Lock()
+	c.cond.Broadcast()
+	c.mu.Unlock()
+	for _, s := range c.streams {
+		s.writer.CloseWithError(e)
+	}
+}
+func (c *labClient) queue(frame webproxy.Frame) error {
+	// Downlink polling must continue while HTTP uplink admission retries. Keep
+	// WINDOW credit in a bounded aggregate instead of blocking on the DATA queue.
+	if frame.Type == webproxy.FrameWindow {
+		delta, err := webproxy.WindowDelta(frame.Payload)
+		if err != nil {
+			return err
+		}
+		c.mu.Lock()
+		previous := c.pendingWindows[frame.StreamID]
+		if uint64(previous)+uint64(delta) > uint64(^uint32(0)) {
+			c.mu.Unlock()
+			return errors.New("pending WINDOW overflow")
+		}
+		c.pendingWindows[frame.StreamID] = previous + delta
+		c.mu.Unlock()
+		select {
+		case c.controlWake <- struct{}{}:
+		default:
+		}
+		return nil
+	}
+
+	select {
+	case c.up <- frame:
+		return nil
+	case <-c.ctx.Done():
+		return context.Cause(c.ctx)
+	}
+}
+func (c *labClient) send(index int, data []byte) error {
+	s := c.streams[index]
+	for len(data) > 0 {
+		n := min(len(data), 64<<10)
+		c.mu.Lock()
+		for s.credit < int64(n) && c.ctx.Err() == nil {
+			c.cond.Wait()
+		}
+		if c.ctx.Err() != nil {
+			c.mu.Unlock()
+			return context.Cause(c.ctx)
+		}
+		s.credit -= int64(n)
+		c.mu.Unlock()
+		part := make([]byte, n)
+		s.enc.XORKeyStream(part, data[:n])
+		if e := c.queue(webproxy.Frame{Type: webproxy.FrameData, StreamID: uint32(index + 1), Payload: part}); e != nil {
+			return e
+		}
+		data = data[n:]
+	}
+	return nil
+}
+
+type labStreamWriter struct {
+	c     *labClient
+	index int
+}
+
+func (w labStreamWriter) Write(b []byte) (int, error) {
+	if e := w.c.send(w.index, b); e != nil {
+		return 0, e
+	}
+	return len(b), nil
+}
+func (c *labClient) uplink() error {
+	seq := int64(1)
+	for {
+		var data []byte
+		count := 0
+		appendFrame := func(f webproxy.Frame) error {
+			var err error
+			data, err = webproxy.AppendFrame(data, f)
+			count++
+			return err
+		}
+		select {
+		case f := <-c.up:
+			if err := appendFrame(f); err != nil {
+				return err
+			}
+		case <-c.controlWake:
+		case <-c.ctx.Done():
+			return context.Cause(c.ctx)
+		}
+		c.mu.Lock()
+		// Stable order and at most one frame per stream. The map cannot grow past
+		// the eight streams of this fixture.
+		for i := range c.streams {
+			id := uint32(i + 1)
+			if delta := c.pendingWindows[id]; delta != 0 {
+				window, err := webproxy.WindowPayload(delta)
+				if err == nil {
+					err = appendFrame(webproxy.Frame{Type: webproxy.FrameWindow, StreamID: id, Payload: window})
+				}
+				if err != nil {
+					c.mu.Unlock()
+					return err
+				}
+				delete(c.pendingWindows, id)
+			}
+		}
+		c.mu.Unlock()
+	drain:
+		for len(data) < 512<<10 && count < webproxy.MaxBatchFrames {
+			select {
+			case f := <-c.up:
+				if err := appendFrame(f); err != nil {
+					return err
+				}
+			default:
+				break drain
+			}
+		}
+		if len(data) == 0 {
+			continue
+		} // A coalesced wake can outlive its pending credit.
+		_, h, err := c.request("POST", "/api/v1/up", data, map[string]string{"X-Up-Seq": strconv.FormatInt(seq, 10)})
+		if err != nil {
+			return err
+		}
+		if h.Get("X-Up-Ack") != strconv.FormatInt(seq, 10) {
+			return fmt.Errorf("uplink ack %q != %d", h.Get("X-Up-Ack"), seq)
+		}
+		seq++
+		c.upBatches.Add(1)
+	}
+}
+func (c *labClient) downlink() error {
+	cursor := "0"
+	for {
+		if c.downBatches.Load() > 0 {
+			time.Sleep(c.downPoll)
+		}
+		data, h, e := c.request("POST", "/api/v1/down", nil, map[string]string{"X-Down-Cursor": cursor})
+		if e != nil {
+			return e
+		}
+		cursor = h.Get("X-Down-Cursor")
+		frames, e := webproxy.ParseBatch(data)
+		if e != nil {
+			return e
+		}
+		c.downBatches.Add(1)
+		for _, f := range frames {
+			if f.Type == webproxy.FramePing {
+				if e = c.queue(webproxy.Frame{Type: webproxy.FramePong, Payload: bytes.Clone(f.Payload)}); e != nil {
+					return e
+				}
+				continue
+			}
+			if f.StreamID == 0 || int(f.StreamID) > len(c.streams) {
+				return fmt.Errorf("unexpected frame %+v", f)
+			}
+			s := c.streams[f.StreamID-1]
+			switch f.Type {
+			case webproxy.FrameWindow:
+				n, e := webproxy.WindowDelta(f.Payload)
+				if e != nil {
+					return e
+				}
+				c.mu.Lock()
+				s.credit += int64(n)
+				c.cond.Broadcast()
+				c.mu.Unlock()
+			case webproxy.FrameData:
+				payload := make([]byte, len(f.Payload))
+				s.dec.XORKeyStream(payload, f.Payload)
+				window, e := webproxy.WindowPayload(uint32(len(payload)))
+				if e != nil {
+					return e
+				}
+				if e = c.queue(webproxy.Frame{Type: webproxy.FrameWindow, StreamID: f.StreamID, Payload: window}); e != nil {
+					return e
+				}
+				if _, e = s.writer.Write(payload); e != nil {
+					return e
+				}
+			case webproxy.FrameClose:
+				if !c.closed.Load() {
+					return fmt.Errorf("unexpected stream close %d", f.StreamID)
+				}
+			default:
+				return fmt.Errorf("unexpected frame type %d", f.Type)
+			}
+		}
+	}
+}
+func labClientHandshake() ([]byte, cipher.Stream, cipher.Stream, error) {
+	plain := make([]byte, 64)
+	if _, e := rand.Read(plain); e != nil {
+		return nil, nil, nil, e
+	}
+	binary.LittleEndian.PutUint32(plain[56:60], uint32(obfuscated2.ConnectionTypePaddedIntermediate))
+	binary.LittleEndian.PutUint16(plain[60:62], 2)
+	keyInput := append(bytes.Clone(plain[8:40]), labSecret...)
+	key := sha256.Sum256(keyInput)
+	enc, e := obfuscated2.NewAESCTR(key[:], plain[40:56])
+	if e != nil {
+		return nil, nil, nil, e
+	}
+	rev := bytes.Clone(plain[8:56])
+	for i := range 24 {
+		rev[i], rev[47-i] = rev[47-i], rev[i]
+	}
+	keyInput = append(bytes.Clone(rev[:32]), labSecret...)
+	key = sha256.Sum256(keyInput)
+	dec, e := obfuscated2.NewAESCTR(key[:], rev[32:])
+	if e != nil {
+		return nil, nil, nil, e
+	}
+	wire := make([]byte, 64)
+	enc.XORKeyStream(wire, plain)
+	copy(wire[8:56], plain[8:56])
+	wire[0] = 0x42
+	return wire, enc, dec, nil
+}
+func labLoad(parent context.Context) error {
+	count, e := strconv.Atoi(os.Getenv("LAB_STREAMS"))
+	if e != nil || count < 1 || count > 8 {
+		return errors.New("invalid stream count")
+	}
+	total, e := strconv.ParseInt(os.Getenv("LAB_BYTES"), 10, 64)
+	if e != nil || total < 1 || total%int64(count) != 0 {
+		return errors.New("invalid transfer size")
+	}
+	upload := os.Getenv("LAB_DIRECTION") == "upload"
+	ctx, cancel := context.WithCancelCause(parent)
+	defer cancel(context.Canceled)
+	pollMS := 1
+	if raw := os.Getenv("LAB_DOWN_POLL_MS"); raw != "" {
+		pollMS, e = strconv.Atoi(raw)
+		if e != nil || pollMS < 0 || pollMS > 1000 {
+			return errors.New("invalid down poll interval")
+		}
+	}
+	c := &labClient{ctx: ctx, cancel: cancel, http: &http.Client{Transport: &http.Transport{MaxConnsPerHost: 4, MaxIdleConnsPerHost: 4, DisableCompression: true}}, up: make(chan webproxy.Frame, 64), pendingWindows: make(map[uint32]uint32), controlWake: make(chan struct{}, 1), downPoll: time.Duration(pollMS) * time.Millisecond}
+	defer c.http.CloseIdleConnections()
+	c.cond = sync.NewCond(&c.mu)
+	metaBytes, e := os.ReadFile(filepath.Join(labRoot, "relay.ready"))
+	if e != nil {
+		return e
+	}
+	var meta struct {
+		Capability string `json:"capability"`
+	}
+	if e = json.Unmarshal(metaBytes, &meta); e != nil {
+		return e
+	}
+	data, _, e := c.request("GET", "/?bridge="+meta.Capability, nil, nil)
+	if e != nil {
+		return e
+	}
+	m := regexp.MustCompile(`let bootstrap="([A-Za-z0-9_-]{43})"`).FindSubmatch(data)
+	if len(m) != 2 {
+		return errors.New("bootstrap absent")
+	}
+	hello, _ := webproxy.EncodeFrame(webproxy.Frame{Type: webproxy.FrameHello, Payload: []byte{1}})
+	_, h, e := c.request("POST", "/api/v1/session", hello, map[string]string{"Authorization": "Bearer " + string(m[1])})
+	if e != nil {
+		return e
+	}
+	c.token = h.Get("X-Session-Token")
+	if c.token == "" {
+		return errors.New("session token absent")
+	}
+	for range count {
+		r, w := io.Pipe()
+		c.streams = append(c.streams, &labClientStream{reader: r, writer: w, credit: webproxy.InitialStreamWindow})
+	}
+	c.wg.Go(func() { c.fail(c.uplink()) })
+	c.wg.Go(func() { c.fail(c.downlink()) })
+	warm := make(chan error, count)
+	done := make(chan error, count)
+	startSignal := make(chan struct{})
+	for i := range count {
+		go func() {
+			wire, enc, dec, e := labClientHandshake()
+			if e != nil {
+				warm <- e
+				return
+			}
+			s := c.streams[i]
+			s.enc = enc
+			s.dec = dec
+			if e = c.queue(webproxy.Frame{Type: webproxy.FrameOpen, StreamID: uint32(i + 1)}); e != nil {
+				warm <- e
+				return
+			}
+			// The opening64bytes are already encrypted; later writes advance enc.
+			if e = c.queue(webproxy.Frame{Type: webproxy.FrameData, StreamID: uint32(i + 1), Payload: wire}); e != nil {
+				warm <- e
+				return
+			}
+			c.mu.Lock()
+			s.credit -= 64
+			c.mu.Unlock()
+			command := make([]byte, 24)
+			copy(command, "LAB3")
+			if upload {
+				command[4] = 1
+			}
+			command[5] = byte(i + 1)
+			binary.BigEndian.PutUint64(command[8:16], uint64(total/int64(count)))
+			binary.BigEndian.PutUint64(command[16:24], 1<<20)
+			if e = c.send(i, command); e != nil {
+				warm <- e
+				return
+			}
+			transfer := func(size int64) error {
+				if e := c.send(i, []byte{1}); e != nil {
+					return e
+				}
+				digest, e := labTransfer(labStreamWriter{c, i}, s.reader, upload, size, byte(i+1))
+				if e != nil {
+					return e
+				}
+				if upload {
+					ack, e := labReadFull(s.reader, 64)
+					if e != nil {
+						return e
+					}
+					if string(ack) != digest {
+						return errors.New("upload digest mismatch")
+					}
+				} else {
+					if e = c.send(i, []byte(digest)); e != nil {
+						return e
+					}
+					ack, e := labReadFull(s.reader, 1)
+					if e != nil {
+						return e
+					}
+					if ack[0] != 0x7f {
+						return errors.New("download acknowledgment invalid")
+					}
+				}
+				return nil
+			}
+			if e = transfer(1 << 20); e != nil {
+				warm <- e
+				return
+			}
+			warm <- nil
+			select {
+			case <-startSignal:
+			case <-ctx.Done():
+				done <- context.Cause(ctx)
+				return
+			}
+			done <- transfer(total / int64(count))
+		}()
+	}
+	for range count {
+		select {
+		case e = <-warm:
+			if e != nil {
+				c.fail(e)
+				return e
+			}
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		}
+	}
+	labWrite("client.warm", map[string]any{"pid": os.Getpid()})
+	if e = labWait(ctx, "measure.go"); e != nil {
+		return e
+	}
+	cpuBefore := labCPU()
+	started := time.Now()
+	close(startSignal)
+	for range count {
+		select {
+		case e = <-done:
+			if e != nil {
+				c.fail(e)
+				return e
+			}
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		}
+	}
+	elapsed := time.Since(started).Seconds()
+	labWrite("client.result", map[string]any{"bytes": total, "seconds": elapsed, "MiB_s": float64(total) / (1 << 20) / elapsed, "streams": count, "direction": os.Getenv("LAB_DIRECTION"), "verified": true, "client_cpu_seconds": labCPU() - cpuBefore, "down_poll_coalescing_ms": int64(c.downPoll / time.Millisecond), "up_batches": c.upBatches.Load(), "down_batches": c.downBatches.Load(), "retryable_http_responses": c.retries.Load()})
+	c.closed.Store(true)
+	_, _, e = c.request("DELETE", "/api/v1/session", nil, nil)
+	if e != nil {
+		return e
+	}
+	cancel(context.Canceled)
+	for _, s := range c.streams {
+		s.reader.Close()
+		s.writer.Close()
+	}
+	c.mu.Lock()
+	c.cond.Broadcast()
+	c.mu.Unlock()
+	c.wg.Wait()
+	return nil
+}
+func TestSyntheticSocketPolicyHarness(t *testing.T) {
+	role := os.Getenv("LAB_ROLE")
+	if role == "" {
+		t.Skip("namespace harness only")
+	}
+	runtime.GOMAXPROCS(2)
+	labRoot = os.Getenv("LAB_ROOT")
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	if role != "client" {
+		go func() {
+			if labWait(ctx, "stop") == nil {
+				cancel()
+			}
+		}()
+	}
+	var e error
+	switch role {
+	case "relay":
+		e = labRelay(ctx)
+	case "peer":
+		e = labPeer(ctx)
+	case "client":
+		e = labLoad(ctx)
+	default:
+		e = errors.New("invalid role")
+	}
+	if e != nil {
+		labWrite(role+".error", map[string]string{"error": e.Error()})
+		t.Fatal(e)
+	}
+}
+
+func labCPU() float64 {
+	var u unix.Rusage
+	if e := unix.Getrusage(unix.RUSAGE_SELF, &u); e != nil {
+		panic(e)
+	}
+	return float64(u.Utime.Sec+u.Stime.Sec) + float64(u.Utime.Usec+u.Stime.Usec)/1e6
+}

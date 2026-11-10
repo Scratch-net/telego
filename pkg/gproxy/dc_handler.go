@@ -11,6 +11,7 @@ import (
 
 	"github.com/panjf2000/gnet/v2"
 
+	"github.com/scratch-net/telego/internal/dialrace"
 	"github.com/scratch-net/telego/pkg/dc"
 	"github.com/scratch-net/telego/pkg/netx"
 	"github.com/scratch-net/telego/pkg/transport/faketls"
@@ -216,23 +217,21 @@ func (h *ProxyHandler) dialDirectDC(ctx context.Context, dcID int, connectionTyp
 		dialFunc = dialer.DialContext
 	}
 
-	var conn netx.Conn
-	var err error
-	var usedAddr dc.Addr
 	dialStart := time.Now()
-	for _, addr := range addrs {
-		if err = ctx.Err(); err != nil {
-			break
-		}
+	conn, selected, err := dialrace.First(ctx, len(addrs), func(ctx context.Context, index int) (netx.Conn, error) {
+		addr := addrs[index]
 		attempt, cancel := context.WithTimeout(ctx, netx.DialTimeout)
-		conn, err = dialFunc(attempt, addr.Network, addr.Address)
-		cancel()
-		if err == nil {
-			usedAddr = addr
-			break
+		defer cancel()
+		conn, err := dialFunc(attempt, addr.Network, addr.Address)
+		if err != nil {
+			h.logger.Debug("DC %d dial failed: %s: %v", dcID, addr.Address, err)
 		}
-		h.logger.Debug("DC %d dial failed: %s: %v", dcID, addr.Address, err)
-	}
+		return conn, err
+	}, func(conn netx.Conn) {
+		if conn != nil {
+			_ = conn.Close()
+		}
+	})
 	dialDuration := time.Since(dialStart)
 
 	if err != nil {
@@ -240,7 +239,7 @@ func (h *ProxyHandler) dialDirectDC(ctx context.Context, dcID int, connectionTyp
 		return nil, err
 	}
 
-	h.logger.Debug("DC %d connected to %s in %v", dcID, usedAddr.Address, dialDuration)
+	h.logger.Debug("DC %d connected to %s in %v", dcID, addrs[selected].Address, dialDuration)
 
 	// Tune the connection
 	if tcpConn, ok := conn.(*net.TCPConn); ok {

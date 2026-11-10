@@ -8,7 +8,9 @@ import (
 )
 
 const (
-	// TCPBufferSize is the socket buffer size for high throughput (512KB).
+	// TCPBufferSize is the former fixed socket buffer size.
+	//
+	// Deprecated: socket buffer sizing is now managed by the operating system.
 	TCPBufferSize = 512 * 1024
 
 	// KeepAliveInterval for TCP keepalive probes.

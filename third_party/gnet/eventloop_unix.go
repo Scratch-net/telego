@@ -166,7 +166,7 @@ func (el *eventloop) open(c *conn) error {
 	}
 
 	if !c.outboundBuffer.IsEmpty() && !el.engine.opts.EdgeTriggeredIO {
-		if err := el.poller.ModReadWrite(&c.pollAttachment, false); err != nil {
+		if err := c.modReadWrite(); err != nil {
 			return err
 		}
 	}
@@ -179,7 +179,7 @@ func (el *eventloop) read0(a any) error {
 }
 
 func (el *eventloop) read(c *conn) error {
-	if !c.opened {
+	if !c.opened || c.readPaused {
 		return nil
 	}
 
@@ -211,6 +211,10 @@ loop:
 	_, _ = c.inboundBuffer.Write(c.buffer)
 	c.buffer = c.buffer[:0]
 
+	// Telego: stop ET/EOF drain and queued continuation reads under pressure.
+	if c.readPaused {
+		return nil
+	}
 	if c.isEOF || (isET && recv < chunk) {
 		goto loop
 	}
@@ -278,7 +282,7 @@ loop:
 	// All data have been sent, it's no need to monitor the writable events for LT mode,
 	// remove the writable event from poller to help the future event-loops if necessary.
 	if !isET && c.outboundBuffer.IsEmpty() {
-		return el.poller.ModRead(&c.pollAttachment, false)
+		return c.modRead()
 	}
 
 	// To prevent infinite writing in ET mode and starving other events,

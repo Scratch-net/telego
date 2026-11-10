@@ -21,7 +21,8 @@ export GOWORK="$test_workspace/go.work"
 cd "$test_root/third_party/gnet"
 
 # Run only the regressions for Telego's local patches, not the upstream suite.
-test_names='TestTelegoClientStartFailureCompletesOnce
+test_names='TestTelegoReadPausePreservesWritesAndEOF
+TestTelegoClientStartFailureCompletesOnce
 TestTelegoPendingTCPAcceptErrors
 TestTelegoServerPartialStartFailureClosesPreparedPoller
 TestTelegoClientConcurrentStopAndAutomaticDone

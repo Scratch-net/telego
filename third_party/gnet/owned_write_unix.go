@@ -70,7 +70,7 @@ func (c *conn) WriteOwned(data []byte, release func(error)) (int, error) {
 	}
 	var err error
 	if !c.loop.engine.opts.EdgeTriggeredIO {
-		err = c.loop.poller.ModReadWrite(&c.pollAttachment, false)
+		err = c.modReadWrite()
 	} else if sent > 0 {
 		err = c.loop.poller.Trigger(queue.HighPriority, c.loop.write0, c)
 	}

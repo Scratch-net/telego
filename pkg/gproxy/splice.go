@@ -205,7 +205,7 @@ func relaySpliceBytes(source clientEndpoint, output *relayOutput, ctx *ConnConte
 	}
 	ctx.refreshAuthenticatedIdle()
 	if source.InboundBuffered() > 0 {
-		if err := wakeClient(source); err != nil {
+		if err := continueRelayInput(source); err != nil {
 			return gnet.Close
 		}
 	}

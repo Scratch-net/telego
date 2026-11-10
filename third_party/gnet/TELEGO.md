@@ -45,6 +45,11 @@ Device-specific IPv6 tests skip only when the selected interface has no IPv6 add
 
 The release targets are Linux amd64, arm64, and arm/v7.
 
+The optional Unix `ReadController` API pauses socket reads while output capacity is exhausted.
+The connection owner calls both methods. Pending writes remain active during a read pause.
+Resume retries retained input before it enables new reads. Peer EOF waits until the consumer resumes.
+Read suspension applies to both pollers and both readiness modes. Windows retains its existing read path.
+
 ## Verification
 
 Root `go test ./...` does not include this nested module.
@@ -56,6 +61,8 @@ The test script creates a temporary workspace that uses the root dependency vers
 
 The optimized poller uses unsafe attachments that are incompatible with the race detector's pointer checks.
 Its gate uses a non-race build.
+
+`read_control_unix_test.go` covers paused writes, repeated pressure, peer EOF, shutdown, and a stale resume after close.
 
 `registration_shutdown_regression_test.go` checks accepted enrollment during owner shutdown through the upstream public APIs.
 The test fails on the recorded upstream revision and passes with this patch.

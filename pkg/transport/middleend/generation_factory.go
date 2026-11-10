@@ -9,6 +9,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/scratch-net/telego/internal/dialrace"
 )
 
 var (
@@ -71,6 +73,7 @@ type gnetGenerationFactoryState struct {
 	buildMu sync.Mutex
 	next    map[DCID]generationEndpointCursor
 	repairs chan struct{}
+	dials   chan struct{} // Shared by initial builds and repairs, including races.
 }
 
 type generationEndpointCursor struct {
@@ -195,6 +198,7 @@ func newGnetGenerationFactory(
 		now:                 now,
 		next:                make(map[DCID]generationEndpointCursor, len(dcIDs)),
 		repairs:             make(chan struct{}, config.DialConcurrency),
+		dials:               make(chan struct{}, config.DialConcurrency),
 	}}, nil
 }
 
@@ -381,64 +385,102 @@ func offsetGenerationEndpointCursor(cursor generationEndpointCursor, offset int)
 	return cursor
 }
 
-func (s *gnetGenerationFactoryState) buildSlot(ctx context.Context, dcID DCID, cursor generationEndpointCursor) generationSlotResult {
-	candidates := generationEndpointOrder(s.snapshot.Endpoints(dcID), cursor)
-	var lastErr error
-	for _, candidate := range candidates {
-		if cause := context.Cause(ctx); cause != nil {
-			return generationSlotResult{err: cause}
-		}
-		conn, serverAddr, clientAddr, err := s.dialer.Dial(ctx, candidate.endpoint, s.endpointDialTimeout)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if conn == nil {
-			lastErr = errors.New("dialer returned a nil TCP connection")
-			continue
-		}
-		if cause := context.Cause(ctx); cause != nil {
-			_ = conn.Close()
-			return generationSlotResult{err: cause}
-		}
+type generationDialResult struct {
+	conn       *net.TCPConn
+	serverAddr netip.AddrPort
+	clientAddr netip.AddrPort
+	candidate  generationEndpointCandidate
+}
 
-		now := s.now()
-		if now.Unix() <= 0 || now.Unix() > int64(^uint32(0)>>1) {
-			_ = conn.Close()
-			return generationSlotResult{err: errors.New("current time is outside the Middle-End int32 timestamp range")}
+func disposeGenerationDial(result generationDialResult) {
+	if result.conn != nil {
+		_ = result.conn.Close()
+	}
+}
+
+func (s *gnetGenerationFactoryState) dialCandidates(ctx context.Context, candidates []generationEndpointCandidate) (generationDialResult, error) {
+	var lastErr error
+	// Preserve the strict IPv4-first policy: finish one family before the next.
+	for len(candidates) > 0 {
+		end := 1
+		for end < len(candidates) && candidates[end].family == candidates[0].family {
+			end++
 		}
-		processID, err := ClientProcessID(clientAddr, s.processID, s.processStartedAt)
-		if err != nil {
-			_ = conn.Close()
-			return generationSlotResult{err: fmt.Errorf("initialize process identity: %w", err)}
+		family := candidates[:end]
+		result, _, err := dialrace.First(ctx, len(family), func(ctx context.Context, index int) (generationDialResult, error) {
+			select {
+			case s.dials <- struct{}{}:
+				defer func() { <-s.dials }()
+			case <-ctx.Done():
+				return generationDialResult{}, context.Cause(ctx)
+			}
+			if cause := context.Cause(ctx); cause != nil {
+				return generationDialResult{}, cause
+			}
+			candidate := family[index]
+			conn, server, client, err := s.dialer.Dial(ctx, candidate.endpoint, s.endpointDialTimeout)
+			if err == nil && conn == nil {
+				err = errors.New("dialer returned a nil TCP connection")
+			}
+			return generationDialResult{conn, server, client, candidate}, err
+		}, disposeGenerationDial)
+		if err == nil {
+			return result, nil
 		}
-		secret := s.snapshot.Secret()
-		bootstrap, err := NewClientBootstrap(ClientBootstrapConfig{
-			Secret:          secret,
-			ServerAddr:      serverAddr,
-			ClientAddr:      clientAddr,
-			LocalProcessID:  processID,
-			ClientTimestamp: int32(now.Unix()),
-		})
-		clear(secret)
-		if err != nil {
-			_ = conn.Close()
-			return generationSlotResult{err: fmt.Errorf("initialize bootstrap: %w", err)}
+		if cause := context.Cause(ctx); cause != nil {
+			return generationDialResult{}, cause
 		}
-		link, err := s.linkBuilder.NewClientLink(conn, bootstrap, s.linkLimits)
-		if err != nil {
-			_ = conn.Close()
-			return generationSlotResult{err: fmt.Errorf("construct gnet link: %w", err)}
-		}
-		return generationSlotResult{
-			slot:     FixedBindingSlot{DCID: dcID, SourceIP: clientAddr.Addr().Unmap(), Link: link},
-			selected: candidate,
-		}
+		lastErr = err
+		candidates = candidates[end:]
 	}
 	if lastErr == nil {
 		lastErr = errors.New("snapshot contains no usable endpoint")
 	}
-	return generationSlotResult{err: lastErr}
+	return generationDialResult{}, lastErr
+}
+
+func (s *gnetGenerationFactoryState) buildSlot(ctx context.Context, dcID DCID, cursor generationEndpointCursor) generationSlotResult {
+	result, err := s.dialCandidates(ctx, generationEndpointOrder(s.snapshot.Endpoints(dcID), cursor))
+	if err != nil {
+		return generationSlotResult{err: err}
+	}
+	conn, serverAddr, clientAddr, candidate := result.conn, result.serverAddr, result.clientAddr, result.candidate
+	if cause := context.Cause(ctx); cause != nil {
+		_ = conn.Close()
+		return generationSlotResult{err: cause}
+	}
+	now := s.now()
+	if now.Unix() <= 0 || now.Unix() > int64(^uint32(0)>>1) {
+		_ = conn.Close()
+		return generationSlotResult{err: errors.New("current time is outside the Middle-End int32 timestamp range")}
+	}
+	processID, err := ClientProcessID(clientAddr, s.processID, s.processStartedAt)
+	if err != nil {
+		_ = conn.Close()
+		return generationSlotResult{err: fmt.Errorf("initialize process identity: %w", err)}
+	}
+	secret := s.snapshot.Secret()
+	bootstrap, err := NewClientBootstrap(ClientBootstrapConfig{
+		Secret:          secret,
+		ServerAddr:      serverAddr,
+		ClientAddr:      clientAddr,
+		LocalProcessID:  processID,
+		ClientTimestamp: int32(now.Unix()),
+	})
+	clear(secret)
+	if err != nil {
+		_ = conn.Close()
+		return generationSlotResult{err: fmt.Errorf("initialize bootstrap: %w", err)}
+	}
+	link, err := s.linkBuilder.NewClientLink(conn, bootstrap, s.linkLimits)
+	if err != nil {
+		_ = conn.Close()
+		return generationSlotResult{err: fmt.Errorf("construct gnet link: %w", err)}
+	}
+	return generationSlotResult{
+		slot:     FixedBindingSlot{DCID: dcID, SourceIP: clientAddr.Addr().Unmap(), Link: link},
+		selected: candidate,
+	}
 }
 
 func (s *gnetGenerationFactoryState) advanceCursor(dcID DCID, selected generationEndpointCandidate) {

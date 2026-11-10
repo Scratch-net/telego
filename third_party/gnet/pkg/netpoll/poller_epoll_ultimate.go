@@ -253,3 +253,28 @@ func (p *Poller) ModReadWrite(pa *PollAttachment, edgeTriggered bool) error {
 func (p *Poller) Delete(fd int) error {
 	return os.NewSyscallError("epoll_ctl del", epollCtl(p.fd, unix.EPOLL_CTL_DEL, fd, nil))
 }
+
+// ModReadPaused changes read interest without discarding pending writes.
+// Telego: no RDHUP while paused, and no level-triggered HUP spin when idle.
+func (p *Poller) ModReadPaused(pa *PollAttachment, paused, writable, edgeTriggered bool) error {
+	var events uint32
+	if !paused {
+		events = ReadEvents
+	}
+	if writable {
+		events |= WriteEvents
+	}
+	if edgeTriggered {
+		events |= unix.EPOLLET
+		if !paused {
+			events |= unix.EPOLLRDHUP
+		}
+	}
+	if paused && !writable {
+		events |= unix.EPOLLET
+	}
+	var ev epollevent
+	ev.events = events
+	convertPollAttachment(unsafe.Pointer(&ev.data), pa)
+	return os.NewSyscallError("epoll_ctl mod", epollCtl(p.fd, unix.EPOLL_CTL_MOD, pa.FD, &ev))
+}

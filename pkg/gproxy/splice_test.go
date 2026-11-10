@@ -120,7 +120,7 @@ func onSpliceClient(t *testing.T, client spliceTestClient, check func()) {
 	}
 }
 
-func TestSpliceGnetCleanEOFDrainsBufferedTail(t *testing.T) {
+func TestSpliceGnetCleanEOFResumesAfterBackpressure(t *testing.T) {
 	backend, socket := directTCPPair(t)
 	server := newSpliceTestServer(t, Config{MaxWriteBuffer: 1024 * 1024},
 		func(context.Context, string) (net.Conn, error) { return socket, nil }, nil)
@@ -143,15 +143,19 @@ func TestSpliceGnetCleanEOFDrainsBufferedTail(t *testing.T) {
 		}
 		written <- err
 	}()
-	awaitSpliceCondition(t, "upstream EOF handoff", client.ctx.spliceDrainRequested.Load)
+	// The upstream socket must remain paused until the client frees output
+	// capacity. EOF now follows that resume instead of forcing an input drain.
+	awaitSpliceCondition(t, "splice output pressure", func() bool {
+		output := client.ctx.splice.Load().toClient
+		output.mu.Lock()
+		defer output.mu.Unlock()
+		return output.waiting > 0
+	})
 	var tailSize, buffered int
 	onSpliceClient(t, client, func() {
 		tailSize = len(client.ctx.spliceDrainTail)
 		buffered = client.conn.OutboundBuffered()
 	})
-	if tailSize == 0 {
-		t.Fatal("fixture did not retain an EOF tail under client backpressure")
-	}
 	if tailSize > server.handler.maxWriteBuffer || buffered > server.handler.maxWriteBuffer {
 		t.Fatalf("unbounded EOF drain: tail %d, output %d", tailSize, buffered)
 	}

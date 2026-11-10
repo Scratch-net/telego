@@ -168,7 +168,7 @@ func (h *ProxyHandler) handleDCTraffic(dcConn gnet.Conn, dcCtx *DCConnContext) g
 	clientCtx.recordServerActivity()
 	_, _ = dcConn.Discard(n)
 	if len(data) > n {
-		if err := dcConn.Wake(nil); err != nil {
+		if err := continueRelayInput(dcConn); err != nil {
 			return gnet.Close
 		}
 	}
@@ -263,7 +263,7 @@ func (h *ProxyHandler) handleDCTrafficDD(dcConn gnet.Conn, dcCtx *DCConnContext)
 	clientCtx.recordServerActivity()
 	_, _ = dcConn.Discard(n)
 	if len(data) > n {
-		if err := dcConn.Wake(nil); err != nil {
+		if err := continueRelayInput(dcConn); err != nil {
 			return gnet.Close
 		}
 	}

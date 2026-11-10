@@ -1142,6 +1142,43 @@ func TestMiddleEndOutputStallTimeoutDoesNotPopEvent(t *testing.T) {
 	closeMiddleEndTestClient(handler, conn, ctx)
 }
 
+func TestMiddleEndHealthyLinkWithoutClientAnswerStaysOpenUntilLinkFails(t *testing.T) {
+	handler, link, conn, ctx, _ := establishMiddleEndDD(t, func(config *MiddleEndFrontendConfig) {
+		config.OutputStallTimeout = 10 * time.Millisecond
+	})
+	t.Cleanup(func() { closeMiddleEndTestClient(handler, conn, ctx) })
+
+	// The request was accepted, but this link never emits a client answer.
+	if got := link.Snapshot().State; got != middleend.LinkStateReady {
+		t.Fatalf("link state = %v, want ready", got)
+	}
+	if got := conn.writes.Load(); got != 0 {
+		t.Fatalf("unexpected downstream writes = %d", got)
+	}
+	link.mu.Lock()
+	link.autoPong = true
+	link.mu.Unlock()
+	manager := handler.middleEnd.source.(*middleend.FixedBindingManager)
+	if err := manager.Probe(t.Context(), 2); err != nil {
+		t.Fatalf("healthy link probe = %v", err)
+	}
+	time.Sleep(25 * time.Millisecond)
+	if action := runMiddleEndOwner(conn, func() gnet.Action { return handler.OnTraffic(conn) }); action != gnet.None {
+		t.Fatalf("silent healthy link action = %v, want None", action)
+	}
+	if got := conn.writes.Load(); got != 0 {
+		t.Fatalf("silent link downstream writes = %d", got)
+	}
+
+	if err := link.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitMiddleEndToken(t, ctx.middleEnd)
+	if action := runMiddleEndOwner(conn, func() gnet.Action { return handler.OnTraffic(conn) }); action != gnet.Close {
+		t.Fatalf("failed link action = %v, want Close", action)
+	}
+}
+
 func TestMiddleEndOutputHeadroomBoundariesAndSingleEncryption(t *testing.T) {
 	handler, link, conn, ctx, responseDecryptor := establishMiddleEndDD(t, nil)
 	answer := append(validMiddleEndPacket(), 9, 10, 11, 12)
