@@ -58,7 +58,7 @@ jobs:
         uses: goreleaser/goreleaser-action@v7.3.0
         with:
           distribution: goreleaser
-          version: v2.20.0
+          version: v2.20.1
           args: release --clean -f dist/.goreleaser.yml --release-notes="docs/releases/${{ github.ref_name }}.md"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
