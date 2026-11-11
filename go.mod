@@ -2,7 +2,7 @@ module github.com/scratch-net/telego
 
 replace github.com/panjf2000/gnet/v2 => ./third_party/gnet
 
-go 1.27.3
+go 1.27.4
 
 require (
 	github.com/alecthomas/kong v1.17.0
