@@ -83,6 +83,28 @@ func TestBridgeFailureCloseValidation(t *testing.T) {
 	}
 }
 
+// The bridge serializes the same fields in the same order. The largest valid
+// report must still fit in one diagnostic request.
+func TestBridgeFailureLargestReportFitsRequestBound(t *testing.T) {
+	const maxMS uint64 = 30 * 24 * 60 * 60 * 1000
+	body := fmt.Sprintf(`{"reason":"ws_lane_closed_transport","error":"response_deadline","lane_id":%d,"close_code":4999,`+
+		`"ready_state":3,"http_status":599,"elapsed_ms":%d,"operation_ms":%d,"queued_bytes":%d,"queued_items":%d,`+
+		`"buffered_bytes":%d,"received_bytes":%d,"idle_ms":%d,"was_clean":true}`,
+		MaxStreamID, maxMS, maxMS, 1<<30, 1<<20, 1<<30, 1<<30, maxMS)
+	if len(body) > maxBridgeDiagnosticBytes {
+		t.Fatalf("largest report has %d bytes, limit %d", len(body), maxBridgeDiagnosticBytes)
+	}
+	failure, valid := parseBridgeFailure([]byte(body))
+	if !valid || failure.ReceivedBytes != 1<<30 || failure.IdleMS != maxMS {
+		t.Fatalf("largest report = %+v, valid %t", failure, valid)
+	}
+	for _, field := range []string{`"received_bytes":1073741825`, fmt.Sprintf(`"idle_ms":%d`, maxMS+1)} {
+		if _, valid := parseBridgeFailure([]byte(`{"reason":"ws_open","error":"none",` + field + `}`)); valid {
+			t.Fatalf("accepted out-of-range %s", field)
+		}
+	}
+}
+
 func TestBridgeDiagnosticAuthenticationAndBounds(t *testing.T) {
 	reports := make(chan BridgeFailure, 8)
 	app := newHTTPTestApplicationWithConfig(t, time.Second, func(config *ManagerConfig) {

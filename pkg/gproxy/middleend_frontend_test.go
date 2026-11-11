@@ -1991,3 +1991,59 @@ func TestMiddleEndActualShutdownOrderLeavesManagerExternal(t *testing.T) {
 		t.Fatalf("rebound CloseResult = %v, %v", closeErr, set)
 	}
 }
+
+type countingMiddleEndSource struct {
+	MiddleEndBindingSource
+	nextReady atomic.Int64
+}
+
+func (s *countingMiddleEndSource) TryNextReady() *middleend.ClientReadyToken {
+	s.nextReady.Add(1)
+	return s.MiddleEndBindingSource.TryNextReady()
+}
+
+// A client blocked on output keeps its ready token. Response pressure that
+// evicts its binding must not make the dispatcher spin, and the parked owner
+// must still observe the terminal state on its next run.
+func TestMiddleEndEvictedParkedBindingDoesNotSpinDispatcher(t *testing.T) {
+	var source *countingMiddleEndSource
+	handler, link, conn, ctx, _ := establishMiddleEndDD(t, func(config *MiddleEndFrontendConfig) {
+		source = &countingMiddleEndSource{MiddleEndBindingSource: config.Source}
+		config.Source = source
+		config.OutputStallTimeout = time.Minute
+	})
+	conn.SetOutboundBuffered(handler.maxWriteBuffer)
+	connectionID := ctx.middleEnd.binding.ConnectionID()
+	packet := append(validMiddleEndPacket(), 1, 2, 3, 4)
+	link.emit(middleend.LinkEvent{Kind: middleend.LinkEventProxyAnswer, ConnectionID: connectionID, Packet: bytes.Clone(packet)})
+	token := waitMiddleEndToken(t, ctx.middleEnd)
+	if action := runMiddleEndOwner(conn, func() gnet.Action { return handler.OnTraffic(conn) }); action != gnet.None {
+		t.Fatalf("parked output action = %v", action)
+	}
+	if ctx.middleEnd.route.currentToken() != token {
+		t.Fatal("blocked output released its ready token")
+	}
+	// The per-binding item limit evicts the parked binding on the last answer.
+	for range middleEndTestLimits().MaxPendingResponseItemsPerBinding {
+		link.emit(middleend.LinkEvent{Kind: middleend.LinkEventProxyAnswer, ConnectionID: connectionID, Packet: bytes.Clone(packet)})
+	}
+	deadline := time.After(3 * time.Second)
+	for evicted := false; !evicted; {
+		select {
+		case submission := <-link.submitted:
+			evicted = submission.ConnectionID == connectionID
+		case <-deadline:
+			t.Fatal("timed out waiting for the eviction close")
+		}
+	}
+	before := source.nextReady.Load()
+	time.Sleep(100 * time.Millisecond)
+	if calls := source.nextReady.Load() - before; calls > 100 {
+		t.Fatalf("dispatcher called TryNextReady %d times in 100ms after eviction", calls)
+	}
+	conn.SetOutboundBuffered(0)
+	if action := runMiddleEndOwner(conn, func() gnet.Action { return handler.OnTraffic(conn) }); action != gnet.Close {
+		t.Fatalf("evicted parked binding action = %v, want Close", action)
+	}
+	closeMiddleEndTestClient(handler, conn, ctx)
+}

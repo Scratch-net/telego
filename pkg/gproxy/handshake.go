@@ -3,9 +3,11 @@ package gproxy
 import (
 	"crypto/cipher"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/panjf2000/gnet/v2"
 
@@ -68,13 +70,16 @@ func (h *ProxyHandler) handleDDFrame(c clientEndpoint, ctx *ConnContext) gnet.Ac
 
 	if matchedSecret == nil {
 		h.logger.Debug("[#%d] dd mode: no matching secret found", ctx.id)
+		h.recordMaskFallback(maskFallbackUnknownSecret)
 		return h.startSplice(c, ctx)
 	}
 
-	// Check replay using first 32 bytes of frame as session ID
-	sessionID := data[:32]
-	if h.replayCache.Seen(sessionID) {
+	// Key replay detection on the key+IV block (bytes 8..55). These bytes
+	// derive both ciphers; bytes 0..7 are unused and unvalidated, so a key
+	// that includes them lets an attacker replay with a changed prefix.
+	if h.replayCache.Seen(data[8:56]) {
 		h.logger.Debug("[#%d] dd mode: replay attack detected", ctx.id)
+		h.recordMaskFallback(maskFallbackReplay)
 		return h.startSplice(c, ctx)
 	}
 
@@ -99,7 +104,9 @@ func (h *ProxyHandler) handleDDFrame(c clientEndpoint, ctx *ConnContext) gnet.Ac
 	if h.connLimiter != nil && clientIP != nil {
 		key, ok := h.connLimiter.TryAcquire(clientIP, matchedSecret.Key)
 		if !ok {
-			h.logger.Info("[#%d:%s] connection limit exceeded for IP: %s", ctx.id, matchedSecret.Name, clientIP)
+			if suppressed, ok := h.ipLimitLog.allow(time.Now().Unix()); ok {
+				h.logger.Info("[#%d:%s] connection limit exceeded for IP: %s (%d more rejections not logged)", ctx.id, matchedSecret.Name, clientIP, suppressed)
+			}
 			return h.failHandshake(ctx, handshakeFailureAdmission)
 		}
 		ctx.mu.Lock()
@@ -121,7 +128,9 @@ func (h *ProxyHandler) handleDDFrame(c clientEndpoint, ctx *ConnContext) gnet.Ac
 				}
 				ctx.mu.Unlock()
 			}
-			h.logger.Info("[#%d:%s] IP blocked for user (too many unique IPs): %s", ctx.id, matchedSecret.Name, clientIP)
+			if suppressed, ok := h.userIPLimitLog.allow(time.Now().Unix()); ok {
+				h.logger.Info("[#%d:%s] IP blocked for user (too many unique IPs): %s (%d more rejections not logged)", ctx.id, matchedSecret.Name, clientIP, suppressed)
+			}
 			return h.failHandshake(ctx, handshakeFailureAdmission)
 		}
 		// Store tracking info for cleanup in OnClose
@@ -164,6 +173,7 @@ func (h *ProxyHandler) handleTLSHeader(c clientEndpoint, ctx *ConnContext) gnet.
 	// Check if this is a TLS handshake record
 	if data[0] != faketls.RecordTypeHandshake {
 		h.logger.Debug("[#%d] not a TLS handshake record: 0x%02x", ctx.id, data[0])
+		h.recordMaskFallback(maskFallbackMalformed)
 		return h.startSplice(c, ctx)
 	}
 
@@ -171,6 +181,7 @@ func (h *ProxyHandler) handleTLSHeader(c clientEndpoint, ctx *ConnContext) gnet.
 	version := binary.BigEndian.Uint16(data[1:3])
 	if version != faketls.VersionTLS10 && version != faketls.VersionTLS11 && version != faketls.VersionTLS12 {
 		h.logger.Debug("[#%d] invalid TLS version: 0x%04x", ctx.id, version)
+		h.recordMaskFallback(maskFallbackMalformed)
 		return h.startSplice(c, ctx)
 	}
 
@@ -178,6 +189,7 @@ func (h *ProxyHandler) handleTLSHeader(c clientEndpoint, ctx *ConnContext) gnet.
 	payloadLen := int(binary.BigEndian.Uint16(data[3:5]))
 	if payloadLen > faketls.MaxRecordPayload {
 		h.logger.Debug("TLS record too large: %d", payloadLen)
+		h.recordMaskFallback(maskFallbackMalformed)
 		return h.startSplice(c, ctx)
 	}
 
@@ -209,29 +221,15 @@ func (h *ProxyHandler) handleTLSPayload(c clientEndpoint, ctx *ConnContext) gnet
 
 	payload, needed, ready, err := clientHelloPayload(data)
 	if err != nil {
+		h.recordMaskFallback(maskFallbackMalformed)
 		return h.startSplice(c, ctx)
 	}
 	if !ready {
 		return gnet.None
 	}
 
-	// Try each secret until one matches
-	var hello *faketls.ClientHello
-	var matchedSecret *Secret
-	for i := range h.config.Secrets {
-		s := &h.config.Secrets[i]
-		parsed, err := faketls.ParseClientHello(s.Key, payload)
-		if err != nil {
-			continue
-		}
-		// Validate against this secret's hostname
-		if err := parsed.Valid(s.Host, h.config.TimeSkewTolerance); err != nil {
-			continue
-		}
-		hello = parsed
-		matchedSecret = s
-		break
-	}
+	sni := faketls.ExtractSNI(payload)
+	hello, matchedSecret, reason := h.matchClientHello(payload, sni)
 
 	if hello == nil {
 		// Log diagnostic info to help troubleshoot
@@ -244,13 +242,14 @@ func (h *ProxyHandler) handleTLSPayload(c clientEndpoint, ctx *ConnContext) gnet
 		// SNI-following: if this probe's claimed SNI is on the mask safelist,
 		// front it to that domain's own server instead of the default target.
 		if len(h.maskSafelist) > 0 {
-			if sni := faketls.ExtractSNI(payload); sni != "" {
+			if sni != "" {
 				if target, ok := h.maskSafelist[strings.ToLower(sni)]; ok {
 					ctx.SetSpliceOverride(target)
 					h.logger.Debug("[#%d] SNI %q safelisted, fronting to %s", ctx.id, sni, target)
 				}
 			}
 		}
+		h.recordMaskFallback(reason)
 		return h.startSplice(c, ctx)
 	}
 
@@ -270,6 +269,7 @@ func (h *ProxyHandler) handleTLSPayload(c clientEndpoint, ctx *ConnContext) gnet
 	// timestamp cannot bypass replay detection.
 	if h.replayCache.Seen(hello.Random[:28]) {
 		h.logger.Debug("[#%d] replay attack detected", ctx.id)
+		h.recordMaskFallback(maskFallbackReplay)
 		return h.startSplice(c, ctx)
 	}
 
@@ -295,7 +295,9 @@ func (h *ProxyHandler) handleTLSPayload(c clientEndpoint, ctx *ConnContext) gnet
 	if h.connLimiter != nil && clientIP != nil {
 		key, ok := h.connLimiter.TryAcquire(clientIP, matchedSecret.Key)
 		if !ok {
-			h.logger.Info("[#%d:%s] connection limit exceeded for IP: %s", ctx.id, matchedSecret.Name, clientIP)
+			if suppressed, ok := h.ipLimitLog.allow(time.Now().Unix()); ok {
+				h.logger.Info("[#%d:%s] connection limit exceeded for IP: %s (%d more rejections not logged)", ctx.id, matchedSecret.Name, clientIP, suppressed)
+			}
 			return h.failHandshake(ctx, handshakeFailureAdmission)
 		}
 		ctx.mu.Lock()
@@ -317,7 +319,9 @@ func (h *ProxyHandler) handleTLSPayload(c clientEndpoint, ctx *ConnContext) gnet
 				}
 				ctx.mu.Unlock()
 			}
-			h.logger.Info("[#%d:%s] IP blocked for user (too many unique IPs): %s", ctx.id, matchedSecret.Name, clientIP)
+			if suppressed, ok := h.userIPLimitLog.allow(time.Now().Unix()); ok {
+				h.logger.Info("[#%d:%s] IP blocked for user (too many unique IPs): %s (%d more rejections not logged)", ctx.id, matchedSecret.Name, clientIP, suppressed)
+			}
 			return h.failHandshake(ctx, handshakeFailureAdmission)
 		}
 		// Store tracking info for cleanup in OnClose
@@ -336,10 +340,10 @@ func (h *ProxyHandler) handleTLSPayload(c clientEndpoint, ctx *ConnContext) gnet
 	// Build ServerHello response
 	var response []byte
 
-	// HYBRID MODE: Use real ServerHello from mask host (best DPI evasion)
+	// HYBRID MODE: Build the ServerHello from the mask host template (best DPI evasion)
 	if h.serverHelloFetcher != nil {
-		realHello, randomOffset, fetchErr := h.serverHelloFetcher.GetServerHelloTemplate()
-		if fetchErr == nil && len(realHello) > 0 {
+		template, fetchErr := h.serverHelloFetcher.Template()
+		if fetchErr == nil {
 			// Size the fake cert record to match the mask backend (config override,
 			// else the captured real first cert-record size) so the accept path and
 			// the splice path show the same cert-record length.
@@ -348,9 +352,8 @@ func (h *ProxyHandler) handleTLSPayload(c clientEndpoint, ctx *ConnContext) gnet
 				certSize = h.serverHelloFetcher.CertRecordLen()
 			}
 			opts := &faketls.ServerHelloOptions{
-				RealServerHello:             realHello,
-				RealServerHelloRandomOffset: randomOffset,
-				FakeCertSize:                certSize,
+				Template:     template,
+				FakeCertSize: certSize,
 			}
 			response, err = faketls.BuildServerHelloWithOptions(matchedSecret.Key, hello, opts)
 			if err != nil {
@@ -410,6 +413,41 @@ func (h *ProxyHandler) handleTLSPayload(c clientEndpoint, ctx *ConnContext) gnet
 	}
 
 	return gnet.None
+}
+
+// matchClientHello tries each secret until one authenticates the hello.
+// Valid rejects a non-empty SNI that differs from the secret host, so such
+// secrets are skipped before their HMAC. Secret order is unchanged. Without
+// a match, reason tells why the hello goes to the mask host.
+func (h *ProxyHandler) matchClientHello(payload []byte, sni string) (*faketls.ClientHello, *Secret, maskFallbackReason) {
+	reason := maskFallbackUnknownSNI
+	for i := range h.config.Secrets {
+		s := &h.config.Secrets[i]
+		if sni != "" && sni != s.Host {
+			continue
+		}
+		if reason == maskFallbackUnknownSNI {
+			reason = maskFallbackUnknownSecret
+		}
+		parsed, err := faketls.ParseClientHello(s.Key, payload)
+		if err != nil {
+			continue
+		}
+		// Validate against this secret's hostname
+		if err := parsed.Valid(s.Host, h.config.TimeSkewTolerance); err != nil {
+			if errors.Is(err, faketls.ErrBadTimestamp) {
+				// The hello is authenticated. Remember it so that it cannot be
+				// replayed later, when its timestamp becomes acceptable
+				// (official MTProxy 818a93ef). A future timestamp stays
+				// acceptable until timestamp + tolerance.
+				h.replayCache.SeenUntil(parsed.Random[:28], parsed.Time.Add(h.config.TimeSkewTolerance))
+				reason = maskFallbackBadTimestamp
+			}
+			continue
+		}
+		return parsed, s, 0
+	}
+	return nil, nil, reason
 }
 
 // handleO2Frame parses the obfuscated2 handshake frame and initiates DC connection.

@@ -189,6 +189,10 @@ func TestServerHelloRefreshRealTLS(t *testing.T) {
 			if err != nil || offset != 11 || len(got) != 5+int(binary.BigEndian.Uint16(got[3:5])) {
 				t.Fatalf("invalid cached record: offset=%d error=%v", offset, err)
 			}
+			// Only a TLS 1.3 ServerHello can be a per-connection template.
+			if _, err := fetcher.Template(); (err == nil) != (version == tls.VersionTLS13) {
+				t.Fatalf("Template() error = %v for %s", err, tls.VersionName(version))
+			}
 		})
 	}
 }
@@ -241,10 +245,10 @@ func TestServerHelloRefreshRejectsHelloRetryRequest(t *testing.T) {
 
 func TestFirstAppDataRecordRequiresCompletePayload(t *testing.T) {
 	data := append(validServerHelloRecord(), 0x17, 3, 3, 0, 2, 1)
-	if got := firstAppDataRecordLen(data); got != 0 {
+	if got := certAppDataRecordLen(data); got != 0 {
 		t.Fatalf("partial application record length = %d", got)
 	}
-	if got := firstAppDataRecordLen(append(data, 2)); got != 2 {
+	if got := certAppDataRecordLen(append(data, 2)); got != 2 {
 		t.Fatalf("complete application record length = %d", got)
 	}
 }

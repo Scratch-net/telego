@@ -131,7 +131,7 @@ func (h *ProxyHandler) handleDCTraffic(dcConn gnet.Conn, dcCtx *DCConnContext) g
 		return gnet.Close
 	}
 	if dcCtx.ToClient == nil {
-		dcCtx.ToClient = newRelayOutput(dcCtx.ClientConn, dcConn, clientCtx, h.maxWriteBuffer)
+		dcCtx.ToClient = newClientRelayOutput(dcCtx.ClientConn, dcConn, clientCtx, h.maxWriteBuffer)
 	}
 	planSize := dcCtx.responseSize
 	maximum := min(len(data), 60*1024)
@@ -157,7 +157,7 @@ func (h *ProxyHandler) handleDCTraffic(dcConn gnet.Conn, dcCtx *DCConnContext) g
 	n := low
 	tlsSize := planSize(n)
 	dcCtx.ToClient.releaseReservation(budget - tlsSize)
-	buffer, release := h.relayBuffer(tlsSize)
+	buffer, release := h.relayBuffer(dcCtx.ToClient, tlsSize)
 	dcCtx.encodeResponse(buffer, data[:n])
 	if err := dcCtx.ToClient.write(buffer, release); err != nil {
 		return gnet.Close
@@ -165,7 +165,6 @@ func (h *ProxyHandler) handleDCTraffic(dcConn gnet.Conn, dcCtx *DCConnContext) g
 	if counter := clientCtx.TrafficOut(); counter != nil {
 		counter.Add(int64(n))
 	}
-	clientCtx.recordServerActivity()
 	_, _ = dcConn.Discard(n)
 	if len(data) > n {
 		if err := continueRelayInput(dcConn); err != nil {
@@ -245,13 +244,13 @@ func (h *ProxyHandler) handleDCTrafficDD(dcConn gnet.Conn, dcCtx *DCConnContext)
 		return gnet.Close
 	}
 	if dcCtx.ToClient == nil {
-		dcCtx.ToClient = newRelayOutput(dcCtx.ClientConn, dcConn, clientCtx, h.maxWriteBuffer)
+		dcCtx.ToClient = newClientRelayOutput(dcCtx.ClientConn, dcConn, clientCtx, h.maxWriteBuffer)
 	}
 	n := dcCtx.ToClient.reserve(min(len(data), relayBatchSize), 1)
 	if n == 0 {
 		return gnet.None
 	}
-	buffer, release := h.relayBuffer(n)
+	buffer, release := h.relayBuffer(dcCtx.ToClient, n)
 	dcCtx.DCDecrypt.XORKeyStream(buffer, data[:n])
 	dcCtx.ClientEncrypt.XORKeyStream(buffer, buffer)
 	if err := dcCtx.ToClient.write(buffer, release); err != nil {
@@ -260,7 +259,6 @@ func (h *ProxyHandler) handleDCTrafficDD(dcConn gnet.Conn, dcCtx *DCConnContext)
 	if counter := clientCtx.TrafficOut(); counter != nil {
 		counter.Add(int64(n))
 	}
-	clientCtx.recordServerActivity()
 	_, _ = dcConn.Discard(n)
 	if len(data) > n {
 		if err := continueRelayInput(dcConn); err != nil {

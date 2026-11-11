@@ -84,6 +84,9 @@ middle-end.enabled = true
 		{"general.max-ips-per-user", "-1"},
 		{"general.ip-block-timeout", `"-1s"`},
 		{"general.handshake-timeout", `"-1s"`},
+		{"general.handshake-timeout", `"999ms"`},
+		{"general.handshake-timeout", `"61s"`},
+		{"general.handshake-timeout", `"1000h"`},
 		{"tls-fronting.mask-port", "-1"},
 		{"tls-fronting.mask-port", "65536"},
 		{"tls-fronting.cert-port", "-1"},
@@ -103,6 +106,9 @@ middle-end.enabled = true
 		{"performance.max-write-buffer-mb", "-1"},
 		{"performance.max-write-buffer-mb", fmt.Sprint(math.MaxInt/(1024*1024) + 1)},
 		{"performance.client-silence-close", `"-1s"`},
+		{"performance.client-silence-close", `"1ms"`},
+		{"performance.client-silence-close", `"999ms"`},
+		{"performance.max-write-buffer-mb", "1025"},
 		{"web-proxy.num-event-loops", "-1"},
 		{"middle-end.max-connections", "-1"},
 		{"middle-end.queue-budget-mb", "-1"},
@@ -138,6 +144,28 @@ func TestConfigServerHelloSegmentSize(t *testing.T) {
 		cfg, err := file.ToGProxyConfig()
 		if err != nil || cfg.ServerHelloSegmentSize != size {
 			t.Fatalf("size=%d cfg=%d error=%v", size, cfg.ServerHelloSegmentSize, err)
+		}
+	}
+}
+
+func TestConfigAcceptsScalarBounds(t *testing.T) {
+	const base = `secrets.test = "0123456789abcdef0123456789abcdef"
+tls-fronting.mask-host = "example.com"
+`
+	for _, values := range [][3]string{
+		{`"1s"`, `"1s"`, "1"},
+		{`"5s"`, `"12s"`, "4"},
+		{`"1m"`, `"24h"`, "1024"},
+	} {
+		content := base + "general.handshake-timeout = " + values[0] +
+			"\nperformance.client-silence-close = " + values[1] +
+			"\nperformance.max-write-buffer-mb = " + values[2] + "\n"
+		cfg, err := Load(writeConfigTestFile(t, content))
+		if err != nil {
+			t.Fatalf("%v: %v", values, err)
+		}
+		if _, err := cfg.ToGProxyConfig(); err != nil {
+			t.Fatalf("%v: %v", values, err)
 		}
 	}
 }

@@ -1,6 +1,9 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +16,30 @@ func TestDoctorTimeout(t *testing.T) {
 		if err := (&DoctorCmd{Timeout: timeout}).Run(); err == nil {
 			t.Fatal("invalid timeout passed", timeout)
 		}
+	}
+}
+
+func TestDoctorPublicIP(t *testing.T) {
+	stun := func() (string, error) { return "198.51.100.2", nil }
+	ip, source, err := doctorPublicIP(t.Context(), " 203.0.113.7 ", stun)
+	if err != nil || ip != netip.MustParseAddr("203.0.113.7") || source != "middle-end.nat-ip" {
+		t.Fatal(ip, source, err)
+	}
+	ip, source, err = doctorPublicIP(t.Context(), "", stun)
+	if err != nil || ip != netip.MustParseAddr("198.51.100.2") || source != "stun" {
+		t.Fatal(ip, source, err)
+	}
+	if _, _, err = doctorPublicIP(t.Context(), "", func() (string, error) { return "", errors.New("stun failed") }); err == nil {
+		t.Fatal("STUN failure passed")
+	}
+	block := make(chan struct{})
+	defer close(block)
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, _, err = doctorPublicIP(ctx, "", func() (string, error) { <-block; return "", nil })
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(started) > time.Second {
+		t.Fatal("stalled STUN discovery was not bounded:", err)
 	}
 }
 

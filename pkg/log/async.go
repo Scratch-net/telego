@@ -60,9 +60,15 @@ func (w *asyncWriter) WriteLevel(level zerolog.Level, p []byte) (int, error) {
 		w.drop()
 		return len(p), nil
 	}
+	// One slot is reserved for a fatal event. A quarter of the queue is also
+	// reserved for warnings and errors, so an info flood cannot drop them.
 	limit := w.capacity - 1
-	if level == zerolog.FatalLevel {
+	switch level {
+	case zerolog.FatalLevel:
 		limit = w.capacity
+	case zerolog.WarnLevel, zerolog.ErrorLevel, zerolog.PanicLevel:
+	default:
+		limit -= w.capacity / 4
 	}
 	if w.pending.Load() >= limit {
 		w.drop()

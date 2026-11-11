@@ -1885,15 +1885,17 @@ func TestFixedBindingGlobalWaitArbitration(t *testing.T) {
 		_, _ = anchor.PrepareProxyRequest(request)
 		waitFixedBindingCondition(t, func() bool { return len(firstLink.attemptedSubmissions()) == 1 })
 		_, _ = blocked.PrepareProxyRequest(request)
-		if status, err := unrelated.PrepareProxyRequest(request); err != nil || status != PrepareProxyRequestWaiting {
+		// Promotion reserves the unrelated request at once, and its caller
+		// builds it without a readiness round trip.
+		if status, err := unrelated.PrepareProxyRequest(request); err != nil || status != PrepareProxyRequestQueued {
 			t.Fatalf("unrelated prepare = %d, %v", status, err)
 		}
+		waitFixedBindingCondition(t, func() bool { return len(secondLink.attemptedSubmissions()) == 1 })
 		manager.state.mu.Lock()
 		blockedPhase := blocked.state.request.phase
-		unrelatedPhase := unrelated.state.request.phase
 		manager.state.mu.Unlock()
-		if blockedPhase != preparedRequestWaiting || unrelatedPhase != preparedRequestReserved {
-			t.Fatalf("local eligibility phases = blocked %d unrelated %d", blockedPhase, unrelatedPhase)
+		if blockedPhase != preparedRequestWaiting {
+			t.Fatalf("local eligibility phase = blocked %d", blockedPhase)
 		}
 	})
 }
@@ -4585,5 +4587,115 @@ func TestFixedBindingManagerConcurrentRaceStress(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("stress manager leaked its consumer")
 		}
+	}
+}
+
+// Eviction keeps an outstanding ready lease. The holder observes the terminal
+// state with its own token, and no fresh token is handed out meanwhile. A
+// fresh token cannot reach a frontend route that still holds the old one, so
+// it would be acknowledged and requeued in a tight loop.
+func TestFixedBindingEvictionKeepsOutstandingReadyLease(t *testing.T) {
+	link := newFixedBindingFakeLink()
+	manager := newStartedFixedBindingManager(t, FixedBindingSlot{DCID: 1, Link: link})
+	binding, err := manager.BindReady(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := binding.PrepareProxyRequest(fixedBindingProxyRequest()); err != nil {
+		t.Fatal(err)
+	}
+	var held *ClientReadyToken
+	waitFixedBindingCondition(t, func() bool { held = manager.TryNextReady(); return held != nil })
+
+	m := manager.state
+	m.mu.Lock()
+	m.evictBackpressuredBindingLocked(binding.state, ErrFixedBindingResponseBackpressure)
+	m.mu.Unlock()
+
+	iterations := 0
+	deadline := time.After(100 * time.Millisecond)
+loop:
+	for {
+		select {
+		case <-deadline:
+			break loop
+		case <-manager.Ready():
+			token := manager.TryNextReady()
+			if token == nil {
+				continue
+			}
+			iterations++
+			_ = token.Ack() // A frontend cannot offer it while the route holds a token.
+		}
+	}
+	if iterations != 0 {
+		t.Fatalf("dispatcher received %d fresh tokens in 100ms while the lease was held", iterations)
+	}
+	if _, _, err := held.TryTakeRequestResult(); err != nil {
+		t.Fatalf("held token after eviction: %v", err)
+	}
+	terminalErr, terminal, err := held.TryTerminal()
+	if err != nil || !terminal || !errors.Is(terminalErr, ErrFixedBindingResponseBackpressure) {
+		t.Fatalf("held token terminal = %v, %v, %v", terminalErr, terminal, err)
+	}
+	if err := held.Ack(); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	resident := binding.state.resident
+	m.mu.Unlock()
+	if resident {
+		t.Fatal("observed evicted binding stayed resident after Ack")
+	}
+}
+
+// A caller whose own waiter is promoted inside PrepareProxyRequest builds the
+// request directly. It must not also leave a ready entry for that request.
+func TestFixedBindingSelfPromotedRequestLeavesNoReadyToken(t *testing.T) {
+	blocked := newFixedBindingFakeLink()
+	blocked.setTryError(ErrLinkBackpressure)
+	open := newFixedBindingFakeLink()
+	open.setTryError(ErrLinkBackpressure)
+	limits := fixedBindingTestLimits()
+	limits.MaxPendingRequestItemsPerSlot = 1
+	manager, err := NewFixedBindingManager([]FixedBindingSlot{{DCID: 1, Link: blocked}, {DCID: 2, Link: open}}, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	blocker, err := manager.BindReady(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter, err := manager.BindReady(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caller, err := manager.BindReady(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := fixedBindingProxyRequest()
+	if status, err := blocker.PrepareProxyRequest(request); err != nil || status != PrepareProxyRequestQueued {
+		t.Fatalf("blocker prepare = %d, %v", status, err)
+	}
+	if status, err := waiter.PrepareProxyRequest(request); err != nil || status != PrepareProxyRequestWaiting {
+		t.Fatalf("waiter prepare = %d, %v", status, err)
+	}
+	// The older waiter cannot take its full slot, so promotion picks the caller.
+	if status, err := caller.PrepareProxyRequest(request); err != nil || status != PrepareProxyRequestQueued {
+		t.Fatalf("caller prepare = %d, %v", status, err)
+	}
+	manager.state.mu.Lock()
+	queued := caller.state.readyQueued
+	manager.state.mu.Unlock()
+	if queued {
+		t.Fatal("self-promoted request left a ready entry")
+	}
+	if token := manager.TryNextReady(); token != nil {
+		t.Fatalf("spurious ready token for connection %d", token.ConnectionID())
 	}
 }

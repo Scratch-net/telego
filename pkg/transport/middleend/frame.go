@@ -78,6 +78,36 @@ func (e *FrameEncoder) encodeForCBC(payload []byte) ([]byte, error) {
 	return e.encode(payload, true)
 }
 
+// encodeInPlaceForCBC frames the payload already stored at
+// frame[frameHeaderSize:len(frame)-4]. It writes the header and checksum into
+// frame and returns it.
+func (e *FrameEncoder) encodeInPlaceForCBC(frame []byte) ([]byte, error) {
+	if e.err != nil {
+		return nil, e.err
+	}
+	if e.exhausted {
+		return nil, ErrSequenceExhausted
+	}
+	if err := validateChecksumMode(e.mode); err != nil {
+		return nil, err
+	}
+	payloadSize := len(frame) - FullFrameOverhead
+	if payloadSize < 4 || payloadSize%4 != 0 {
+		return nil, fmt.Errorf("%w: payload length %d", ErrInvalidFrameSize, payloadSize)
+	}
+	if payloadSize > e.maxFrameSize-FullFrameOverhead {
+		return nil, fmt.Errorf("%w: payload %d exceeds frame maximum %d", ErrFrameTooLarge, payloadSize, e.maxFrameSize)
+	}
+	sequence := e.nextSequence
+	if sequence < 0 {
+		// The handshake frame updates checksum state and uses encode.
+		return nil, fmt.Errorf("%w: in-place frame before handshake", ErrInvalidFrameSize)
+	}
+	putFrameEnvelope(frame, sequence, e.mode)
+	e.advanceSequence(sequence, nil)
+	return frame, nil
+}
+
 func (e *FrameEncoder) encode(payload []byte, padCBC bool) ([]byte, error) {
 	if e.err != nil {
 		return nil, e.err
@@ -91,6 +121,11 @@ func (e *FrameEncoder) encode(payload []byte, padCBC bool) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	e.advanceSequence(sequence, payload)
+	return wire, nil
+}
+
+func (e *FrameEncoder) advanceSequence(sequence int32, payload []byte) {
 	if e.checksumTransitionOpen && sequence >= 0 {
 		e.checksumTransitionOpen = false
 		e.checksumTransitionDone = true
@@ -106,7 +141,6 @@ func (e *FrameEncoder) encode(payload []byte, padCBC bool) ([]byte, error) {
 			e.checksumTransitionOpen = true
 		}
 	}
-	return wire, nil
 }
 
 // ApplyPeerHandshake locks the post-handshake checksum selected by a
@@ -162,11 +196,20 @@ func encodeFrameBuffer(sequence int32, payload []byte, mode ChecksumMode, maxFra
 		capacity = (capacity + aes.BlockSize - 1) &^ (aes.BlockSize - 1)
 	}
 	frame := make([]byte, frameSize, capacity)
+	copy(frame[frameHeaderSize:frameSize-4], payload)
+	putFrameEnvelope(frame, sequence, mode)
+	return frame, nil
+}
+
+// frameHeaderSize is the length and sequence prefix of a full frame.
+const frameHeaderSize = 8
+
+// putFrameEnvelope writes the header and checksum around a stored payload.
+func putFrameEnvelope(frame []byte, sequence int32, mode ChecksumMode) {
+	frameSize := len(frame)
 	binary.LittleEndian.PutUint32(frame[0:4], uint32(frameSize))
 	binary.LittleEndian.PutUint32(frame[4:8], uint32(sequence))
-	copy(frame[8:frameSize-4], payload)
 	binary.LittleEndian.PutUint32(frame[frameSize-4:], checksum(frame[:frameSize-4], mode))
-	return frame, nil
 }
 
 // DecodeFrame is a stateless low-level helper that validates and decodes one

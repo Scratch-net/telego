@@ -83,10 +83,19 @@ func (m *Manager) wakeBudgetWaiter() {
 		return
 	}
 	var backend *backendStream
+	// Waiters of one class keep FIFO order, so a smaller later request cannot
+	// starve a blocked head. Classes have different limits and can still
+	// pass each other; a strict global order could block a class that frees
+	// the capacity which the head needs.
+	var blocked [pendingBackendInput + 1]bool
 	for entry := m.budgetQueue.Front(); entry != nil; entry = entry.Next() {
 		waiter := entry.Value.(*backendBudgetWait)
+		if blocked[waiter.key.class] {
+			continue
+		}
 		byteLimit, itemLimit := m.pendingBudgetLimits(waiter.key.class)
 		if int64(waiter.cost) > int64(byteLimit)-m.pendingBytes || int64(waiter.items) > int64(itemLimit)-m.pendingItems {
+			blocked[waiter.key.class] = true
 			continue
 		}
 		backend = waiter.key.backend

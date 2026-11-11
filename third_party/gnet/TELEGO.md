@@ -22,7 +22,12 @@ Poller changes serialize notifications with descriptor closure and discard queue
 Modified source files identify the Telego changes. The upstream copyright notices remain.
 
 Linux TCP listeners recover from pending-connection network errors without stopping the engine.
-Resource exhaustion and permanent listener errors retain their existing shutdown behavior.
+Unix listeners also recover from accept resource exhaustion: `EMFILE`, `ENFILE`, `ENOBUFS`, and `ENOMEM`.
+The listener owner disables listener readiness and retries after a delay. The delay starts at 5ms and doubles to a maximum of 1s.
+A successful accept resets the delay. The owner logs at most one error per listener each second.
+The owner continues to serve its connections and shutdown requests during the delay.
+The retry accepts directly, so a backlog that arrived during the delay does not depend on a new readiness event from each poller.
+Permanent listener errors retain their existing shutdown behavior.
 The accept regression gate injects errors through temporary source overlays; production syscalls have no test hooks.
 
 The optional `OwnedWriter` API retains caller-owned output slices until socket drain or disposal.
@@ -63,6 +68,9 @@ The optimized poller uses unsafe attachments that are incompatible with the race
 Its gate uses a non-race build.
 
 `read_control_unix_test.go` covers paused writes, repeated pressure, peer EOF, shutdown, and a stale resume after close.
+
+`testdata/accept_fault_regression_test.go` runs only through the source overlay in `dist/test-gnet-accept.py`.
+It checks pending-connection recovery, resource-exhaustion backoff and recovery, shutdown during backoff, and fatal permanent errors.
 
 `registration_shutdown_regression_test.go` checks accepted enrollment during owner shutdown through the upstream public APIs.
 The test fails on the recorded upstream revision and passes with this patch.

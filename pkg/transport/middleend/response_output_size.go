@@ -14,10 +14,12 @@ const ResponseOutputNodeBytes = int(unsafe.Sizeof(struct {
 	release func(error)
 }{}))
 
-// ResponseOutputOwnerBytes covers the explicit frontend allocation owner.
+// ResponseOutputOwnerBytes covers the explicit frontend allocation owner and
+// its connection activity target.
 const ResponseOutputOwnerBytes = int(unsafe.Sizeof(struct {
 	data       []byte
 	allocation *ResponseAllocation
+	activity   *byte
 }{}))
 
 // ResponseOutputCallbackBytes covers the Go compiler closure layout: code

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"time"
 )
 
@@ -26,7 +27,12 @@ type CertificateReport struct {
 	NotBefore time.Time
 	NotAfter  time.Time
 	Version   uint16
+	CurveID   tls.CurveID
 }
+
+// doctorCurves offers X25519MLKEM768 first with classical fallbacks. The
+// explicit list keeps the result independent from GODEBUG=tlsmlkem.
+var doctorCurves = []tls.CurveID{tls.X25519MLKEM768, tls.X25519, tls.CurveP256, tls.CurveP384, tls.CurveP521}
 
 // CheckCertificate verifies trust, hostname, validity, and server authentication.
 // It does not use the runtime certificate cache or disable TLS verification.
@@ -58,7 +64,9 @@ func CheckCertificate(ctx context.Context, check CertificateCheck) (CertificateR
 			return report, fmt.Errorf("write diagnostic PROXY preface: %w", errors.Join(err, errors.New("incomplete preface")))
 		}
 	}
-	tlsConn := tls.Client(conn, &tls.Config{ServerName: check.ServerName, RootCAs: check.Roots, MinVersion: tls.VersionTLS12})
+	tlsConn := tls.Client(conn, &tls.Config{
+		ServerName: check.ServerName, RootCAs: check.Roots, MinVersion: tls.VersionTLS12, CurvePreferences: doctorCurves,
+	})
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		return report, fmt.Errorf("verify TLS certificate: %w", err)
 	}
@@ -69,8 +77,26 @@ func CheckCertificate(ctx context.Context, check CertificateCheck) (CertificateR
 	leaf := state.PeerCertificates[0]
 	return CertificateReport{
 		Subject: leaf.Subject.String(), Issuer: leaf.Issuer.String(),
-		NotBefore: leaf.NotBefore, NotAfter: leaf.NotAfter, Version: state.Version,
+		NotBefore: leaf.NotBefore, NotAfter: leaf.NotAfter, Version: state.Version, CurveID: state.CurveID,
 	}, nil
+}
+
+// LookupNetIPFunc has the signature of (*net.Resolver).LookupNetIP.
+type LookupNetIPFunc func(ctx context.Context, network, host string) ([]netip.Addr, error)
+
+// CheckMaskHostAddress returns the A and AAAA records of host and reports
+// whether one of them is publicIP.
+func CheckMaskHostAddress(ctx context.Context, lookup LookupNetIPFunc, host string, publicIP netip.Addr) ([]netip.Addr, bool, error) {
+	addrs, err := lookup(ctx, "ip", host)
+	if err != nil {
+		return nil, false, fmt.Errorf("resolve mask host: %w", err)
+	}
+	match := false
+	for i, addr := range addrs {
+		addrs[i] = addr.Unmap()
+		match = match || addrs[i] == publicIP.Unmap()
+	}
+	return addrs, match, nil
 }
 
 func diagnosticProxyHeader(conn net.Conn, version int) ([]byte, error) {

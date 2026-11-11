@@ -340,11 +340,22 @@ log-level = "info"
 # Accept incoming PROXY protocol headers (from HAProxy/nginx)
 # proxy-protocol = false
 
+# TCP peers allowed to send PROXY headers. Empty = any peer.
+# Unix socket peers are always allowed. Other peers are direct clients.
+# Set this when telego listens on TCP behind a proxy, or a direct client can spoof its IP.
+# trusted-proxy-cidrs = ["127.0.0.1/32"]
+
 # Maximum connections per IP (0 = unlimited)
 # Applies to ALL connections (including unauthenticated) from a single IP
 # max-connections-per-ip = 100
 
-# Max time for handshake before dropping connection (default: 5s)
+# Maximum concurrent client connections in every mode.
+# 0 = derive from the RLIMIT_NOFILE soft limit: (limit - min(256, limit / 2)) / 2,
+# because each direct client uses two descriptors (client and DC).
+# Middle-End max-connections can only lower this value.
+# max-connections = 0
+
+# Max time for handshake before dropping connection (default: 5s; allowed: 1s to 1m)
 # handshake-timeout = "5s"
 
 # Maximum unique IPs per user (0 = unlimited)
@@ -410,7 +421,7 @@ prefer-ip = "prefer-ipv4"    # prefer-ipv4, prefer-ipv6, only-ipv4, only-ipv6
 idle-timeout = "5m"          # Connection idle timeout (hot-reloadable)
 num-event-loops = 0          # 0 = auto (all CPU cores)
 # tcp-buffer-kb = 0          # Legacy setting; accepted but has no effect
-# client-silence-close = "12s"  # Close relays whose server reply stays unanswered (fixes iOS "Updating"); 0 = off
+# client-silence-close = "12s"  # Close relays whose server reply stays unanswered (fixes iOS "Updating"); 0 = off, minimum 1s
 
 # Upstream (DC connection) settings
 [upstream]
@@ -444,6 +455,11 @@ telego version   Show version information
 telego doctor -c <config> [--timeout 10s] [--cert-source]
                              Verify the fallback TLS certificate and mask hostname
 ```
+
+`telego doctor` also prints two warnings. They do not make the command fail.
+
+- The checked endpoint does not negotiate `X25519MLKEM768`. TSPU is reported to block iOS clients when the mask host supports only classical key exchange.
+- The A and AAAA records of `mask-host` do not include the proxy public IP. TSPU is reported to compare them. Doctor uses `[middle-end] nat-ip` as the public IP. If it is empty, doctor uses STUN. If STUN fails, doctor skips this check.
 
 ---
 
@@ -482,6 +498,29 @@ services:
 docker build -f dist/Dockerfile.build -t telego .
 docker run -d -p 443:443 -v ./config.toml:/config.toml telego
 ```
+
+### SYN Limit
+
+TSPU can block the proxy port for 2 minutes after a burst of SYN packets.
+`synlimit.sh` limits new connections per source IP in the `DOCKER-USER` chain.
+It uses the telemt defaults: 48 SYN per minute with a burst of 24.
+A second lane allows 12 SYN per second with a burst of 24 for iOS-like SYN packets.
+Packets over the limit get a TCP reset.
+
+The script is optional. It works only with the Docker iptables backend.
+Docker does not remove rules from `DOCKER-USER`, but the rules are lost on reboot.
+To apply them at boot, install the script and the systemd unit:
+
+```bash
+sudo install -m 0755 synlimit.sh /usr/local/sbin/telego-synlimit
+sudo install -m 0644 dist/synlimit@.service /etc/systemd/system/telego-synlimit@.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now telego-synlimit@443.service
+```
+
+The instance name is the published host port.
+The script finds the public interface from the default IPv4 route.
+To set it, run `sudo systemctl edit telego-synlimit@443.service` and add `Environment=PUBLIC_IF=eth0` under `[Service]`.
 
 ---
 
@@ -611,6 +650,19 @@ sudo systemctl start telego
 
 Service file is installed to `/etc/systemd/system/telego.service`.
 
+### Shutdown and exit status
+
+SIGTERM or SIGINT starts a shutdown. The shutdown has a limit of 25 seconds.
+The log drain after it can take up to 2 more seconds. This fits in a stop timeout of 30 seconds.
+The default Docker stop timeout is 10 seconds. Use `docker stop -t 30` or `stop_grace_period: 30s` to allow the full shutdown.
+A second SIGTERM or SIGINT stops the wait immediately.
+A clean shutdown after a signal exits with status 0.
+A shutdown that exceeds the limit, or is interrupted by a second signal, exits with a non-zero status.
+If the public listener or the Middle-End network runtime stops without a signal, Telego exits with a non-zero status.
+SIGHUP and a closed stderr pipe do not stop the process.
+
+The service file sets `Restart=always` and `TimeoutStopSec=30`.
+
 ---
 
 ## Config Hot-Reload
@@ -663,7 +715,8 @@ Tested on Intel i9-12900K, Linux 6.6:
 
 Log producers queue JSON events; one consumer formats and writes them to stderr.
 The queue holds 4,096 events, including one reserved slot for a fatal event.
-When the normal queue is full, new events are dropped and counted by `telego_log_dropped_messages_total`.
+Info, debug, and trace events can use at most three quarters of the queue. The other 1,024 slots are kept for warning and error events.
+When the available part of the queue is full, new events are dropped and counted by `telego_log_dropped_messages_total`.
 Events submitted after shutdown starts are also dropped and counted.
 Shutdown and fatal exit allow up to two seconds to drain queued events. A stalled sink can leave events unwritten at exit.
 
@@ -747,6 +800,8 @@ To disable diagnostics, set `diagnostics = false`. Then restart Telego.
 | `telego_traffic_in_bytes_total` | Counter | Bytes received from clients |
 | `telego_traffic_out_bytes_total` | Counter | Bytes sent to clients |
 | `telego_handshake_failures_total` | Counter | MTProxy handshake failures by `stage` |
+| `telego_mask_fallbacks_total` | Counter | Connections sent to the mask host, by `reason`: `malformed`, `unknown_sni`, `unknown_secret`, `bad_timestamp`, or `replay` |
+| `telego_replay_cache_evictions_total` | Counter | Replay cache entries evicted before their 10-minute TTL because the cache was full. A growing value means the replay window is shorter. This metric has no labels. |
 | `telego_log_dropped_messages_total` | Counter | Log events dropped when the queue is full or shutdown has started. This metric has no labels. |
 | `telego_web_websocket_connections_active` | Gauge | Active WEB WebSocket carrier connections. This metric has no labels. |
 | `telego_web_sessions_active` | Gauge | Active WEB sessions |

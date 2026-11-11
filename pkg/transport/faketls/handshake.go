@@ -46,6 +46,9 @@ type ClientHello struct {
 	CipherSuite uint16
 	ALPN        []string // ALPN protocols offered by client
 	OffersPQ    bool     // client offered the X25519MLKEM768 (0x11ec) key_share group
+
+	CipherSuites   []uint16 // offered cipher suites in client order
+	KeyShareGroups []uint16 // groups of the client's key_share entries in client order
 }
 
 // ParseClientHello parses and validates a FakeTLS ClientHello.
@@ -68,40 +71,31 @@ func ParseClientHello(secret []byte, payload []byte) (*ClientHello, error) {
 			ErrInvalidPayload, handshakeLen, len(payload)-4)
 	}
 
-	hello := &ClientHello{}
-
-	// Extract random bytes (before zeroing)
-	copy(hello.Random[:], payload[clientHelloRandomOffset:clientHelloRandomOffset+randomLen])
-
-	// Create a copy of payload with zeroed random for HMAC computation
-	payloadCopy := make([]byte, len(payload))
-	copy(payloadCopy, payload)
-	copy(payloadCopy[clientHelloRandomOffset:], emptyRandom)
-
-	// Build full TLS record for HMAC computation:
-	// [type(1)][version(2)][length(2)][payload]
-	// mtg uses TLS 1.0 version (0x0301) for the record header
-	record := make([]byte, 5+len(payloadCopy))
-	record[0] = RecordTypeHandshake // 0x16
-	record[1] = 0x03                // TLS 1.0 major
-	record[2] = 0x01                // TLS 1.0 minor
-	binary.BigEndian.PutUint16(record[3:5], uint16(len(payloadCopy)))
-	copy(record[5:], payloadCopy)
-
-	// Compute HMAC-SHA256 over the entire record
+	// Compute HMAC-SHA256 over the full TLS record with a zero random:
+	// [type(1)][version(2)][length(2)][payload]. mtg uses TLS 1.0 (0x0301)
+	// for the record header. The payload is hashed in place, without copies.
+	header := [RecordHeaderSize]byte{RecordTypeHandshake, 0x03, 0x01, byte(len(payload) >> 8), byte(len(payload))}
 	mac := hmac.New(sha256.New, secret)
-	mac.Write(record)
-	computedRandom := mac.Sum(nil)
+	mac.Write(header[:])
+	mac.Write(payload[:clientHelloRandomOffset])
+	mac.Write(emptyRandom)
+	mac.Write(payload[clientHelloRandomOffset+randomLen:])
+	var computedRandom [sha256.Size]byte
+	mac.Sum(computedRandom[:0])
 
 	// XOR with transmitted random to get verification data
+	transmitted := payload[clientHelloRandomOffset : clientHelloRandomOffset+randomLen]
 	for i := range randomLen {
-		computedRandom[i] ^= hello.Random[i]
+		computedRandom[i] ^= transmitted[i]
 	}
 
 	// First 28 bytes should be zero after XOR
 	if subtle.ConstantTimeCompare(emptyRandom[:randomLen-4], computedRandom[:randomLen-4]) != 1 {
 		return nil, ErrBadDigest
 	}
+
+	hello := &ClientHello{}
+	copy(hello.Random[:], transmitted)
 
 	// Last 4 bytes contain timestamp (little-endian)
 	timestamp := binary.LittleEndian.Uint32(computedRandom[randomLen-4:])
@@ -117,6 +111,7 @@ func ParseClientHello(secret []byte, payload []byte) (*ClientHello, error) {
 
 	// Select the first non-GREASE cipher suite.
 	hello.CipherSuite = extractCipherSuite(payload, sessionIDLen)
+	hello.CipherSuites = extractCipherSuites(payload, sessionIDLen)
 
 	// Extract SNI hostname from extensions
 	hello.Host = extractSNI(payload)
@@ -128,8 +123,27 @@ func ParseClientHello(secret []byte, payload []byte) (*ClientHello, error) {
 	// (X25519MLKEM768, 0x11ec). Used to echo a matching group in the synthetic
 	// ServerHello so we don't emit a passive group-downgrade tell.
 	hello.OffersPQ = clientOffersPQKeyShare(payload)
+	hello.KeyShareGroups = extractKeyShareGroups(payload)
 
 	return hello, nil
+}
+
+// extractCipherSuites returns the declared cipher suite vector.
+func extractCipherSuites(payload []byte, sessionIDLen int) []uint16 {
+	offset := 4 + 2 + 32 + 1 + sessionIDLen
+	if offset+2 > len(payload) {
+		return nil
+	}
+	length := int(binary.BigEndian.Uint16(payload[offset : offset+2]))
+	offset += 2
+	if length%2 != 0 || length > len(payload)-offset {
+		return nil
+	}
+	suites := make([]uint16, 0, length/2)
+	for end := offset + length; offset < end; offset += 2 {
+		suites = append(suites, binary.BigEndian.Uint16(payload[offset:offset+2]))
+	}
+	return suites
 }
 
 // extractCipherSuite selects the first non-GREASE suite in the declared vector.
@@ -154,10 +168,12 @@ func extractCipherSuite(payload []byte, sessionIDLen int) uint16 {
 	return 0
 }
 
-// bootTimeThreshold is the maximum timestamp considered as "boot time" (uptime).
-// Some embedded clients send uptime instead of Unix timestamp.
-// ~2.7 years in seconds - timestamps below this are likely uptime, not Unix time.
-const bootTimeThreshold = 60 * 60 * 24 * 1000
+// bootTimeMaxSeconds bounds the "boot time" bypass: some embedded clients
+// send uptime instead of a Unix timestamp. A bypassed hello has no freshness
+// check, so only the replay cache stops its replay. The bound stays below the
+// replay cache TTL (10 minutes) and matches telemt's
+// BOOT_TIME_COMPAT_MAX_SECS (2 minutes).
+const bootTimeMaxSeconds = 2 * 60
 
 // Valid checks if the ClientHello is valid for the given host and time tolerance.
 func (h *ClientHello) Valid(expectedHost string, tolerance time.Duration) error {
@@ -169,9 +185,9 @@ func (h *ClientHello) Valid(expectedHost string, tolerance time.Duration) error 
 	// Check timestamp
 	timestamp := h.Time.Unix()
 
-	// Boot time quirk: some clients send uptime instead of Unix time
-	// Accept small timestamps (< ~2.7 years) as valid boot time
-	if timestamp > 0 && timestamp < bootTimeThreshold {
+	// Boot time quirk: some clients send uptime instead of Unix time.
+	// Accept only uptimes below bootTimeMaxSeconds.
+	if timestamp > 0 && timestamp < bootTimeMaxSeconds {
 		return nil
 	}
 
@@ -396,6 +412,50 @@ func clientOffersPQKeyShare(payload []byte) bool {
 	return false
 }
 
+// extractKeyShareGroups returns the groups of the client's key_share entries.
+// It walks the same layout as clientOffersPQKeyShare.
+func extractKeyShareGroups(payload []byte) []uint16 {
+	offset := clientHelloSessionIDOffset
+	if offset >= len(payload) {
+		return nil
+	}
+	offset += 1 + int(payload[offset])
+	if offset+2 > len(payload) {
+		return nil
+	}
+	offset += 2 + int(binary.BigEndian.Uint16(payload[offset:]))
+	if offset+1 > len(payload) {
+		return nil
+	}
+	offset += 1 + int(payload[offset])
+	if offset+2 > len(payload) {
+		return nil
+	}
+	extensionsEnd := offset + 2 + int(binary.BigEndian.Uint16(payload[offset:]))
+	offset += 2
+	for offset+4 <= extensionsEnd && offset+4 <= len(payload) {
+		extType := binary.BigEndian.Uint16(payload[offset:])
+		extLen := int(binary.BigEndian.Uint16(payload[offset+2:]))
+		offset += 4
+		if extType != extensionKeyShare {
+			offset += extLen
+			continue
+		}
+		if offset+2 > len(payload) {
+			return nil
+		}
+		var groups []uint16
+		kp := offset + 2
+		ksEnd := min(offset+extLen, len(payload))
+		for kp+4 <= ksEnd {
+			groups = append(groups, binary.BigEndian.Uint16(payload[kp:]))
+			kp += 4 + int(binary.BigEndian.Uint16(payload[kp+2:]))
+		}
+		return groups
+	}
+	return nil
+}
+
 // WelcomePacketRandomOffset is the offset of server random in the welcome packet.
 // This is: record_header(5) + handshake_type(1) + handshake_length(3) + version(2) = 11
 const WelcomePacketRandomOffset = 11
@@ -407,15 +467,12 @@ type ServerHelloOptions struct {
 	// DPI see real certificate bytes.
 	CertChain [][]byte
 
-	// RealServerHello is a captured ServerHello response from a real TLS server.
-	// If non-nil, this will be used as the base response instead of generating
-	// a synthetic one. The random field will be patched with the computed HMAC.
-	// This provides authentic TLS fingerprints to defeat DPI.
-	RealServerHello []byte
-
-	// RealServerHelloRandomOffset is the offset within RealServerHello where
-	// the 32-byte random field starts. Required when RealServerHello is set.
-	RealServerHelloRandomOffset int
+	// Template is a parsed ServerHello from a real TLS server. If non-nil,
+	// the ServerHello keeps its record version, extension order, and
+	// preferred cipher suite and group, but echoes the client session ID,
+	// uses a cipher suite and group the client offered, and carries a fresh
+	// key share.
+	Template *ServerHelloTemplate
 
 	// FakeCertSize, when > 0, sets the exact payload length of the fake
 	// "encrypted certificate" ApplicationData record instead of the default
@@ -454,7 +511,7 @@ func BuildServerHello(secret []byte, clientHello *ClientHello) ([]byte, error) {
 // BuildServerHelloWithOptions creates a ServerHello response with configurable options.
 func BuildServerHelloWithOptions(secret []byte, clientHello *ClientHello, opts *ServerHelloOptions) ([]byte, error) {
 	// HYBRID MODE: Use real ServerHello from mask host if provided
-	if opts != nil && len(opts.RealServerHello) > 0 {
+	if opts != nil && opts.Template != nil {
 		return buildHybridServerHello(secret, clientHello, opts)
 	}
 
@@ -462,26 +519,15 @@ func BuildServerHelloWithOptions(secret []byte, clientHello *ClientHello, opts *
 	return buildSyntheticServerHello(secret, clientHello, opts)
 }
 
-// buildHybridServerHello uses a real ServerHello record from a mask host,
+// buildHybridServerHello builds a ServerHello from a mask host template,
 // then appends synthetic ChangeCipherSpec + ApplicationData.
-// This gives authentic TLS fingerprint on the ServerHello while maintaining
+// This gives the mask host's ServerHello shape while maintaining
 // the packet structure the Telegram client expects.
 func buildHybridServerHello(secret []byte, clientHello *ClientHello, opts *ServerHelloOptions) ([]byte, error) {
-	if opts.RealServerHelloRandomOffset < 11 || opts.RealServerHelloRandomOffset+32 > len(opts.RealServerHello) {
-		return nil, fmt.Errorf("invalid RealServerHelloRandomOffset: %d (response len: %d)",
-			opts.RealServerHelloRandomOffset, len(opts.RealServerHello))
-	}
-
 	buf := &bytes.Buffer{}
 
-	// Write the real ServerHello record (with zeroed random for now)
-	serverHelloRecord := make([]byte, len(opts.RealServerHello))
-	copy(serverHelloRecord, opts.RealServerHello)
-	randomOffset := opts.RealServerHelloRandomOffset
-	for i := range 32 {
-		serverHelloRecord[randomOffset+i] = 0
-	}
-	buf.Write(serverHelloRecord)
+	// Write the ServerHello record (with zeroed random for now)
+	opts.Template.appendServerHelloRecord(buf, clientHello)
 
 	// Append synthetic ChangeCipherSpec + ApplicationData (same as legacy)
 	writeRecordTLS12(buf, RecordTypeChangeCipherSpec, []byte{0x01})
@@ -497,7 +543,7 @@ func buildHybridServerHello(secret []byte, clientHello *ClientHello, opts *Serve
 	serverRandom := mac.Sum(nil)
 
 	// Patch the random field
-	copy(packet[randomOffset:], serverRandom)
+	copy(packet[WelcomePacketRandomOffset:], serverRandom)
 
 	return packet, nil
 }
@@ -518,8 +564,7 @@ func buildSyntheticServerHello(secret []byte, clientHello *ClientHello, opts *Se
 	// Build the encrypted portion content
 	var encryptedData []byte
 	if opts != nil && len(opts.CertChain) > 0 {
-		// Include real certificate bytes for DPI evasion
-		// Format: fake "encrypted" handshake with real cert data
+		// Size the encrypted portion like the real certificate chain.
 		encryptedData = buildEncryptedHandshakeWithCert(opts.CertChain)
 	} else {
 		fakeCertSize := 0
@@ -547,63 +592,22 @@ func buildSyntheticServerHello(secret []byte, clientHello *ClientHello, opts *Se
 	return packet, nil
 }
 
-// buildEncryptedHandshakeWithCert creates fake encrypted handshake bytes
-// that include the real certificate data. This makes DPI see valid cert bytes.
+// buildEncryptedHandshakeWithCert returns random bytes sized like an
+// encrypted TLS 1.3 Certificate message for certChain plus CertificateVerify
+// and Finished. TLS 1.3 encrypts the Certificate message, so plaintext
+// certificate DER in an ApplicationData record would be a DPI tell.
 func buildEncryptedHandshakeWithCert(certChain [][]byte) []byte {
-	buf := &bytes.Buffer{}
-
-	// Build Certificate message structure (will appear as encrypted data)
-	// TLS 1.3 Certificate message format:
-	// - certificate_request_context length (1 byte) = 0
-	// - certificate_list length (3 bytes)
-	// - for each cert:
-	//   - cert_data length (3 bytes)
-	//   - cert_data
-	//   - extensions length (2 bytes) = 0
-
-	// Calculate total cert list length
-	certListLen := 0
+	// Certificate handshake header (4) + request context (1) + list length (3)
+	// + per certificate: length (3) + DER + extensions length (2).
+	size := 4 + 1 + 3
 	for _, cert := range certChain {
-		certListLen += 3 + len(cert) + 2 // length(3) + cert + extensions(2)
+		size += 3 + len(cert) + 2
 	}
-
-	// Certificate message
-	certMsg := &bytes.Buffer{}
-	certMsg.WriteByte(0) // certificate_request_context length = 0
-
-	// Certificate list length (3 bytes)
-	certMsg.WriteByte(byte(certListLen >> 16))
-	certMsg.WriteByte(byte(certListLen >> 8))
-	certMsg.WriteByte(byte(certListLen))
-
-	// Write each certificate
-	for _, cert := range certChain {
-		// Cert length (3 bytes)
-		certMsg.WriteByte(byte(len(cert) >> 16))
-		certMsg.WriteByte(byte(len(cert) >> 8))
-		certMsg.WriteByte(byte(len(cert)))
-		certMsg.Write(cert)
-		// Extensions length (2 bytes) = 0
-		certMsg.WriteByte(0)
-		certMsg.WriteByte(0)
-	}
-
-	// Add handshake header for Certificate (type 0x0b)
-	certBody := certMsg.Bytes()
-	buf.WriteByte(0x0b) // Certificate handshake type
-	buf.WriteByte(byte(len(certBody) >> 16))
-	buf.WriteByte(byte(len(certBody) >> 8))
-	buf.WriteByte(byte(len(certBody)))
-	buf.Write(certBody)
-
-	// Add random padding to match expected size (similar to random-only path)
-	// Include some fake CertificateVerify and Finished-like data
-	paddingLen := 256 + int(time.Now().UnixNano()%512)
-	padding := make([]byte, paddingLen)
-	rand.Read(padding)
-	buf.Write(padding)
-
-	return buf.Bytes()
+	// Add random padding for CertificateVerify and Finished-like data.
+	size += 256 + int(time.Now().UnixNano()%512)
+	data := make([]byte, size)
+	rand.Read(data)
+	return data
 }
 
 // writeApplicationDataChunked writes data as ApplicationData records,
@@ -656,7 +660,7 @@ func generateX25519Key() []byte {
 }
 
 // buildServerHelloMessage creates the ServerHello handshake message.
-// Generates proper X25519 keys and optionally includes ALPN.
+// Generates proper X25519 keys.
 func buildServerHelloMessage(clientHello *ClientHello) []byte {
 	buf := &bytes.Buffer{}
 
@@ -698,10 +702,8 @@ func buildServerHelloMessage(clientHello *ClientHello) []byte {
 	// FakeTLS clients validate only record framing + the server-random HMAC, and
 	// we are not a TLS terminator, so a valid ciphertext buys nothing.
 	if clientHello.OffersPQ {
-		// X25519MLKEM768 server share: ML-KEM-768 ciphertext (1088) || X25519 (32) = 1120.
-		const pqKeyLen = 1120
-		pqKey := make([]byte, pqKeyLen)
-		rand.Read(pqKey)
+		const pqKeyLen = pqServerKeyLen
+		pqKey := generateKeyShare(pqNamedGroup)
 		extBuf.Write([]byte{0x00, 0x33})                                 // type: key_share
 		extLen := 2 + 2 + pqKeyLen                                       // group(2)+key_len(2)+key
 		extBuf.Write([]byte{byte(extLen >> 8), byte(extLen)})            // ext length
@@ -717,25 +719,8 @@ func buildServerHelloMessage(clientHello *ClientHello) []byte {
 		extBuf.Write(x25519Key)
 	}
 
-	// Extension: ALPN (if client offered any)
-	// Safe to include - client only validates record headers, not ServerHello content
-	if len(clientHello.ALPN) > 0 {
-		// Select first protocol (typically "h2" or "http/1.1")
-		selectedProto := clientHello.ALPN[0]
-		protoBytes := []byte(selectedProto)
-
-		// ALPN extension format:
-		// type(2) + ext_len(2) + list_len(2) + proto_len(1) + proto
-		extBuf.Write([]byte{0x00, 0x10}) // type: ALPN
-		listLen := 1 + len(protoBytes)
-		extLen := 2 + listLen
-		extBuf.WriteByte(byte(extLen >> 8))
-		extBuf.WriteByte(byte(extLen))
-		extBuf.WriteByte(byte(listLen >> 8))
-		extBuf.WriteByte(byte(listLen))
-		extBuf.WriteByte(byte(len(protoBytes)))
-		extBuf.Write(protoBytes)
-	}
+	// No ALPN here: RFC 8446 section 4.2 allows it only in EncryptedExtensions,
+	// which this synthetic response carries inside the encrypted records.
 
 	// Write extensions length + data
 	extensions := extBuf.Bytes()

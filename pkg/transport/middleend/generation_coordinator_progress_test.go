@@ -502,6 +502,142 @@ func TestGenerationCoordinatorApplyWaitsForMatchingPlanAfterBackgroundRecovery(t
 	}
 }
 
+func TestGenerationCoordinatorPendingRetryBacksOffUntilContentChanges(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	raw := fixtureArtifacts(t)
+	changed := changedCoordinatorArtifacts(t, raw, "198.51.100.112:8888")
+	latestRaw := changedCoordinatorArtifacts(t, raw, "198.51.100.212:8888")
+	source := &sequenceArtifactSource{results: []artifactSourceResult{{raw: raw}, {raw: changed}, {raw: latestRaw}}}
+	cache := newGenerationCoordinatorTestCache(t, func() time.Time { return now }, source)
+	dcIDs := mustParseGenerationCoordinatorSnapshot(t, raw, now).DCIDs()
+	initial := newGenerationTestManager(t, dcIDs, true)
+	latest := newGenerationTestManager(t, dcIDs, true)
+	rejected := errors.New("candidate rejected")
+	initialFactory := &generationTestFactory{steps: []generationTestFactoryStep{{manager: initial.manager}}}
+	pendingFactory := &generationTestFactory{steps: []generationTestFactoryStep{{err: rejected}, {err: rejected}, {err: rejected}}}
+	latestFactory := &generationTestFactory{steps: []generationTestFactoryStep{{err: rejected}, {manager: latest.manager}}}
+	factories := []*generationTestFactory{initialFactory, pendingFactory, latestFactory}
+	var builds int
+	supervisor := newGenerationTestSupervisor(t, generationTestConfig())
+	coordinator := newGenerationCoordinatorForTest(t, cache, supervisor, func(ArtifactSnapshot) (FixedBindingGenerationFactory, error) {
+		factory := factories[builds]
+		builds++
+		return factory.build, nil
+	}, func() time.Time { return now })
+	assertDelay := func(base time.Duration) {
+		t.Helper()
+		for range 20 {
+			delay := coordinator.state.nextDelay()
+			if delay < base || delay > base+base/2 {
+				t.Fatalf("retry delay %v is outside [%v, %v]", delay, base, base+base/2)
+			}
+		}
+	}
+	if err := coordinator.Reconcile(t.Context()); err != nil {
+		t.Fatalf("initial reconcile: %v", err)
+	}
+	now = now.Add(TelegramArtifactRefreshInterval)
+	for _, base := range []time.Duration{time.Second, 2 * time.Second, 4 * time.Second} {
+		waitGenerationCondition(t, supervisor, time.Second, func(snapshot GenerationSupervisorSnapshot) bool {
+			return snapshot.Admitting
+		})
+		if err := coordinator.Reconcile(t.Context()); !errors.Is(err, rejected) {
+			t.Fatalf("pending reconcile: %v", err)
+		}
+		assertDelay(base)
+	}
+	now = now.Add(TelegramArtifactRefreshInterval)
+	waitGenerationCondition(t, supervisor, time.Second, func(snapshot GenerationSupervisorSnapshot) bool {
+		return snapshot.Admitting
+	})
+	if err := coordinator.Reconcile(t.Context()); !errors.Is(err, rejected) {
+		t.Fatalf("latest reconcile: %v", err)
+	}
+	assertDelay(time.Second)
+	waitGenerationCondition(t, supervisor, time.Second, func(snapshot GenerationSupervisorSnapshot) bool {
+		return snapshot.Admitting
+	})
+	if err := coordinator.Reconcile(t.Context()); err != nil {
+		t.Fatalf("latest retry: %v", err)
+	}
+	coordinator.state.mu.Lock()
+	failures := coordinator.state.pendingFailures
+	coordinator.state.mu.Unlock()
+	if failures != 0 {
+		t.Fatalf("pending failures after success = %d", failures)
+	}
+	assertCoordinatorActiveManager(t, supervisor, latest.manager)
+}
+
+// During an artifact fetch outage the fetch retries on the plain interval,
+// but a failing pending apply keeps its own backoff.
+func TestGenerationCoordinatorPendingRetryBacksOffDuringFetchOutage(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	raw := fixtureArtifacts(t)
+	changed := changedCoordinatorArtifacts(t, raw, "198.51.100.112:8888")
+	outage := errors.New("artifact fetch outage")
+	source := &sequenceArtifactSource{results: []artifactSourceResult{
+		{raw: raw}, {raw: changed}, {err: outage}, {err: outage}, {err: outage},
+	}}
+	cache := newGenerationCoordinatorTestCache(t, func() time.Time { return now }, source)
+	dcIDs := mustParseGenerationCoordinatorSnapshot(t, raw, now).DCIDs()
+	initial := newGenerationTestManager(t, dcIDs, true)
+	rejected := errors.New("candidate rejected")
+	initialFactory := &generationTestFactory{steps: []generationTestFactoryStep{{manager: initial.manager}}}
+	pendingFactory := &generationTestFactory{steps: []generationTestFactoryStep{{err: rejected}, {err: rejected}, {err: rejected}, {err: rejected}}}
+	factories := []*generationTestFactory{initialFactory, pendingFactory}
+	var builds int
+	supervisor := newGenerationTestSupervisor(t, generationTestConfig())
+	coordinator := newGenerationCoordinatorForTest(t, cache, supervisor, func(ArtifactSnapshot) (FixedBindingGenerationFactory, error) {
+		factory := factories[builds]
+		builds++
+		return factory.build, nil
+	}, func() time.Time { return now })
+	reconcile := func() error {
+		t.Helper()
+		waitGenerationCondition(t, supervisor, time.Second, func(snapshot GenerationSupervisorSnapshot) bool {
+			return snapshot.Admitting
+		})
+		return coordinator.Reconcile(t.Context())
+	}
+	if err := coordinator.Reconcile(t.Context()); err != nil {
+		t.Fatalf("initial reconcile: %v", err)
+	}
+	now = now.Add(TelegramArtifactRefreshInterval)
+	if err := reconcile(); !errors.Is(err, rejected) {
+		t.Fatalf("changed content reconcile: %v", err)
+	}
+	now = now.Add(TelegramArtifactRefreshInterval)
+	// The first outage attempt is past the one-interval backoff and applies.
+	if err := reconcile(); !errors.Is(err, outage) || !errors.Is(err, rejected) {
+		t.Fatalf("first outage reconcile: %v", err)
+	}
+	if calls := pendingFactory.callCount(); calls != 2 {
+		t.Fatalf("pending apply attempts = %d, want 2", calls)
+	}
+	// Two failures back off for at least two intervals. A fetch retry one
+	// interval later must not redial the pending candidate.
+	for range 20 {
+		if delay := coordinator.state.nextDelay(); delay < time.Second || delay > time.Second+time.Second/2 {
+			t.Fatalf("fetch retry delay %v is outside the plain retry interval", delay)
+		}
+	}
+	now = now.Add(time.Second)
+	if err := reconcile(); !errors.Is(err, outage) || errors.Is(err, rejected) {
+		t.Fatalf("fetch retry reconcile: %v", err)
+	}
+	if calls := pendingFactory.callCount(); calls != 2 {
+		t.Fatalf("fetch retry redialed the pending candidate: %d attempts", calls)
+	}
+	now = now.Add(2 * time.Second)
+	if err := reconcile(); !errors.Is(err, outage) || !errors.Is(err, rejected) {
+		t.Fatalf("pending retry after backoff: %v", err)
+	}
+	if calls := pendingFactory.callCount(); calls != 3 {
+		t.Fatalf("pending apply attempts after backoff = %d, want 3", calls)
+	}
+}
+
 func assertCoordinatorRetryDelay(t testing.TB, coordinator *GenerationCoordinator) {
 	t.Helper()
 	for range 20 {

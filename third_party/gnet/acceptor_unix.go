@@ -14,11 +14,13 @@
 
 //go:build darwin || dragonfly || freebsd || linux || netbsd || openbsd
 
-// Telego local modification: explicit accept ownership and pending TCP error recovery. See TELEGO.md.
+// Telego local modification: explicit accept ownership, pending TCP error recovery,
+// and accept backoff on resource exhaustion. See TELEGO.md.
 package gnet
 
 import (
 	"runtime"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -33,6 +35,7 @@ func (el *eventloop) accept0(fd int, _ netpoll.IOEvent, _ netpoll.IOFlags) error
 		nfd, sa, err := socket.Accept(fd)
 		switch err {
 		case nil:
+			el.listeners[fd].acceptPause = 0 // Telego: end the backoff episode.
 		case unix.EAGAIN: // the Accept queue has been drained out, we can return now
 			return nil
 		case unix.EINTR, unix.ECONNRESET, unix.ECONNABORTED:
@@ -46,6 +49,9 @@ func (el *eventloop) accept0(fd int, _ netpoll.IOEvent, _ netpoll.IOFlags) error
 					return errors.ErrEngineShutdown
 				}
 				continue
+			}
+			if isResourceAcceptError(err) {
+				return el.pauseAccept(el.listeners[fd], err, true)
 			}
 			el.getLogger().Errorf("Accept() failed due to error: %v", err)
 			return errors.ErrAcceptSocket
@@ -88,6 +94,7 @@ func (el *eventloop) accept(fd int, ev netpoll.IOEvent, flags netpoll.IOFlags) e
 	nfd, sa, err := socket.Accept(fd)
 	switch err {
 	case nil:
+		el.listeners[fd].acceptPause = 0 // Telego: end the backoff episode.
 	case unix.EINTR, unix.EAGAIN, unix.ECONNRESET, unix.ECONNABORTED:
 		// ECONNRESET or ECONNABORTED could indicate that a socket
 		// in the Accept queue was closed before we Accept()ed it.
@@ -99,6 +106,9 @@ func (el *eventloop) accept(fd int, ev netpoll.IOEvent, flags netpoll.IOFlags) e
 				return errors.ErrEngineShutdown
 			}
 			return nil
+		}
+		if isResourceAcceptError(err) {
+			return el.pauseAccept(el.listeners[fd], err, false)
 		}
 		el.getLogger().Errorf("Accept() failed due to error: %v", err)
 		return errors.ErrAcceptSocket
@@ -124,4 +134,66 @@ func (el *eventloop) accept(fd int, ev netpoll.IOEvent, flags netpoll.IOFlags) e
 
 	c := newStreamConn(network, nfd, el, sa, el.listeners[fd].addr, remoteAddr)
 	return el.register0(c)
+}
+
+// Telego: accept backoff on resource exhaustion; see TELEGO.md.
+const (
+	acceptPauseMin = 5 * time.Millisecond
+	acceptPauseMax = time.Second
+)
+
+// isResourceAcceptError identifies accept errors caused by descriptor or
+// memory exhaustion. The listener remains usable once resources are released.
+func isResourceAcceptError(err error) bool {
+	switch err {
+	case unix.EMFILE, unix.ENFILE, unix.ENOBUFS, unix.ENOMEM:
+		return true
+	default:
+		return false
+	}
+}
+
+// pauseAccept disables listener readiness and re-enables it after a backoff
+// that starts at 5ms and doubles up to 1s. The event loop keeps serving its
+// connections and shutdown tasks while the listener is paused.
+func (el *eventloop) pauseAccept(ln *listener, err error, edgeTriggered bool) error {
+	ln.acceptPause = min(max(2*ln.acceptPause, acceptPauseMin), acceptPauseMax)
+	if now := time.Now(); now.Sub(ln.acceptPauseLogged) >= time.Second {
+		ln.acceptPauseLogged = now
+		el.getLogger().Errorf("Accept() failed due to resource exhaustion: %v; retrying in %v", err, ln.acceptPause)
+	}
+	if err = el.poller.ModReadPaused(ln.pollAttachment, true, false, edgeTriggered); err != nil {
+		el.getLogger().Errorf("failed to pause listener fd=%d: %v", ln.fd, err)
+		return errors.ErrAcceptSocket
+	}
+	time.AfterFunc(ln.acceptPause, func() {
+		// Trigger fails only after the poller closes during engine shutdown.
+		_ = el.poller.Trigger(queue.HighPriority, func(any) error {
+			return el.resumeAccept(ln, edgeTriggered)
+		}, nil)
+	})
+	return nil
+}
+
+// resumeAccept runs on the listener owner. It restores readiness and then
+// accepts directly. Linux EPOLL_CTL_MOD also reports a listener that is
+// already readable; the direct accept does not depend on that behavior of
+// each poller, and an empty backlog returns EAGAIN.
+func (el *eventloop) resumeAccept(ln *listener, edgeTriggered bool) error {
+	if el.engine.isStopping() {
+		return nil
+	}
+	err := el.poller.ModReadPaused(ln.pollAttachment, false, false, edgeTriggered)
+	if err == nil {
+		err = ln.pollAttachment.Callback(ln.fd, 0, 0)
+	} else {
+		el.getLogger().Errorf("failed to resume listener fd=%d: %v", ln.fd, err)
+		err = errors.ErrAcceptSocket
+	}
+	if err == errors.ErrAcceptSocket {
+		// Task errors do not stop the poller; keep permanent errors fatal.
+		el.engine.shutdown(err)
+		return errors.ErrEngineShutdown
+	}
+	return err
 }

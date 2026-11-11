@@ -81,7 +81,7 @@ func (h *ProxyHandler) handleRelay(c clientEndpoint, ctx *ConnContext) gnet.Acti
 		consumed += recordLen
 	}
 	relay.ToDC.releaseReservation(budget - planned)
-	buffer, release := h.relayBuffer(planned)
+	buffer, release := h.relayBuffer(relay.ToDC, planned)
 	offset := 0
 	for remaining := data[:consumed]; len(remaining) > 0; {
 		payloadLen := int(binary.BigEndian.Uint16(remaining[3:5]))
@@ -130,7 +130,7 @@ func (h *ProxyHandler) handleRelayDD(c clientEndpoint, ctx *ConnContext) gnet.Ac
 	if n == 0 {
 		return gnet.None
 	}
-	buffer, release := h.relayBuffer(n)
+	buffer, release := h.relayBuffer(relay.ToDC, n)
 	relay.Decryptor.XORKeyStream(buffer, data[:n])
 	relay.DCEncrypt.XORKeyStream(buffer, buffer)
 	if err := relay.ToDC.write(buffer, release); err != nil {

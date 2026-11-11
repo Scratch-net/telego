@@ -8,7 +8,7 @@ import "golang.org/x/sys/unix"
 
 // isPendingTCPAcceptError identifies errors Linux accept4 passes through from
 // the pending TCP connection. The listener remains usable; accept(2) requires
-// retrying these like EAGAIN. Resource exhaustion and listener errors stay fatal.
+// retrying these like EAGAIN. Resource exhaustion backs off; listener errors stay fatal.
 func isPendingTCPAcceptError(network string, err error) bool {
 	if network != "tcp" {
 		return false

@@ -60,6 +60,7 @@ type bootstrap struct {
 	sessionToken string
 	session      *Session
 	used         bool
+	order        *list.Element
 }
 
 type closedToken struct {
@@ -107,6 +108,7 @@ type Manager struct {
 	sessions                map[uint64]*Session
 	closedTokens            map[uint64]*closedToken
 	closedOrder             list.List
+	bootstrapOrder          list.List // issue order, which is also expiry order
 	streams                 int
 	dials                   int
 	pendingBytes            int64
@@ -209,13 +211,14 @@ func (m *Manager) IssueBootstrap(capability Capability, clientIP string) (string
 	if err != nil {
 		return "", err
 	}
-	now := time.Now()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
 		return "", ErrClosed
 	}
+	// Read the clock under m.mu so that bootstrapOrder stays in expiry order.
+	now := time.Now()
 	m.removeExpiredLocked(now)
 	if len(m.bootstraps) >= m.limits.MaxBootstraps && !m.evictOldestUnusedBootstrapLocked() {
 		m.recordBackpressure(carrierOperationBridge)
@@ -237,6 +240,7 @@ func (m *Manager) IssueBootstrap(capability Capability, clientIP string) (string
 		expires:    now.Add(m.timeouts.BootstrapLifetime),
 		profile:    profile,
 		issuanceIP: clientIP,
+		order:      m.bootstrapOrder.PushBack(key.prefix()),
 	}
 	return token, nil
 }
@@ -372,7 +376,7 @@ func (m *Manager) bootstrapAuthenticated(key sessionBearer, now time.Time) bool 
 		return false
 	}
 	if !now.Before(entry.expires) {
-		delete(m.bootstraps, key.prefix())
+		m.deleteBootstrapLocked(key.prefix(), entry)
 		return false
 	}
 	return true
@@ -614,7 +618,7 @@ func (m *Manager) sessionFinished(key sessionBearer, session *Session, reason se
 	}
 	for bootstrapKey, entry := range m.bootstraps {
 		if entry.session == session {
-			delete(m.bootstraps, bootstrapKey)
+			m.deleteBootstrapLocked(bootstrapKey, entry)
 		}
 	}
 	m.mu.Unlock()
@@ -651,20 +655,19 @@ func (m *Manager) tokenPrefixUsedLocked(key sessionBearer) bool {
 }
 
 func (m *Manager) evictOldestUnusedBootstrapLocked() bool {
-	var oldestKey uint64
-	var oldest *bootstrap
-	for key, entry := range m.bootstraps {
-		if entry.used || (oldest != nil && !entry.expires.Before(oldest.expires)) {
-			continue
+	for element := m.bootstrapOrder.Front(); element != nil; element = element.Next() {
+		key := element.Value.(uint64)
+		if entry := m.bootstraps[key]; !entry.used {
+			m.deleteBootstrapLocked(key, entry)
+			return true
 		}
-		oldestKey = key
-		oldest = entry
 	}
-	if oldest == nil {
-		return false
-	}
-	delete(m.bootstraps, oldestKey)
-	return true
+	return false
+}
+
+func (m *Manager) deleteBootstrapLocked(key uint64, entry *bootstrap) {
+	delete(m.bootstraps, key)
+	m.bootstrapOrder.Remove(entry.order)
 }
 
 func (m *Manager) cleanupLoop() {
@@ -700,17 +703,25 @@ func (m *Manager) cleanupLoop() {
 	}
 }
 
+// Both lists are in expiry order: every entry uses BootstrapLifetime, and a
+// refreshed closed token moves to the back. Only expired entries are visited.
 func (m *Manager) removeExpiredLocked(now time.Time) {
-	for key, entry := range m.bootstraps {
-		if !now.Before(entry.expires) {
-			delete(m.bootstraps, key)
+	for element := m.bootstrapOrder.Front(); element != nil; element = m.bootstrapOrder.Front() {
+		key := element.Value.(uint64)
+		entry := m.bootstraps[key]
+		if now.Before(entry.expires) {
+			break
 		}
+		m.deleteBootstrapLocked(key, entry)
 	}
-	for key, entry := range m.closedTokens {
-		if !now.Before(entry.expires) {
-			delete(m.closedTokens, key)
-			m.closedOrder.Remove(entry.order)
+	for element := m.closedOrder.Front(); element != nil; element = m.closedOrder.Front() {
+		key := element.Value.(uint64)
+		entry := m.closedTokens[key]
+		if now.Before(entry.expires) {
+			break
 		}
+		delete(m.closedTokens, key)
+		m.closedOrder.Remove(element)
 	}
 }
 

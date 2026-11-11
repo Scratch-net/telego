@@ -211,9 +211,11 @@ log-level = "info"
 
 # Защита от абьюза
 max-connections-per-ip = 100  # Макс. подключений с одного IP (включая неавторизованные)
+# max-connections = 0         # Макс. подключений всего. 0 = (RLIMIT_NOFILE - min(256, RLIMIT_NOFILE / 2)) / 2
+# trusted-proxy-cidrs = ["127.0.0.1/32"] # TCP-адреса, которым разрешён PROXY-заголовок. Пусто = любые
 max-ips-per-user = 3          # Макс. IP на один секрет
 ip-block-timeout = "5m"       # Время блокировки IP
-# handshake-timeout = "5s"    # Таймаут хэндшейка (по умолчанию 5с)
+# handshake-timeout = "5s"    # Таймаут хэндшейка (по умолчанию 5с; от 1с до 1м)
 
 [secrets]
 user1 = "0123456789abcdef0123456789abcdef"
@@ -291,6 +293,29 @@ services:
       - ./config.toml:/config.toml:ro
 ```
 
+### Лимит SYN
+
+ТСПУ может заблокировать порт прокси на 2 минуты после всплеска SYN-пакетов.
+`synlimit.sh` ограничивает новые соединения с одного IP в цепочке `DOCKER-USER`.
+Значения взяты из telemt: 48 SYN в минуту, burst 24.
+Вторая полоса для SYN-пакетов, похожих на iOS: 12 SYN в секунду, burst 24.
+Пакеты сверх лимита получают TCP reset.
+
+Скрипт необязателен. Он работает только с iptables-бэкендом Docker.
+Docker не удаляет правила из `DOCKER-USER`, но после перезагрузки они пропадают.
+Чтобы применять их при загрузке, установите скрипт и unit systemd:
+
+```bash
+sudo install -m 0755 synlimit.sh /usr/local/sbin/telego-synlimit
+sudo install -m 0644 dist/synlimit@.service /etc/systemd/system/telego-synlimit@.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now telego-synlimit@443.service
+```
+
+Имя экземпляра — опубликованный порт хоста.
+Скрипт находит публичный интерфейс по маршруту IPv4 по умолчанию.
+Чтобы задать его, выполните `sudo systemctl edit telego-synlimit@443.service` и добавьте `Environment=PUBLIC_IF=eth0` в `[Service]`.
+
 ---
 
 ## Установка
@@ -325,6 +350,8 @@ make build
 | `telego_blocked_total` | Counter | Всего блокировок |
 | `telego_traffic_in_bytes_total` | Counter | Входящий трафик |
 | `telego_traffic_out_bytes_total` | Counter | Исходящий трафик |
+| `telego_mask_fallbacks_total` | Counter | Подключения, отправленные на mask-хост, по `reason`: `malformed`, `unknown_sni`, `unknown_secret`, `bad_timestamp` или `replay` |
+| `telego_replay_cache_evictions_total` | Counter | Записи кэша повторов, вытесненные до истечения 10 минут из-за переполнения. Метрика не имеет лейблов. |
 | `telego_middleend_admitting` | Gauge | Готовность ME принимать новые привязки |
 | `telego_middleend_links` | Gauge | Физические ME-соединения по DC и состоянию |
 | `telego_middleend_slot_failure_total` | Counter | Отказы физических ME-соединений |

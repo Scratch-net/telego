@@ -1002,6 +1002,85 @@ func writeBytesOneAtATime(t *testing.T, writer io.Writer, data []byte) {
 	}
 }
 
+func TestGenerationSOCKS5DialTimeoutBoundsOnlyTCPConnect(t *testing.T) {
+	const connectTimeout = 100 * time.Millisecond
+	proxyAddress := startSOCKS5TCPServer(t, func(conn *net.TCPConn) {
+		greeting := make([]byte, 3)
+		if _, err := io.ReadFull(conn, greeting); err != nil {
+			t.Errorf("read greeting: %v", err)
+			return
+		}
+		if err := writeAll(conn, []byte{socks5Version, socks5AuthNone}); err != nil {
+			t.Errorf("write method: %v", err)
+			return
+		}
+		request := make([]byte, 10)
+		if _, err := io.ReadFull(conn, request); err != nil {
+			t.Errorf("read CONNECT request: %v", err)
+			return
+		}
+		// A high-RTT proxy and its own upstream connect delay the reply.
+		time.Sleep(3 * connectTimeout)
+		if err := writeAll(conn, mustDecodeSOCKS5Hex(t, "05000001080808089c40")); err != nil {
+			t.Errorf("write reply: %v", err)
+		}
+	})
+	socks5, err := NewSOCKS5Dialer(proxyAddress, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	dialer := productionGenerationDialer{socks5: socks5}
+	conn, _, _, err := dialer.Dial(ctx, netip.MustParseAddrPort("149.154.175.50:8888"), connectTimeout)
+	if err != nil {
+		t.Fatalf("Dial through slow SOCKS5 proxy: %v", err)
+	}
+	_ = conn.Close()
+}
+
+func TestGenerationSOCKS5DialBoundsHungConnect(t *testing.T) {
+	const connectTimeout = 100 * time.Millisecond
+	proxyAddress := startSOCKS5TCPServer(t, func(conn *net.TCPConn) {
+		greeting := make([]byte, 3)
+		if _, err := io.ReadFull(conn, greeting); err != nil {
+			t.Errorf("read greeting: %v", err)
+			return
+		}
+		if err := writeAll(conn, []byte{socks5Version, socks5AuthNone}); err != nil {
+			t.Errorf("write method: %v", err)
+			return
+		}
+		request := make([]byte, 10)
+		if _, err := io.ReadFull(conn, request); err != nil {
+			t.Errorf("read CONNECT request: %v", err)
+			return
+		}
+		// The proxy never answers CONNECT. Wait until the client gives up.
+		_, _ = io.Copy(io.Discard, conn)
+	})
+	socks5, err := NewSOCKS5Dialer(proxyAddress, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	dialer := productionGenerationDialer{socks5: socks5}
+	started := time.Now()
+	conn, _, _, err := dialer.Dial(ctx, netip.MustParseAddrPort("149.154.175.50:8888"), connectTimeout)
+	elapsed := time.Since(started)
+	if err == nil {
+		_ = conn.Close()
+		t.Fatal("Dial through a proxy that never answers CONNECT succeeded")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Dial error = %v, want deadline exceeded", err)
+	}
+	if limit := socks5AttemptTimeoutFactor*connectTimeout + time.Second; elapsed > limit {
+		t.Fatalf("hung SOCKS5 CONNECT held the attempt for %v, want at most %v", elapsed, limit)
+	}
+}
+
 func mustDecodeSOCKS5Hex(tb testing.TB, value string) []byte {
 	tb.Helper()
 	decoded, err := hex.DecodeString(value)

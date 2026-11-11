@@ -3,6 +3,7 @@ package metrics
 
 import (
 	"context"
+	"errors"
 	"math"
 	"net"
 	"net/http"
@@ -37,6 +38,13 @@ type StatsProvider interface {
 // ProxyStatsProvider supplies cumulative MTProxy handshake diagnostics.
 type ProxyStatsProvider interface {
 	HandshakeFailureStats() []gproxy.HandshakeFailureStat
+}
+
+// maskFallbackStatsProvider supplies mask-host fallback reasons and replay
+// cache pressure.
+type maskFallbackStatsProvider interface {
+	MaskFallbackStats() []gproxy.MaskFallbackStat
+	ReplayCacheEvictions() uint64
 }
 
 type middleEndFrontendStatsProvider interface {
@@ -511,6 +519,24 @@ func registerProxyMetrics(meter metric.Meter, provider ProxyStatsProvider) {
 			return nil
 		}),
 	)
+	if fallback, ok := provider.(maskFallbackStatsProvider); ok {
+		meter.Int64ObservableCounter("telego_mask_fallbacks_total",
+			metric.WithDescription("Connections sent to the mask host, by reason"),
+			metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
+				for _, stat := range fallback.MaskFallbackStats() {
+					observer.Observe(metricValue(stat.Total), metric.WithAttributes(attribute.String("reason", stat.Reason)))
+				}
+				return nil
+			}),
+		)
+		meter.Int64ObservableCounter("telego_replay_cache_evictions_total",
+			metric.WithDescription("Replay cache entries evicted before their TTL because the cache was full"),
+			metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
+				observer.Observe(metricValue(fallback.ReplayCacheEvictions()))
+				return nil
+			}),
+		)
+	}
 	frontend, ok := provider.(middleEndFrontendStatsProvider)
 	if !ok {
 		return
@@ -799,7 +825,9 @@ func (s *Server) Start() error {
 		return err
 	}
 	go func() {
-		_ = s.httpServer.Serve(listener)
+		if err := s.httpServer.Serve(listener); !errors.Is(err, http.ErrServerClosed) {
+			log.Error().Err(err).Msg("metrics server stopped")
+		}
 	}()
 	return nil
 }

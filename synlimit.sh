@@ -19,9 +19,9 @@ fi
   exit 1
 }
 
-# --- telemt defaults ---
+# --- telemt defaults (src/config/defaults.rs, telemt 3.5.0+) ---
 GEN_RATE="48/minute"    # 48 SYN / 60s  (~0.8/sec)  -- Android/desktop lane
-GEN_BURST=1
+GEN_BURST=24            # telemt#876: Telegram opens several connections at once
 IOS_RATE="12/second"    # 12 SYN / 1s                -- iOS lane
 IOS_BURST=24
 IOS_LEN_V4=64           # iOS SYN total packet length

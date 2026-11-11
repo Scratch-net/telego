@@ -11,6 +11,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/scratch-net/telego/pkg/transport/faketls"
 )
 
 // ServerHelloFetcher fetches and caches real ServerHello responses from mask hosts.
@@ -21,9 +23,10 @@ type ServerHelloFetcher struct {
 
 	refreshMu     sync.Mutex // Serialize network refreshes without blocking cache readers.
 	mu            sync.RWMutex
-	cachedFull    []byte // Full response (ServerHello + ChangeCipherSpec + ApplicationData)
-	randomOffset  int    // Offset of random field within cachedFull
-	certRecordLen int    // Payload length of the backend's first ApplicationData (cert) record
+	cachedFull    []byte                       // Full response (ServerHello + ChangeCipherSpec + ApplicationData)
+	randomOffset  int                          // Offset of random field within cachedFull
+	template      *faketls.ServerHelloTemplate // nil when cachedFull is not a TLS 1.3 ServerHello
+	certRecordLen int                          // Payload length of the backend's largest first-flight ApplicationData (cert) record
 	lastFetch     time.Time
 	refreshPeriod time.Duration
 	worker        refreshWorker
@@ -80,6 +83,18 @@ func (f *ServerHelloFetcher) GetServerHelloTemplate() (response []byte, randomOf
 		return nil, 0, errors.New("no cached ServerHello template")
 	}
 	return bytes.Clone(f.cachedFull), f.randomOffset, nil
+}
+
+// Template returns the parsed TLS 1.3 ServerHello template from the last
+// successful fetch. It returns an error when no fetch succeeded or when the
+// mask host answered with TLS 1.2. The template is immutable and shared.
+func (f *ServerHelloFetcher) Template() (*faketls.ServerHelloTemplate, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if f.template == nil {
+		return nil, errors.New("no cached TLS 1.3 ServerHello template")
+	}
+	return f.template, nil
 }
 
 // Refresh fetches an expired or missing template. Call it only during startup
@@ -152,10 +167,11 @@ func (f *ServerHelloFetcher) RefreshContext(ctx context.Context) error {
 		return fmt.Errorf("parse ServerHello: %w", parseErr)
 	}
 
-	// Capture the size of the backend's first ApplicationData (encrypted cert
-	// flight) record from the FULL response before truncating. Matching our
+	// Capture the size of the backend's encrypted Certificate record (the
+	// largest first-flight ApplicationData record) from the FULL response
+	// before truncating. Matching our
 	// fake cert record to this removes the accept-vs-mask cert-record-size tell.
-	certRecordLen := firstAppDataRecordLen(response)
+	certRecordLen := certAppDataRecordLen(response)
 
 	// Extract ONLY the first TLS record (ServerHello).
 	// The full response may contain Certificate, ServerKeyExchange, etc.
@@ -163,11 +179,15 @@ func (f *ServerHelloFetcher) RefreshContext(ctx context.Context) error {
 	// ChangeCipherSpec + ApplicationData in buildHybridServerHello.
 	firstRecordLen := 5 + int(binary.BigEndian.Uint16(response[3:5]))
 	response = response[:firstRecordLen]
+	// A TLS 1.2 ServerHello cannot be a template; connections then use the
+	// synthetic ServerHello.
+	template, _ := faketls.ParseServerHelloTemplate(response)
 
 	// Publish only a complete, validated template. Network work never holds mu.
 	f.mu.Lock()
 	f.cachedFull = bytes.Clone(response)
 	f.randomOffset = randomOffset
+	f.template = template
 	f.certRecordLen = certRecordLen
 	f.lastFetch = time.Now()
 	f.mu.Unlock()
@@ -198,21 +218,23 @@ func (r *recordingConn) GetServerData() []byte {
 	return bytes.Clone(r.serverData)
 }
 
-// firstAppDataRecordLen walks the TLS record stream and returns the payload
-// length of the first ApplicationData (0x17) record, or 0 if none is present.
-func firstAppDataRecordLen(data []byte) int {
-	pos := 0
+// certAppDataRecordLen walks the TLS record stream and returns the payload
+// length of the largest complete ApplicationData (0x17) record, or 0 if none
+// is present. That record carries the encrypted Certificate: servers that
+// send EncryptedExtensions in its own record put a small record first.
+func certAppDataRecordLen(data []byte) int {
+	pos, largest := 0, 0
 	for pos+5 <= len(data) {
 		recordLen := int(binary.BigEndian.Uint16(data[pos+3 : pos+5]))
 		if recordLen > len(data)-pos-5 {
-			return 0
+			return largest
 		}
 		if data[pos] == recordTypeApplicationData {
-			return recordLen
+			largest = max(largest, recordLen)
 		}
 		pos += 5 + recordLen
 	}
-	return 0
+	return largest
 }
 
 // findServerHelloRandomOffset parses TLS records to find the random field offset.
@@ -289,7 +311,7 @@ func findServerHelloRandomOffset(data []byte) (int, error) {
 
 // StartBackgroundRefresh starts periodic refresh of the cached ServerHello.
 func (f *ServerHelloFetcher) StartBackgroundRefresh() {
-	f.worker.start(f.refreshPeriod, func(ctx context.Context) { _ = f.RefreshContext(ctx) })
+	f.worker.start(f.refreshPeriod, f.RefreshContext)
 }
 
 // StopBackgroundRefresh cancels and joins the worker. Repeated calls are safe.

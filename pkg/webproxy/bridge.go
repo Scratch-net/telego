@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // PermissionsPolicy disables browser features that the HTTPS bridge does not
@@ -77,9 +78,9 @@ func renderBridgeAtPath(hostname, bootstrapToken string, batchBytes int, carrier
 	if maxStreamsPerSession <= 0 {
 		return BridgePage{}, errors.New("WEB bridge stream limit is out of range")
 	}
-	document := bridgeDocument
+	document := bridgeHTTPSTemplate()
 	if carrier.usesWebSocket() {
-		document, err = bridgeDocumentWithWebSocket()
+		document, err = bridgeWebSocketTemplate()
 		if err != nil {
 			return BridgePage{}, err
 		}
@@ -99,8 +100,6 @@ func renderBridgeAtPath(hostname, bootstrapToken string, batchBytes int, carrier
 	tokenJSON, _ := json.Marshal(bootstrapToken)
 	carrierJSON, _ := json.Marshal(carrier)
 	body := strings.NewReplacer(
-		"__RECOVERY__", bridgeRecoveryScript,
-		"__HTTPS__", bridgeHTTPSScript,
 		"__NONCE__", nonce,
 		"__ORIGIN__", string(originJSON),
 		"__BOOTSTRAP__", string(tokenJSON),
@@ -179,6 +178,23 @@ func bridgeOrigins(authority string) (relayOrigin, webSocketOrigin string, err e
 	}
 	return "https://" + authority, "wss://" + authority, nil
 }
+
+// The documents and the embedded scripts are static, and the scripts contain
+// no placeholders. Each carrier template therefore needs only one build.
+var (
+	bridgeScriptReplacer = strings.NewReplacer(
+		"__RECOVERY__", bridgeRecoveryScript,
+		"__HTTPS__", bridgeHTTPSScript,
+	)
+	bridgeHTTPSTemplate     = sync.OnceValue(func() string { return bridgeScriptReplacer.Replace(bridgeDocument) })
+	bridgeWebSocketTemplate = sync.OnceValues(func() (string, error) {
+		document, err := bridgeDocumentWithWebSocket()
+		if err != nil {
+			return "", err
+		}
+		return bridgeScriptReplacer.Replace(document), nil
+	})
+)
 
 func bridgeDocumentWithWebSocket() (string, error) {
 	document := bridgeDocument
@@ -298,10 +314,12 @@ function closeWebSocketsWithFailure(report){
 async function openWebSocket(){
  const generation=epoch,retired=epochController.signal;
  const socket=new WebSocket(webSocketTarget,'tproxy-v1.'+sessionToken);webSocket=socket;socket.binaryType='arraybuffer';let opened=false;
+ if(diagnostics)socket.createdAt=Date.now();
  socket.onmessage=event=>{
   if(closed||!opened||webSocket!==socket)return;
+  noteReceived(event.data,socket);
   if(!(event.data instanceof ArrayBuffer)||!event.data.byteLength){fail('ws_receive_type',null,0,socket);return}
-  try{deliver(event.data);status('connected')}catch(error){fail('ws_frames',error)}
+  try{deliver(event.data);status('connected')}catch(error){fail('ws_frames',error,0,socket)}
  };
  socket.onclose=event=>{if(current(generation))fail('ws_closed',null,0,socket,event.code)};
  try{await waitForWebSocketOpen(socket,retired);ensureOpen(retired);opened=true}catch(error){error.recoverable=true;if(current(generation))fail('ws_open',error,0,socket);throw error}
@@ -349,9 +367,10 @@ function failWebSocketLaneOpen(lane,socket,error,closeCode,started){
 function openWebSocketLane(lane){
  const started=diagnostics?Date.now():0;
  const socket=new WebSocket(webSocketTarget,'tproxy-lane-v1.'+sessionToken+'.'+lane.id);
- lane.socket=socket;lane.openController=new AbortController();socket.binaryType='arraybuffer';
+ lane.socket=socket;lane.openController=new AbortController();socket.binaryType='arraybuffer';socket.createdAt=started;
  socket.onmessage=event=>{
   if(closed||lane.finished||!lane.opened||lanes.get(lane.id)!==lane||lane.socket!==socket)return;
+  noteReceived(event.data,socket);
   if(!(event.data instanceof ArrayBuffer)||!event.data.byteLength){fail('ws_lane_receive_type',null,lane.id,socket);return}
   let frames;try{frames=splitFrames(event.data)}catch(error){fail('ws_lane_frames',error,lane.id,socket);return}
   if(frames.some(frame=>frame.id!==lane.id)){fail('ws_lane_cross_lane',null,lane.id,socket);return}if(frames.some(frame=>frame.type===3))lane.remoteClosed=true;
@@ -421,6 +440,8 @@ const requestTimeoutMs=90000;
 const diagnostics=__DIAGNOSTICS__,bridgeStartedAt=diagnostics?Date.now():0;
 let failureReported=false;
 let laneReportWindow=bridgeStartedAt,laneReportCount=0;
+// HTTPS carriers count downlink bytes since bridge start or the last recovery.
+let carrierReceivedBytes=0,carrierReceivedAt=bridgeStartedAt;
 let initialized=false,closed=false,port=null,sessionToken='',createStarted=false;
 let queuedBytes=0,queuedItems=0,upSequence=1,downCursor='0',upRunning=false,pollController=null;
 const lifecycleController=new AbortController();
@@ -573,16 +594,30 @@ function diagnosticError(error){
  ]);
  return messages.get(error.message)||({TypeError:'type_error',RangeError:'range_error',AbortError:'abort',NetworkError:'network',SecurityError:'security',InvalidStateError:'invalid_state'})[error.name]||'error';
 }
+// A WebSocket report counts bytes on the failed socket. An HTTPS report uses
+// the carrier counters because the browser hides its HTTP connections. A
+// WebSocket carrier never updates the carrier counters, so its report without
+// a socket has zero received bytes and idle time.
+function noteReceived(data,socket){
+ if(!diagnostics)return;
+ const size=data&&data.byteLength||0,now=Date.now();
+ if(socket){socket.receivedBytes=(socket.receivedBytes||0)+size;socket.receivedAt=now}
+ else{carrierReceivedBytes+=size;carrierReceivedAt=now}
+}
 function reportFailure(reason,error,laneID,socket,closeCode,wasClean){
  if(!diagnostics)return;
  let report;
  try{
   const number=(value,limit)=>Number.isFinite(value)?Math.max(0,Math.min(Math.floor(value),limit)):0;
+  const webSocketCarrier=carrier==='websocket'||carrier==='websocket-lanes';
+  const receivedBytes=socket?socket.receivedBytes||0:webSocketCarrier?0:carrierReceivedBytes;
+  const receivedAt=socket?socket.receivedAt||socket.createdAt:webSocketCarrier?0:carrierReceivedAt;
   report={reason,error:diagnosticError(error),lane_id:number(laneID,16777215),
    close_code:number(closeCode||(error&&error.closeCode),4999),ready_state:number(socket&&socket.readyState,3),
    http_status:number(error&&error.httpStatus,599),elapsed_ms:number(Date.now()-bridgeStartedAt,2592000000),
    operation_ms:number(error&&error.operationMS,2592000000),queued_bytes:number(queuedBytes,1073741824),
-   queued_items:number(queuedItems,1048576),buffered_bytes:number(socket&&socket.bufferedAmount,1073741824),was_clean:!!wasClean};
+   queued_items:number(queuedItems,1048576),buffered_bytes:number(socket&&socket.bufferedAmount,1073741824),
+   received_bytes:number(receivedBytes,1073741824),idle_ms:number(receivedAt?Date.now()-receivedAt:0,2592000000),was_clean:!!wasClean};
   // A separate keepalive request survives normal page cleanup. Never delay recovery for diagnostics.
   fetch(relayOrigin+'/api/v1/diagnostic',options('POST',sessionToken||bootstrap,JSON.stringify(report),null,undefined,true)).then(cancelResponse).catch(()=>{});
  }catch(reportError){}

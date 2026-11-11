@@ -417,6 +417,11 @@ func (s *gnetGenerationFactoryState) dialCandidates(ctx context.Context, candida
 			if cause := context.Cause(ctx); cause != nil {
 				return generationDialResult{}, cause
 			}
+			if runtime, ok := s.linkBuilder.(interface{ stoppedErr() error }); ok {
+				if err := runtime.stoppedErr(); err != nil {
+					return generationDialResult{}, err
+				}
+			}
 			candidate := family[index]
 			conn, server, client, err := s.dialer.Dial(ctx, candidate.endpoint, s.endpointDialTimeout)
 			if err == nil && conn == nil {
@@ -539,6 +544,13 @@ func closeGenerationSlots(results []generationSlotResult) {
 	}
 }
 
+// socks5AttemptTimeoutFactor bounds one SOCKS5 attempt by this multiple of
+// the endpoint connect timeout. The attempt has four steps that can each take
+// about one connect timeout: the TCP connect to the proxy, the method
+// exchange, the optional authentication, and the CONNECT reply, which
+// includes the proxy's own upstream TCP connect.
+const socks5AttemptTimeoutFactor = 4
+
 func (d productionGenerationDialer) Dial(
 	ctx context.Context,
 	endpoint netip.AddrPort,
@@ -556,10 +568,15 @@ func (d productionGenerationDialer) Dial(
 			return nil, netip.AddrPort{}, netip.AddrPort{}, fmt.Errorf("direct NAT tuple: %w", err)
 		}
 	}
-	dialContext, cancelDial := context.WithTimeout(ctx, connectTimeout)
-	defer cancelDial()
 	if d.socks5 != nil {
-		conn, bound, err := d.socks5.DialContext(dialContext, endpoint.String())
+		// The connect timeout bounds only the TCP connect to the proxy. The
+		// handshake and the proxy's upstream connect can take several proxy
+		// round trips, so they get a larger per-attempt bound. Without it, a
+		// proxy that never answers CONNECT holds one of the two dial race
+		// attempts until the slot deadline.
+		attemptContext, cancelAttempt := context.WithTimeout(ctx, socks5AttemptTimeoutFactor*connectTimeout)
+		conn, bound, err := d.socks5.dialContext(attemptContext, endpoint.String(), connectTimeout)
+		cancelAttempt()
 		if err != nil {
 			return nil, netip.AddrPort{}, netip.AddrPort{}, fmt.Errorf("SOCKS5 CONNECT: %w", err)
 		}
@@ -571,6 +588,8 @@ func (d productionGenerationDialer) Dial(
 		return conn, serverAddr, clientAddr, nil
 	}
 
+	dialContext, cancelDial := context.WithTimeout(ctx, connectTimeout)
+	defer cancelDial()
 	network := "tcp6"
 	if endpoint.Addr().Unmap().Is4() {
 		network = "tcp4"

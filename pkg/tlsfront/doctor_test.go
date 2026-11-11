@@ -6,9 +6,13 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -155,5 +159,69 @@ func TestCheckCertificateProxyProtocol(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestCheckCertificateKeyExchange(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		curves []tls.CurveID
+		want   tls.CurveID
+	}{
+		{name: "post-quantum", curves: []tls.CurveID{tls.X25519MLKEM768, tls.X25519}, want: tls.X25519MLKEM768},
+		{name: "classical", curves: []tls.CurveID{tls.X25519}, want: tls.X25519},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewUnstartedServer(http.NotFoundHandler())
+			server.TLS = &tls.Config{CurvePreferences: tc.curves}
+			server.StartTLS()
+			defer server.Close()
+			roots := x509.NewCertPool()
+			roots.AddCert(server.Certificate())
+			report, err := CheckCertificate(t.Context(), CertificateCheck{
+				Address: server.Listener.Addr().String(), ServerName: "example.com", Roots: roots,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if report.CurveID != tc.want {
+				t.Fatalf("key exchange %v, want %v", report.CurveID, tc.want)
+			}
+		})
+	}
+}
+
+func TestCheckMaskHostAddress(t *testing.T) {
+	public := netip.MustParseAddr("203.0.113.7")
+	for _, tc := range []struct {
+		name    string
+		records []string
+		match   bool
+	}{
+		{name: "match", records: []string{"2001:db8::1", "203.0.113.7"}, match: true},
+		{name: "mapped", records: []string{"::ffff:203.0.113.7"}, match: true},
+		{name: "mismatch", records: []string{"198.51.100.1", "2001:db8::1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lookup := func(_ context.Context, network, host string) ([]netip.Addr, error) {
+				if network != "ip" || host != "mask.example.com" {
+					t.Fatalf("lookup %s %s", network, host)
+				}
+				var addrs []netip.Addr
+				for _, record := range tc.records {
+					addrs = append(addrs, netip.MustParseAddr(record))
+				}
+				return addrs, nil
+			}
+			addrs, match, err := CheckMaskHostAddress(t.Context(), lookup, "mask.example.com", public)
+			if err != nil || match != tc.match || len(addrs) != len(tc.records) {
+				t.Fatalf("addrs=%v match=%v err=%v", addrs, match, err)
+			}
+		})
+	}
+	lookupErr := errors.New("no such host")
+	failing := func(context.Context, string, string) ([]netip.Addr, error) { return nil, lookupErr }
+	if _, _, err := CheckMaskHostAddress(t.Context(), failing, "mask.example.com", public); !errors.Is(err, lookupErr) {
+		t.Fatal(err)
 	}
 }

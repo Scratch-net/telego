@@ -108,6 +108,7 @@ function recoveryComplete(){
  if(!recovering)return;
  if(recoveryRemaining()<=0)throw new Error('recovery deadline reached');
  recovering=false;if(recoveryTimer)clearTimeout(recoveryTimer);recoveryTimer=0;
+ carrierReceivedBytes=0;carrierReceivedAt=diagnostics?Date.now():0;
 }
 function wake(){
  if(!closed&&welcomed&&!recovering&&Date.now()-lastActivity>=30000)beginRecovery();

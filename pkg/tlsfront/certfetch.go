@@ -166,8 +166,9 @@ func (f *CertFetcher) fetchFromHostContext(ctx context.Context, host string, por
 
 // StartBackgroundRefresh starts a goroutine to refresh certificates before expiry.
 func (f *CertFetcher) StartBackgroundRefresh(host string, port int) {
-	f.worker.start(time.Duration(f.refreshH)*time.Hour/2, func(ctx context.Context) {
-		_, _ = f.FetchCertContext(ctx, host, port)
+	f.worker.start(time.Duration(f.refreshH)*time.Hour/2, func(ctx context.Context) error {
+		_, err := f.FetchCertContext(ctx, host, port)
+		return err
 	})
 }
 

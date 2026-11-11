@@ -1,6 +1,7 @@
 package webproxy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -413,7 +414,7 @@ func (h *httpEventHandler) OnTraffic(connection gnet.Conn) gnet.Action {
 			_, _ = connection.Discard(connection.InboundBuffered())
 		}
 		if connection.OutboundBuffered() != 0 {
-			state.armDrainWake(connection)
+			// The owned output release wakes this connection after the drain.
 			return gnet.None
 		}
 		closeAfter := state.finishResponse()
@@ -473,9 +474,9 @@ func (h *httpEventHandler) OnTraffic(connection gnet.Conn) gnet.Action {
 		prepared, disposition := h.prepare(request, state.peerIP, connection.InboundBuffered())
 		switch disposition {
 		case requestPassthrough:
-			return h.writeImmediate(connection, state, h.passthroughFallback())
+			return h.respondBeforeBody(connection, state, request, consumed, h.passthroughFallback())
 		case requestSanitizedFallback:
-			return h.writeImmediate(connection, state, h.sanitizedFallback())
+			return h.respondBeforeBody(connection, state, request, consumed, h.sanitizedFallback())
 		case requestCarrier:
 		default:
 			return h.writeImmediate(connection, state, rejectResponse(500))
@@ -495,12 +496,12 @@ func (h *httpEventHandler) OnTraffic(connection gnet.Conn) gnet.Action {
 				if errors.Is(err, ErrBackpressure) {
 					prepared.session.recordBackpressure(carrierOperationUplink)
 					if discard := prepared.session.reserveHTTPUpDiscard(); discard != nil {
-						return h.rejectUpload(connection, state, discard, size)
+						return h.rejectUpload(connection, state, discard, size, retryResponse())
 					}
 					return h.writeImmediate(connection, state, retryResponse())
 				}
 				prepared.session.laneProtocolFailure(prepared.laneID, nil)
-				return h.writeImmediate(connection, state, rejectResponse(400))
+				return h.rejectUpload(connection, state, nil, size, rejectResponse(400))
 			}
 			prepared.httpUp = reservation
 		}
@@ -518,12 +519,24 @@ type httpConnectionState struct {
 	lease      *PollLease
 	deadline   *time.Timer
 	deadlineID uint64
-	drainWake  *time.Timer
-	peerIP     string
-	pending    *preparedRequest
-	input      []byte
-	websocket  *webSocketConnection
-	rejected   *rejectedHTTPUpload
+	deadlineAt time.Time
+	// deadlineArmed is cleared by invalidation. A timer that fired before
+	// the invalidation reads the newer deadlineID, so the ID alone cannot
+	// reject it.
+	deadlineArmed bool
+	// A write deadline is a stall limit. While writeWatch is set, expiry
+	// extends the deadline if OutboundBuffered changed since writeBuffered,
+	// or if the peer acknowledged more bytes than writeAcked.
+	writeWatch    bool
+	writeBuffered int
+	writeAcked    uint64
+	writeTimeout  time.Duration
+	drainWake     *time.Timer
+	peerIP        string
+	pending       *preparedRequest
+	input         []byte
+	websocket     *webSocketConnection
+	rejected      *rejectedHTTPUpload
 
 	responseStop chan struct{}
 }
@@ -562,16 +575,20 @@ func (s *httpConnectionState) readHeader(connection gnet.Conn) bool {
 	return true
 }
 
+var httpHeaderTerminator = []byte("\r\n\r\n")
+
 func headerCompletion(prefix, next []byte) int {
+	// A terminator can start in the last three bytes of prefix. Check that
+	// edge first, because it precedes any terminator inside next.
 	boundary := min(3, len(prefix))
-	probe := make([]byte, 0, boundary+len(next))
-	probe = append(probe, prefix[len(prefix)-boundary:]...)
-	probe = append(probe, next...)
-	if end := strings.Index(string(probe), "\r\n\r\n"); end >= 0 {
-		consumed := end + 4 - boundary
-		if consumed > 0 {
-			return consumed
-		}
+	var edge [6]byte
+	size := copy(edge[:], prefix[len(prefix)-boundary:])
+	size += copy(edge[size:], next[:min(3, len(next))])
+	if end := bytes.Index(edge[:size], httpHeaderTerminator); end >= 0 && end < boundary {
+		return end + 4 - boundary
+	}
+	if end := bytes.Index(next, httpHeaderTerminator); end >= 0 {
+		return end + 4
 	}
 	return 0
 }
@@ -653,7 +670,7 @@ func (s *httpConnectionState) beginResponse(
 	s.draining = true
 	s.closeAfter = closeAfter
 	s.lease = lease
-	s.armDeadlineLocked(connection, writeTimeout)
+	s.armWriteDeadlineLocked(connection, writeTimeout)
 	s.mu.Unlock()
 	cancel()
 }
@@ -671,10 +688,6 @@ func (s *httpConnectionState) finishResponse() bool {
 	s.active = false
 	s.draining = false
 	s.closeAfter = false
-	if s.drainWake != nil {
-		s.drainWake.Stop()
-		s.drainWake = nil
-	}
 	s.mu.Unlock()
 	lease.Release()
 	return closeAfter
@@ -742,41 +755,83 @@ func (s *httpConnectionState) armDeadline(connection gnet.Conn, duration time.Du
 	s.mu.Unlock()
 }
 
+// armDeadlineLocked reuses one timer for every phase of the connection. A
+// stale expiry can observe a newer generation, so the owner-loop check also
+// requires the newest deadline time to have passed.
 func (s *httpConnectionState) armDeadlineLocked(connection gnet.Conn, duration time.Duration) {
-	if s.deadline != nil {
-		s.deadline.Stop()
-	}
 	s.deadlineID++
+	s.deadlineArmed = true
+	s.writeWatch = false
+	s.deadlineAt = time.Now().Add(duration)
+	if s.deadline == nil {
+		s.deadline = time.AfterFunc(duration, func() { s.deadlineExpired(connection) })
+		return
+	}
+	s.deadline.Reset(duration)
+}
+
+// armWriteDeadline arms a stall limit for output that is already queued or is
+// queued by the caller before the deadline expires.
+func (s *httpConnectionState) armWriteDeadline(connection gnet.Conn, duration time.Duration) {
+	s.mu.Lock()
+	s.armWriteDeadlineLocked(connection, duration)
+	s.mu.Unlock()
+}
+
+func (s *httpConnectionState) armWriteDeadlineLocked(connection gnet.Conn, duration time.Duration) {
+	s.armDeadlineLocked(connection, duration)
+	s.writeWatch = true
+	s.writeBuffered = connection.OutboundBuffered()
+	s.writeAcked, _ = socketBytesAcked(connection)
+	s.writeTimeout = duration
+}
+
+func (s *httpConnectionState) deadlineExpired(connection gnet.Conn) {
+	s.mu.Lock()
 	id := s.deadlineID
-	s.deadline = time.AfterFunc(duration, func() {
-		_ = connection.EventLoop().Execute(context.Background(), gnet.RunnableFunc(func(context.Context) error {
-			s.mu.Lock()
-			if s.deadlineID != id {
+	s.mu.Unlock()
+	_ = connection.EventLoop().Execute(context.Background(), gnet.RunnableFunc(func(context.Context) error {
+		s.mu.Lock()
+		if !s.deadlineArmed || s.deadlineID != id || time.Now().Before(s.deadlineAt) {
+			s.mu.Unlock()
+			return nil
+		}
+		if s.writeWatch {
+			// Only the current response or WebSocket message occupies the
+			// output buffer. Any change means that the peer accepted bytes
+			// or that the queued write entered the buffer. The kernel send
+			// buffer can hold the userspace buffer still while the peer
+			// reads, so new acknowledged bytes also count as progress.
+			buffered := connection.OutboundBuffered()
+			acked, ackedKnown := socketBytesAcked(connection)
+			if buffered != 0 && (buffered != s.writeBuffered || ackedKnown && acked != s.writeAcked) {
+				s.armWriteDeadlineLocked(connection, s.writeTimeout)
 				s.mu.Unlock()
 				return nil
 			}
-			cancel := s.cancel
-			s.cancel = nil
-			s.invalidateDeadlineLocked()
-			s.mu.Unlock()
-			if cancel != nil {
-				cancel()
-			}
-			// This runnable is executing on the owning event loop. No phase
-			// transition can occur between the generation check and close.
-			if s.websocket != nil {
-				s.websocket.noteClose("write_timeout", 0)
-			}
-			return connection.EventLoop().Close(connection)
-		}))
-	})
+		}
+		cancel := s.cancel
+		s.cancel = nil
+		s.invalidateDeadlineLocked()
+		s.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		// This runnable is executing on the owning event loop. No phase
+		// transition can occur between the generation check and close.
+		if s.websocket != nil {
+			s.websocket.noteClose("write_timeout", 0)
+		}
+		return connection.EventLoop().Close(connection)
+	}))
 }
 
 func (s *httpConnectionState) invalidateDeadlineLocked() {
 	if s.deadline != nil {
 		s.deadline.Stop()
-		s.deadline = nil
 	}
+	s.deadlineArmed = false
+	s.writeWatch = false
 	s.deadlineID++
 }
 
@@ -1282,7 +1337,7 @@ func (h *httpEventHandler) dispatch(
 				{"X-Down-Cursor", strconv.FormatUint(request.cursor, 10)},
 			}, close: closeAfter}
 		}
-		err := connection.AsyncWritev(response.encodedParts(), func(current gnet.Conn, writeErr error) error {
+		err := asyncWriteOwned(connection, response.encodedParts(), func(current gnet.Conn, writeErr error) error {
 			if writeErr != nil {
 				response.lease.Release()
 				cancel()
@@ -1292,7 +1347,6 @@ func (h *httpEventHandler) dispatch(
 			state.beginResponse(current, cancel, response.lease, closeAfter, h.server.config.WriteTimeout)
 			if current.OutboundBuffered() != 0 {
 				state.watchResponse(current, response.lease)
-				state.armDrainWake(current)
 				return nil
 			}
 			if state.finishResponse() || closeAfter {
@@ -1406,13 +1460,13 @@ func (h *httpEventHandler) serve(
 		var lease *PollLease
 		var err error
 		if manager.CarrierMode() == CarrierHTTPSLanes {
-			responseBody, cursor, laneClosed, lease, err = request.session.PollCarrierLane(
+			responseBody, cursor, laneClosed, lease, err = request.session.pollCarrierLaneShared(
 				ctx,
 				request.laneID,
 				request.cursor,
 			)
 		} else {
-			responseBody, cursor, lease, err = request.session.PollCarrier(ctx, request.cursor)
+			responseBody, cursor, lease, err = request.session.pollCarrierShared(ctx, request.cursor)
 		}
 		if err != nil {
 			if ctx.Err() != nil {
@@ -1422,6 +1476,8 @@ func (h *httpEventHandler) serve(
 		}
 		headers := []responseHeader{
 			{"Cache-Control", "no-store"},
+			// Nginx honors this header when a TLS proxy keeps proxy_buffering on.
+			{"X-Accel-Buffering", "no"},
 			{"X-Down-Cursor", strconv.FormatUint(cursor, 10)},
 		}
 		if laneClosed {
@@ -1510,20 +1566,44 @@ func rejectResponse(status int) carrierResponse {
 	}
 }
 
+// respondBeforeBody sends a fallback or rejection for a parsed header. A
+// complete, validated body of at most maxCarrierBatchBytes is discarded
+// before the close. Other requests close after the response, as before.
+func (h *httpEventHandler) respondBeforeBody(
+	connection gnet.Conn,
+	state *httpConnectionState,
+	request carrierRequest,
+	consumed int,
+	response carrierResponse,
+) gnet.Action {
+	size, valid := checkedContentLength(request.contentLength)
+	if !request.hasContentLength || !valid || size == 0 || size > maxCarrierBatchBytes || consumed != len(state.input) {
+		return h.writeImmediate(connection, state, response)
+	}
+	state.input = nil
+	return h.rejectUpload(connection, state, nil, size, response)
+}
+
 // A buffered reverse proxy may still be sending the rejected body when it
-// receives 503. Closing with unread data can turn that response into a reset
-// and a proxy-generated 502. Return 503 now, then discard only the validated
-// Content-Length before closing. No rejected body storage is allocated.
-func (h *httpEventHandler) rejectUpload(connection gnet.Conn, state *httpConnectionState, reservation *httpUpDiscardReservation, size int) gnet.Action {
+// receives an early response. Closing with unread data can turn that response
+// into a reset and a proxy-generated 502. Return the response now, then
+// discard only the validated Content-Length before closing. No rejected body
+// storage is allocated. A nil reservation means that no 503 permit applies.
+func (h *httpEventHandler) rejectUpload(
+	connection gnet.Conn,
+	state *httpConnectionState,
+	reservation *httpUpDiscardReservation,
+	size int,
+	response carrierResponse,
+) gnet.Action {
 	deadline := min(h.server.config.BodyTimeout, h.server.config.WriteTimeout)
 	if !state.startRequest(connection, func() {}, deadline) {
 		reservation.Release()
 		return gnet.Close
 	}
 	state.rejected = &rejectedHTTPUpload{reservation: reservation, remaining: size}
-	response := retryResponse()
 	response.close = true
-	if _, err := connection.Write(response.encoded()); err != nil {
+	if err := writeOwned(connection, [][]byte{response.encoded()}); err != nil {
 		return gnet.Close
 	}
 	state.mu.Lock()
@@ -1548,7 +1628,6 @@ func (h *httpEventHandler) discardRejectedUpload(connection gnet.Conn, state *ht
 		}
 	}
 	if connection.OutboundBuffered() != 0 {
-		state.armDrainWake(connection)
 		return gnet.None
 	}
 	if rejected.remaining != 0 {
@@ -1563,7 +1642,7 @@ func (h *httpEventHandler) writeImmediate(connection gnet.Conn, state *httpConne
 	if !state.startRequest(connection, func() {}, h.server.config.WriteTimeout) {
 		return gnet.Close
 	}
-	if _, err := connection.Write(response.encoded()); err != nil {
+	if err := writeOwned(connection, [][]byte{response.encoded()}); err != nil {
 		state.finishRequest()
 		return gnet.Close
 	}
@@ -1572,8 +1651,64 @@ func (h *httpEventHandler) writeImmediate(connection gnet.Conn, state *httpConne
 		state.finishResponse()
 		return gnet.Close
 	}
-	state.armDrainWake(connection)
 	return gnet.None
+}
+
+// writeOwned must run on the connection's event loop. It queues parts without
+// copying them, so they must remain unchanged until gnet releases them. If the
+// last part drains after writeOwned returns, its release wakes the connection.
+// That wake replaces polling OutboundBuffered while a response drains.
+func writeOwned(connection gnet.Conn, parts [][]byte) error {
+	writer, ok := connection.(gnet.OwnedWriter)
+	if !ok {
+		return errorx.ErrUnsupportedOp
+	}
+	if len(parts) > 1 {
+		// Separate owned parts use separate send calls. Join small output so
+		// that a header and its payload leave in one segment, as with writev.
+		total := 0
+		for _, part := range parts {
+			total += len(part)
+		}
+		if total <= RelayDataChunk {
+			parts = [][]byte{bytes.Join(parts, nil)}
+		}
+	}
+	writing := true
+	defer func() { writing = false }()
+	for i, part := range parts {
+		release := func(error) {}
+		if i == len(parts)-1 {
+			release = func(err error) {
+				if err == nil && !writing {
+					_ = connection.Wake(nil)
+				}
+			}
+		}
+		if _, err := writer.WriteOwned(part, release); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// asyncWriteOwned is AsyncWritev with writeOwned on the owner loop. It uses
+// the same high-priority queue, so it keeps the AsyncWritev order. Owners
+// without that queue (including Windows) keep the copying AsyncWritev path.
+func asyncWriteOwned(connection gnet.Conn, parts [][]byte, callback gnet.AsyncCallback) error {
+	_, owned := connection.(gnet.OwnedWriter)
+	if owned {
+		_, owned = connection.EventLoop().(interface {
+			ExecuteHighPriority(context.Context, gnet.Runnable) error
+		})
+	}
+	if !owned {
+		return connection.AsyncWritev(parts, callback)
+	}
+	return gnet.ExecuteHighPriority(connection.EventLoop(), context.Background(), gnet.RunnableFunc(func(context.Context) error {
+		_ = callback(connection, writeOwned(connection, parts))
+		return nil
+	}))
 }
 
 func (r carrierResponse) encoded() []byte {
@@ -1590,29 +1725,27 @@ func (r carrierResponse) encodedParts() [][]byte {
 }
 
 func (r carrierResponse) encodedHeader() []byte {
-	var builder strings.Builder
-	builder.Grow(256)
-	builder.WriteString("HTTP/1.1 ")
-	builder.WriteString(strconv.Itoa(r.status))
-	builder.WriteByte(' ')
-	builder.WriteString(statusText(r.status))
-	builder.WriteString("\r\n")
-	for _, header := range r.headers {
-		builder.WriteString(header.name)
-		builder.WriteString(": ")
-		builder.WriteString(header.value)
-		builder.WriteString("\r\n")
+	header := make([]byte, 0, 256)
+	header = append(header, "HTTP/1.1 "...)
+	header = strconv.AppendInt(header, int64(r.status), 10)
+	header = append(header, ' ')
+	header = append(header, statusText(r.status)...)
+	header = append(header, "\r\n"...)
+	for _, field := range r.headers {
+		header = append(header, field.name...)
+		header = append(header, ": "...)
+		header = append(header, field.value...)
+		header = append(header, "\r\n"...)
 	}
 	if r.status != 204 {
-		builder.WriteString("Content-Length: ")
-		builder.WriteString(strconv.Itoa(len(r.body)))
-		builder.WriteString("\r\n")
+		header = append(header, "Content-Length: "...)
+		header = strconv.AppendInt(header, int64(len(r.body)), 10)
+		header = append(header, "\r\n"...)
 	}
 	if r.close {
-		builder.WriteString("Connection: close\r\n")
+		header = append(header, "Connection: close\r\n"...)
 	}
-	builder.WriteString("\r\n")
-	return []byte(builder.String())
+	return append(header, "\r\n"...)
 }
 
 func statusText(status int) string {

@@ -1,0 +1,14 @@
+[Unit]
+Description=Telego SYN limit for published Docker port %i
+Requires=docker.service
+Wants=network-online.target
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/telego-synlimit %i apply
+ExecStop=/usr/local/sbin/telego-synlimit %i clear
+
+[Install]
+WantedBy=multi-user.target

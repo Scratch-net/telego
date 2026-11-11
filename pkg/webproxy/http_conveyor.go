@@ -154,8 +154,7 @@ func (s *Session) releaseUplinkPendingQuietLocked(cost, items int) {
 	s.carrierOwnedItems += refillItems
 	s.releasePendingQuietLocked(cost-refillCost, items-refillItems)
 	if refillCost != 0 || refillItems != 0 {
-		close(s.budgetNotify)
-		s.budgetNotify = make(chan struct{})
+		s.notifyBudgetLocked()
 	}
 }
 
@@ -379,8 +378,7 @@ func (r *httpUpReservation) leaveApplicationQueueLocked() {
 	pool := &s.httpApplication
 	if index := slices.Index(pool.waiters, r); index >= 0 {
 		pool.waiters = slices.Delete(pool.waiters, index, index+1)
-		close(s.budgetNotify)
-		s.budgetNotify = make(chan struct{})
+		s.notifyBudgetLocked()
 	}
 }
 
@@ -537,13 +535,12 @@ func (r *httpUpReservation) Process(ctx context.Context, body []byte) (uint64, e
 			r.lane.applying = false
 			s.httpApplication.applying = false
 			r.lane.signal()
-			close(s.budgetNotify)
-			s.budgetNotify = make(chan struct{})
+			s.notifyBudgetLocked()
 			s.mu.Unlock()
 			return ack, err
 		}
 		changed := r.lane.notify
-		budgetChanged := s.budgetNotify
+		budgetChanged := s.budgetWaitLocked()
 		s.mu.Unlock()
 		select {
 		case <-changed:

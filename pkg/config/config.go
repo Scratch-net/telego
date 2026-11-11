@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"math"
 	"net"
 	"net/netip"
 	"os"
@@ -47,6 +46,8 @@ type GeneralConfig struct {
 	LogLevel            string   `toml:"log-level"`              // trace, debug, info, warn, error
 	ProxyProtocol       bool     `toml:"proxy-protocol"`         // Accept incoming PROXY protocol
 	MaxConnectionsPerIP int      `toml:"max-connections-per-ip"` // Max connections per IP+secret, 0 = unlimited
+	MaxConnections      int      `toml:"max-connections"`        // Max concurrent client connections, 0 = derive from RLIMIT_NOFILE
+	TrustedProxyCIDRs   []string `toml:"trusted-proxy-cidrs"`    // TCP peers allowed to send PROXY headers, empty = any
 	MaxIPsPerUser       int      `toml:"max-ips-per-user"`       // Max unique IPs per user, 0 = unlimited
 	IPBlockTimeout      Duration `toml:"ip-block-timeout"`       // How long blocked IPs stay blocked
 	HandshakeTimeout    Duration `toml:"handshake-timeout"`      // Max time for handshake (default 5s)
@@ -265,12 +266,24 @@ func (c *Config) validateScalars() error {
 	if c.TLSFronting.SpliceProxyProtocol < 0 || c.TLSFronting.SpliceProxyProtocol > 2 {
 		return errors.New("tls-fronting.splice-proxy-protocol must be 0, 1, or 2")
 	}
-	if c.Performance.MaxWriteBufferMB > math.MaxInt/(1024*1024) {
-		return errors.New("performance.max-write-buffer-mb is too large to represent in bytes")
+	// A pre-auth connection holds a descriptor until the handshake timeout.
+	if t := c.General.HandshakeTimeout.Duration(); t != 0 && (t < time.Second || t > time.Minute) {
+		return errors.New("general.handshake-timeout must be 0 (default 5s) or between 1s and 1m")
+	}
+	// The silence check runs once per second; shorter values close healthy relays.
+	if t := c.Performance.ClientSilenceClose.Duration(); t != 0 && t < time.Second {
+		return errors.New("performance.client-silence-close must be 0 (off) or at least 1s")
+	}
+	// 1024 MiB per connection also fits in a 32-bit int.
+	if c.Performance.MaxWriteBufferMB > 1024 {
+		return errors.New("performance.max-write-buffer-mb must be at most 1024 (0 uses the default 4)")
 	}
 	// Disabled optional sections have always ignored dormant settings.
 	if c.WebProxy.Enabled && c.WebProxy.NumEventLoops < 0 {
 		return errors.New("web-proxy.num-event-loops cannot be negative")
+	}
+	if c.General.MaxConnections < 0 {
+		return errors.New("general.max-connections cannot be negative")
 	}
 	if c.MiddleEnd.Enabled {
 		if c.MiddleEnd.MaxConnections < 0 {
@@ -396,6 +409,13 @@ func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
 
 	// General settings
 	cfg.ProxyProtocol = c.General.ProxyProtocol || c.ProxyProtocol
+	for _, value := range c.General.TrustedProxyCIDRs {
+		prefix, err := netip.ParsePrefix(value)
+		if err != nil || prefix != prefix.Masked() || prefix.String() != value {
+			return gproxy.Config{}, fmt.Errorf("general.trusted-proxy-cidrs contains noncanonical CIDR %q", value)
+		}
+		cfg.TrustedProxyPrefixes = append(cfg.TrustedProxyPrefixes, prefix)
+	}
 	cfg.MaxConnectionsPerIP = c.General.MaxConnectionsPerIP
 	cfg.HandshakeTimeout = c.General.HandshakeTimeout.Duration()
 	cfg.MaxIPsPerUser = c.General.MaxIPsPerUser
@@ -415,8 +435,13 @@ func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
 	cfg.InternalProxyProtocol = c.WebProxy.Enabled && c.WebProxy.Backend != ""
 	cfg.WebProxyFingerprint = c.webProxyFingerprint()
 	cfg.MiddleEndFingerprint = c.middleEndFingerprint()
+	// The global cap applies in every mode; Middle-End can only lower it.
+	cfg.MaxConnections = generalMaxConnections(c.General.MaxConnections)
 	if c.MiddleEnd.Enabled {
-		cfg.MaxConnections = middleEndMaxConnections(c.MiddleEnd.MaxConnections)
+		middleEndMax := middleEndMaxConnections(c.MiddleEnd.MaxConnections)
+		if cfg.MaxConnections == 0 || middleEndMax < cfg.MaxConnections {
+			cfg.MaxConnections = middleEndMax
+		}
 	}
 
 	return cfg, nil

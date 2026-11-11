@@ -5,7 +5,6 @@ import (
 	"crypto/cipher"
 	"encoding/binary"
 	"fmt"
-	"slices"
 )
 
 const maxCBCPlaintextPerFeed = MaxMEFrameSize / aes.BlockSize * aes.BlockSize
@@ -89,6 +88,8 @@ func (e *CBCEncrypter) encrypt(plaintext []byte, owned bool) ([]byte, error) {
 type CBCDecrypter struct {
 	mode    cipher.BlockMode
 	pending []byte
+	// pendingStore backs pending, so a partial block needs no allocation.
+	pendingStore [aes.BlockSize]byte
 }
 
 // String prevents accidental disclosure of expanded AES and pending state.
@@ -121,35 +122,49 @@ func NewCBCDecrypter(key []byte, iv []byte) (*CBCDecrypter, error) {
 // bounded output budget. Returned plaintext retains official no-op alignment
 // frames for FrameDecoder to skip.
 func (d *CBCDecrypter) Feed(data []byte) (int, []byte) {
+	return d.feedInto(data, nil)
+}
+
+// feedInto is Feed with optional caller-owned plaintext storage. The returned
+// plaintext uses scratch when it is large enough. The caller must stop using
+// it before the next feed that shares scratch.
+func (d *CBCDecrypter) feedInto(data, scratch []byte) (int, []byte) {
 	if len(data) == 0 {
 		return 0, nil
 	}
 
 	if len(d.pending) == 0 {
-		return d.feedAligned(data)
+		return d.feedAligned(data, scratch)
 	}
-	return d.feedWithPending(data)
+	return d.feedWithPending(data, scratch)
 }
 
-func (d *CBCDecrypter) feedAligned(data []byte) (int, []byte) {
+func cbcPlaintextBuffer(scratch []byte, size int) []byte {
+	if size <= cap(scratch) {
+		return scratch[:size]
+	}
+	return make([]byte, size)
+}
+
+func (d *CBCDecrypter) feedAligned(data, scratch []byte) (int, []byte) {
 	completeSize := min(len(data)/aes.BlockSize*aes.BlockSize, maxCBCPlaintextPerFeed)
 	if completeSize == 0 {
-		d.pending = slices.Clone(data)
+		d.pending = append(d.pendingStore[:0], data...)
 		return len(data), nil
 	}
 
-	plaintext := make([]byte, completeSize)
+	plaintext := cbcPlaintextBuffer(scratch, completeSize)
 	d.mode.CryptBlocks(plaintext, data[:completeSize])
 	consumed := completeSize
 	remaining := data[completeSize:]
 	if completeSize < maxCBCPlaintextPerFeed && len(remaining) < aes.BlockSize {
-		d.pending = slices.Clone(remaining)
+		d.pending = append(d.pendingStore[:0], remaining...)
 		consumed += len(remaining)
 	}
 	return consumed, plaintext
 }
 
-func (d *CBCDecrypter) feedWithPending(data []byte) (int, []byte) {
+func (d *CBCDecrypter) feedWithPending(data, scratch []byte) (int, []byte) {
 	needed := aes.BlockSize - len(d.pending)
 	if len(data) < needed {
 		d.pending = append(d.pending, data...)
@@ -158,7 +173,7 @@ func (d *CBCDecrypter) feedWithPending(data []byte) (int, []byte) {
 
 	remaining := data[needed:]
 	directSize := min(len(remaining)/aes.BlockSize*aes.BlockSize, maxCBCPlaintextPerFeed-aes.BlockSize)
-	plaintext := make([]byte, aes.BlockSize+directSize)
+	plaintext := cbcPlaintextBuffer(scratch, aes.BlockSize+directSize)
 
 	var firstBlock [aes.BlockSize]byte
 	copy(firstBlock[:], d.pending)
@@ -174,7 +189,7 @@ func (d *CBCDecrypter) feedWithPending(data []byte) (int, []byte) {
 	consumed := needed + directSize
 	tail := remaining[directSize:]
 	if len(plaintext) < maxCBCPlaintextPerFeed && len(tail) < aes.BlockSize {
-		d.pending = slices.Clone(tail)
+		d.pending = append(d.pendingStore[:0], tail...)
 		consumed += len(tail)
 	}
 	return consumed, plaintext

@@ -103,21 +103,50 @@ func TestAsyncWriterCountsDroppedMessages(t *testing.T) {
 	t.Cleanup(func() { sink.unblock(); _ = w.Close() })
 	_, _ = w.Write([]byte("first\n"))
 	waitForLogSink(t, sink)
+	// Unleveled events leave the fatal slot and the warning reserve free.
 	for i := range 12 {
 		_, _ = fmt.Fprintf(w, "%d\n", i)
 	}
-	if got := DroppedMessages() - before; got != 8 {
-		t.Fatalf("dropped before sink resumes = %d, want 8", got)
+	if got := DroppedMessages() - before; got != 9 {
+		t.Fatalf("dropped before sink resumes = %d, want 9", got)
 	}
 	sink.unblock()
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if got := DroppedMessages() - before; got != 8 {
-		t.Fatalf("dropped = %d, want 8", got)
+	if got := DroppedMessages() - before; got != 9 {
+		t.Fatalf("dropped = %d, want 9", got)
 	}
-	if got, want := sink.String(), "first\n0\n1\n2\n3\n"; got != want {
+	if got, want := sink.String(), "first\n0\n1\n2\n"; got != want {
 		t.Fatalf("output = %q, want %q", got, want)
+	}
+}
+
+func TestAsyncWriterReservesCapacityForWarnings(t *testing.T) {
+	sink := newBlockedLogSink(t)
+	var missed atomic.Int64
+	w := newAsyncWriter(sink, 16, func(n int) { missed.Add(int64(n)) })
+	t.Cleanup(func() { sink.unblock(); _ = w.Close() })
+	_, _ = w.WriteLevel(zerolog.InfoLevel, []byte("first\n"))
+	waitForLogSink(t, sink)
+	for i := range 32 {
+		_, _ = w.WriteLevel(zerolog.InfoLevel, fmt.Appendf(nil, "info %d\n", i))
+	}
+	infoDropped := missed.Load()
+	if infoDropped == 0 {
+		t.Fatal("info flood did not fill its share of the queue")
+	}
+	_, _ = w.WriteLevel(zerolog.WarnLevel, []byte("warn\n"))
+	_, _ = w.WriteLevel(zerolog.ErrorLevel, []byte("error\n"))
+	if got := missed.Load() - infoDropped; got != 0 {
+		t.Fatalf("warnings dropped behind an info flood: %d", got)
+	}
+	sink.unblock()
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if out := sink.String(); !strings.HasSuffix(out, "warn\nerror\n") {
+		t.Fatalf("output = %q; want queued warning and error", out)
 	}
 }
 
@@ -336,4 +365,19 @@ func BenchmarkLogProducer(b *testing.B) {
 			b.ReportMetric(float64(dropped.Load())/float64(b.N), "dropped/op")
 		})
 	}
+}
+
+func BenchmarkLogProducerParallel(b *testing.B) {
+	sink := zerolog.ConsoleWriter{Out: io.Discard, NoColor: true}
+	var dropped atomic.Uint64
+	w := newAsyncWriter(sink, 4096, func(n int) { dropped.Add(uint64(n)) })
+	b.Cleanup(func() { _ = w.Close() })
+	l := zerolog.New(w).With().Timestamp().Logger()
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			l.Info().Int("dc", 2).Str("reason", "timeout").Msg("upstream connection failed")
+		}
+	})
+	b.ReportMetric(float64(dropped.Load())/float64(b.N), "dropped/op")
 }

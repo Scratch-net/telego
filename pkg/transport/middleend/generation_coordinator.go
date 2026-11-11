@@ -10,6 +10,9 @@ import (
 	"time"
 )
 
+// generationCoordinatorMaxRetryShift bounds pending-content backoff growth.
+const generationCoordinatorMaxRetryShift = 5
+
 var (
 	// ErrInvalidGenerationCoordinator reports a missing lifecycle dependency or
 	// an invalid retry interval.
@@ -25,8 +28,10 @@ type GenerationFactoryBuilder func(ArtifactSnapshot) (FixedBindingGenerationFact
 
 // GenerationCoordinatorConfig contains the externally owned artifact cache and
 // supervisor. RetryInterval controls retries after fetch, factory, or generation
-// failures. Failed retries add up to 50 percent positive jitter. Daily
-// successful refresh timing still comes from ArtifactCache.
+// failures. Failed retries add up to 50 percent positive jitter. Repeated
+// failures for the same pending content double the retry delay, up to
+// RetryInterval << generationCoordinatorMaxRetryShift. Daily successful
+// refresh timing still comes from ArtifactCache.
 type GenerationCoordinatorConfig struct {
 	Cache         *ArtifactCache
 	Supervisor    *FixedBindingGenerationSupervisor
@@ -105,13 +110,19 @@ type generationCoordinatorState struct {
 	appliedBuild *generationFactoryPlan
 	pending      *ArtifactSnapshot
 	pendingBuild *generationFactoryPlan
-	lastAttempt  time.Time
-	lastSuccess  time.Time
-	refreshOK    uint64
-	refreshFail  uint64
-	applyOK      uint64
-	applyFail    uint64
-	lastErr      error
+	// pendingFailures counts consecutive failed attempts for the current
+	// pending content. New content and a successful apply reset it.
+	pendingFailures uint
+	// pendingRetryDue is the earliest time a failed pending apply runs again
+	// while artifact fetches fail. It is valid only when pendingFailures > 0.
+	pendingRetryDue time.Time
+	lastAttempt     time.Time
+	lastSuccess     time.Time
+	refreshOK       uint64
+	refreshFail     uint64
+	applyOK         uint64
+	applyFail       uint64
+	lastErr         error
 
 	reconcileMu sync.Mutex
 	operations  sync.WaitGroup
@@ -221,8 +232,9 @@ func (s *generationCoordinatorState) run() {
 func (s *generationCoordinatorState) nextDelay() time.Duration {
 	s.mu.Lock()
 	pending := s.pending != nil
+	failures := s.pendingFailures
 	s.mu.Unlock()
-	if pending || s.cache.RefreshDue(s.now()) {
+	if s.cache.RefreshDue(s.now()) {
 		return jitteredRetryDelay(s.retryInterval)
 	}
 	snapshot, ok := s.cache.Snapshot()
@@ -232,6 +244,13 @@ func (s *generationCoordinatorState) nextDelay() time.Duration {
 	delay := snapshot.FetchedAt().Add(TelegramArtifactRefreshInterval).Sub(s.now())
 	if delay <= 0 {
 		return jitteredRetryDelay(s.retryInterval)
+	}
+	if pending {
+		// Each pending attempt dials and bootstraps every candidate link.
+		// Repeated failures for the same content back off; the scheduled
+		// refresh still runs on time.
+		shift := min(max(failures, 1)-1, generationCoordinatorMaxRetryShift)
+		return min(jitteredRetryDelay(s.retryInterval<<shift), delay)
 	}
 	return delay
 }
@@ -303,7 +322,12 @@ func (s *generationCoordinatorState) reconcile(ctx context.Context) error {
 	if ok {
 		s.selectSnapshot(snapshot)
 	}
-	applyErr := s.applyPending(ctx)
+	var applyErr error
+	if refreshErr == nil || !s.pendingRetryDeferred() {
+		// A fetch outage retries the fetch on the plain interval. A failed
+		// pending apply still waits for its own backoff.
+		applyErr = s.applyPending(ctx)
+	}
 	if refreshErr != nil {
 		// Applying a retained candidate can succeed during a fetch outage.
 		// Keep that success without hiding the independent refresh failure.
@@ -333,6 +357,9 @@ func (s *generationCoordinatorState) selectSnapshot(snapshot ArtifactSnapshot) {
 		// A failed newer plan may already be the supervisor's recovery
 		// source. Restore the applied plan through the transition boundary,
 		// even when its still-active manager requires no replacement.
+		if !sameArtifactContent(*s.pending, snapshot) {
+			s.pendingFailures = 0
+		}
 		s.pending = new(snapshot.clone())
 		s.pendingBuild = s.appliedBuild
 		return
@@ -343,6 +370,7 @@ func (s *generationCoordinatorState) selectSnapshot(snapshot ArtifactSnapshot) {
 	}
 	s.pending = new(snapshot.clone())
 	s.pendingBuild = nil
+	s.pendingFailures = 0
 }
 
 func (s *generationCoordinatorState) applyPending(ctx context.Context) error {
@@ -359,10 +387,10 @@ func (s *generationCoordinatorState) applyPending(ctx context.Context) error {
 	if plan == nil {
 		factory, err := s.buildFactory(snapshot)
 		if err != nil {
-			return s.recordGenerationFailure(fmt.Errorf("build Middle-End generation factory: %w", err))
+			return s.recordPendingFailure(snapshot, fmt.Errorf("build Middle-End generation factory: %w", err))
 		}
 		if factory == nil {
-			return s.recordGenerationFailure(errors.New("build Middle-End generation factory: nil factory"))
+			return s.recordPendingFailure(snapshot, errors.New("build Middle-End generation factory: nil factory"))
 		}
 		plan = &generationFactoryPlan{build: factory}
 		s.mu.Lock()
@@ -377,7 +405,7 @@ func (s *generationCoordinatorState) applyPending(ctx context.Context) error {
 		if s.isClosing() {
 			return ErrGenerationCoordinatorClosed
 		}
-		return s.recordGenerationFailure(err)
+		return s.recordPendingFailure(snapshot, err)
 	}
 
 	s.mu.Lock()
@@ -385,6 +413,7 @@ func (s *generationCoordinatorState) applyPending(ctx context.Context) error {
 	s.appliedBuild = plan
 	s.pending = nil
 	s.pendingBuild = nil
+	s.pendingFailures = 0
 	// Count new content adopted after background recovery, but not a no-op
 	// reversion that only restores the existing manager's recovery source.
 	if published || !previouslyApplied {
@@ -394,6 +423,12 @@ func (s *generationCoordinatorState) applyPending(ctx context.Context) error {
 	s.lastErr = nil
 	s.mu.Unlock()
 	return nil
+}
+
+func (s *generationCoordinatorState) pendingRetryDeferred() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pending != nil && s.pendingFailures > 0 && s.now().Before(s.pendingRetryDue)
 }
 
 func (s *generationCoordinatorState) recordRefreshFailure(err error) error {
@@ -409,6 +444,19 @@ func (s *generationCoordinatorState) isClosing() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.closing
+}
+
+// recordPendingFailure counts a failed attempt for snapshot while it remains
+// the pending content.
+func (s *generationCoordinatorState) recordPendingFailure(snapshot ArtifactSnapshot, err error) error {
+	s.mu.Lock()
+	if s.pending != nil && sameArtifactContent(*s.pending, snapshot) {
+		s.pendingFailures++
+		shift := min(s.pendingFailures-1, generationCoordinatorMaxRetryShift)
+		s.pendingRetryDue = s.now().Add(jitteredRetryDelay(s.retryInterval << shift))
+	}
+	s.mu.Unlock()
+	return s.recordGenerationFailure(err)
 }
 
 func (s *generationCoordinatorState) recordGenerationFailure(err error) error {

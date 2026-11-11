@@ -535,3 +535,30 @@ func TestGnetGenerationFactoryEndpointTimeoutCancelsEveryWorker(t *testing.T) {
 		t.Fatalf("active dials after Build = %d", active)
 	}
 }
+
+func TestGnetGenerationFactoryDoesNotDialAfterRuntimeStops(t *testing.T) {
+	runtime, err := NewGnetClientRuntime(GnetClientRuntimeConfig{EventLoops: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.Stop(context.Background()) })
+	// An unexpected gnet client exit, not a Stop call by the owner.
+	if err := runtime.client.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-runtime.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runtime did not observe the client exit")
+	}
+	endpoint := netip.MustParseAddrPort("192.0.2.1:8888")
+	dialer := &generationFactoryTestDialer{}
+	snapshot := generationFactoryTestSnapshot(map[DCID][]netip.AddrPort{1: {endpoint}})
+	factory := newGenerationFactoryForTest(t, snapshot, dialer, runtime, nil)
+	if _, err := factory.Build(t.Context()); !errors.Is(err, ErrGnetRuntimeStopped) {
+		t.Fatalf("Build error = %v", err)
+	}
+	if attempts := dialer.snapshotAttempts(); len(attempts) != 0 {
+		t.Fatalf("dial attempts after runtime exit = %d", len(attempts))
+	}
+}

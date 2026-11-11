@@ -27,6 +27,48 @@ var handshakeFailureStageNames = [...]string{
 	"backend_dial",
 }
 
+type maskFallbackReason uint8
+
+const (
+	maskFallbackMalformed maskFallbackReason = iota
+	maskFallbackUnknownSNI
+	maskFallbackUnknownSecret
+	maskFallbackBadTimestamp
+	maskFallbackReplay
+	maskFallbackReasonCount
+)
+
+var maskFallbackReasonNames = [...]string{
+	"malformed",
+	"unknown_sni",
+	"unknown_secret",
+	"bad_timestamp",
+	"replay",
+}
+
+// MaskFallbackStat is one cumulative counter of connections sent to the
+// mask host, by reason.
+type MaskFallbackStat struct {
+	Reason string
+	Total  uint64
+}
+
+func (h *ProxyHandler) recordMaskFallback(reason maskFallbackReason) {
+	h.maskFallbacks[reason].Add(1)
+}
+
+// MaskFallbackStats returns one stable counter for each fallback reason.
+func (h *ProxyHandler) MaskFallbackStats() []MaskFallbackStat {
+	result := make([]MaskFallbackStat, 0, maskFallbackReasonCount)
+	for reason := range maskFallbackReasonCount {
+		result = append(result, MaskFallbackStat{
+			Reason: maskFallbackReasonNames[reason],
+			Total:  h.maskFallbacks[reason].Load(),
+		})
+	}
+	return result
+}
+
 // HandshakeFailureStat is one cumulative MTProxy handshake failure counter.
 type HandshakeFailureStat struct {
 	Stage string
@@ -43,6 +85,11 @@ func (h *ProxyHandler) HandshakeFailureStats() []HandshakeFailureStat {
 		})
 	}
 	return result
+}
+
+// ReplayCacheEvictions returns replay cache entries evicted before their TTL.
+func (h *ProxyHandler) ReplayCacheEvictions() uint64 {
+	return h.replayCache.Evictions()
 }
 
 // MiddleEndFrontendStats returns aggregate public-side ME buffer pressure. A

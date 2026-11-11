@@ -14,6 +14,7 @@
 
 //go:build darwin || dragonfly || freebsd || linux || netbsd || openbsd
 
+// Telego local modification: accept backoff state. See TELEGO.md.
 package gnet
 
 import (
@@ -22,6 +23,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -39,6 +41,9 @@ type listener struct {
 	sockOptInts         []socket.Option[int]
 	sockOptStrs         []socket.Option[string]
 	pollAttachment      *netpoll.PollAttachment // listener attachment for poller
+	// Telego: accept backoff state, owned by the accepting event loop.
+	acceptPause       time.Duration
+	acceptPauseLogged time.Time
 }
 
 func (ln *listener) packPollAttachment(handler netpoll.PollEventHandler) *netpoll.PollAttachment {

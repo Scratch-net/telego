@@ -202,6 +202,36 @@ func TestBackendGlobalBudgetWakeDoesNotHerdOrSpin(t *testing.T) {
 	}
 }
 
+// A large head waiter must not starve while later, smaller waiters of the
+// same class take every partial release.
+func TestBackendGlobalBudgetSmallWaiterCannotOvertakeHead(t *testing.T) {
+	x := newBudgetTestFixture(t, 3)
+	large := bytes.Repeat([]byte{1}, 4000)
+	x.openInput(t, 1, large)
+	x.openInput(t, 2, []byte{1})
+	filler := x.fillGlobal(t, pendingBackendInput)
+	for index := 1; index < 3; index++ {
+		x.owners[index].drain(t)
+	}
+	head, small := <-x.opened, <-x.opened
+	if head.heldBytes != 0 || small.heldBytes != 0 {
+		t.Fatal("inputs were not blocked on global budget")
+	}
+	x.releaseGlobal(4 * queueItemCost)
+	select {
+	case <-x.owners[2].queue:
+		t.Fatal("a small waiter overtook the blocked head waiter")
+	case <-time.After(20 * time.Millisecond):
+	}
+	x.releaseGlobal(filler - 4*queueItemCost)
+	x.owners[1].next(t)
+	x.owners[1].drain(t)
+	x.owners[2].next(t)
+	if head.heldBytes != len(large) || small.heldBytes != 1 {
+		t.Fatalf("waiters resumed with %d and %d bytes", head.heldBytes, small.heldBytes)
+	}
+}
+
 func TestBackendGlobalBudgetCancelAndRetireQueuedWake(t *testing.T) {
 	x := newBudgetTestFixture(t, 3)
 	for index := 1; index < 3; index++ {

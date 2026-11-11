@@ -76,6 +76,35 @@ class SynlimitTests(unittest.TestCase):
         for family in ("iptables", "ip6tables"):
             self.assertEqual(state[family], [["--comment", "telego-syn-4430"]])
 
+    def test_rule_values_match_telemt_defaults(self):
+        result = self.run_script("443")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(self.state.read_text())
+        for family, length in (("iptables", "64"), ("ip6tables", "84")):
+            ios_accept, ios_reject, gen_accept, gen_reject = state[family][:4]
+            self.assertEqual(ios_accept[ios_accept.index("--length") + 1], length)
+            self.assertEqual(ios_accept[ios_accept.index("--hashlimit-upto") + 1], "12/second")
+            self.assertEqual(ios_accept[ios_accept.index("--hashlimit-burst") + 1], "24")
+            self.assertEqual(gen_accept[gen_accept.index("--hashlimit-upto") + 1], "48/minute")
+            self.assertEqual(gen_accept[gen_accept.index("--hashlimit-burst") + 1], "24")
+            for rule in (ios_reject, gen_reject):
+                self.assertEqual(rule[rule.index("--reject-with") + 1], "tcp-reset")
+
+    def test_systemd_unit_applies_and_clears(self):
+        unit = (Path(__file__).resolve().parent / "synlimit@.service").read_text()
+        commands = dict(line.split("=", 1) for line in unit.splitlines()
+                        if line.startswith(("ExecStart=", "ExecStop=")))
+        for key, rules in (("ExecStart", 5), ("ExecStop", 1)):
+            with self.subTest(key=key):
+                argv = commands[key].replace("%i", "443").split()
+                self.assertEqual(argv[0], "/usr/local/sbin/telego-synlimit")
+                result = subprocess.run(["bash", str(SCRIPT), *argv[1:]],
+                                        env=dict(self.env, PUBLIC_IF="eth-test"),
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                state = json.loads(self.state.read_text())
+                self.assertEqual(len(state["iptables"]), rules)
+
     def test_invalid_ports_do_not_modify_firewall(self):
         for port in ("0", "65536", "-1", "443x", "999999999999999999999"):
             with self.subTest(port=port):

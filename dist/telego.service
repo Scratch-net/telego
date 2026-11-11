@@ -5,8 +5,10 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/telego run -c CONFIG_PATH
-Restart=on-failure
+Restart=always
 RestartSec=5
+# Telego bounds shutdown to 25s plus up to 2s of log drain.
+TimeoutStopSec=30
 LimitNOFILE=65535
 
 # Security hardening (ProtectHome disabled to allow config in /root)

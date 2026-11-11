@@ -134,6 +134,7 @@ type supersessionHTTPConn struct {
 
 func (c *supersessionHTTPConn) EventLoop() gnet.EventLoop   { return c.owner }
 func (c *supersessionHTTPConn) OutboundBuffered() int       { return c.buffered }
+func (*supersessionHTTPConn) Fd() int                       { return -1 }
 func (*supersessionHTTPConn) Wake(gnet.AsyncCallback) error { return nil }
 
 func (c *supersessionHTTPConn) AsyncWritev(parts [][]byte, callback gnet.AsyncCallback) error {

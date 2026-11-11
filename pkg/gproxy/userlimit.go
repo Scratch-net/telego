@@ -46,6 +46,11 @@ type userIPState struct {
 	activeIPs      *lru.Cache[string, *userIPEntry]
 	nextGeneration uint64
 
+	// Counts over activeIPs entries, kept under the shard lock so Stats
+	// never walks the IP list that admission also locks.
+	connections  int64 // sum of entry counts
+	connectedIPs int   // entries with count > 0
+
 	// Blocked IPs with TTL, protected by the user shard lock.
 	// Nil when limiting is disabled.
 	blockedIPs *ttlSet
@@ -75,8 +80,8 @@ type UserIPStats struct {
 	TrackedIPs    int // Unique IPs in LRU cache (may include disconnected)
 	ActiveIPs     int // IPs with active connections right now
 	BlockedIPs    int
-	TrackedIPList []string // List of tracked IP addresses
-	BlockedIPList []string // List of currently blocked IP addresses
+	TrackedIPList []string // List of tracked IP addresses (StatsWithIPLists only)
+	BlockedIPList []string // List of currently blocked IP addresses (StatsWithIPLists only)
 	Connections   int64
 	BytesIn       int64
 	BytesOut      int64
@@ -131,17 +136,23 @@ func (l *UserIPLimiter) getOrCreateUserState(shard *userLimiterShard, secretKey 
 		blockTimeout:    l.blockTimeout,
 	}
 
+	// An evicted entry leaves the counts, as it previously left Stats.
+	evicted := func(ip string, entry *userIPEntry) {
+		if entry.count > 0 {
+			state.connections -= entry.count
+			state.connectedIPs--
+		}
+		// Only block IPs that still have active connections when evicted.
+		// IPs that had legitimately disconnected (count=0) should not be blocked -
+		// they're just being removed to make room for new IPs.
+		if state.blockedIPs != nil && entry.count > 0 {
+			state.blockedIPs.add(ip)
+			state.blockedTotal.Add(1)
+		}
+	}
 	if l.limitingEnabled {
 		// Limiting mode: use configured max with eviction callback
-		activeIPs, _ := lru.NewWithEvict[string, *userIPEntry](l.maxIPsPerUser, func(ip string, entry *userIPEntry) {
-			// Only block IPs that still have active connections when evicted.
-			// IPs that had legitimately disconnected (count=0) should not be blocked -
-			// they're just being removed to make room for new IPs.
-			if state.blockedIPs != nil && entry.count > 0 {
-				state.blockedIPs.add(ip)
-				state.blockedTotal.Add(1)
-			}
-		})
+		activeIPs, _ := lru.NewWithEvict[string, *userIPEntry](l.maxIPsPerUser, evicted)
 		state.activeIPs = activeIPs
 
 		state.blockedIPs = newTTLSet(
@@ -150,7 +161,7 @@ func (l *UserIPLimiter) getOrCreateUserState(shard *userLimiterShard, secretKey 
 		)
 	} else {
 		// Stats-only mode: large LRU for tracking, no blocking
-		activeIPs, _ := lru.New[string, *userIPEntry](statsOnlyMaxIPs)
+		activeIPs, _ := lru.NewWithEvict[string, *userIPEntry](statsOnlyMaxIPs, evicted)
 		state.activeIPs = activeIPs
 		// blockedIPs stays nil - no blocking in stats-only mode
 	}
@@ -193,7 +204,11 @@ func (l *UserIPLimiter) TryAcquire(ip net.IP, secret []byte, secretName string) 
 	// Check if IP is already active
 	if entry, exists := state.activeIPs.Get(ipStr); exists {
 		// Increment connection count
+		if entry.count == 0 {
+			state.connectedIPs++
+		}
 		entry.count++
+		state.connections++
 		return entry.key, true
 	}
 
@@ -204,6 +219,8 @@ func (l *UserIPLimiter) TryAcquire(ip net.IP, secret []byte, secretName string) 
 	binary.LittleEndian.PutUint64(prefix[secretKeySize:], state.nextGeneration)
 	key = string(prefix[:]) + ipStr
 	state.activeIPs.Add(ipStr, &userIPEntry{key: key, count: 1})
+	state.connections++
+	state.connectedIPs++
 	return key, true
 }
 
@@ -239,6 +256,10 @@ func (l *UserIPLimiter) Release(key string) {
 	// Keep IP in LRU even at 0 connections - preserves LRU ordering.
 	// Will be evicted naturally when other IPs need the slot.
 	entry.count--
+	state.connections--
+	if entry.count == 0 {
+		state.connectedIPs--
+	}
 }
 
 // TrafficCounters returns pointers to traffic counters for a user.
@@ -265,8 +286,20 @@ func (l *UserIPLimiter) TrafficCounters(secret []byte) (bytesIn, bytesOut *atomi
 	return &state.bytesIn, &state.bytesOut
 }
 
-// Stats returns statistics for all users.
+// Stats returns per-user counts without IP lists. Its cost per user is
+// constant, so a metrics collector does not hold admission shard locks for
+// a walk over up to statsOnlyMaxIPs entries.
 func (l *UserIPLimiter) Stats() []UserIPStats {
+	return l.stats(false)
+}
+
+// StatsWithIPLists also returns the tracked and blocked IP lists. It walks
+// every tracked IP under the shard lock.
+func (l *UserIPLimiter) StatsWithIPLists() []UserIPStats {
+	return l.stats(true)
+}
+
+func (l *UserIPLimiter) stats(lists bool) []UserIPStats {
 	if l == nil {
 		return nil
 	}
@@ -278,36 +311,26 @@ func (l *UserIPLimiter) Stats() []UserIPStats {
 		shard.mu.Lock()
 
 		for _, state := range shard.users {
-			var totalConns int64
-			var activeIPs int
-			trackedKeys := state.activeIPs.Keys()
-			for _, ip := range trackedKeys {
-				if entry, ok := state.activeIPs.Peek(ip); ok {
-					count := entry.count
-					totalConns += count
-					if count > 0 {
-						activeIPs++
-					}
+			stat := UserIPStats{
+				SecretName:   state.secretName,
+				TrackedIPs:   state.activeIPs.Len(),
+				ActiveIPs:    state.connectedIPs,
+				Connections:  state.connections,
+				BytesIn:      state.bytesIn.Load(),
+				BytesOut:     state.bytesOut.Load(),
+				BlockedTotal: state.blockedTotal.Load(),
+			}
+			if state.blockedIPs != nil {
+				stat.BlockedIPs = state.blockedIPs.len()
+			}
+			if lists {
+				stat.TrackedIPList = state.activeIPs.Keys()
+				if state.blockedIPs != nil {
+					stat.BlockedIPList = state.blockedIPs.keys()
+					stat.BlockedIPs = len(stat.BlockedIPList)
 				}
 			}
-
-			var blockedKeys []string
-			if state.blockedIPs != nil {
-				blockedKeys = state.blockedIPs.keys()
-			}
-
-			stats = append(stats, UserIPStats{
-				SecretName:    state.secretName,
-				TrackedIPs:    state.activeIPs.Len(),
-				ActiveIPs:     activeIPs,
-				BlockedIPs:    len(blockedKeys),
-				TrackedIPList: trackedKeys,
-				BlockedIPList: blockedKeys,
-				Connections:   totalConns,
-				BytesIn:       state.bytesIn.Load(),
-				BytesOut:      state.bytesOut.Load(),
-				BlockedTotal:  state.blockedTotal.Load(),
-			})
+			stats = append(stats, stat)
 		}
 
 		shard.mu.Unlock()

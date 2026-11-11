@@ -324,6 +324,25 @@ func (s *Service) Done() <-chan struct{} {
 	return s.state.done
 }
 
+// RuntimeDone closes when the shared gnet runtime has stopped. Before Close,
+// this means the runtime failed: Middle-End cannot open or keep links, and
+// the process owner should exit so its supervisor restarts it.
+func (s *Service) RuntimeDone() <-chan struct{} {
+	if s == nil || s.state == nil || s.state.runtime == nil {
+		return nil
+	}
+	return s.state.runtime.done
+}
+
+// RuntimeErr reports why the shared gnet runtime stopped. It returns nil
+// while the runtime runs.
+func (s *Service) RuntimeErr() error {
+	if s == nil || s.state == nil || s.state.runtime == nil {
+		return nil
+	}
+	return s.state.runtime.stoppedErr()
+}
+
 // Close starts an idempotent ordered shutdown: coordinator, NAT resolver,
 // supervisor, gnet runtime, then artifact cache. If ctx expires, shutdown
 // continues and a later Close call can wait for the final result.

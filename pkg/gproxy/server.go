@@ -3,6 +3,7 @@ package gproxy
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -87,6 +88,9 @@ type Config struct {
 
 	// Incoming connection handling
 	ProxyProtocol bool // Accept incoming PROXY protocol headers
+	// TrustedProxyPrefixes limits ProxyProtocol to TCP peers in these
+	// prefixes. Unix socket peers are always trusted. Empty trusts any peer.
+	TrustedProxyPrefixes []netip.Prefix
 	// InternalProxyProtocol accepts PROXY headers only from loopback TCP or Unix
 	// peers that authenticate with the process-local token. Native WEB backends
 	// use it to retain the validated browser IP.

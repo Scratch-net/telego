@@ -165,9 +165,81 @@ func TestTelegoAcceptPendingErrorsRecoverQueuedClient(t *testing.T) {
 	}
 }
 
-func TestTelegoAcceptResourceAndPermanentErrorsRemainFatal(t *testing.T) {
+func TestTelegoAcceptResourceExhaustionRecoversQueuedClient(t *testing.T) {
 	for _, reuse := range []bool{false, true} {
-		for _, errno := range []unix.Errno{unix.EMFILE, unix.ENFILE, unix.ENOBUFS, unix.ENOMEM, unix.EBADF, unix.EINVAL, unix.ENOTSOCK, unix.EIO} {
+		for _, errno := range []unix.Errno{unix.EMFILE, unix.ENFILE, unix.ENOBUFS, unix.ENOMEM} {
+			t.Run(fmt.Sprintf("reuseport=%t/%s", reuse, errno.Error()), func(t *testing.T) {
+				var calls atomic.Int32
+				s := startAcceptFaultServer(t, reuse, func(fd int) (int, unix.Sockaddr, error) {
+					if calls.Add(1) <= 3 {
+						return -1, nil, errno
+					}
+					return unix.Accept4(fd, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
+				})
+				// One arrival only: the resumed listener must accept the existing backlog.
+				s.connect(t, true)
+				if calls.Load() < 4 || s.events.opened.Load() != 1 {
+					t.Fatal("resource exhaustion did not lead to exactly one admitted client")
+				}
+				select {
+				case <-s.done:
+					t.Fatalf("resource exhaustion stopped the engine: %v", s.result)
+				default:
+				}
+			})
+		}
+	}
+}
+
+func TestTelegoAcceptResourceExhaustionBacksOffAndStops(t *testing.T) {
+	for _, reuse := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reuseport=%t", reuse), func(t *testing.T) {
+			var inject atomic.Bool
+			var failures atomic.Int32
+			s := startAcceptFaultServer(t, reuse, func(fd int) (int, unix.Sockaddr, error) {
+				if inject.Load() {
+					failures.Add(1)
+					return -1, nil, unix.EMFILE
+				}
+				return unix.Accept4(fd, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
+			})
+			active := s.connect(t, true)
+			inject.Store(true)
+			s.connect(t, false)
+			time.Sleep(500 * time.Millisecond)
+			// Backoff from 5ms doubling allows about seven retries in 500ms.
+			if n := failures.Load(); n < 2 || n > 20 {
+				t.Fatalf("accept retries during 500ms of exhaustion=%d; want backoff", n)
+			}
+			const message = "still-connected"
+			if _, err := io.WriteString(active, message); err != nil {
+				t.Fatal(err)
+			}
+			got := make([]byte, len(message))
+			if _, err := io.ReadFull(active, got); err != nil || string(got) != message {
+				t.Fatalf("active client lost relay progress: reply=%q err=%v", got, err)
+			}
+			started := time.Now()
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
+			if err := s.boot.engine.Stop(ctx); err != nil {
+				t.Fatalf("Stop during accept backoff: %v", err)
+			}
+			select {
+			case <-s.done:
+			case <-time.After(time.Second):
+				t.Fatal("Run did not join after Stop")
+			}
+			if elapsed := time.Since(started); elapsed > time.Second {
+				t.Fatalf("Stop during accept backoff took %v", elapsed)
+			}
+		})
+	}
+}
+
+func TestTelegoAcceptResourceClassExcludesPermanentErrors(t *testing.T) {
+	for _, reuse := range []bool{false, true} {
+		for _, errno := range []unix.Errno{unix.EBADF, unix.EINVAL, unix.ENOTSOCK, unix.EIO} {
 			t.Run(fmt.Sprintf("reuseport=%t/%s", reuse, errno.Error()), func(t *testing.T) {
 				s := startAcceptFaultServer(t, reuse, func(int) (int, unix.Sockaddr, error) { return -1, nil, errno })
 				connection := s.connect(t, false)

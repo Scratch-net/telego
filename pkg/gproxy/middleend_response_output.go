@@ -19,9 +19,21 @@ const _ = uint(middleend.ResponseOutputNodeBytes - int(logicalOwnedOutputMetadat
 type middleEndOwnedOutput struct {
 	data       []byte
 	allocation *middleend.ResponseAllocation
+	ctx        *ConnContext
 }
 
 const _ = uint(middleend.ResponseOutputOwnerBytes - int(unsafe.Sizeof(middleEndOwnedOutput{})))
+
+// complete runs when the output leaves the user-space buffer or is discarded.
+// Only a complete drain counts as server activity for the silence breaker.
+func (o *middleEndOwnedOutput) complete(err error) {
+	ctx := o.ctx
+	o.ctx = nil
+	o.release()
+	if err == nil && ctx != nil {
+		ctx.recordServerActivity()
+	}
+}
 
 func (o *middleEndOwnedOutput) release() {
 	clear(o.data)
@@ -125,13 +137,13 @@ func (h *ProxyHandler) writeMiddleEndOwnedEvent(connection clientEndpoint, ctx *
 	wire = nil
 	work.plain.Release()
 	work.plain = nil
-	owner := &middleEndOwnedOutput{data: out, allocation: work.output}
+	owner := &middleEndOwnedOutput{data: out, allocation: work.output, ctx: ctx}
 	work.output = nil
 	size := len(out)
 	// Keep this capture immutable and singular: the shared envelope charges
 	// the code pointer plus this owner pointer, without a boxed slice header.
-	written, err := writeMiddleEndOwnedOutput(connection, out, func(error) {
-		owner.release()
+	written, err := writeMiddleEndOwnedOutput(connection, out, func(err error) {
+		owner.complete(err)
 	})
 	if err == nil && written != size {
 		err = io.ErrShortWrite
@@ -146,6 +158,5 @@ func (h *ProxyHandler) writeMiddleEndOwnedEvent(connection clientEndpoint, ctx *
 	if counter := ctx.TrafficOut(); counter != nil {
 		counter.Add(int64(payloadBytes))
 	}
-	ctx.recordServerActivity()
 	return gnet.None
 }

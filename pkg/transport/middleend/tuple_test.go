@@ -555,6 +555,56 @@ func TestNATResolverFailedRefreshKeepsOnlyBoundedStaleAddress(t *testing.T) {
 	}
 }
 
+func TestNATResolverCallerCancellationDoesNotFailSharedProbe(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enterOnce sync.Once
+	var calls atomic.Int32
+	probe := func(ctx context.Context, _ AddressFamily, _ []string, _ int) (natProbeResult, error) {
+		calls.Add(1)
+		enterOnce.Do(func() { close(entered) })
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return natProbeResult{}, context.Cause(ctx)
+		}
+		return natProbeResult{address: netip.MustParseAddr("8.8.8.8"), respondingServers: 2, agreeingServers: 2}, nil
+	}
+	resolver, err := newNATResolver(natResolverTestConfig(), time.Now, probe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupNATResolver(t, resolver)
+
+	callerContext, cancelCaller := context.WithCancel(t.Context())
+	first := make(chan error, 1)
+	go func() {
+		_, err := resolver.Resolve(callerContext, AddressFamilyIPv4)
+		first <- err
+	}()
+	<-entered
+	cancelCaller()
+	if err := <-first; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled caller error = %v", err)
+	}
+	second := make(chan error, 1)
+	go func() {
+		address, err := resolver.Resolve(t.Context(), AddressFamilyIPv4)
+		if err == nil && address != netip.MustParseAddr("8.8.8.8") {
+			err = fmt.Errorf("address = %s", address)
+		}
+		second <- err
+	}()
+	close(release)
+	if err := <-second; err != nil {
+		t.Fatalf("waiter after caller cancellation: %v", err)
+	}
+	snapshot := resolver.Snapshot().IPv4
+	if !snapshot.Ready || snapshot.Failures != 0 || snapshot.Successes != 1 || calls.Load() != 1 {
+		t.Fatalf("snapshot = %+v calls = %d", snapshot, calls.Load())
+	}
+}
+
 func TestNATResolverFailureBackoff(t *testing.T) {
 	var clock atomic.Int64
 	clock.Store(time.Unix(1_700_000_000, 0).UnixNano())

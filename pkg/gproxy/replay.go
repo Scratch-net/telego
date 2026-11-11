@@ -2,6 +2,7 @@ package gproxy
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,6 +24,7 @@ type ReplayCache struct {
 	shards      [numShards]replayShard
 	maxPerShard int
 	ttl         time.Duration
+	evictions   atomic.Uint64 // live entries removed before their TTL
 }
 
 // NewReplayCache creates a new replay cache.
@@ -65,12 +67,48 @@ func (c *ReplayCache) Seen(sessionID []byte) bool {
 	// Atomic check-and-add with shard lock
 	shard.mu.Lock()
 	exists := shard.cache.contains(key)
+	evicted := false
 	if !exists {
-		shard.cache.add(key)
+		evicted = shard.cache.add(key)
 	}
 	shard.mu.Unlock()
+	if evicted {
+		c.evictions.Add(1)
+	}
 
 	return exists
+}
+
+// maxReplayHold bounds how long SeenUntil keeps an entry beyond its TTL.
+const maxReplayHold = 24 * time.Hour
+
+// SeenUntil is Seen for an entry that must also survive until until, at most
+// maxReplayHold from now. A hello rejected for a future timestamp uses it, so
+// the hello cannot be replayed when the clock reaches its timestamp.
+func (c *ReplayCache) SeenUntil(sessionID []byte, until time.Time) bool {
+	if limit := time.Now().Add(maxReplayHold); until.After(limit) {
+		until = limit
+	}
+	key := string(sessionID)
+	shard := &c.shards[c.getShardIdx(key)]
+	shard.mu.Lock()
+	exists := shard.cache.contains(key)
+	evicted := false
+	if !exists {
+		evicted = shard.cache.addUntil(key, until)
+	}
+	shard.mu.Unlock()
+	if evicted {
+		c.evictions.Add(1)
+	}
+	return exists
+}
+
+// Evictions returns how many entries were removed before their TTL because
+// a shard was full. A growing value means the replay window is shorter
+// than the TTL.
+func (c *ReplayCache) Evictions() uint64 {
+	return c.evictions.Load()
 }
 
 // Len returns the total number of entries across all shards.

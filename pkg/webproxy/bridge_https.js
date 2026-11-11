@@ -86,7 +86,7 @@ async function readDownlink(response,lane,signal,deadline){
    ensureOpen(signal);if(Date.now()>=deadline)throw new Error('response deadline reached');
    const part=await reader.read();ensureOpen(signal);if(Date.now()>=deadline)throw new Error('response deadline reached');
    if(part.done)break;
-   const bytes=part.value;
+   const bytes=part.value;noteReceived(bytes,null);
    if(!(bytes instanceof Uint8Array)||++chunks>65536||bytes.byteLength>bodyLimit-position)throw new Error('response body exceeds its limit');
    const overlap=Math.min(bytes.byteLength,Math.max(0,owner.retained-position));
    for(let i=0;i<overlap;i++)if(bytes[i]!==owner.bytes[position+i])throw new Error('invalid downlink response');

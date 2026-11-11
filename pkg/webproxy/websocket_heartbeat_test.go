@@ -106,6 +106,7 @@ type heartbeatTestConn struct {
 
 func (c *heartbeatTestConn) EventLoop() gnet.EventLoop { return c.owner }
 func (c *heartbeatTestConn) OutboundBuffered() int     { return c.buffered }
+func (*heartbeatTestConn) Fd() int                     { return -1 }
 func (*heartbeatTestConn) InboundBuffered() int        { return 0 }
 func (*heartbeatTestConn) Discard(int) (int, error)    { return 0, nil }
 

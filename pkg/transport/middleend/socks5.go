@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -164,6 +165,13 @@ func NewSOCKS5Dialer(proxyAddress string, credentials *SOCKS5Credentials) (*SOCK
 // 1928 CONNECT handshake, and returns the proxy's exact BND endpoint. The
 // context governs both the TCP dial and every handshake read and write.
 func (d *SOCKS5Dialer) DialContext(ctx context.Context, targetAddress string) (*net.TCPConn, SOCKS5Address, error) {
+	return d.dialContext(ctx, targetAddress, 0)
+}
+
+// dialContext bounds the TCP connect to the proxy by connectTimeout when it is
+// positive. ctx alone bounds the handshake, which includes the proxy's own
+// upstream connect.
+func (d *SOCKS5Dialer) dialContext(ctx context.Context, targetAddress string, connectTimeout time.Duration) (*net.TCPConn, SOCKS5Address, error) {
 	var zero SOCKS5Address
 	if ctx == nil {
 		return nil, zero, errors.New("SOCKS5 DialContext: nil context")
@@ -176,7 +184,12 @@ func (d *SOCKS5Dialer) DialContext(ctx context.Context, targetAddress string) (*
 		return nil, zero, fmt.Errorf("target address: %w", err)
 	}
 
-	conn, err := d.dialTCP(ctx, "tcp", d.proxyAddress)
+	connectContext, cancelConnect := ctx, context.CancelFunc(func() {})
+	if connectTimeout > 0 {
+		connectContext, cancelConnect = context.WithTimeout(ctx, connectTimeout)
+	}
+	conn, err := d.dialTCP(connectContext, "tcp", d.proxyAddress)
+	cancelConnect()
 	if err != nil {
 		return nil, zero, fmt.Errorf("dial SOCKS5 proxy: %w", err)
 	}

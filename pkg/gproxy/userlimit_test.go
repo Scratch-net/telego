@@ -201,7 +201,7 @@ func TestUserIPLimiter_BlockExpires(t *testing.T) {
 			t.Fatalf("blocked IPs before deadline = %d, want 1", got)
 		}
 		time.Sleep(time.Nanosecond)
-		if stats := l.Stats()[0]; stats.BlockedIPs != 0 || len(stats.BlockedIPList) != 0 {
+		if stats := l.StatsWithIPLists()[0]; stats.BlockedIPs != 0 || len(stats.BlockedIPList) != 0 {
 			t.Fatal("stats retained an expired block")
 		}
 		if _, ok := l.TryAcquire(ip1, secret, "test"); !ok {
@@ -230,7 +230,7 @@ func TestUserIPLimiterStaleReleaseAfterReentry(t *testing.T) {
 			t.Fatalf("stale releases changed replacement entry: %+v", stats)
 		}
 		l.TryAcquire(net.ParseIP("192.0.2.3"), secret, "test")
-		if !slices.Contains(l.Stats()[0].BlockedIPList, ip.String()) {
+		if !slices.Contains(l.StatsWithIPLists()[0].BlockedIPList, ip.String()) {
 			t.Fatal("replacement with a live connection was not blocked at eviction")
 		}
 		l.Release(current)
@@ -297,7 +297,7 @@ func TestUserIPLimiter_BlockedCapacityAndRefreshOrder(t *testing.T) {
 			t.Fatal("new IP was rejected")
 		}
 	}
-	if stats := l.Stats()[0]; stats.BlockedIPs != 10 || stats.BlockedIPList[0] != "192.0.2.2" {
+	if stats := l.StatsWithIPLists()[0]; stats.BlockedIPs != 10 || stats.BlockedIPList[0] != "192.0.2.2" {
 		t.Fatalf("blocked capacity eviction is incorrect: %v", stats.BlockedIPList)
 	}
 	if _, ok := l.TryAcquire(net.ParseIP("192.0.2.2"), secret, "test"); ok {
@@ -305,7 +305,7 @@ func TestUserIPLimiter_BlockedCapacityAndRefreshOrder(t *testing.T) {
 	}
 	l.TryAcquire(net.ParseIP("192.0.2.13"), secret, "test")
 	want := []string{"192.0.2.4", "192.0.2.5", "192.0.2.6", "192.0.2.7", "192.0.2.8", "192.0.2.9", "192.0.2.10", "192.0.2.11", "192.0.2.2", "192.0.2.12"}
-	if got := l.Stats()[0].BlockedIPList; !slices.Equal(got, want) {
+	if got := l.StatsWithIPLists()[0].BlockedIPList; !slices.Equal(got, want) {
 		t.Fatalf("blocked order after refresh and eviction = %v, want %v", got, want)
 	}
 }
@@ -403,7 +403,7 @@ func TestUserIPLimiter_Stats(t *testing.T) {
 	key2, _ := l.TryAcquire(ip1, secret, "testuser")
 	key3, _ := l.TryAcquire(ip2, secret, "testuser")
 
-	stats := l.Stats()
+	stats := l.StatsWithIPLists()
 	if len(stats) != 1 {
 		t.Fatalf("Expected 1 user stat, got %d", len(stats))
 	}
@@ -532,7 +532,7 @@ func TestUserIPLimiter_StatsWithBlockedIPs(t *testing.T) {
 	l.TryAcquire(ip2, secret, "testuser")
 	l.TryAcquire(ip3, secret, "testuser") // Evicts ip1
 
-	stats := l.Stats()
+	stats := l.StatsWithIPLists()
 	if len(stats) != 1 {
 		t.Fatalf("Expected 1 user stat, got %d", len(stats))
 	}

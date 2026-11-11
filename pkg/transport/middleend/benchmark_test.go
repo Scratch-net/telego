@@ -137,7 +137,7 @@ func BenchmarkClientBootstrapReadyFeed(b *testing.B) {
 	}
 }
 
-func newReadyBenchmarkPair(b *testing.B) (*ClientBootstrap, *runtimeTestServer) {
+func newReadyBenchmarkPair(b testing.TB) (*ClientBootstrap, *runtimeTestServer) {
 	b.Helper()
 	client, err := NewClientBootstrap(testBootstrapConfig())
 	if err != nil {

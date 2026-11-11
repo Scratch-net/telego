@@ -122,7 +122,7 @@ func TestHTTPApplicationRefillKeepsGlobalCreditAndWakes(t *testing.T) {
 				!reader.transferApplicationLocked(amount.cost, amount.items) {
 				t.Fatal("cannot transfer bounded application credit")
 			}
-			wake := session.budgetNotify
+			wake := session.budgetWaitLocked()
 			before := manager.Capacity()
 			// The backend source has been disposed. Refill its application
 			// credit before any other session can consume a global release.

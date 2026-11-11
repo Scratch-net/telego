@@ -1,6 +1,7 @@
 package middleend
 
 import (
+	"crypto/aes"
 	"encoding/binary"
 	"fmt"
 	"net/netip"
@@ -77,14 +78,51 @@ func (r ProxyRequest) MarshalBinary() ([]byte, error) {
 	}
 
 	wire := make([]byte, headerSize+len(r.Packet))
+	if err := r.marshalInto(wire, headerSize, hasTag); err != nil {
+		return nil, err
+	}
+	return wire, nil
+}
+
+// marshalFrame encodes the request inside a full-frame buffer with room for
+// the frame header, trailer, and CBC padding. It returns the buffer and the
+// payload view inside it.
+func (r ProxyRequest) marshalFrame() ([]byte, []byte, error) {
+	hasTag := r.Tag != nil
+	if err := validateProxyRequestFlags(r.Flags, hasTag); err != nil {
+		return nil, nil, err
+	}
+	if err := validateProxyPacket(r.Packet, r.Flags); err != nil {
+		return nil, nil, err
+	}
+	headerSize := ProxyRequestBaseSize
+	if hasTag {
+		headerSize = ProxyRequestTaggedHeaderSize
+	}
+	if len(r.Packet) > MaxClientPacketSize {
+		return nil, nil, fmt.Errorf("%w: proxy request packet %d exceeds %d", ErrClientPacketTooLarge, len(r.Packet), MaxClientPacketSize)
+	}
+	size := headerSize + len(r.Packet)
+	frameSize := size + FullFrameOverhead
+	frame := make([]byte, frameSize, (frameSize+aes.BlockSize-1)&^(aes.BlockSize-1))
+	payload := frame[frameHeaderSize : frameHeaderSize+size : frameHeaderSize+size]
+	if err := r.marshalInto(payload, headerSize, hasTag); err != nil {
+		return nil, nil, err
+	}
+	return frame, payload, nil
+}
+
+// marshalInto writes the validated request into wire, which has exactly the
+// encoded size.
+func (r ProxyRequest) marshalInto(wire []byte, headerSize int, hasTag bool) error {
 	binary.LittleEndian.PutUint32(wire[0:4], OperationProxyRequest)
 	binary.LittleEndian.PutUint32(wire[4:8], uint32(r.Flags))
 	binary.LittleEndian.PutUint64(wire[8:16], uint64(r.ConnectionID))
 	if err := putProxyAddress(wire[16:36], r.RemoteAddr, true); err != nil {
-		return nil, fmt.Errorf("encode remote address: %w", err)
+		return fmt.Errorf("encode remote address: %w", err)
 	}
 	if err := putProxyAddress(wire[36:56], r.ProxyAddr, false); err != nil {
-		return nil, fmt.Errorf("encode proxy address: %w", err)
+		return fmt.Errorf("encode proxy address: %w", err)
 	}
 
 	if hasTag {
@@ -95,7 +133,7 @@ func (r ProxyRequest) MarshalBinary() ([]byte, error) {
 		// wire[81:84] is the zero TL-string padding.
 	}
 	copy(wire[headerSize:], r.Packet)
-	return wire, nil
+	return nil
 }
 
 // ParseProxyRequest decodes a strict RPC_PROXY_REQ payload.

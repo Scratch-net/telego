@@ -95,6 +95,10 @@ type LinkSubmission struct {
 	SubmissionID uint64
 	ConnectionID int64
 	Payload      []byte
+	// frame optionally backs Payload at frame[frameHeaderSize:] with room
+	// for the frame trailer and CBC padding. A gnet owner then frames and
+	// encrypts it in place instead of copying the payload.
+	frame []byte
 }
 
 // String reports routing metadata without disclosing the RPC payload.

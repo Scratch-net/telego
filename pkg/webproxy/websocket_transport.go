@@ -10,6 +10,7 @@ import (
 
 	"github.com/gobwas/ws"
 	"github.com/panjf2000/gnet/v2"
+	"github.com/zeebo/xxh3"
 )
 
 const (
@@ -129,6 +130,9 @@ type webSocketInboundBudget struct {
 	maxBytes int
 	maxItems int
 	copies   map[*webSocketOwnedInput]int
+	// copyMax is the largest live copy size; copyMaxCount owners have it.
+	copyMax      int
+	copyMaxCount int
 }
 
 type webSocketOwnedInput struct {
@@ -154,6 +158,7 @@ func (b *webSocketInboundBudget) reserve(owner *webSocketOwnedInput, size, copyB
 		b.copies = make(map[*webSocketOwnedInput]int)
 	}
 	b.copies[owner] = copyBytes
+	b.addCopy(copyBytes)
 	b.rawBytes += size
 	b.bytes = b.rawBytes + max(copyLimit, copyBytes)
 	b.items++
@@ -166,15 +171,22 @@ func (b *webSocketInboundBudget) resize(owner *webSocketOwnedInput, previous, ne
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if _, owned := b.copies[owner]; !owned || previous > b.rawBytes {
+	current, owned := b.copies[owner]
+	if !owned || previous > b.rawBytes {
 		return false
 	}
-	copyLimit := max(b.copyLimit(owner), copyBytes)
+	// Growth needs no scan: the live maximum already includes current.
+	copyLimit := max(b.copyMax, copyBytes)
+	if copyBytes < current {
+		copyLimit = max(b.copyLimit(owner), copyBytes)
+	}
 	rawBytes := b.rawBytes + next - previous
 	if rawBytes+copyLimit > b.maxBytes {
 		return false
 	}
 	b.copies[owner] = copyBytes
+	b.addCopy(copyBytes)
+	b.dropCopy(current)
 	b.rawBytes = rawBytes
 	b.bytes = rawBytes + copyLimit
 	return true
@@ -186,11 +198,12 @@ func (b *webSocketInboundBudget) release(owner *webSocketOwnedInput, size int) {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	_, owned := b.copies[owner]
+	copyBytes, owned := b.copies[owner]
 	if size < 0 || !owned || size > b.rawBytes {
 		panic("invalid WEB WebSocket local budget release")
 	}
 	delete(b.copies, owner)
+	b.dropCopy(copyBytes)
 	b.rawBytes -= size
 	b.bytes = b.rawBytes + b.copyLimit(nil)
 	b.items--
@@ -198,7 +211,11 @@ func (b *webSocketInboundBudget) release(owner *webSocketOwnedInput, size int) {
 
 // Only the serial worker coalesces. All live inputs share one local spare
 // sized for the largest possible copy, while each prepays its global copy.
+// Only the exclusion of the single largest copy requires a scan.
 func (b *webSocketInboundBudget) copyLimit(exclude *webSocketOwnedInput) int {
+	if size, ok := b.copies[exclude]; !ok || size != b.copyMax || b.copyMaxCount > 1 {
+		return b.copyMax
+	}
 	limit := 0
 	for owner, size := range b.copies {
 		if owner != exclude {
@@ -206,6 +223,29 @@ func (b *webSocketInboundBudget) copyLimit(exclude *webSocketOwnedInput) int {
 		}
 	}
 	return limit
+}
+
+func (b *webSocketInboundBudget) addCopy(size int) {
+	switch {
+	case size > b.copyMax:
+		b.copyMax, b.copyMaxCount = size, 1
+	case size == b.copyMax:
+		b.copyMaxCount++
+	}
+}
+
+// dropCopy runs after the copies map no longer holds size for its owner.
+func (b *webSocketInboundBudget) dropCopy(size int) {
+	if size != b.copyMax {
+		return
+	}
+	if b.copyMaxCount--; b.copyMaxCount != 0 {
+		return
+	}
+	b.copyMax = 0
+	for _, live := range b.copies {
+		b.addCopy(live)
+	}
 }
 
 func (b *webSocketInboundBudget) snapshot() (int, int) {
@@ -320,6 +360,7 @@ type webSocketConnection struct {
 	failures            chan webSocketFailure
 	liveness            *time.Timer
 	livenessID          uint64
+	livenessAt          time.Time
 	heartbeat           *time.Timer
 	heartbeatID         uint64
 	heartbeatDue        bool
@@ -532,8 +573,9 @@ func (w *webSocketConnection) processUplink(
 	defer deadline.Stop()
 	retry := time.NewTicker(w.backpressureRetry)
 	defer retry.Stop()
+	digest := xxh3.Hash128(input.body).Bytes()
 	for {
-		acknowledged, err := input.reservation.session.processUp(sequence, input.body, w.lane)
+		acknowledged, err := input.reservation.session.processUp(sequence, input.body, w.lane, digest)
 		if err == nil && acknowledged == sequence {
 			return 0
 		}
@@ -559,9 +601,9 @@ func (w *webSocketConnection) downlinkLoop(connection gnet.Conn) {
 		var lease *PollLease
 		var err error
 		if w.lane != nil {
-			body, next, laneClosed, lease, err = w.lane.PollCarrier(w.ctx, cursor)
+			body, next, laneClosed, lease, err = w.lane.pollCarrierShared(w.ctx, cursor)
 		} else {
-			body, next, lease, err = w.session.PollCarrier(w.ctx, cursor)
+			body, next, lease, err = w.session.pollCarrierShared(w.ctx, cursor)
 		}
 		if err != nil {
 			if w.ctx.Err() == nil {
@@ -629,30 +671,35 @@ func (w *webSocketConnection) fail(connection gnet.Conn, code ws.StatusCode, rea
 	_ = connection.Wake(nil)
 }
 
+// touchLiveness reuses one timer. The owner loop compares the newest expiry
+// time, so a stale timer callback cannot close a refreshed connection.
 func (w *webSocketConnection) touchLiveness(connection gnet.Conn) {
 	if w.phase != webSocketOpen {
 		return
 	}
-	if w.liveness != nil {
-		w.liveness.Stop()
-	}
 	w.livenessID++
 	w.livenessExpired = false
-	id := w.livenessID
 	idle := 2 * w.session.timeouts.LongPoll
-	w.liveness = time.AfterFunc(idle, func() {
-		_ = connection.EventLoop().Execute(context.Background(), gnet.RunnableFunc(func(context.Context) error {
-			if w.phase != webSocketOpen || w.livenessID != id {
-				return nil
-			}
-			if w.uplinkPending != 0 {
-				w.livenessExpired = true
-				return nil
-			}
-			w.noteClose("liveness_timeout", 0)
-			return connection.EventLoop().Close(connection)
-		}))
-	})
+	w.livenessAt = time.Now().Add(idle)
+	if w.liveness == nil {
+		w.liveness = time.AfterFunc(idle, func() { w.livenessTimerFired(connection) })
+		return
+	}
+	w.liveness.Reset(idle)
+}
+
+func (w *webSocketConnection) livenessTimerFired(connection gnet.Conn) {
+	_ = connection.EventLoop().Execute(context.Background(), gnet.RunnableFunc(func(context.Context) error {
+		if w.phase != webSocketOpen || time.Now().Before(w.livenessAt) {
+			return nil
+		}
+		if w.uplinkPending != 0 {
+			w.livenessExpired = true
+			return nil
+		}
+		w.noteClose("liveness_timeout", 0)
+		return connection.EventLoop().Close(connection)
+	}))
 }
 
 func (w *webSocketConnection) armHeartbeat(connection gnet.Conn) {
@@ -851,7 +898,7 @@ func (h *httpEventHandler) upgradeWebSocket(
 	request.webSocketLane = nil
 	request.webSocketMultiplex = false
 	state.beginWebSocket(connection, transport, h.server.config.WriteTimeout)
-	err = connection.AsyncWrite(webSocketHandshakeResponse(request.webSocket), func(current gnet.Conn, writeErr error) error {
+	err = asyncWriteOwned(connection, [][]byte{webSocketHandshakeResponse(request.webSocket)}, func(current gnet.Conn, writeErr error) error {
 		if writeErr != nil {
 			return current.EventLoop().Close(current)
 		}
@@ -881,7 +928,7 @@ func (h *httpEventHandler) onWebSocketTraffic(
 			if connection.InboundBuffered() != 0 {
 				return gnet.Close
 			}
-			state.armDrainWake(connection)
+			// The owned output release wakes this connection after the drain.
 			return gnet.None
 		}
 		state.invalidateDeadline()
@@ -1098,7 +1145,7 @@ func (h *httpEventHandler) pumpWebSocketWrites(
 			return gnet.None
 		}
 		if connection.OutboundBuffered() != 0 {
-			state.armDrainWake(connection)
+			// The owned output release wakes this connection after the drain.
 			return gnet.None
 		}
 		state.invalidateDeadline()
@@ -1133,8 +1180,8 @@ func (h *httpEventHandler) pumpWebSocketWrites(
 	}
 	transport.current = item
 	transport.asyncWritePending = true
-	state.armDeadline(connection, h.server.config.WriteTimeout)
-	if err := connection.AsyncWritev(item.writeBatch, func(current gnet.Conn, writeErr error) error {
+	state.armWriteDeadline(connection, h.server.config.WriteTimeout)
+	if err := asyncWriteOwned(connection, item.writeBatch, func(current gnet.Conn, writeErr error) error {
 		transport.asyncWritePending = false
 		if writeErr != nil {
 			transport.noteClose("write_error", 0)

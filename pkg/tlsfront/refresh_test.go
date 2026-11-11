@@ -15,7 +15,7 @@ func TestRefreshWorkerStartStopIsIdempotent(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var worker refreshWorker
 		var calls atomic.Int32
-		refresh := func(context.Context) { calls.Add(1) }
+		refresh := func(context.Context) error { calls.Add(1); return nil }
 		for range 3 {
 			worker.start(time.Minute, refresh)
 		}

@@ -581,8 +581,10 @@ func TestExtractALPN_None(t *testing.T) {
 	}
 }
 
-// TestBuildServerHello_WithALPN tests that ALPN is echoed in ServerHello.
-func TestBuildServerHello_WithALPN(t *testing.T) {
+// TestBuildServerHello_OmitsALPN checks that the TLS 1.3 ServerHello carries no
+// ALPN extension. RFC 8446 section 4.2 permits ALPN only in ClientHello and
+// EncryptedExtensions, so ALPN in a ServerHello is a passive fingerprint.
+func TestBuildServerHello_OmitsALPN(t *testing.T) {
 	secret := make([]byte, 16)
 	rand.Read(secret)
 
@@ -599,24 +601,29 @@ func TestBuildServerHello_WithALPN(t *testing.T) {
 		t.Fatalf("BuildServerHello failed: %v", err)
 	}
 
-	// Response should contain ALPN extension (0x00 0x10)
-	// Find it in the ServerHello portion
-	found := false
-	for i := 0; i < len(response)-1; i++ {
-		if response[i] == 0x00 && response[i+1] == 0x10 {
-			// Check if "h2" follows (the selected protocol)
-			for j := i + 2; j < len(response)-2 && j < i+20; j++ {
-				if response[j] == 'h' && response[j+1] == '2' {
-					found = true
-					break
-				}
-			}
-			break
-		}
+	// Walk the ServerHello extensions: record(5) + handshake(4) + version(2) +
+	// random(32) + session ID + cipher(2) + compression(1) + extensions.
+	if len(response) < 5+4+2+32+1 || response[0] != RecordTypeHandshake || response[5] != 0x02 {
+		t.Fatalf("response does not start with a ServerHello record")
 	}
-
-	if !found {
-		t.Error("ALPN extension with 'h2' not found in ServerHello")
+	recordEnd := 5 + int(binary.BigEndian.Uint16(response[3:5]))
+	pos := 5 + 4 + 2 + 32
+	pos += 1 + int(response[pos])
+	pos += 2 + 1
+	extEnd := pos + 2 + int(binary.BigEndian.Uint16(response[pos:pos+2]))
+	if extEnd != recordEnd {
+		t.Fatalf("extensions end at %d, record ends at %d", extEnd, recordEnd)
+	}
+	for pos += 2; pos+4 <= extEnd; {
+		extType := binary.BigEndian.Uint16(response[pos : pos+2])
+		extLen := int(binary.BigEndian.Uint16(response[pos+2 : pos+4]))
+		if extType == 0x0010 {
+			t.Fatal("ServerHello contains an ALPN extension")
+		}
+		pos += 4 + extLen
+	}
+	if pos != extEnd {
+		t.Fatalf("extension walk ended at %d, want %d", pos, extEnd)
 	}
 }
 
@@ -698,33 +705,27 @@ func buildClientHelloWithALPN(secret []byte, host string, sessionID []byte, alpn
 	return payload
 }
 
-// TestClientHello_Valid_BootTime tests that boot time timestamps are accepted.
+// TestClientHello_Valid_BootTime tests the boot-time bypass. It covers only
+// the first bootTimeMaxSeconds, which the replay cache TTL also covers; a
+// larger uptime-style timestamp could be replayed after its cache entry
+// expires.
 func TestClientHello_Valid_BootTime(t *testing.T) {
-	// Simulate a device that's been running for 2 hours
-	// Timestamp = 7200 seconds (uptime, not Unix time)
-	hello := &ClientHello{
-		Host: "www.example.com",
-		Time: time.Unix(7200, 0), // 2 hours uptime
-	}
-
-	err := hello.Valid("www.example.com", DefaultTimeSkewTolerance)
-	if err != nil {
-		t.Errorf("boot time should be accepted, got %v", err)
-	}
-
-	// Test edge case: 1 day uptime (should still be accepted)
-	hello.Time = time.Unix(86400, 0)
-	err = hello.Valid("www.example.com", DefaultTimeSkewTolerance)
-	if err != nil {
-		t.Errorf("1 day uptime should be accepted, got %v", err)
-	}
-
-	// Test: timestamp just above threshold should use normal validation
-	// (and fail if it's way off from current time)
-	hello.Time = time.Unix(bootTimeThreshold+1, 0)
-	err = hello.Valid("www.example.com", DefaultTimeSkewTolerance)
-	if err != ErrBadTimestamp {
-		t.Errorf("timestamp above boot threshold should fail normal validation, got %v", err)
+	hello := &ClientHello{Host: "www.example.com"}
+	for _, test := range []struct {
+		timestamp int64
+		want      error
+	}{
+		{1, nil},
+		{60, nil},
+		{bootTimeMaxSeconds - 1, nil},
+		{bootTimeMaxSeconds, ErrBadTimestamp},
+		{7200, ErrBadTimestamp},
+		{86400, ErrBadTimestamp},
+	} {
+		hello.Time = time.Unix(test.timestamp, 0)
+		if err := hello.Valid("www.example.com", DefaultTimeSkewTolerance); err != test.want {
+			t.Errorf("timestamp %d: Valid = %v, want %v", test.timestamp, err, test.want)
+		}
 	}
 }
 

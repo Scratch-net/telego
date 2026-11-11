@@ -244,6 +244,9 @@ type fixedBindingSlot struct {
 	requestBytes int
 	controlItems int
 	controlBytes int
+	// staleCloses holds connection IDs with a queued close for an unknown
+	// binding. Repeated replies for one ID queue only one close.
+	staleCloses map[int64]struct{}
 
 	requestItemsHighWater  int
 	requestBytesHighWater  int
@@ -351,6 +354,8 @@ type fixedBindingManager struct {
 	readyTail  *clientBinding
 	waitTicket uint64
 	probeID    uint64
+	// waitingSlots counts slots with a nonempty request wait list.
+	waitingSlots int
 
 	consumersOnce sync.Once
 	consumers     sync.WaitGroup
@@ -1796,7 +1801,10 @@ func (b *clientBinding) prepareProxyRequest(request ProxyRequest) (PrepareProxyR
 	b.request = requestState
 	m.appendOutboundLocked(b.slot, item)
 
-	if item == b.slot.outHead && !m.hasWaitersLocked() && m.canReserveRequestLocked(b.slot, size) {
+	// The outbound list fixes the send order. A request that can reserve
+	// capacity is built now, even behind other items, so it never waits for
+	// another round trip through its client event loop.
+	if !m.hasWaitersLocked() && m.canReserveRequestLocked(b.slot, size) {
 		if err := m.reserveRequestLocked(requestState); err != nil {
 			m.removeOutboundLocked(b.slot, item)
 			b.request = nil
@@ -1823,6 +1831,19 @@ func (b *clientBinding) prepareProxyRequest(request ProxyRequest) (PrepareProxyR
 	requestState.ticket = ticket
 	m.appendWaitLocked(b.slot, requestState)
 	m.promoteRequestsLocked()
+	if requestState.phase == preparedRequestReserved && !requestState.handed {
+		// Promotion reserved this caller, which still holds the request.
+		m.claimMaterializationLocked(requestState)
+		if !m.bindingHasReadyReasonLocked(b) {
+			// Promotion queued a ready entry for the reservation it built here.
+			m.unlinkReadyLocked(b)
+		}
+		m.mu.Unlock()
+		if err := b.materializePreparedRequest(requestState, request); err != nil {
+			return 0, err
+		}
+		return PrepareProxyRequestQueued, nil
+	}
 	m.mu.Unlock()
 	return PrepareProxyRequestWaiting, nil
 }
@@ -1912,7 +1933,7 @@ func (b *clientBinding) materializePreparedRequest(state *preparedRequest, reque
 		return err
 	}
 	request.ConnectionID = b.connectionID
-	payload, marshalErr := request.MarshalBinary()
+	frame, payload, marshalErr := request.marshalFrame()
 	if marshalErr != nil {
 		m.mu.Lock()
 		m.finishMaterializationFailureLocked(state)
@@ -1930,7 +1951,7 @@ func (b *clientBinding) materializePreparedRequest(state *preparedRequest, reque
 		m.mu.Unlock()
 		return err
 	}
-	state.submission = LinkSubmission{SubmissionID: submissionID, ConnectionID: b.connectionID, Payload: payload}
+	state.submission = LinkSubmission{SubmissionID: submissionID, ConnectionID: b.connectionID, Payload: payload, frame: frame}
 	state.phase = preparedRequestMaterialized
 	state.handed = true
 	if b.slot.outHead == state.outbound {
@@ -2003,6 +2024,7 @@ func (m *fixedBindingManager) allocateWaitTicketLocked() (uint64, error) {
 func (m *fixedBindingManager) appendWaitLocked(slot *fixedBindingSlot, request *preparedRequest) {
 	request.waitPrev = slot.waitTail
 	if slot.waitTail == nil {
+		m.waitingSlots++
 		slot.waitHead = request
 	} else {
 		slot.waitTail.waitNext = request
@@ -2026,6 +2048,9 @@ func (m *fixedBindingManager) removeWaitLocked(slot *fixedBindingSlot, request *
 	}
 	request.waitPrev = nil
 	request.waitNext = nil
+	if slot.waitHead == nil {
+		m.waitingSlots--
+	}
 }
 
 func (m *fixedBindingManager) appendOutboundLocked(slot *fixedBindingSlot, item *outboundItem) {
@@ -2062,16 +2087,11 @@ func (m *fixedBindingManager) removeOutboundLocked(slot *fixedBindingSlot, item 
 }
 
 func (m *fixedBindingManager) hasWaitersLocked() bool {
-	for _, slot := range m.order {
-		if slot.waitHead != nil {
-			return true
-		}
-	}
-	return false
+	return m.waitingSlots != 0
 }
 
 func (m *fixedBindingManager) promoteRequestsLocked() {
-	for m.state == fixedBindingManagerReady {
+	for m.state == fixedBindingManagerReady && m.waitingSlots != 0 {
 		var candidate *preparedRequest
 		for _, slot := range m.order {
 			request := slot.waitHead
@@ -2160,8 +2180,14 @@ const closeConnectionEncodedSize = ClosePayloadSize
 func (m *fixedBindingManager) queueControlLocked(slot *fixedBindingSlot, binding *clientBinding, connectionID int64) error {
 	reservedGlobalItems := len(m.order)
 	reservedGlobalBytes := len(m.order) * KeepalivePayloadSize
-	if slot.controlItems >= m.limits.MaxPendingControlItemsPerSlot-1 ||
-		closeConnectionEncodedSize > m.limits.MaxPendingControlBytesPerSlot-KeepalivePayloadSize-slot.controlBytes ||
+	// A slot can use at most its fair share of the global close capacity, so
+	// a stalled link cannot drop closes for healthy links.
+	closeShareItems := max((m.limits.MaxPendingControlItems-reservedGlobalItems)/len(m.order), 1)
+	closeShareBytes := max((m.limits.MaxPendingControlBytes-reservedGlobalBytes)/len(m.order), closeConnectionEncodedSize)
+	slotItems := min(m.limits.MaxPendingControlItemsPerSlot, closeShareItems+1)
+	slotBytes := min(m.limits.MaxPendingControlBytesPerSlot, closeShareBytes+KeepalivePayloadSize)
+	if slot.controlItems >= slotItems-1 ||
+		closeConnectionEncodedSize > slotBytes-KeepalivePayloadSize-slot.controlBytes ||
 		m.controlItems >= m.limits.MaxPendingControlItems-reservedGlobalItems ||
 		closeConnectionEncodedSize > m.limits.MaxPendingControlBytes-reservedGlobalBytes-m.controlBytes {
 		m.controlBackpressureEvents++
@@ -2188,6 +2214,12 @@ func (m *fixedBindingManager) queueControlLocked(slot *fixedBindingSlot, binding
 	}
 	wasEmpty := slot.outHead == nil
 	m.appendOutboundLocked(slot, item)
+	if binding == nil {
+		if slot.staleCloses == nil {
+			slot.staleCloses = make(map[int64]struct{})
+		}
+		slot.staleCloses[connectionID] = struct{}{}
+	}
 	slot.controlItems++
 	slot.controlBytes += len(payload)
 	m.controlItems++
@@ -2358,6 +2390,13 @@ func (b *ClientBinding) PrepareReservedProxyRequest(reservation *ClientPrepareRe
 		err := fmt.Errorf("%w: reservation does not match request", ErrFixedBindingRequestRejected)
 		m.terminalizeBinding(state, err)
 		return err
+	}
+	if state.remoteClosed {
+		// Middle-End closed the connection after the client took the
+		// reservation. The request has no receiver; the close stays clean.
+		m.cancelRequestLocked(prepared, true)
+		m.mu.Unlock()
+		return nil
 	}
 	m.claimMaterializationLocked(prepared)
 	m.mu.Unlock()
@@ -2951,6 +2990,7 @@ func (m *fixedBindingManager) closeAll() {
 		slot.requestBytes = 0
 		slot.controlItems = 0
 		slot.controlBytes = 0
+		slot.staleCloses = nil
 	}
 	m.pending = 0
 	m.pendingBytes = 0
@@ -3162,6 +3202,9 @@ func (m *fixedBindingManager) finishControlAttemptLocked(slot *fixedBindingSlot,
 
 func (m *fixedBindingManager) releaseControlLocked(slot *fixedBindingSlot, item *outboundItem) {
 	size := len(item.submission.Payload)
+	if item.kind == outboundControl && item.binding == nil {
+		delete(slot.staleCloses, item.submission.ConnectionID)
+	}
 	slot.controlItems--
 	slot.controlBytes -= size
 	m.controlItems--
@@ -3233,6 +3276,10 @@ func (m *fixedBindingManager) routeEventIncarnation(slot *fixedBindingSlot, even
 		}
 		connectionID := event.ConnectionID
 		clearLinkEventPacket(&event)
+		if _, queued := slot.staleCloses[connectionID]; queued {
+			m.mu.Unlock()
+			return nil
+		}
 		err := m.queueControlLocked(slot, nil, connectionID)
 		m.mu.Unlock()
 		if errors.Is(err, ErrFixedBindingSubmissionIDExhausted) {
@@ -3272,6 +3319,7 @@ func (m *fixedBindingManager) routeEventIncarnation(slot *fixedBindingSlot, even
 		// It requires no queue growth and remains ordered after all payloads.
 		binding.remoteClosePending = true
 		binding.remoteClosed = true
+		m.cancelRemoteClosedRequestLocked(binding)
 		if binding.items == 0 {
 			binding.responseNonemptySince = time.Now()
 		}
@@ -3333,6 +3381,7 @@ func (m *fixedBindingManager) routeEventIncarnation(slot *fixedBindingSlot, even
 	}
 	if event.Kind == LinkEventCloseExternal {
 		binding.remoteClosed = true
+		m.cancelRemoteClosedRequestLocked(binding)
 		m.detachActiveBindingLocked(binding)
 		m.publishBindingTerminalLocked(binding, nil)
 	}
@@ -3340,11 +3389,28 @@ func (m *fixedBindingManager) routeEventIncarnation(slot *fixedBindingSlot, even
 	return nil
 }
 
+// cancelRemoteClosedRequestLocked drops a request that has not been built yet.
+// Middle-End already closed the connection, so the request has no receiver.
+// A reservation already taken by the client stays until the client returns it
+// through PrepareReservedProxyRequest, which then drops it without sending.
+func (m *fixedBindingManager) cancelRemoteClosedRequestLocked(binding *clientBinding) {
+	request := binding.request
+	if request == nil {
+		return
+	}
+	if request.phase == preparedRequestWaiting || (request.phase == preparedRequestReserved && !request.handed) {
+		m.cancelRequestLocked(request, true)
+	}
+}
+
 func (m *fixedBindingManager) evictBackpressuredBindingLocked(binding *clientBinding, cause error) int {
 	m.detachActiveBindingLocked(binding)
 	released := m.clearBindingQueueLocked(binding)
 	binding.result = nil
-	m.invalidateReadyLocked(binding)
+	// An outstanding lease stays valid: its holder observes the terminal
+	// state and its Ack requeues. A fresh token cannot reach a frontend route
+	// that still holds the old one, so it would be acknowledged in a loop.
+	m.unlinkReadyLocked(binding)
 	if binding.request != nil {
 		m.cancelRequestLocked(binding.request, true)
 	}

@@ -1189,3 +1189,76 @@ func countStartedLiveGenerationTestManagers(managers []generationTestManager) in
 	}
 	return live
 }
+
+func TestGenerationSupervisorCloseJoinsConcurrentRepairRequest(t *testing.T) {
+	for range 2000 {
+		supervisor, err := NewFixedBindingGenerationSupervisor(generationTestConfig())
+		if err != nil {
+			t.Fatal(err)
+		}
+		state := supervisor.state
+		start := make(chan struct{})
+		var requests sync.WaitGroup
+		requests.Go(func() {
+			<-start
+			state.requestRepair()
+		})
+		close(start)
+		if err := supervisor.Close(); err != nil {
+			t.Fatal(err)
+		}
+		state.mu.Lock()
+		repairing := state.repairing
+		state.mu.Unlock()
+		requests.Wait()
+		if repairing {
+			t.Fatal("Close returned before joining a repair worker")
+		}
+	}
+}
+
+func TestGenerationSupervisorRotationPublishesPreparedCandidateAfterActiveFailure(t *testing.T) {
+	dcIDs := []DCID{1}
+	oldActive := newGenerationTestManager(t, dcIDs, true)
+	initial := &generationTestFactory{steps: []generationTestFactoryStep{{manager: oldActive.manager}}}
+	candidate := newGenerationTestManager(t, dcIDs, true)
+	release := make(chan struct{})
+	rotation := &generationTestFactory{steps: []generationTestFactoryStep{{manager: candidate.manager, gate: release}}}
+	supervisor := newGenerationTestSupervisor(t, generationTestConfig())
+	if err := supervisor.Start(t.Context(), initial.build); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	result := make(chan error, 1)
+	go func() { result <- supervisor.Rotate(t.Context(), rotation.build) }()
+	deadline := time.Now().Add(time.Second)
+	for rotation.callCount() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("rotation factory was not called")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// The failure watcher waits for transitions, so only the flag is visible.
+	supervisor.state.mu.Lock()
+	supervisor.state.active.failed.Store(true)
+	supervisor.state.mu.Unlock()
+	close(release)
+	if err := <-result; err != nil {
+		t.Fatalf("Rotate after active failure: %v", err)
+	}
+	if calls := rotation.callCount(); calls != 1 {
+		t.Fatalf("rotation factory calls = %d, want 1", calls)
+	}
+	if snapshot := supervisor.Snapshot(); !snapshot.Admitting {
+		t.Fatalf("snapshot after rotation = %+v", snapshot)
+	}
+	binding, err := supervisor.Bind(1)
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if binding.state.manager != candidate.manager.state {
+		t.Fatal("binding did not select the prepared candidate")
+	}
+	if err := binding.Close(); err != nil {
+		t.Fatalf("Close binding: %v", err)
+	}
+}

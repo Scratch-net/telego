@@ -34,6 +34,12 @@ func (mockProxyStatsProvider) HandshakeFailureStats() []gproxy.HandshakeFailureS
 	return []gproxy.HandshakeFailureStat{{Stage: "tls_mtproto", Total: 3}}
 }
 
+func (mockProxyStatsProvider) MaskFallbackStats() []gproxy.MaskFallbackStat {
+	return []gproxy.MaskFallbackStat{{Reason: "replay", Total: 6}}
+}
+
+func (mockProxyStatsProvider) ReplayCacheEvictions() uint64 { return 9 }
+
 func (mockProxyStatsProvider) MiddleEndFrontendStats() gproxy.MiddleEndFrontendStats {
 	return gproxy.MiddleEndFrontendStats{
 		MiddleEndBindingsActive:  4,
@@ -234,6 +240,8 @@ func TestMetricsIntegration(t *testing.T) {
 		"telego_traffic_in_bytes_total",
 		"telego_traffic_out_bytes_total",
 		"telego_handshake_failures_total",
+		`telego_mask_fallbacks_total{otel_scope_name="telego",otel_scope_schema_url="",otel_scope_version="",reason="replay"} 6`,
+		`telego_replay_cache_evictions_total{otel_scope_name="telego",otel_scope_schema_url="",otel_scope_version=""} 9`,
 		"telego_web_websocket_connections_active",
 		"telego_web_sessions_active",
 		"telego_web_streams_active",

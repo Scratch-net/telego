@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -61,6 +62,11 @@ type ProxyHandler struct {
 	// Metrics
 	activeConns       atomic.Int64
 	handshakeFailures [handshakeFailureStageCount]atomic.Uint64
+	maskFallbacks     [maskFallbackReasonCount]atomic.Uint64
+
+	connectionLimitLog logRateLimit
+	ipLimitLog         logRateLimit
+	userIPLimitLog     logRateLimit
 
 	// Hard limit for OOM protection (bytes per connection)
 	maxWriteBuffer int
@@ -274,7 +280,7 @@ func (h *ProxyHandler) OnOpen(c gnet.Conn) ([]byte, gnet.Action) {
 		h.config.InternalProxyAuth != nil &&
 		trustedInternalProxyPeer(c.RemoteAddr())
 	ctx.internalProxyCandidate = internalProxy
-	parseProxy := h.config.ProxyProtocol || ctx.internalProxyCandidate
+	parseProxy := (h.config.ProxyProtocol && h.trustedProxyPeer(c.RemoteAddr())) || ctx.internalProxyCandidate
 	if parseProxy {
 		ctx.SetState(StateReadProxyProto)
 	}
@@ -289,11 +295,14 @@ func (h *ProxyHandler) openClient(c clientEndpoint, ctx *ConnContext) gnet.Actio
 	if h.upstreamContext.Err() != nil {
 		return gnet.Close
 	}
-	h.logger.Info("[#%d] new connection from %s (active: %d)", ctx.id, c.RemoteAddr(), conns)
 	if h.config.MaxConnections > 0 && conns > int64(h.config.MaxConnections) {
-		h.logger.Info("[#%d] global connection limit reached: %d > %d", ctx.id, conns, h.config.MaxConnections)
+		// A flood at the limit must not also flood the log.
+		if suppressed, ok := h.connectionLimitLog.allow(time.Now().Unix()); ok {
+			h.logger.Info("global connection limit reached: %d > %d (%d more rejections not logged)", conns, h.config.MaxConnections, suppressed)
+		}
 		return h.failHandshake(ctx, handshakeFailureAdmission)
 	}
+	h.logger.Debug("[#%d] new connection from %s (active: %d)", ctx.id, c.RemoteAddr(), conns)
 
 	// Every peer consumes admission immediately. Unix WEB candidates use a
 	// synthetic loopback address because Unix peer addresses contain no IP.
@@ -486,7 +495,8 @@ func (h *ProxyHandler) handleProxyProto(c clientEndpoint, ctx *ConnContext) gnet
 			}
 		case internalPrefaceNoMatch:
 			ctx.internalProxyCandidate = false
-			if !h.config.ProxyProtocol {
+			// Public PROXY parsing applies trusted-proxy-cidrs on this path too.
+			if !h.config.ProxyProtocol || !h.trustedProxyPeer(c.RemoteAddr()) {
 				return h.fallbackFromProxyProtocol(c, ctx)
 			}
 		}
@@ -568,6 +578,31 @@ func trustedInternalProxyPeer(address net.Addr) bool {
 	}
 }
 
+// trustedProxyPeer reports whether a peer may send a public PROXY header.
+// An untrusted peer is handled as a direct client, so a header it sends
+// fails authentication like any other unknown input.
+func (h *ProxyHandler) trustedProxyPeer(address net.Addr) bool {
+	if len(h.config.TrustedProxyPrefixes) == 0 {
+		return true
+	}
+	switch typed := address.(type) {
+	case *net.UnixAddr:
+		return true
+	case *net.TCPAddr:
+		peer, ok := netip.AddrFromSlice(typed.IP)
+		if !ok {
+			return false
+		}
+		peer = peer.Unmap()
+		for _, prefix := range h.config.TrustedProxyPrefixes {
+			if prefix.Contains(peer) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 var internalUnixAdmissionAddress = &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)}
 
 func (h *ProxyHandler) acquireInitialIPLimit(ctx *ConnContext, address net.Addr, active int64) bool {
@@ -580,7 +615,9 @@ func (h *ProxyHandler) acquireInitialIPLimit(ctx *ConnContext, address net.Addr,
 	}
 	key, ok := h.connLimiter.TryAcquireIP(ip)
 	if !ok {
-		h.logger.Info("[#%d] per-IP connection limit exceeded for %s (active: %d)", ctx.id, ip, active)
+		if suppressed, ok := h.ipLimitLog.allow(time.Now().Unix()); ok {
+			h.logger.Info("[#%d] per-IP connection limit exceeded for %s (active: %d, %d more rejections not logged)", ctx.id, ip, active, suppressed)
+		}
 		return false
 	}
 	ctx.ipLimitTracked = true
@@ -605,7 +642,9 @@ func (h *ProxyHandler) transferInitialIPLimit(ctx *ConnContext, address net.Addr
 	}
 	newKey, ok := h.connLimiter.TryAcquireIP(ip)
 	if !ok {
-		h.logger.Info("[#%d] per-IP connection limit exceeded for %s (active: %d)", ctx.id, ip, active)
+		if suppressed, ok := h.ipLimitLog.allow(time.Now().Unix()); ok {
+			h.logger.Info("[#%d] per-IP connection limit exceeded for %s (active: %d, %d more rejections not logged)", ctx.id, ip, active, suppressed)
+		}
 		return false
 	}
 	oldKey := ctx.ipLimitKey
@@ -644,3 +683,20 @@ func (defaultLogger) Info(format string, args ...any)  {}
 func (defaultLogger) Warn(format string, args ...any)  {}
 func (defaultLogger) Error(format string, args ...any) {}
 func (defaultLogger) DebugEnabled() bool               { return false }
+
+// logRateLimit allows one log line per second and counts the rest.
+type logRateLimit struct {
+	lastSecond atomic.Int64
+	suppressed atomic.Uint64
+}
+
+func (r *logRateLimit) allow(second int64) (suppressed uint64, ok bool) {
+	last := r.lastSecond.Load()
+	// Compare for inequality, not order: a wall-clock step back must not
+	// silence the log until the clock reaches the stored second again.
+	if second == last || !r.lastSecond.CompareAndSwap(last, second) {
+		r.suppressed.Add(1)
+		return 0, false
+	}
+	return r.suppressed.Swap(0), true
+}

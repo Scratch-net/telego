@@ -77,13 +77,15 @@ func (c GnetClientRuntimeConfig) Validate() error {
 type GnetClientRuntime struct {
 	client *gnet.Client
 
-	mu       sync.Mutex
-	links    map[*GnetClientLink]struct{}
-	stopping bool
-	enrolls  sync.WaitGroup
-	stopErr  error
-	stopOnce sync.Once
-	done     chan struct{}
+	mu    sync.Mutex
+	links map[*GnetClientLink]struct{}
+	// feedScratch holds one CBC plaintext buffer per event loop.
+	feedScratch map[gnet.EventLoop][]byte
+	stopping    bool
+	enrolls     sync.WaitGroup
+	stopErr     error
+	stopOnce    sync.Once
+	done        chan struct{}
 }
 
 // String redacts all nested link and protocol state.
@@ -104,8 +106,9 @@ func NewGnetClientRuntime(config GnetClientRuntimeConfig) (*GnetClientRuntime, e
 		return nil, err
 	}
 	runtime := &GnetClientRuntime{
-		links: make(map[*GnetClientLink]struct{}),
-		done:  make(chan struct{}),
+		links:       make(map[*GnetClientLink]struct{}),
+		feedScratch: make(map[gnet.EventLoop][]byte),
+		done:        make(chan struct{}),
 	}
 	handler := &gnetClientEventHandler{runtime: runtime}
 	client, err := gnet.NewClient(handler, gnetClientOptions(config)...)
@@ -133,6 +136,32 @@ func (r *GnetClientRuntime) monitorClient() {
 	}
 	r.mu.Unlock()
 	r.beginStop()
+}
+
+// stoppedErr reports a runtime that can no longer enroll links. A factory
+// checks it before dialing, so a dead runtime opens no new TCP connections.
+func (r *GnetClientRuntime) stoppedErr() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.stopping {
+		return nil
+	}
+	if r.stopErr != nil && !errors.Is(r.stopErr, ErrGnetRuntimeStopped) {
+		return fmt.Errorf("%w: %w", ErrGnetRuntimeStopped, r.stopErr)
+	}
+	return ErrGnetRuntimeStopped
+}
+
+// loopFeedScratch returns the shared plaintext buffer of one event loop.
+func (r *GnetClientRuntime) loopFeedScratch(owner gnet.EventLoop) []byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	scratch, ok := r.feedScratch[owner]
+	if !ok {
+		scratch = make([]byte, maxBootstrapBorrowedFeedSize)
+		r.feedScratch[owner] = scratch
+	}
+	return scratch
 }
 
 func gnetClientOptions(config GnetClientRuntimeConfig) []gnet.Option {
@@ -344,37 +373,42 @@ type GnetClientLink struct {
 	done             chan struct{}
 	startDone        chan struct{}
 
-	mu                        sync.Mutex
-	state                     LinkState
-	startInitiated            bool
-	startPublished            bool
-	startResult               error
-	terminalClaimed           bool
-	terminalErr               error
-	transport                 LinkTransportSnapshot
-	transportFrozen           bool
-	finalized                 bool
-	closeScheduled            bool
-	drainScheduled            bool
-	pollScheduled             bool
-	pollDelay                 time.Duration
-	pollTimer                 *time.Timer
-	owner                     gnet.EventLoop
-	gconn                     gnet.Conn
-	submissions               []LinkSubmission
-	eventCharges              []int
-	responseSink              func(LinkEvent) error
-	responsePreparation       responseSinkPreparation
-	pendingSubmissions        int
-	pendingSubmissionBytes    int
-	submissionHighWater       int
-	submissionBytesHighWater  int
-	pendingEvents             int
-	pendingEventBytes         int
-	eventHighWater            int
-	eventBytesHighWater       int
-	ownerWireTotal            uint64
-	ownerWireSegments         []gnetWireSegment
+	mu                       sync.Mutex
+	state                    LinkState
+	startInitiated           bool
+	startPublished           bool
+	startResult              error
+	terminalClaimed          bool
+	terminalErr              error
+	transport                LinkTransportSnapshot
+	transportFrozen          bool
+	finalized                bool
+	closeScheduled           bool
+	drainScheduled           bool
+	pollScheduled            bool
+	pollDelay                time.Duration
+	pollTimer                *time.Timer
+	pollFires                uint64
+	owner                    gnet.EventLoop
+	gconn                    gnet.Conn
+	submissions              []LinkSubmission
+	eventCharges             []int
+	responseSink             func(LinkEvent) error
+	responsePreparation      responseSinkPreparation
+	pendingSubmissions       int
+	pendingSubmissionBytes   int
+	submissionHighWater      int
+	submissionBytesHighWater int
+	pendingEvents            int
+	pendingEventBytes        int
+	eventHighWater           int
+	eventBytesHighWater      int
+	ownerWireTotal           uint64
+	ownerWireSegments        []gnetWireSegment
+	// Owner-loop state for owned-write drain notification. Each pending
+	// callback observes the outbound buffer when its batch leaves gnet.
+	ownedDrainsPending        int
+	ownerBatchWriting         bool
 	ownerControlItems         int
 	ownerControlBytes         int
 	ownerControlItemHighWater int
@@ -621,6 +655,7 @@ func (l *GnetClientLink) onOpen(conn gnet.Conn) ([]byte, gnet.Action) {
 		return nil, gnet.Close
 	}
 	l.mu.Unlock()
+	l.bootstrap.useFeedScratch(l.runtime.loopFeedScratch(conn.EventLoop()))
 
 	initial, err := l.bootstrap.Start()
 	if err != nil {
@@ -912,9 +947,12 @@ func (l *GnetClientLink) drainOwner() {
 			clearWireBatch(wires)
 			return
 		}
-		wire, err := l.bootstrap.Encode(batch[index].Payload)
+		wire, err := l.bootstrap.encodeSubmission(batch[index])
 		charge := batch[index].ByteSize()
-		clear(batch[index].Payload)
+		if err != nil || batch[index].frame == nil {
+			// An in-place encode already replaced the plaintext with ciphertext.
+			clear(batch[index].Payload)
+		}
 		batch[index] = LinkSubmission{}
 		if err != nil {
 			clearSubmissionBatch(batch[index+1:])
@@ -975,7 +1013,7 @@ func (l *GnetClientLink) writeOwnerBatch(conn gnet.Conn, wires [][]byte, charges
 	// Ciphertext is public wire data; unlike plaintext and keys, wiping it adds
 	// no secrecy and would zero every transmitted byte on the owner-loop path.
 	l.beginOwnerWrite(total)
-	written, err := conn.Writev(slices.Clone(wires))
+	written, err := l.writeOwnerWires(conn, wires)
 	l.endOwnerWrite()
 	for index := range wires {
 		charges[index].wireBytes = len(wires[index])
@@ -1003,6 +1041,42 @@ func (l *GnetClientLink) writeOwnerBatch(conn gnet.Conn, wires [][]byte, charges
 		}
 	}
 	return l.observeOwnerOutbound(conn, true)
+}
+
+// writeOwnerWires writes the batch in order. With an owned writer, the last
+// wire carries a release callback. gnet calls it when the batch leaves its
+// user-space buffer, so a backlogged link needs no periodic poll.
+func (l *GnetClientLink) writeOwnerWires(conn gnet.Conn, wires [][]byte) (int, error) {
+	owned, ok := conn.(gnet.OwnedWriter)
+	if !ok || len(wires) == 0 {
+		return conn.Writev(slices.Clone(wires))
+	}
+	last := len(wires) - 1
+	written := 0
+	if last > 0 {
+		var err error
+		written, err = conn.Writev(slices.Clone(wires[:last]))
+		if err != nil {
+			return written, err
+		}
+	}
+	l.ownerBatchWriting = true
+	l.ownedDrainsPending++
+	sent, err := owned.WriteOwned(wires[last], func(err error) { l.finishOwnedDrain(conn, err) })
+	l.ownerBatchWriting = false
+	return written + sent, err
+}
+
+func (l *GnetClientLink) finishOwnedDrain(conn gnet.Conn, err error) {
+	l.ownedDrainsPending--
+	// The writer observes the buffer itself after recording its segments.
+	if err != nil || l.ownerBatchWriting || l.isTerminalClaimed() {
+		return
+	}
+	if err := l.observeOwnerOutbound(conn, false); err != nil {
+		l.claimOwnerFailure(err)
+		l.scheduleOwnerClose()
+	}
 }
 
 func (l *GnetClientLink) observeOwnerOutbound(conn gnet.Conn, afterWrite bool) error {
@@ -1061,11 +1135,13 @@ func (l *GnetClientLink) observeOwnerOutbound(conn gnet.Conn, afterWrite bool) e
 		l.cancelOutboundPoll()
 		l.scheduleNextDrain()
 	} else if outbound != 0 {
-		delay := gnetOutboundPollBacklog
-		if afterWrite {
-			delay = gnetOutboundPollFast
+		if l.ownedDrainsPending == 0 {
+			delay := gnetOutboundPollBacklog
+			if afterWrite {
+				delay = gnetOutboundPollFast
+			}
+			l.scheduleOutboundPoll(delay)
 		}
-		l.scheduleOutboundPoll(delay)
 		if outbound <= gnetDrainResumeOutboundBytes {
 			l.scheduleNextDrain()
 		}
@@ -1110,6 +1186,7 @@ func (l *GnetClientLink) fireOutboundPoll() {
 	}
 	l.pollScheduled = false
 	l.pollDelay = 0
+	l.pollFires++
 	conn := l.gconn
 	l.mu.Unlock()
 	if conn == nil {

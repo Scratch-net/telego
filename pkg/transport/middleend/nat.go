@@ -436,46 +436,65 @@ func (r *NATResolver) resolve(ctx context.Context, family AddressFamily, forcePr
 		cached.inFlight = make(chan struct{})
 		inFlight := cached.inFlight
 		cached.attempts++
+		// The shared probe runs under the resolver lifecycle. Cancellation of
+		// the initiating caller ends only its wait and is not a probe failure.
+		outcome := new(natProbeOutcome)
+		state.tasks.Go(func() { state.runProbe(r, family, inFlight, outcome) })
 		state.mu.Unlock()
 
-		probeContext, cancelProbe := context.WithTimeoutCause(ctx, state.probeTimeout, ErrNATPublicIPDiscovery)
-		result, err := state.probe(probeContext, family, state.servers, state.probeConcurrency)
-		cancelProbe()
-		if err == nil {
-			err = validateNATProbeResult(result, family)
+		select {
+		case <-inFlight:
+		case <-ctx.Done():
+			return netip.Addr{}, fmt.Errorf("%w: wait for shared probe: %w", ErrNATPublicIPDiscovery, context.Cause(ctx))
 		}
-
-		state.mu.Lock()
-		cached = &state.families[family]
-		if err == nil {
-			cached.address = result.address.Unmap()
-			cached.expiresAt = state.now().Add(state.cacheTTL)
-			cached.retryAt = time.Time{}
-			cached.consecutiveFailures = 0
-			cached.lastErr = nil
-			cached.successes++
-			cached.respondingServers = result.respondingServers
-			cached.agreeingServers = result.agreeingServers
-			state.scheduleLocked(r, family, cached.expiresAt.Add(-state.refreshLead))
-		} else {
-			cached.consecutiveFailures++
-			cached.lastErr = err
-			cached.lastFailure = err
-			cached.failures++
-			cached.respondingServers = 0
-			cached.agreeingServers = 0
-			cached.retryAt = state.now().Add(state.failureBackoff(cached.consecutiveFailures))
-			state.scheduleLocked(r, family, cached.retryAt)
+		if outcome.err != nil {
+			return netip.Addr{}, fmt.Errorf("%w: %w", ErrNATPublicIPDiscovery, outcome.err)
 		}
-		close(inFlight)
-		cached.inFlight = nil
-		state.mu.Unlock()
-
-		if err != nil {
-			return netip.Addr{}, fmt.Errorf("%w: %w", ErrNATPublicIPDiscovery, err)
-		}
-		return result.address.Unmap(), nil
+		return outcome.result.address.Unmap(), nil
 	}
+}
+
+type natProbeOutcome struct {
+	result natProbeResult
+	err    error
+}
+
+// runProbe performs one shared STUN batch. It fills outcome and publishes the
+// cache result before it closes inFlight.
+func (s *natResolverState) runProbe(r *NATResolver, family AddressFamily, inFlight chan struct{}, outcome *natProbeOutcome) {
+	probeContext, cancelProbe := context.WithTimeoutCause(s.lifecycle, s.probeTimeout, ErrNATPublicIPDiscovery)
+	result, err := s.probe(probeContext, family, s.servers, s.probeConcurrency)
+	cancelProbe()
+	if err == nil {
+		err = validateNATProbeResult(result, family)
+	}
+
+	s.mu.Lock()
+	cached := &s.families[family]
+	if err == nil {
+		cached.address = result.address.Unmap()
+		cached.expiresAt = s.now().Add(s.cacheTTL)
+		cached.retryAt = time.Time{}
+		cached.consecutiveFailures = 0
+		cached.lastErr = nil
+		cached.successes++
+		cached.respondingServers = result.respondingServers
+		cached.agreeingServers = result.agreeingServers
+		s.scheduleLocked(r, family, cached.expiresAt.Add(-s.refreshLead))
+	} else {
+		cached.consecutiveFailures++
+		cached.lastErr = err
+		cached.lastFailure = err
+		cached.failures++
+		cached.respondingServers = 0
+		cached.agreeingServers = 0
+		cached.retryAt = s.now().Add(s.failureBackoff(cached.consecutiveFailures))
+		s.scheduleLocked(r, family, cached.retryAt)
+	}
+	outcome.result, outcome.err = result, err
+	close(inFlight)
+	cached.inFlight = nil
+	s.mu.Unlock()
 }
 
 func (s *natResolverState) scheduleLocked(resolver *NATResolver, family AddressFamily, at time.Time) {

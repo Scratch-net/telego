@@ -34,7 +34,11 @@ type BridgeFailure struct {
 	QueuedBytes   uint64      `json:"queued_bytes"`
 	QueuedItems   uint32      `json:"queued_items"`
 	BufferedBytes uint64      `json:"buffered_bytes"`
-	WasClean      bool        `json:"was_clean,omitzero"`
+	// ReceivedBytes and IdleMS describe the failed WebSocket, or HTTPS
+	// downlink bytes since bridge start or the last recovery.
+	ReceivedBytes uint64 `json:"received_bytes"`
+	IdleMS        uint64 `json:"idle_ms"`
+	WasClean      bool   `json:"was_clean,omitzero"`
 }
 
 func (f BridgeFailure) IsLaneClosure() bool {
@@ -139,7 +143,8 @@ func validBridgeFailure(failure BridgeFailure) bool {
 	const maxDiagnosticMS = 30 * 24 * 60 * 60 * 1000
 	if failure.LaneID > MaxStreamID || failure.CloseCode > 4999 || failure.ReadyState > 3 ||
 		failure.HTTPStatus > 599 || failure.ElapsedMS > maxDiagnosticMS || failure.OperationMS > maxDiagnosticMS ||
-		failure.QueuedBytes > 1<<30 || failure.QueuedItems > 1<<20 || failure.BufferedBytes > 1<<30 {
+		failure.QueuedBytes > 1<<30 || failure.QueuedItems > 1<<20 || failure.BufferedBytes > 1<<30 ||
+		failure.ReceivedBytes > 1<<30 || failure.IdleMS > maxDiagnosticMS {
 		return false
 	}
 	return true

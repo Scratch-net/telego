@@ -154,6 +154,7 @@ type Session struct {
 	closeReason       sessionCloseReason
 	lastActivity      time.Time
 	budgetNotify      chan struct{}
+	budgetWaiting     bool // a waiter holds budgetNotify
 	done              chan struct{}
 	finishNotified    chan struct{}
 	finishOnce        sync.Once
@@ -329,7 +330,9 @@ func (r *webSocketInputReservation) consumeCopy(size int) bool {
 	return true
 }
 
-func (r *webSocketInputReservation) processUp(sequence uint64, body []byte, lane *WebSocketLaneLease) (uint64, error) {
+// processUp uses the digest of body, which the caller owns and computes once
+// for all backpressure retries of the same message.
+func (r *webSocketInputReservation) processUp(sequence uint64, body []byte, lane *WebSocketLaneLease, digest [16]byte) (uint64, error) {
 	if r == nil || r.session == nil {
 		return 0, ErrClosed
 	}
@@ -337,12 +340,12 @@ func (r *webSocketInputReservation) processUp(sequence uint64, body []byte, lane
 		if lane.session != r.session || lane.lane == nil {
 			return 0, ErrClosed
 		}
-		return r.session.processUp(lane.laneID, sequence, body, true, lane.lane, r)
+		return r.session.processUpWithDigest(lane.laneID, sequence, body, true, lane.lane, r, digest)
 	}
 	if r.session.carrier.usesLanes() {
 		return 0, ErrProtocol
 	}
-	return r.session.processUp(0, sequence, body, false, nil, r)
+	return r.session.processUpWithDigest(0, sequence, body, false, nil, r, digest)
 }
 
 func (r *webSocketInputReservation) transferApplicationLocked(cost, items int) bool {
@@ -431,8 +434,18 @@ func (l *WebSocketLaneLease) Poll(
 	return body, next, closed, err
 }
 
-// PollCarrier retains the downlink claim until the caller releases it.
+// PollCarrier retains the downlink claim until the caller releases it. The
+// caller owns the returned body and can change it.
 func (l *WebSocketLaneLease) PollCarrier(
+	ctx context.Context,
+	cursor uint64,
+) ([]byte, uint64, bool, *PollLease, error) {
+	body, next, closed, lease, err := l.pollCarrierShared(ctx, cursor)
+	return bytes.Clone(body), next, closed, lease, err
+}
+
+// pollCarrierShared returns the immutable shared batch; see Session.pollCarrierShared.
+func (l *WebSocketLaneLease) pollCarrierShared(
 	ctx context.Context,
 	cursor uint64,
 ) ([]byte, uint64, bool, *PollLease, error) {
@@ -588,6 +601,14 @@ func (s *Session) processUpWithDigest(
 		requestBackendCloses(backends)
 		return 0, ErrProtocol
 	}
+	// Stream-ID history keeps its chunks until the session closes. closeLocked
+	// releases this charge because it is not part of the retained storage.
+	historyCost := s.usedStreams.chargedGrowth(frames)
+	if !s.reservePendingLocked(historyCost, 0, pendingUplink) {
+		s.mu.Unlock()
+		s.recordBackpressure(carrierOperationUplink)
+		return 0, ErrBackpressure
+	}
 	reservedCost, reservedItems, ok := s.backendWriteReservationLocked(frames)
 	if ok && prepaid != nil {
 		ok = prepaid.transferApplicationLocked(reservedCost, reservedItems)
@@ -595,6 +616,7 @@ func (s *Session) processUpWithDigest(
 		ok = s.reservePendingLocked(reservedCost, reservedItems, pendingUplink)
 	}
 	if !ok {
+		s.releasePendingLocked(historyCost, 0)
 		s.mu.Unlock()
 		s.recordBackpressure(carrierOperationUplink)
 		return 0, ErrBackpressure
@@ -765,8 +787,17 @@ func (s *Session) PollLane(ctx context.Context, laneID uint32, cursor uint64) ([
 }
 
 // PollCarrier retains the newest-poll claim until the returned lease is
-// released by the carrier after its HTTP response drains.
+// released by the carrier after its HTTP response drains. The caller owns the
+// returned body and can change it.
 func (s *Session) PollCarrier(ctx context.Context, cursor uint64) ([]byte, uint64, *PollLease, error) {
+	body, next, lease, err := s.pollCarrierShared(ctx, cursor)
+	return bytes.Clone(body), next, lease, err
+}
+
+// pollCarrierShared returns the retained replay batch itself. The caller must
+// not change it. A new batch is allocated for every take, and nothing writes
+// to a batch after takeDownBatchLocked returns it.
+func (s *Session) pollCarrierShared(ctx context.Context, cursor uint64) ([]byte, uint64, *PollLease, error) {
 	if s.carrier.usesLanes() {
 		return nil, cursor, nil, ErrProtocol
 	}
@@ -775,7 +806,18 @@ func (s *Session) PollCarrier(ctx context.Context, cursor uint64) ([]byte, uint6
 }
 
 // PollCarrierLane retains the per-lane response claim until HTTP drains it.
+// The caller owns the returned body and can change it.
 func (s *Session) PollCarrierLane(
+	ctx context.Context,
+	laneID uint32,
+	cursor uint64,
+) ([]byte, uint64, bool, *PollLease, error) {
+	body, next, closed, lease, err := s.pollCarrierLaneShared(ctx, laneID, cursor)
+	return bytes.Clone(body), next, closed, lease, err
+}
+
+// pollCarrierLaneShared is PollCarrierLane with the immutable shared batch.
+func (s *Session) pollCarrierLaneShared(
 	ctx context.Context,
 	laneID uint32,
 	cursor uint64,
@@ -865,7 +907,7 @@ func (s *Session) pollCarrier(
 	defer timer.Stop()
 	if len(lane.unacked) != 0 {
 		if cursor == lane.unackedBase {
-			body := bytes.Clone(lane.unacked)
+			body := lane.unacked
 			lease.retainBodyLocked()
 			next := lane.downCursor
 			s.mu.Unlock()
@@ -916,7 +958,7 @@ func (s *Session) pollCarrier(
 			s.carrierOwnedCost += batch.cost
 			s.carrierOwnedItems += batch.items
 			next := lane.downCursor
-			body := bytes.Clone(batch.body)
+			body := batch.body
 			lease.retainBodyLocked()
 			s.mu.Unlock()
 			return body, next, false, lease, nil
@@ -1265,7 +1307,7 @@ func (s *Session) nextReadAllowance(streamID uint32, streamDone <-chan struct{})
 			}
 		}
 		creditNotify := state.creditNotify
-		budgetNotify := s.budgetNotify
+		budgetNotify := s.budgetWaitLocked()
 		s.mu.Unlock()
 		select {
 		case <-creditNotify:
@@ -1478,6 +1520,22 @@ func (s *Session) releasePendingQuietLocked(cost, items int) {
 	if s.budget != nil {
 		s.budget(-cost, -items, pendingUplink)
 	}
+	s.notifyBudgetLocked()
+}
+
+// budgetWaitLocked returns the channel that the next budget change closes.
+func (s *Session) budgetWaitLocked() chan struct{} {
+	s.budgetWaiting = true
+	return s.budgetNotify
+}
+
+// notifyBudgetLocked wakes budget waiters. Without a waiter, a release
+// allocates no replacement channel.
+func (s *Session) notifyBudgetLocked() {
+	if !s.budgetWaiting {
+		return
+	}
+	s.budgetWaiting = false
 	close(s.budgetNotify)
 	s.budgetNotify = make(chan struct{})
 }

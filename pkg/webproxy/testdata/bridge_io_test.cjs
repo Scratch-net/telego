@@ -11,11 +11,11 @@ const budget = 90000;
 const batchLimit = 2 * 1024 * 1024;
 const flush = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
 
-function harness(carrier, smallBatch = false, diagnostics = true) {
+function harness(carrier, smallBatch = false, diagnostics = true, startedAt = 0) {
   const html = readFileSync(join(process.env.TELEGO_BRIDGE_FIXTURES, carrier + (!diagnostics ? '.quiet.html' : smallBatch ? '.small.html' : '.html')), 'utf8');
   const match = /<script nonce="[^"]+">([\s\S]*?)<\/script>/.exec(html);
   assert.ok(match, 'rendered script exists');
-  let now = 0, nextTimer = 0;
+  let now = startedAt, nextTimer = 0;
   const timers = new Map(), sockets = [], events = new Map(), messages = [], requests = [], uplinks = [];
   class Socket extends EventTarget {
     static CONNECTING = 0; static OPEN = 1; static CLOSED = 3;
@@ -1099,6 +1099,64 @@ for (const carrier of ['websocket', 'websocket-lanes']) {
       assertClean(h);
     });
   }
+}
+
+test('websocket: failure report counts bytes and idle time on the failed socket', async () => {
+  const h = harness('websocket'); h.api.setSession();
+  await h.advance(500, false);
+  const opened = h.api.openWebSocket(); h.sockets[0].open(); await opened;
+  await h.advance(250, false);
+  h.sockets[0].emit('message', dataFrame(1, 16000 - 8).buffer); await flush();
+  await h.advance(3000, false);
+  h.api.fail('ws_closed', null, 0, h.sockets[0], 1006); await flush();
+  const report = JSON.parse(h.requests.find(request => request.url.endsWith('/api/v1/diagnostic')).options.body);
+  assert.equal(report.received_bytes, 16000);
+  assert.equal(report.idle_ms, 3000);
+  assertClean(h);
+});
+
+test('websocket: failure report without received bytes measures idle time from socket creation', async () => {
+  const h = harness('websocket'); h.api.setSession();
+  await h.advance(500, false);
+  const opened = h.api.openWebSocket(); h.sockets[0].open(); await opened;
+  await h.advance(2000, false);
+  h.api.fail('ws_closed', null, 0, h.sockets[0], 1006); await flush();
+  const report = JSON.parse(h.requests.find(request => request.url.endsWith('/api/v1/diagnostic')).options.body);
+  assert.equal(report.received_bytes, 0);
+  assert.equal(report.idle_ms, 2000);
+  assertClean(h);
+});
+
+test('websocket: invalid frame report counts bytes on the receiving socket', async () => {
+  const h = harness('websocket'); h.api.setSession();
+  await h.advance(500, false);
+  const opened = h.api.openWebSocket(); h.sockets[0].open(); await opened;
+  h.sockets[0].emit('message', dataFrame(1, 16000 - 8).buffer); await flush();
+  await h.advance(3000, false);
+  h.sockets[0].emit('message', new ArrayBuffer(3)); await flush();
+  const report = JSON.parse(h.requests.find(request => request.url.endsWith('/api/v1/diagnostic')).options.body);
+  assert.equal(report.reason, 'ws_frames');
+  assert.equal(report.received_bytes, 16003);
+  assert.equal(report.idle_ms, 0);
+  assert.equal(report.ready_state, 1);
+});
+
+for (const carrier of ['websocket', 'websocket-lanes']) {
+  test(carrier + ': failure report without a socket has zero received bytes and idle time', async () => {
+    // A nonzero start time makes a fallback to the unused carrier counters visible.
+    const h = harness(carrier, false, true, 10000); h.api.setSession();
+    await h.advance(500, false);
+    if (carrier === 'websocket') {
+      const opened = h.api.openWebSocket(); h.sockets[0].open(); await opened;
+      h.sockets[0].emit('message', dataFrame(1, 16000 - 8).buffer); await flush();
+    }
+    await h.advance(3000, false);
+    h.api.fail('carrier_queue', new Error('carrier queue full')); await flush();
+    const report = JSON.parse(h.requests.find(request => request.url.endsWith('/api/v1/diagnostic')).options.body);
+    assert.equal(report.reason, 'carrier_queue');
+    assert.equal(report.received_bytes, 0);
+    assert.equal(report.idle_ms, 0);
+  });
 }
 
 test('failure close diagnostic stays within control frame size at numeric limits', async () => {

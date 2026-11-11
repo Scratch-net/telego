@@ -26,6 +26,10 @@ import (
 
 const middleEndLifecycleTimeout = 100 * time.Second
 
+// shutdownTimeout bounds the whole shutdown. With the log drain of at most two
+// seconds, the process exits within a 30-second supervisor stop timeout.
+const shutdownTimeout = 25 * time.Second
+
 // Build-time variables injected via ldflags.
 var (
 	version = "dev"
@@ -279,21 +283,73 @@ func (c *RunCmd) Run() error {
 		}
 	}
 
+	return waitForStop(sigCh, errCh, webRuntime.Errors(), middleEndRuntimeFailure(middleEndService), cleanup, shutdownTimeout)
+}
+
+// middleEndRuntimeFailure reports a shared ME gnet runtime that stopped
+// before shutdown. Without it ME cannot recover, so the process exits.
+func middleEndRuntimeFailure(service *middleend.Service) <-chan error {
+	done := service.RuntimeDone()
+	if done == nil {
+		return nil
+	}
+	failure := make(chan error, 1)
+	go func() {
+		<-done
+		failure <- fmt.Errorf("Middle-End runtime stopped: %w", service.RuntimeErr())
+	}()
+	return failure
+}
+
+// waitForStop waits for a stop signal or a service failure, then runs cleanup.
+// Only a signal gives a nil result. An engine stop without a signal is an error,
+// so the supervisor can restart the process.
+func waitForStop(sigCh <-chan os.Signal, errCh, webErrCh, meErrCh <-chan error, cleanup func(), timeout time.Duration) error {
+	var err error
 	select {
 	case sig := <-sigCh:
 		log.Info().Str("signal", sig.String()).Msg("shutting down")
-		cleanup()
-		return nil
-	case err := <-errCh:
-		cleanup()
-		return err
-	case err, ok := <-webRuntime.Errors():
-		cleanup()
-		if !ok || err == nil {
-			return fmt.Errorf("WEB HTTP server stopped unexpectedly")
+	case err = <-errCh:
+		if err == nil {
+			err = errors.New("public proxy stopped unexpectedly")
 		}
-		return fmt.Errorf("WEB HTTP server failed: %w", err)
+	case err = <-meErrCh:
+	case webErr, ok := <-webErrCh:
+		if !ok || webErr == nil {
+			err = errors.New("WEB HTTP server stopped unexpectedly")
+		} else {
+			err = fmt.Errorf("WEB HTTP server failed: %w", webErr)
+		}
 	}
+	return errors.Join(err, runShutdown(cleanup, sigCh, timeout))
+}
+
+// runShutdown stops waiting for cleanup at the deadline or on a further signal.
+// The caller then exits with an error; cleanup can still be running.
+func runShutdown(cleanup func(), sigCh <-chan os.Signal, timeout time.Duration) error {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		cleanup()
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return nil
+	case sig := <-sigCh:
+		return fmt.Errorf("shutdown interrupted by %s", sig)
+	case <-timer.C:
+		return fmt.Errorf("shutdown did not finish within %v", timeout)
+	}
+}
+
+// keepRunningOnSignals stops two signals from terminating the process. The hot
+// reloader handles SIGHUP while it runs; this registration covers startup and
+// shutdown. os/signal: without Notify for SIGPIPE, a write to a broken stderr
+// pipe exits the process. Signals on this channel are dropped.
+func keepRunningOnSignals() {
+	signal.Notify(make(chan os.Signal, 1), syscall.SIGHUP, syscall.SIGPIPE)
 }
 
 // shutdownProxyServices keeps upstream owners alive until WEB cleanup finishes.
@@ -402,7 +458,11 @@ func printWebProxyLinks(hostname, basePath string, profiles []webproxy.Profile) 
 // getPublicIP discovers the public IP address using STUN.
 func getPublicIP() (string, error) {
 	// Use Google's STUN server
-	conn, err := net.Dial("udp", "stun.l.google.com:19302")
+	return getPublicIPFrom("stun.l.google.com:19302")
+}
+
+func getPublicIPFrom(server string) (string, error) {
+	conn, err := net.Dial("udp", server)
 	if err != nil {
 		return "", err
 	}
@@ -419,16 +479,18 @@ func getPublicIP() (string, error) {
 	message := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
 
 	var xorAddr stun.XORMappedAddress
+	var responseErr error
 	if err := c.Do(message, func(res stun.Event) {
 		if res.Error != nil {
-			err = res.Error
+			responseErr = res.Error
 			return
 		}
-		if getErr := xorAddr.GetFrom(res.Message); getErr != nil {
-			err = getErr
-		}
+		responseErr = xorAddr.GetFrom(res.Message)
 	}); err != nil {
 		return "", err
+	}
+	if responseErr != nil {
+		return "", responseErr
 	}
 
 	return xorAddr.IP.String(), nil
@@ -504,6 +566,7 @@ func (c *VersionCmd) Run() error {
 }
 
 func main() {
+	keepRunningOnSignals()
 	defer log.Close()
 	ctx := kong.Parse(&CLI,
 		kong.Name("telego"),

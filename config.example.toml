@@ -15,13 +15,27 @@ log-level = "info"
 # When enabled, parses PROXY protocol v1/v2 to get real client IP
 # proxy-protocol = false
 
+# TCP peers allowed to send PROXY headers. Empty = any peer.
+# Unix socket peers are always allowed. Other peers are direct clients.
+# Set this when telego listens on TCP behind a proxy.
+# Otherwise a direct client can send a PROXY header and spoof its IP.
+# trusted-proxy-cidrs = ["127.0.0.1/32"]
+
 # Maximum connections per IP (0 = unlimited)
 # Applies to ALL connections (including unauthenticated) from a single IP.
 # Protects against connection floods from scanners/probes.
 # max-connections-per-ip = 100
 
+# Maximum concurrent client connections in every mode.
+# 0 derives the limit from the RLIMIT_NOFILE soft limit: (limit - min(256, limit / 2)) / 2.
+# Each direct client uses two descriptors: the client and the DC.
+# Excess connections are closed before any handshake work.
+# [middle-end] max-connections can only lower this value.
+# max-connections = 0
+
 # Max time to complete handshake before closing (default: 5s)
 # Connections that don't authenticate within this time are dropped.
+# Allowed values: 0 (default) or 1s to 1m.
 # handshake-timeout = "5s"
 
 # Maximum unique IP addresses per user/secret (0 = unlimited)
@@ -239,6 +253,7 @@ idle-timeout = "5m"
 # Best-effort: a value below your slowest legitimate server response will
 # occasionally close a healthy connection too (just a brief reconnect). Keep it
 # well above that. 0 = off (default); ~10-15s is a sane starting point.
+# The minimum non-zero value is 1s.
 # Requires a restart to change (enables the engine ticker).
 # client-silence-close = "12s"
 
@@ -248,6 +263,7 @@ num-event-loops = 0
 # Max pending write bytes per connection before closing slow client (MB)
 # Prevents memory exhaustion when clients are slow to receive data
 # 0 = 4MB default, which allows ~4MB buffered data per connection
+# The maximum is 1024.
 # max-write-buffer-mb = 4
 
 # Upstream (DC connection) settings

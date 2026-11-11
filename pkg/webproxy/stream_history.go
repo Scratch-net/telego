@@ -8,6 +8,7 @@ const (
 	streamHistoryChunkCount = (MaxStreamID + 1) / streamHistoryChunkBits
 	streamHistoryWordCount  = streamHistoryChunkBits / streamHistoryWordBits
 	streamHistoryMaxBytes   = (MaxStreamID + 1) / 8
+	streamHistoryChunkBytes = streamHistoryWordCount * 8
 )
 
 type streamIDChunk [streamHistoryWordCount]uint64
@@ -51,5 +52,31 @@ func (h *streamIDHistory) Add(id uint32) bool {
 }
 
 func (h *streamIDHistory) AllocatedBytes() int {
-	return int(h.allocated) * streamHistoryWordCount * 8
+	return int(h.allocated) * streamHistoryChunkBytes
+}
+
+// chargedGrowth returns the bytes that OPEN frames would allocate beyond the
+// first chunk. The first chunk covers ordinary sequential IDs without a charge.
+func (h *streamIDHistory) chargedGrowth(frames []Frame) int {
+	var added map[uint32]struct{}
+	allocated := int(h.allocated)
+	charged := 0
+	for _, frame := range frames {
+		chunkIndex := frame.StreamID >> streamHistoryChunkShift
+		if frame.Type != FrameOpen || h.chunks[chunkIndex] != nil {
+			continue
+		}
+		if _, exists := added[chunkIndex]; exists {
+			continue
+		}
+		if added == nil {
+			added = make(map[uint32]struct{})
+		}
+		added[chunkIndex] = struct{}{}
+		allocated++
+		if allocated > 1 {
+			charged += streamHistoryChunkBytes
+		}
+	}
+	return charged
 }

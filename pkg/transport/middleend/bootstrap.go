@@ -78,6 +78,7 @@ type ClientBootstrap struct {
 	decrypter       *CBCDecrypter
 	localHandshake  HandshakePacket
 	remoteProcessID ProcessID
+	feedScratch     []byte
 	err             error
 }
 
@@ -170,7 +171,7 @@ func (b *ClientBootstrap) Start() ([]byte, error) {
 // fragmentation and returns partial consumption at the plaintext-to-encrypted
 // transition so the caller can immediately write Outbound before resuming.
 func (b *ClientBootstrap) Feed(data []byte) (int, BootstrapUpdate, error) {
-	return b.feed(data, nil, nil)
+	return b.feed(data, nil, nil, nil)
 }
 
 const maxBootstrapBorrowedFeedSize = 64 * 1024
@@ -186,10 +187,17 @@ func (b *ClientBootstrap) feedFrames(data []byte, becameReady func() error, fram
 	if frame == nil {
 		return 0, BootstrapUpdate{}, fmt.Errorf("%w: nil frame callback", ErrBootstrapState)
 	}
-	return b.feed(data[:min(len(data), maxBootstrapBorrowedFeedSize)], becameReady, frame)
+	return b.feed(data[:min(len(data), maxBootstrapBorrowedFeedSize)], b.feedScratch, becameReady, frame)
 }
 
-func (b *ClientBootstrap) feed(data []byte, becameReady func() error, frame func(Frame) error) (int, BootstrapUpdate, error) {
+// useFeedScratch sets plaintext storage for feedFrames. The gnet runtime
+// shares one buffer per event loop; a loop runs one feed at a time, and the
+// decoder copies plaintext before feedFrames returns.
+func (b *ClientBootstrap) useFeedScratch(scratch []byte) {
+	b.feedScratch = scratch
+}
+
+func (b *ClientBootstrap) feed(data, scratch []byte, becameReady func() error, frame func(Frame) error) (int, BootstrapUpdate, error) {
 	var update BootstrapUpdate
 	if b == nil {
 		return 0, update, fmt.Errorf("%w: nil bootstrap", ErrBootstrapState)
@@ -203,7 +211,7 @@ func (b *ClientBootstrap) feed(data []byte, becameReady func() error, frame func
 	case clientBootstrapNonceSent:
 		return b.feedServerNonce(data)
 	case clientBootstrapHandshakeSent, clientBootstrapReady:
-		return b.feedEncrypted(data, becameReady, frame)
+		return b.feedEncrypted(data, scratch, becameReady, frame)
 	default:
 		return 0, update, b.fail(fmt.Errorf("%w: stage %d", ErrBootstrapState, b.stage))
 	}
@@ -289,9 +297,9 @@ func (b *ClientBootstrap) feedServerNonce(data []byte) (int, BootstrapUpdate, er
 	return consumed, update, nil
 }
 
-func (b *ClientBootstrap) feedEncrypted(data []byte, becameReady func() error, visit func(Frame) error) (int, BootstrapUpdate, error) {
+func (b *ClientBootstrap) feedEncrypted(data, scratch []byte, becameReady func() error, visit func(Frame) error) (int, BootstrapUpdate, error) {
 	var update BootstrapUpdate
-	consumed, plaintext := b.decrypter.Feed(data)
+	consumed, plaintext := b.decrypter.feedInto(data, scratch)
 	defer clear(plaintext)
 	for len(plaintext) != 0 {
 		fed, err := b.decoder.Feed(plaintext)
@@ -367,6 +375,35 @@ func (b *ClientBootstrap) Encode(payload []byte) ([]byte, error) {
 		return nil, b.fail(err)
 	}
 	wire, err := b.encrypter.encryptOwned(frame)
+	if err != nil {
+		return nil, b.fail(err)
+	}
+	return wire, nil
+}
+
+// encodeSubmission is Encode for a link submission. A submission with a frame
+// buffer is framed and encrypted in place, so its payload becomes ciphertext.
+func (b *ClientBootstrap) encodeSubmission(submission LinkSubmission) ([]byte, error) {
+	frame := submission.frame
+	size := len(submission.Payload)
+	if frame == nil || size == 0 || len(frame) != size+FullFrameOverhead ||
+		&frame[frameHeaderSize] != &submission.Payload[0] {
+		return b.Encode(submission.Payload)
+	}
+	if b == nil {
+		return nil, fmt.Errorf("%w: nil bootstrap", ErrBootstrapState)
+	}
+	if b.err != nil {
+		return nil, b.err
+	}
+	if b.stage != clientBootstrapReady {
+		return nil, fmt.Errorf("%w: link is not ready", ErrBootstrapState)
+	}
+	framed, err := b.encoder.encodeInPlaceForCBC(frame)
+	if err != nil {
+		return nil, b.fail(err)
+	}
+	wire, err := b.encrypter.encryptOwned(framed)
 	if err != nil {
 		return nil, b.fail(err)
 	}

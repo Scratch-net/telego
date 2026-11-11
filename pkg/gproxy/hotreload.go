@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"sync"
 	"syscall"
 	"time"
@@ -284,7 +285,7 @@ func (r *HotReloader) warnNonHotChanges(old, new *Config) bool {
 		restartRequired = true
 	}
 
-	if old.ProxyProtocol != new.ProxyProtocol {
+	if old.ProxyProtocol != new.ProxyProtocol || !slices.Equal(old.TrustedProxyPrefixes, new.TrustedProxyPrefixes) {
 		r.logger.Warn("proxy-protocol setting changed but requires restart")
 		restartRequired = true
 	}

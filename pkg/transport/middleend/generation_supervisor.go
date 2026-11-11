@@ -329,6 +329,13 @@ func (s *generationSupervisorState) rotateActive(ctx context.Context, plan *gene
 	}
 	candidate.plan = plan
 	s.mu.Lock()
+	if context.Cause(ctx) == nil && !s.closing && s.active == oldActive && !healthyGeneration(oldActive) {
+		// The failure watcher waits for transitions. Retire the failed active
+		// here and publish the probed candidate instead of rebuilding it.
+		s.mu.Unlock()
+		s.retireFailedActive(oldActive)
+		return s.publishRecoveredGeneration(ctx, candidate)
+	}
 	if context.Cause(ctx) != nil || s.closing || s.active != oldActive || !healthyGeneration(oldActive) || s.retiring != nil {
 		s.mu.Unlock()
 		s.closeGeneration(candidate)
@@ -395,6 +402,12 @@ func (s *generationSupervisorState) ensureActive(ctx context.Context, plan *gene
 	}
 
 	candidate.plan = plan
+	return s.publishRecoveredGeneration(ctx, candidate)
+}
+
+// publishRecoveredGeneration publishes candidate while no active generation
+// exists. The caller holds transitions.
+func (s *generationSupervisorState) publishRecoveredGeneration(ctx context.Context, candidate *supervisedGeneration) error {
 	s.mu.Lock()
 	if context.Cause(ctx) != nil || s.closing || s.active != nil {
 		s.mu.Unlock()
@@ -849,8 +862,10 @@ func (s *generationSupervisorState) requestRepair() {
 		return
 	}
 	s.repairing = true
-	s.mu.Unlock()
+	// close sets closing under mu before it waits for workers. Adding the
+	// worker under mu orders this Add before that Wait.
 	s.workers.Go(s.repairLoop)
+	s.mu.Unlock()
 }
 
 func (s *generationSupervisorState) repairLoop() {

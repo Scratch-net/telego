@@ -157,11 +157,18 @@ func TestMiddleEndOwnedOutputPromotesAtFullOrdinaryCapacity(t *testing.T) {
 						if budget.Snapshot().UsedBytes != before {
 							t.Fatal("partial write released retained allocation")
 						}
+						if ctx.lastServerByteMs.Load() != 0 {
+							t.Fatal("queued output stamped server activity before drain")
+						}
 						var terminal error
 						if completion == "close" {
 							terminal = net.ErrClosed
 						}
 						conn.drain(conn.OutboundBuffered(), terminal)
+					}
+					// Only a completed drain is delivered server activity.
+					if delivered := ctx.lastServerByteMs.Load() != 0; delivered != (completion == "drain" || completion == "immediate") {
+						t.Fatalf("server activity stamped=%t after %s", delivered, completion)
 					}
 					work.release()
 					if budget.Snapshot().UsedBytes != metadata {

@@ -12,8 +12,18 @@ import (
 
 const (
 	relayDrainInterval    = 5 * time.Millisecond
+	relayDrainIntervalMax = 80 * time.Millisecond
 	relayMaxPendingWrites = 512
 )
+
+// relayOutputStallTimeout closes a relay whose source waits for output
+// capacity while the destination accepts no bytes. It matches the
+// Middle-End output stall timeout. Tests replace it.
+var relayOutputStallTimeout = 100 * time.Second
+
+// relayStallSamples is the number of owned-write backlog samples per stall
+// period.
+const relayStallSamples = 4
 
 // relayOutput bounds both submissions waiting for the destination loop and
 // bytes retained by gnet. Only that loop reads OutboundBuffered. A stale
@@ -37,6 +47,20 @@ type relayOutput struct {
 	chargedBytes    int
 	chargedItems    int
 	pendingWrites   map[*relayPendingWrite]struct{}
+	retryDelay      time.Duration // next drain poll; doubles while no progress
+	stallDeadline   time.Time     // set while waiting; extended on progress
+	// stallOutbound and stallAcked describe the destination at the last owned
+	// stall sample. A smaller userspace backlog or more acknowledged socket
+	// bytes at the next sample is partial drain of an owned write.
+	stallOutbound int
+	stallAcked    uint64
+	stallSampled  bool
+	timerDue      time.Time
+	timerSeq      uint64
+	timerRuns     int
+	// serverActivity stamps the client's last server byte on each completed
+	// write, so the silence breaker sees delivered replies, not queued ones.
+	serverActivity bool
 }
 
 type relayPendingWrite struct {
@@ -54,6 +78,13 @@ func newRelayOutput(destination, source clientEndpoint, client *ConnContext, lim
 		})
 	}
 	return &relayOutput{destination: destination, source: source, client: client, limit: limit, ownedNative: owned}
+}
+
+// newClientRelayOutput returns the DC-to-client relay output.
+func newClientRelayOutput(destination, source clientEndpoint, client *ConnContext, limit int) *relayOutput {
+	output := newRelayOutput(destination, source, client, limit)
+	output.serverActivity = true
+	return output
 }
 
 // reserve is called before advancing any cipher. minimum allows a TLS record
@@ -96,6 +127,9 @@ func (o *relayOutput) reserve(want, minimum int) int {
 // waitForCapacityLocked runs on the source owner before any cipher advances.
 func (o *relayOutput) waitForCapacityLocked(minimum int) {
 	o.waiting = max(o.waiting, minimum)
+	if o.stallDeadline.IsZero() {
+		o.stallDeadline = time.Now().Add(relayOutputStallTimeout)
+	}
 	if controller, ok := o.source.(gnet.ReadController); ok {
 		if err := controller.PauseRead(); err != nil {
 			// Closing is asynchronous. Do not reenter a relay callback under o.mu.
@@ -143,25 +177,95 @@ func (o *relayOutput) cancelReservation(n int) {
 	releaseClientOutput(o.destination, n, 1)
 }
 
+// relayPoolMinimum is the smallest batch that takes a pooled buffer. The
+// unused pool capacity is at most half of the retained buffer.
+const relayPoolMinimum = relayBatchSize / 2
+
 // relayBuffer uses the fixed-size pool only when every retained byte is
-// charged to the output reservation. Small writes allocate their exact size.
-func (h *ProxyHandler) relayBuffer(size int) ([]byte, func()) {
-	buffer := h.dcBufPool.Get()
-	if len(*buffer) == size {
-		return *buffer, func() { h.dcBufPool.Put(buffer) }
+// charged to the output reservation: a large batch also charges the unused
+// pool capacity until release. Small writes and logical endpoints, whose
+// shared budgets charge only the batch size, allocate their exact size.
+func (h *ProxyHandler) relayBuffer(o *relayOutput, size int) ([]byte, func()) {
+	if size < relayPoolMinimum || size > relayBatchSize {
+		return make([]byte, size), nil
 	}
-	h.dcBufPool.Put(buffer)
-	return make([]byte, size), nil
+	extra := relayBatchSize - size
+	if !o.chargeExtra(extra) {
+		return make([]byte, size), nil
+	}
+	buffer := h.dcBufPool.Get()
+	return (*buffer)[:size], func() {
+		h.dcBufPool.Put(buffer)
+		o.releaseExtra(extra)
+	}
 }
 
+// chargeExtra adds retained bytes beyond a granted reservation. The write
+// that carries them releases the charge before its completion refresh.
+func (o *relayOutput) chargeExtra(n int) bool {
+	if _, logical := o.source.(*LogicalStream); logical {
+		return false
+	}
+	if _, logical := o.destination.(*LogicalStream); logical {
+		return false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.limit-o.queued-o.buffered < n {
+		return false
+	}
+	o.queued += n
+	return true
+}
+
+func (o *relayOutput) releaseExtra(n int) {
+	o.mu.Lock()
+	o.queued -= n
+	o.mu.Unlock()
+}
+
+// scheduleLocked arms the drain timer. When every wait is covered by an
+// owned write completion, that completion calls refresh and wakes the
+// source, so the timer only enforces the stall deadline. Otherwise the
+// timer polls OutboundBuffered with exponential backoff.
 func (o *relayOutput) scheduleLocked() {
-	if o.timer != nil || o.closed {
+	if o.closed {
 		return
 	}
-	o.timer = time.AfterFunc(relayDrainInterval, func() {
+	now := time.Now()
+	delay := max(o.retryDelay, relayDrainInterval)
+	_, logicalSource := o.source.(*LogicalStream)
+	if o.ownedNative && o.inflight > 0 && !logicalSource && !o.stallDeadline.IsZero() {
+		// Completions wake the source. Sample the backlog a few times per
+		// stall period so partial drain of an owned write counts as progress.
+		delay = min(o.stallDeadline.Sub(now), relayOutputStallTimeout/relayStallSamples)
+	}
+	if !o.stallDeadline.IsZero() {
+		delay = max(0, min(delay, o.stallDeadline.Sub(now)))
+	}
+	due := now.Add(delay)
+	if o.timer != nil {
+		if !o.timerDue.After(due) {
+			return
+		}
+		o.timer.Stop()
+	}
+	o.timerSeq++
+	seq := o.timerSeq
+	o.timerDue = due
+	o.timer = time.AfterFunc(delay, func() {
 		// Execute, unlike Wake, does not invoke the destination's input handler.
 		err := executeClient(o.destination, gnet.RunnableFunc(func(context.Context) error {
-			o.refresh(0)
+			o.mu.Lock()
+			current := o.timer != nil && o.timerSeq == seq
+			if current {
+				o.timer = nil
+				o.timerRuns++
+			}
+			o.mu.Unlock()
+			if current {
+				o.refresh(0)
+			}
 			return nil
 		}))
 		if err != nil {
@@ -173,7 +277,12 @@ func (o *relayOutput) scheduleLocked() {
 // refresh runs only on the destination loop, after the submitted bytes have
 // either entered its outbound buffer or reached the socket.
 func (o *relayOutput) refresh(completed int) {
+	if completed > 0 && o.serverActivity {
+		o.client.recordServerActivity()
+	}
 	o.mu.Lock()
+	retained := o.queued + o.buffered
+	partialDrain := false
 	o.queued -= completed
 	if completed > 0 {
 		o.inflight--
@@ -185,8 +294,13 @@ func (o *relayOutput) refresh(completed int) {
 			// it drains; completion of an owned write proves its prefix drained.
 			if completed > 0 {
 				o.buffered = 0
+				o.stallSampled = false
 			} else {
-				o.buffered = min(o.buffered, o.destination.OutboundBuffered())
+				outbound := o.destination.OutboundBuffered()
+				acked, ackedKnown := socketAckedBytes(o.destination)
+				partialDrain = o.stallSampled && (outbound < o.stallOutbound || (ackedKnown && acked > o.stallAcked))
+				o.stallOutbound, o.stallAcked, o.stallSampled = outbound, acked, true
+				o.buffered = min(o.buffered, outbound)
 			}
 		} else {
 			o.buffered = o.destination.OutboundBuffered()
@@ -198,15 +312,33 @@ func (o *relayOutput) refresh(completed int) {
 		o.mu.Unlock()
 		return
 	}
-	if completed == 0 {
-		o.timer = nil
+	now := time.Now()
+	if o.queued+o.buffered < retained || partialDrain {
+		o.retryDelay = relayDrainInterval
+		if !o.stallDeadline.IsZero() {
+			o.stallDeadline = now.Add(relayOutputStallTimeout)
+		}
+	} else if completed == 0 && o.waiting > 0 {
+		o.retryDelay = min(2*max(o.retryDelay, relayDrainInterval), relayDrainIntervalMax)
 	}
 	wake := o.waiting > 0 && o.limit-o.queued-o.buffered >= o.waiting && o.inflight < relayMaxPendingWrites
 	if wake {
 		o.waiting = 0
+		o.stallDeadline = time.Time{}
+		o.stallSampled = false
+		o.retryDelay = relayDrainInterval
+	} else if o.waiting > 0 && !now.Before(o.stallDeadline) {
+		// The source waited a full stall timeout with no destination progress.
+		o.mu.Unlock()
+		o.fail()
+		return
 	}
 	_, logicalSource := o.source.(*LogicalStream)
-	if o.waiting > 0 || (logicalSource && o.buffered > 0) {
+	if o.waiting > 0 {
+		o.scheduleLocked()
+	} else if logicalSource && o.buffered > 0 {
+		// Release the logical input charge as soon as the prefix drains.
+		o.retryDelay = relayDrainInterval
 		o.scheduleLocked()
 	}
 	o.mu.Unlock()
@@ -341,6 +473,7 @@ func (o *relayOutput) stopLocked() {
 		o.timer.Stop()
 		o.timer = nil
 	}
+	o.timerSeq++
 }
 
 func (o *relayOutput) close() {

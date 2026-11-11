@@ -89,6 +89,7 @@ func logWebBridgeFailure(failure webproxy.BridgeFailure) {
 		Uint64("elapsed_ms", failure.ElapsedMS).Uint64("operation_ms", failure.OperationMS).
 		Uint64("queued_bytes", failure.QueuedBytes).Uint32("queued_items", failure.QueuedItems).
 		Uint64("buffered_bytes", failure.BufferedBytes).
+		Uint64("received_bytes", failure.ReceivedBytes).Uint64("idle_ms", failure.IdleMS).
 		Bool("was_clean", failure.WasClean).Msg(message)
 }
 

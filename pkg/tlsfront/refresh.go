@@ -6,6 +6,14 @@ import (
 	"time"
 )
 
+const (
+	// refreshRetryInitial is the first retry delay after a failed fetch.
+	refreshRetryInitial = 5 * time.Second
+	// refreshRetryMaximum bounds the retry delay. The bound is also at most
+	// half of the refresh period, so a failure never waits a full period.
+	refreshRetryMaximum = 5 * time.Minute
+)
+
 // refreshWorker owns one periodic worker and joins its current network fetch.
 // Once stopped, it cannot be restarted by a concurrent or repeated Start.
 type refreshWorker struct {
@@ -15,7 +23,9 @@ type refreshWorker struct {
 	stopped bool
 }
 
-func (w *refreshWorker) start(period time.Duration, refresh func(context.Context)) {
+// A failed refresh is retried after refreshRetryInitial, doubling up to
+// min(period/2, refreshRetryMaximum). A success restores the normal period.
+func (w *refreshWorker) start(period time.Duration, refresh func(context.Context) error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.stopped || w.done != nil {
@@ -29,18 +39,26 @@ func (w *refreshWorker) start(period time.Duration, refresh func(context.Context
 		if ctx.Err() != nil {
 			return
 		}
-		refresh(ctx)
-		ticker := time.NewTicker(period)
-		defer ticker.Stop()
+		retryMaximum := min(period/2, refreshRetryMaximum)
+		var retry time.Duration
+		timer := time.NewTimer(period)
+		defer timer.Stop()
 		for {
+			delay := period
+			if err := refresh(ctx); err != nil {
+				retry = min(max(2*retry, refreshRetryInitial), retryMaximum)
+				delay = retry
+			} else {
+				retry = 0
+			}
+			timer.Reset(delay)
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
+			case <-timer.C:
 				if ctx.Err() != nil {
 					return
 				}
-				refresh(ctx)
 			}
 		}
 	}()

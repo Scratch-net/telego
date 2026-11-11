@@ -70,6 +70,11 @@ func (l *ConnLimiter) TryAcquireIP(ip net.IP) (key string, ok bool) {
 }
 
 func (l *ConnLimiter) hashKey(ip net.IP, secret []byte) [limiterKeySize]byte {
+	// One IPv4 client can arrive as a 16-byte v4-mapped address (dual-stack
+	// listener) or a 4-byte address (WEB stream, PROXY v2). Hash one form.
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
 	h := hasherPool.Get().(*xxh3.Hasher128)
 	h.Reset()
 	h.Write(ip)

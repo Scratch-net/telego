@@ -138,7 +138,7 @@ func (h *ProxyHandler) dialDC(clientConn clientEndpoint, ctx *ConnContext) {
 		// Native gnet address storage is released on this owner at close.
 		clientAddr := ctx.RealClientAddr(clientConn.RemoteAddr())
 		h.logger.Info("[#%d:%s] %s -> DC %d", ctx.id, userName, clientAddr, dcID)
-		dcCtx.ToClient = newRelayOutput(clientConn, dcGnetConn, ctx, h.maxWriteBuffer)
+		dcCtx.ToClient = newClientRelayOutput(clientConn, dcGnetConn, ctx, h.maxWriteBuffer)
 		dcCtx.ToClient.buffered = clientConn.OutboundBuffered()
 		ctx.mu.Lock()
 		pendingData, pendingRelease := ctx.pendingData, ctx.pendingDataRelease
@@ -311,7 +311,7 @@ func (h *ProxyHandler) sendPendingDataGnet(relay *RelayContext, pendingData []by
 	if relay.ToDC.reserve(len(pendingData), len(pendingData)) == 0 {
 		return errors.New("pending handshake data exceeds direct output capacity")
 	}
-	buffer, release := h.relayBuffer(len(pendingData))
+	buffer, release := h.relayBuffer(relay.ToDC, len(pendingData))
 	relay.Decryptor.XORKeyStream(buffer, pendingData)
 	relay.DCEncrypt.XORKeyStream(buffer, buffer)
 	return relay.ToDC.write(buffer, release)
