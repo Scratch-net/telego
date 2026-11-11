@@ -25,6 +25,39 @@ const (
 
 var sessionCloseReasonNames = [...]string{"client", "expired", "protocol", "resource", "shutdown"}
 
+// webSocketCloseReason indexes the fixed WebSocket close reasons. The names
+// are the strings that the transport passes to noteClose. A close without a
+// recorded reason is transport_closed.
+type webSocketCloseReason uint8
+
+const webSocketCloseReasonCount = webSocketCloseReason(len(webSocketCloseReasonNames))
+
+var webSocketCloseReasonNames = [...]string{
+	"transport_closed",
+	"session_closed",
+	"downlink_error",
+	"lane_closed",
+	"output_capacity",
+	"liveness_timeout",
+	"server_close",
+	"uplink_error",
+	"input_capacity",
+	"decode_error",
+	"peer_close",
+	"encode_error",
+	"write_error",
+	"write_timeout",
+}
+
+func webSocketCloseReasonFor(reason string) webSocketCloseReason {
+	for index, name := range webSocketCloseReasonNames {
+		if name == reason {
+			return webSocketCloseReason(index)
+		}
+	}
+	return 0
+}
+
 // RuntimeCounter is one labeled cumulative WEB counter.
 type RuntimeCounter struct {
 	Label string
@@ -39,6 +72,11 @@ type RuntimeStats struct {
 	SessionsClosed   []RuntimeCounter
 	CarrierRetries   []RuntimeCounter
 	Backpressure     []RuntimeCounter
+	// WebSocketCloses counts each opened WebSocket carrier once, by reason.
+	WebSocketCloses []RuntimeCounter
+	// HTTPWriteTimeouts counts HTTP carrier connections closed because a
+	// response write made no progress before the write timeout.
+	HTTPWriteTimeouts uint64
 }
 
 // RuntimeStats returns WEB diagnostics without bearer or client identifiers.
@@ -50,6 +88,14 @@ func (m *Manager) RuntimeStats() RuntimeStats {
 		SessionsClosed:   make([]RuntimeCounter, 0, sessionCloseReasonCount),
 		CarrierRetries:   make([]RuntimeCounter, 0, carrierOperationCount),
 		Backpressure:     make([]RuntimeCounter, 0, carrierOperationCount),
+		WebSocketCloses:  make([]RuntimeCounter, 0, webSocketCloseReasonCount),
+	}
+	stats.HTTPWriteTimeouts = m.httpWriteTimeouts.Load()
+	for reason := range webSocketCloseReasonCount {
+		stats.WebSocketCloses = append(stats.WebSocketCloses, RuntimeCounter{
+			Label: webSocketCloseReasonNames[reason],
+			Total: m.webSocketCloses[reason].Load(),
+		})
 	}
 	for reason := range sessionCloseReasonCount {
 		stats.SessionsClosed = append(stats.SessionsClosed, RuntimeCounter{

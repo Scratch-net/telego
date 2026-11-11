@@ -41,6 +41,7 @@ type ProxyHandler struct {
 	upstreamContext       context.Context
 	cancelUpstream        context.CancelFunc
 	upstreamStopRequested atomic.Bool
+	shutdownStarted       atomic.Bool
 
 	// Replay cache for anti-replay protection
 	replayCache *ReplayCache
@@ -63,6 +64,7 @@ type ProxyHandler struct {
 	activeConns       atomic.Int64
 	handshakeFailures [handshakeFailureStageCount]atomic.Uint64
 	maskFallbacks     [maskFallbackReasonCount]atomic.Uint64
+	connectionCloses  [closeReasonCount]atomic.Uint64
 
 	connectionLimitLog logRateLimit
 	ipLimitLog         logRateLimit
@@ -241,6 +243,7 @@ func (h *ProxyHandler) OnTick() (time.Duration, gnet.Action) {
 		ls := e.ctx.lastServerByteMs.Load()
 		if silenceWedged(lc, ls, now, h.clientSilenceCloseMs) {
 			h.logger.Info("[#%d] closing relay: server reply unanswered %dms (iOS bad_salt wedge breaker)", e.ctx.id, now-ls)
+			e.ctx.noteClose(closeReasonClientSilence)
 			e.conn.Close()
 			h.relayConns.Delete(k)
 		}
@@ -340,6 +343,13 @@ func (h *ProxyHandler) closeClient(c clientEndpoint, ctx *ConnContext, err error
 	if !ctx.closeStarted.CompareAndSwap(false, true) {
 		return gnet.None
 	}
+	// Read the cause before this close reaches the upstream, whose close
+	// callback records its own cause on another loop.
+	route := ctx.route.Load()
+	reason := closeReasonUnset
+	if route != routeNone {
+		reason = h.recordConnectionClose(ctx, err)
+	}
 	conns := h.activeConns.Add(-1)
 
 	// Mark as closed FIRST - goroutines check this before proceeding
@@ -389,6 +399,11 @@ func (h *ProxyHandler) closeClient(c clientEndpoint, ctx *ConnContext, err error
 	dcID := ctx.DCID()
 	if authenticated && ctx.internalProxyAuthenticated && ctx.webDiagnostics && h.logger.DebugEnabled() {
 		h.logWebStreamClose(ctx, err)
+	}
+	if route != routeNone && h.logger.DebugEnabled() {
+		h.logger.Debug("[%s] connection closed reason=%s route=%s web=%t dc_id=%d age_ms=%d error=%s",
+			prefix, closeReasonNames[reason], routeNames[route], ctx.internalProxyAuthenticated, dcID,
+			duration.Milliseconds(), webStreamCloseError(err))
 	}
 
 	// Determine if this is a real error (not just EOF/normal close)

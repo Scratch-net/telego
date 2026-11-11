@@ -307,6 +307,7 @@ func (f *middleEndFrontend) wakeAll() {
 
 type middleEndRoute struct {
 	conn   clientEndpoint
+	ctx    *ConnContext
 	client *middleEndClient
 
 	mu     sync.Mutex
@@ -483,7 +484,7 @@ func (f *middleEndFrontend) commit(
 	if client.mode == ModeEE {
 		client.drs = faketls.NewDRSState(enableDRS, enableSplitTLS, faketls.MaxRecordPayload)
 	}
-	route := &middleEndRoute{conn: c, client: client}
+	route := &middleEndRoute{conn: c, ctx: ctx, client: client}
 	client.route = route
 	if !client.reconcileInput(c) {
 		client.releaseBudgets()
@@ -532,6 +533,7 @@ func (f *middleEndFrontend) commit(
 	ctx.middleEnd = client
 	ctx.mu.Unlock()
 	ctx.SetState(StateMiddleEnd)
+	ctx.route.Store(routeMiddleEnd)
 	f.mu.Unlock()
 
 	ctx.startAuthenticatedIdle(c, idleTimeout)
@@ -630,15 +632,18 @@ func (h *ProxyHandler) handleMiddleEnd(c clientEndpoint, ctx *ConnContext) (resu
 	}()
 	if !client.reconcileInput(c) {
 		h.logger.Debug("[%s] Middle-End aggregate client input limit reached", ctx.LogPrefix())
+		ctx.noteClose(closeReasonMiddleEndBackpressure)
 		return gnet.Close
 	}
 	defer client.reconcileInput(c)
 	if !client.refreshOutput(c, 0) {
 		h.logger.Debug("[%s] Middle-End client output made no progress before the stall deadline", ctx.LogPrefix())
+		ctx.noteClose(closeReasonOutputStall)
 		return gnet.Close
 	}
 	if buffered := c.InboundBuffered(); buffered > client.frontend.maxPendingClient {
 		h.logger.Debug("[%s] Middle-End client input exceeded bound: %d > %d", ctx.LogPrefix(), buffered, client.frontend.maxPendingClient)
+		ctx.noteClose(closeReasonMiddleEndBackpressure)
 		return gnet.Close
 	}
 	if client.closeAfterDrain {
@@ -646,11 +651,17 @@ func (h *ProxyHandler) handleMiddleEnd(c clientEndpoint, ctx *ConnContext) (resu
 	}
 	select {
 	case <-client.frontend.source.Done():
+		ctx.noteClose(closeReasonMiddleEndTerminal)
 		return gnet.Close
 	default:
 	}
 
 	blocked, action := h.handleMiddleEndToken(c, ctx, client)
+	if action == gnet.Close {
+		// Token sites record specific causes first. The remaining closes
+		// come from binding and token failures.
+		ctx.noteClose(closeReasonMiddleEndTerminal)
+	}
 	if action != gnet.None || blocked || client.awaitingResult {
 		return action
 	}
@@ -722,6 +733,7 @@ func (h *ProxyHandler) handleMiddleEndToken(
 		if terminalErr != nil {
 			h.logger.Debug("[%s] Middle-End binding terminated: %v", ctx.LogPrefix(), terminalErr)
 		}
+		ctx.noteClose(middleEndTerminalReason(terminalErr))
 		if err := client.finishToken(token); err != nil {
 			return false, gnet.Close
 		}
@@ -750,6 +762,7 @@ func (h *ProxyHandler) handleMiddleEndToken(
 		if ok {
 			event.Release()
 			ctx.noteWebClose(webCloseMiddleEnd)
+			ctx.noteClose(closeReasonMiddleEndClosed)
 			action = client.beginOrderlyClose(c)
 		}
 		if err := client.finishToken(token); err != nil {
@@ -781,6 +794,7 @@ func (h *ProxyHandler) handleMiddleEndToken(
 			return false, gnet.None
 		}
 		if client.frontend.evictOutputPressureVictim(client) {
+			ctx.noteClose(closeReasonMiddleEndBackpressure)
 			return false, gnet.Close
 		}
 		client.armOutputRetry(c, client.frontend.stallTimeout)
@@ -826,6 +840,7 @@ func (h *ProxyHandler) handleMiddleEndToken(
 			action = h.writeMiddleEndOwnedEvent(c, ctx, client, event, &work)
 		}
 		if !client.refreshOutput(c, outputReservation) {
+			ctx.noteClose(closeReasonOutputStall)
 			action = gnet.Close
 		}
 		if err := client.finishToken(token); err != nil {
@@ -844,6 +859,7 @@ func (h *ProxyHandler) handleMiddleEndToken(
 			if terminalErr != nil {
 				h.logger.Debug("[%s] Middle-End binding terminated: %v", ctx.LogPrefix(), terminalErr)
 			}
+			ctx.noteClose(middleEndTerminalReason(terminalErr))
 			if err := client.finishToken(token); err != nil {
 				return false, gnet.Close
 			}
@@ -996,6 +1012,7 @@ func (h *ProxyHandler) prepareMiddleEndRequest(
 	status, err := client.binding.PrepareProxyRequest(request)
 	if err != nil {
 		clear(request.Packet)
+		ctx.noteClose(closeReasonMiddleEndTerminal)
 		return gnet.Close
 	}
 	client.awaitingResult = true
@@ -1006,6 +1023,7 @@ func (h *ProxyHandler) prepareMiddleEndRequest(
 		client.waiting = &request
 	default:
 		clear(request.Packet)
+		ctx.noteClose(closeReasonMiddleEndTerminal)
 		return gnet.Close
 	}
 	if counter := ctx.TrafficIn(); counter != nil {
@@ -1043,6 +1061,7 @@ func (h *ProxyHandler) writeMiddleEndEvent(
 		wire, err = middleend.EncodeSimpleAckForClient(client.connectionType, event.ConfirmKey)
 	case middleend.LinkEventCloseExternal:
 		ctx.noteWebClose(webCloseMiddleEnd)
+		ctx.noteClose(closeReasonMiddleEndClosed)
 		return client.beginOrderlyClose(c)
 	default:
 		err = fmt.Errorf("%w: unexpected event kind %d", ErrMiddleEndClientProtocol, event.Kind)

@@ -801,6 +801,7 @@ To disable diagnostics, set `diagnostics = false`. Then restart Telego.
 | `telego_traffic_out_bytes_total` | Counter | Bytes sent to clients |
 | `telego_handshake_failures_total` | Counter | MTProxy handshake failures by `stage` |
 | `telego_mask_fallbacks_total` | Counter | Connections sent to the mask host, by `reason`: `malformed`, `unknown_sni`, `unknown_secret`, `bad_timestamp`, or `replay` |
+| `telego_connection_closes_total` | Counter | Closes of client connections that reached a relay session, by `reason`. See the reasons below. |
 | `telego_replay_cache_evictions_total` | Counter | Replay cache entries evicted before their 10-minute TTL because the cache was full. A growing value means the replay window is shorter. This metric has no labels. |
 | `telego_log_dropped_messages_total` | Counter | Log events dropped when the queue is full or shutdown has started. This metric has no labels. |
 | `telego_web_websocket_connections_active` | Gauge | Active WEB WebSocket carrier connections. This metric has no labels. |
@@ -813,6 +814,8 @@ To disable diagnostics, set `diagnostics = false`. Then restart Telego.
 | `telego_web_sessions_closed_total` | Counter | WEB sessions closed by `reason` |
 | `telego_web_carrier_retries_total` | Counter | WEB retries and replays by `operation` |
 | `telego_web_backpressure_total` | Counter | WEB backpressure events by `operation` |
+| `telego_web_websocket_closes_total` | Counter | Closes of opened WEB WebSocket carriers, by `reason`. See the reasons below. |
+| `telego_web_http_write_timeouts_total` | Counter | WEB HTTP carrier connections closed because a response write made no progress before the write timeout. This metric has no labels. |
 | `telego_middleend_admitting` | Gauge | Whether an active ME generation accepts new bindings |
 | `telego_middleend_links` | Gauge | ME links by generation role, signed DC, and state |
 | `telego_middleend_slot_failure_total` | Counter | Physical-link failures |
@@ -832,6 +835,36 @@ To disable diagnostics, set `diagnostics = false`. Then restart Telego.
 Connection, IP, block, and traffic metrics include a `user` label. Diagnostic metrics use the labels in the table.
 
 `telego_web_websocket_connections_active` has no labels. It counts accepted WebSocket carriers after the HTTP upgrade response leaves Telego.
+
+`telego_connection_closes_total` counts each client connection once, when it closes.
+It counts only connections that reached a direct DC relay or a Middle-End binding.
+Earlier closes are in `telego_handshake_failures_total` and `telego_mask_fallbacks_total`.
+Mask-host splices are not counted.
+The site that starts the close records the reason. The first recorded reason is used.
+
+| Reason | Meaning |
+|--------|---------|
+| `client_eof` | The client closed the connection (EOF). |
+| `client_error` | The client socket failed, for example with a reset. |
+| `upstream_closed` | The direct DC connection closed or failed. |
+| `middleend_closed` | Middle-End sent a close for this client (`CloseExternal`). |
+| `middleend_backpressure` | Telego evicted the binding or closed the client because a Middle-End buffer limit was reached. |
+| `middleend_terminal` | The Middle-End binding ended for a proxy-side reason: link failure, generation retirement, manager close, or a protocol error. |
+| `idle_timeout` | No payload moved in either direction for the idle timeout. |
+| `relay_stall_downlink` | The client accepted no relayed bytes for 100 seconds. |
+| `relay_stall_uplink` | The Telegram DC accepted no relayed bytes for 100 seconds. |
+| `output_stall` | Middle-End output to the client made no progress for the output stall timeout. |
+| `client_silence` | The client-silence breaker closed the connection. |
+| `shutdown` | Telego was stopping. |
+| `other` | Telego closed the connection for a cause that has no reason, for example a protocol violation. |
+
+A WEB logical stream reports a Telego-side close without a recorded reason as `client_eof`. Its close always passes EOF.
+
+`telego_web_websocket_closes_total` counts each WebSocket carrier once, after the upgrade completes.
+The reasons are `transport_closed` (the socket closed without another reason), `session_closed`, `downlink_error`, `lane_closed`, `output_capacity`, `liveness_timeout`, `server_close`, `uplink_error`, `input_capacity`, `decode_error`, `peer_close`, `encode_error`, `write_error`, and `write_timeout`.
+
+When debug logging is on, Telego logs one line for each counted client close.
+The line has the connection ID, user, reason, route, WEB flag, DC, age, and error category.
 
 ---
 

@@ -47,6 +47,12 @@ type maskFallbackStatsProvider interface {
 	ReplayCacheEvictions() uint64
 }
 
+// connectionCloseStatsProvider supplies established connection closes by
+// reason.
+type connectionCloseStatsProvider interface {
+	ConnectionCloseStats() []gproxy.ConnectionCloseStat
+}
+
 type middleEndFrontendStatsProvider interface {
 	MiddleEndFrontendStats() gproxy.MiddleEndFrontendStats
 }
@@ -537,6 +543,17 @@ func registerProxyMetrics(meter metric.Meter, provider ProxyStatsProvider) {
 			}),
 		)
 	}
+	if closes, ok := provider.(connectionCloseStatsProvider); ok {
+		meter.Int64ObservableCounter("telego_connection_closes_total",
+			metric.WithDescription("Established client connections closed, by reason"),
+			metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
+				for _, stat := range closes.ConnectionCloseStats() {
+					observer.Observe(metricValue(stat.Total), metric.WithAttributes(attribute.String("reason", stat.Reason)))
+				}
+				return nil
+			}),
+		)
+	}
 	frontend, ok := provider.(middleEndFrontendStatsProvider)
 	if !ok {
 		return
@@ -702,6 +719,20 @@ func registerWebMetrics(meter metric.Meter, provider WebStatsProvider) {
 			observer.ObserveInt64(backpressure, metricValue(counter.Total), metric.WithAttributes(attribute.String("operation", counter.Label)))
 		}
 	}, backpressure)
+	webSocketCloses, _ := meter.Int64ObservableCounter("telego_web_websocket_closes_total",
+		metric.WithDescription("Opened WEB WebSocket carrier connections closed, by reason"),
+	)
+	group.add(func(observer metric.Observer, collected webproxy.RuntimeStats) {
+		for _, counter := range collected.WebSocketCloses {
+			observer.ObserveInt64(webSocketCloses, metricValue(counter.Total), metric.WithAttributes(attribute.String("reason", counter.Label)))
+		}
+	}, webSocketCloses)
+	httpWriteTimeouts, _ := meter.Int64ObservableCounter("telego_web_http_write_timeouts_total",
+		metric.WithDescription("WEB HTTP carrier connections closed because a response write made no progress before the write timeout"),
+	)
+	group.add(func(observer metric.Observer, collected webproxy.RuntimeStats) {
+		observer.ObserveInt64(httpWriteTimeouts, metricValue(collected.HTTPWriteTimeouts))
+	}, httpWriteTimeouts)
 }
 
 func metricValue(value uint64) int64 {

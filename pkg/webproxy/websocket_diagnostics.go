@@ -61,6 +61,9 @@ type webSocketDiagnostic struct {
 }
 
 func (w *webSocketConnection) noteClose(reason string, code ws.StatusCode) {
+	if w.closeReason == "" {
+		w.closeReason = reason
+	}
 	if d := w.diagnostic; d != nil && d.closeReason == "" {
 		d.closeReason, d.closeCode = reason, uint16(code)
 	}

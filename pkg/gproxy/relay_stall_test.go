@@ -297,3 +297,93 @@ func TestDirectRelaySlowSteadyReaderNotClosed(t *testing.T) {
 		t.Fatal("steadily draining slow reader was closed by the stall deadline")
 	}
 }
+
+// stalledUploadRelay starts a direct relay whose DC never reads its uplink
+// while the client keeps uploading and the DC keeps sending small replies.
+func stalledUploadRelay(t *testing.T) (*ConnContext, *ProxyHandler) {
+	t.Helper()
+	client, clientSocket := directTCPPair(t)
+	dc, dcSocket := directTCPPair(t)
+	if err := dc.SetReadBuffer(4096); err != nil {
+		t.Fatal(err)
+	}
+	proxy := NewProxyHandler(&Config{MaxWriteBuffer: 4096, IdleTimeout: time.Hour}, &testLogger{})
+	proxy.directDCDial = func(context.Context, int, obfuscated2.ConnectionType) (*directDCConn, error) {
+		return &directDCConn{Conn: dcSocket, encryptor: &mockCipher{}, decryptor: &mockCipher{}}, nil
+	}
+	upstream, err := gnet.NewClient(&dcEventHandler{proxy: proxy}, gnet.WithSocketSendBuffer(4096))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = upstream.Start(); err != nil {
+		t.Fatal(err)
+	}
+	proxy.dcClient = upstream
+	t.Cleanup(func() { _ = proxy.stopDCClient() })
+	frontend, err := gnet.NewClient(&directClientTestHandler{ProxyHandler: proxy}, gnet.WithSocketSendBuffer(4096))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = frontend.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = frontend.Stop() })
+	ctx := NewConnContext()
+	ctx.protocolMode = ModeDD
+	ctx.decryptor = &mockCipher{}
+	ctx.encryptor = &mockCipher{}
+	ctx.SetState(StateDialingDC)
+	if _, err = frontend.EnrollContext(clientSocket, ctx); err != nil {
+		t.Fatal(err)
+	}
+	awaitDirectRelay(t, ctx)
+
+	stop := make(chan struct{})
+	done := make(chan struct{}, 3)
+	t.Cleanup(func() {
+		close(stop)
+		_ = dc.Close()
+		_ = client.Close()
+		for range 3 {
+			<-done
+		}
+	})
+	go func() { // client upload that the DC never reads
+		defer func() { done <- struct{}{} }()
+		block := bytes.Repeat([]byte{0x75}, 16<<10)
+		for {
+			_ = client.SetWriteDeadline(time.Now().Add(50 * time.Millisecond))
+			if _, err := client.Write(block); err != nil && !isTimeout(err) {
+				return
+			}
+			select {
+			case <-stop:
+				return
+			default:
+			}
+		}
+	}()
+	go func() { // client drains the DC's replies
+		defer func() { done <- struct{}{} }()
+		buffer := make([]byte, 4096)
+		for {
+			if _, err := client.Read(buffer); err != nil {
+				return
+			}
+		}
+	}()
+	go func() { // DC replies
+		defer func() { done <- struct{}{} }()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(20 * time.Millisecond):
+			}
+			if _, err := dc.Write([]byte{1, 2, 3, 4}); err != nil {
+				return
+			}
+		}
+	}()
+	return ctx, proxy
+}

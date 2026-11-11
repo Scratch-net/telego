@@ -370,6 +370,7 @@ type webSocketConnection struct {
 	queueMu             sync.Mutex
 	closed              bool
 	metricsActive       bool
+	closeReason         string // first noteClose reason; owner-only
 	backpressureTimeout time.Duration
 	backpressureRetry   time.Duration
 }
@@ -805,6 +806,7 @@ func (w *webSocketConnection) close() {
 		w.reportClose()
 		if w.metricsActive {
 			w.manager.webSocketsActive.Add(-1)
+			w.manager.webSocketCloses[webSocketCloseReasonFor(w.closeReason)].Add(1)
 			w.metricsActive = false
 		}
 		w.queueMu.Lock()

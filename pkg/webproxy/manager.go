@@ -127,6 +127,9 @@ type Manager struct {
 	carrierRetries   [carrierOperationCount]atomic.Uint64
 	backpressure     [carrierOperationCount]atomic.Uint64
 	webSocketsActive atomic.Int64
+
+	webSocketCloses   [webSocketCloseReasonCount]atomic.Uint64
+	httpWriteTimeouts atomic.Uint64
 }
 
 // NewManager validates and copies config before starting its expiry worker.

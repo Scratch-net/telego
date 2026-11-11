@@ -196,6 +196,7 @@ func (f *middleEndFrontend) evictOutputPressureVictim(current *middleEndClient) 
 	connection := victim.conn
 	f.mu.Unlock()
 	if !isCurrent {
+		victim.ctx.noteClose(closeReasonMiddleEndBackpressure)
 		_ = connection.Close()
 	}
 	return isCurrent

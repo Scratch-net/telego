@@ -351,6 +351,7 @@ make build
 | `telego_traffic_in_bytes_total` | Counter | Входящий трафик |
 | `telego_traffic_out_bytes_total` | Counter | Исходящий трафик |
 | `telego_mask_fallbacks_total` | Counter | Подключения, отправленные на mask-хост, по `reason`: `malformed`, `unknown_sni`, `unknown_secret`, `bad_timestamp` или `replay` |
+| `telego_connection_closes_total` | Counter | Закрытия клиентских подключений, которые дошли до relay или привязки ME, по `reason`. Причины перечислены в README.md. |
 | `telego_replay_cache_evictions_total` | Counter | Записи кэша повторов, вытесненные до истечения 10 минут из-за переполнения. Метрика не имеет лейблов. |
 | `telego_middleend_admitting` | Gauge | Готовность ME принимать новые привязки |
 | `telego_middleend_links` | Gauge | Физические ME-соединения по DC и состоянию |

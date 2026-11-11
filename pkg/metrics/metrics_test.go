@@ -28,6 +28,9 @@ type countingStatsProvider struct {
 	stats     []gproxy.UserIPStats
 }
 
+// The production handler must expose the optional close counter.
+var _ connectionCloseStatsProvider = (*gproxy.ProxyHandler)(nil)
+
 type mockProxyStatsProvider struct{}
 
 func (mockProxyStatsProvider) HandshakeFailureStats() []gproxy.HandshakeFailureStat {
@@ -39,6 +42,10 @@ func (mockProxyStatsProvider) MaskFallbackStats() []gproxy.MaskFallbackStat {
 }
 
 func (mockProxyStatsProvider) ReplayCacheEvictions() uint64 { return 9 }
+
+func (mockProxyStatsProvider) ConnectionCloseStats() []gproxy.ConnectionCloseStat {
+	return []gproxy.ConnectionCloseStat{{Reason: "relay_stall_downlink", Total: 4}}
+}
 
 func (mockProxyStatsProvider) MiddleEndFrontendStats() gproxy.MiddleEndFrontendStats {
 	return gproxy.MiddleEndFrontendStats{
@@ -62,12 +69,14 @@ type mockWebStatsProvider struct{}
 
 func (mockWebStatsProvider) RuntimeStats() webproxy.RuntimeStats {
 	return webproxy.RuntimeStats{
-		Capacity:         webproxy.Capacity{Sessions: 2, Streams: 4, BackendDials: 1, PendingBytes: 128, PendingItems: 3},
-		WebSocketsActive: 2,
-		SessionsCreated:  5,
-		SessionsClosed:   []webproxy.RuntimeCounter{{Label: "client", Total: 2}},
-		CarrierRetries:   []webproxy.RuntimeCounter{{Label: "uplink", Total: 7}},
-		Backpressure:     []webproxy.RuntimeCounter{{Label: "uplink", Total: 1}},
+		Capacity:          webproxy.Capacity{Sessions: 2, Streams: 4, BackendDials: 1, PendingBytes: 128, PendingItems: 3},
+		WebSocketsActive:  2,
+		SessionsCreated:   5,
+		SessionsClosed:    []webproxy.RuntimeCounter{{Label: "client", Total: 2}},
+		CarrierRetries:    []webproxy.RuntimeCounter{{Label: "uplink", Total: 7}},
+		Backpressure:      []webproxy.RuntimeCounter{{Label: "uplink", Total: 1}},
+		WebSocketCloses:   []webproxy.RuntimeCounter{{Label: "write_timeout", Total: 5}},
+		HTTPWriteTimeouts: 8,
 	}
 }
 
@@ -242,6 +251,7 @@ func TestMetricsIntegration(t *testing.T) {
 		"telego_handshake_failures_total",
 		`telego_mask_fallbacks_total{otel_scope_name="telego",otel_scope_schema_url="",otel_scope_version="",reason="replay"} 6`,
 		`telego_replay_cache_evictions_total{otel_scope_name="telego",otel_scope_schema_url="",otel_scope_version=""} 9`,
+		`telego_connection_closes_total{otel_scope_name="telego",otel_scope_schema_url="",otel_scope_version="",reason="relay_stall_downlink"} 4`,
 		"telego_web_websocket_connections_active",
 		"telego_web_sessions_active",
 		"telego_web_streams_active",
@@ -252,6 +262,8 @@ func TestMetricsIntegration(t *testing.T) {
 		"telego_web_sessions_closed_total",
 		"telego_web_carrier_retries_total",
 		"telego_web_backpressure_total",
+		`telego_web_websocket_closes_total{otel_scope_name="telego",otel_scope_schema_url="",otel_scope_version="",reason="write_timeout"} 5`,
+		`telego_web_http_write_timeouts_total{otel_scope_name="telego",otel_scope_schema_url="",otel_scope_version=""} 8`,
 		"telego_middleend_admitting",
 		"telego_middleend_capacity",
 		"telego_middleend_repairing",

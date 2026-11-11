@@ -374,7 +374,7 @@ func (h *httpEventHandler) OnOpen(connection gnet.Conn) ([]byte, gnet.Action) {
 		return backend.onOpen(connection)
 	}
 	_ = connection.SetNoDelay(true)
-	state := &httpConnectionState{peerIP: remoteIP(connection.RemoteAddr())}
+	state := &httpConnectionState{peerIP: remoteIP(connection.RemoteAddr()), manager: h.server.config.Manager}
 	connection.SetContext(state)
 	state.armDeadline(connection, h.server.config.HeaderTimeout)
 	return nil, gnet.None
@@ -533,6 +533,7 @@ type httpConnectionState struct {
 	writeTimeout  time.Duration
 	drainWake     *time.Timer
 	peerIP        string
+	manager       *Manager // counts write stalls; nil in some tests
 	pending       *preparedRequest
 	input         []byte
 	websocket     *webSocketConnection
@@ -812,6 +813,7 @@ func (s *httpConnectionState) deadlineExpired(connection gnet.Conn) {
 		}
 		cancel := s.cancel
 		s.cancel = nil
+		writeStall := s.writeWatch
 		s.invalidateDeadlineLocked()
 		s.mu.Unlock()
 		if cancel != nil {
@@ -821,6 +823,8 @@ func (s *httpConnectionState) deadlineExpired(connection gnet.Conn) {
 		// transition can occur between the generation check and close.
 		if s.websocket != nil {
 			s.websocket.noteClose("write_timeout", 0)
+		} else if writeStall && s.manager != nil {
+			s.manager.httpWriteTimeouts.Add(1)
 		}
 		return connection.EventLoop().Close(connection)
 	}))

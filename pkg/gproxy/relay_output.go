@@ -330,6 +330,13 @@ func (o *relayOutput) refresh(completed int) {
 	} else if o.waiting > 0 && !now.Before(o.stallDeadline) {
 		// The source waited a full stall timeout with no destination progress.
 		o.mu.Unlock()
+		// Only DC-to-client outputs stamp server activity, so the flag
+		// tells which side stopped reading.
+		if o.serverActivity {
+			o.client.noteClose(closeReasonRelayStallDownlink)
+		} else {
+			o.client.noteClose(closeReasonRelayStallUplink)
+		}
 		o.fail()
 		return
 	}

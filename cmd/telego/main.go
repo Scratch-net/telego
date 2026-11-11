@@ -180,6 +180,8 @@ func (c *RunCmd) Run() error {
 		middleEndStatusMonitor = startMiddleEndMonitor(middleEndService, handler)
 	}
 	stopProxyServices := func() {
+		// WEB cleanup closes logical streams before the public engine stops.
+		handler.MarkShutdown()
 		shutdownProxyServices(webRuntime, shutdown, func() {
 			middleEndStatusMonitor.Stop()
 			closeMiddleEndService(middleEndService, middleEndRuntimeConfig)

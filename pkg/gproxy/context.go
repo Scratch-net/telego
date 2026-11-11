@@ -104,6 +104,10 @@ type ConnContext struct {
 	directDialCancel context.CancelFunc // protected by mu; retired after setup
 	// handshakeFailureRecorded makes explicit failure accounting one-shot.
 	handshakeFailureRecorded atomic.Bool
+	// closeReason is the first recorded connCloseReason. route is set once
+	// when the connection enters a relay session.
+	closeReason atomic.Uint32
+	route       atomic.Uint32
 
 	// Protocol mode (ee or dd) - set during detection, immutable after
 	protocolMode ProtocolMode
@@ -258,6 +262,7 @@ func (c *ConnContext) Relay() *RelayContext {
 // SetRelay sets the relay context and transitions to relay state.
 func (c *ConnContext) SetRelay(r *RelayContext) {
 	c.relay.Store(r)
+	c.route.Store(routeDirect)
 	c.state.Store(int32(StateRelaying))
 }
 

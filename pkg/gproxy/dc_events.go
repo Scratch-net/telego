@@ -85,6 +85,8 @@ func (h *dcEventHandler) OnClose(c gnet.Conn, err error) gnet.Action {
 	ctx.activationMu.Lock()
 	defer ctx.activationMu.Unlock()
 	ctx.closed.Store(true)
+	// Every path below ends the client because its DC connection ended.
+	h.proxy.noteUpstreamClose(ctx.ClientCtx, closeReasonUpstreamClosed)
 	orderly := ctx.ClientConn != nil && ctx.ClientCtx != nil && ctx.ClientCtx.State() != StateClosed && errors.Is(err, io.EOF)
 	if orderly {
 		ctx.orderlyEOF.Store(true)
