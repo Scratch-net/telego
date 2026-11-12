@@ -44,7 +44,7 @@ func (c *timerReuseTestConn) EventLoop() gnet.EventLoop { return c.owner }
 // That callback must not close the refreshed connection.
 func TestReusedTimersIgnoreStaleExpiry(t *testing.T) {
 	newConnection := func() *timerReuseTestConn {
-		return &timerReuseTestConn{owner: &timerReuseTestOwner{budgetTestOwner: budgetTestOwner{queue: make(chan gnet.Runnable, 4)}}}
+		return &timerReuseTestConn{owner: &timerReuseTestOwner{queue: make(chan gnet.Runnable, 4)}}
 	}
 	expire := func(t *testing.T, connection *timerReuseTestConn, refresh func()) {
 		t.Helper()
