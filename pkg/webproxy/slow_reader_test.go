@@ -6,10 +6,12 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/gobwas/ws"
+	"golang.org/x/sys/unix"
 )
 
 // throttledReader delivers at most rate bytes per second. It models a client
@@ -52,9 +54,38 @@ func queueSlowReaderBatch(t *testing.T, session *Session, fill byte) int {
 	return 2 * (FrameHeaderSize + payloadSize)
 }
 
+// dialPathMSSTest is dialHTTPTest with an Ethernet-sized MSS advertised by the
+// client, as on a real path. Loopback otherwise uses a 64 KiB MSS. With a small
+// receive buffer, Linux 7.0 drops those segments and delivers at about 40 KB/s
+// with acknowledgements seconds apart, independent of the server.
+func dialPathMSSTest(t *testing.T, address string) net.Conn {
+	t.Helper()
+	dialer := net.Dialer{Control: func(_, _ string, raw syscall.RawConn) error {
+		var socketErr error
+		if err := raw.Control(func(fd uintptr) {
+			socketErr = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_MAXSEG, 1400)
+		}); err != nil {
+			return err
+		}
+		return socketErr
+	}}
+	connection, err := dialer.Dial("tcp", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := connection.(*net.TCPConn).SetNoDelay(true); err != nil {
+		connection.Close()
+		t.Fatal(err)
+	}
+	return connection
+}
+
 // slowReaderRate and slowReaderBytes model a client on a slow link. With the
 // default kernel send buffer, the userspace output buffer of the server can
 // stay unchanged for longer than WriteTimeout while the kernel still sends.
+// On Linux 6.x loopback this happens, and the slow-reader tests fail without
+// the acknowledged-bytes check. Linux 7.0 refills from the userspace buffer
+// often enough that the tests pass without it, so they guard it on 6.x only.
 const (
 	slowReaderRate  = 128 << 10
 	slowReaderBytes = 512 << 10
@@ -71,13 +102,10 @@ func TestHTTPServerSlowReaderCompletesDownlinkBeyondWriteTimeout(t *testing.T) {
 	created := createTestSession(t, application.manager, application.profiles[0])
 	want := queueSlowReaderBatch(t, created.Session, 0x41)
 
+	// Default socket buffers, as in the WebSocket test below. A tiny receive
+	// buffer makes Linux 7.0 drop the 64 KiB loopback segments.
 	connection := dialHTTPTest(t, application.address)
 	defer connection.Close()
-	if tcp, ok := connection.(*net.TCPConn); ok {
-		if err := tcp.SetReadBuffer(4096); err != nil {
-			t.Fatal(err)
-		}
-	}
 	request := "POST /api/v1/down HTTP/1.1\r\nHost: proxy.example.com\r\nAuthorization: Bearer " + created.Token + "\r\nX-Down-Cursor: 0\r\nContent-Length: 0\r\n\r\n"
 	if _, err := io.WriteString(connection, request); err != nil {
 		t.Fatal(err)
@@ -151,7 +179,7 @@ func TestHTTPServerStalledReaderClosesWithDefaultSendBuffer(t *testing.T) {
 	created := createTestSession(t, application.manager, application.profiles[0])
 	want := queueSlowReaderBatch(t, created.Session, 0x51)
 
-	connection := dialHTTPTest(t, application.address)
+	connection := dialPathMSSTest(t, application.address)
 	defer connection.Close()
 	if tcp, ok := connection.(*net.TCPConn); ok {
 		if err := tcp.SetReadBuffer(4096); err != nil {

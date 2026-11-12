@@ -7,11 +7,13 @@ import (
 	"context"
 	"net"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/panjf2000/gnet/v2"
 	"github.com/scratch-net/telego/pkg/transport/obfuscated2"
+	"golang.org/x/sys/unix"
 )
 
 type stallObservedDCHandler struct {
@@ -176,11 +178,46 @@ func TestDirectRelayStalledReaderTimerWakeups(t *testing.T) {
 	}
 }
 
+// pathMSSTCPPair is directTCPPair with the dialed end advertising a path MSS.
+// Loopback otherwise uses a 64 KiB MSS. With a small receive buffer that MSS
+// makes acknowledgement timing depend on the kernel version: Linux 7.0 drops
+// the oversized segments and acknowledges in bursts seconds apart.
+func pathMSSTCPPair(t *testing.T, mss int) (*net.TCPConn, *net.TCPConn) {
+	t.Helper()
+	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	dialer := net.Dialer{Control: func(_, _ string, raw syscall.RawConn) error {
+		var socketErr error
+		if err := raw.Control(func(fd uintptr) {
+			socketErr = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_MAXSEG, mss)
+		}); err != nil {
+			return err
+		}
+		return socketErr
+	}}
+	connection, err := dialer.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := connection.(*net.TCPConn)
+	accepted, err := listener.AcceptTCP()
+	if err != nil {
+		peer.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = peer.Close(); _ = accepted.Close() })
+	return peer, accepted
+}
+
 // slowSteadyRelay starts a direct relay whose client reads chunk bytes every
-// readEvery. The client also sends pings, as a real client does.
+// readEvery. The client also sends pings, as a real client does. The client
+// advertises an Ethernet-sized MSS, as a client on a real path does.
 func slowSteadyRelay(t *testing.T, readEvery time.Duration, chunk int) (*ConnContext, *stallObservedDCHandler) {
 	t.Helper()
-	client, clientSocket := directTCPPair(t)
+	client, clientSocket := pathMSSTCPPair(t, 1400)
 	dc, dcSocket := directTCPPair(t)
 	if err := client.SetReadBuffer(4096); err != nil {
 		t.Fatal(err)
