@@ -33,7 +33,7 @@ jobs:
       - name: Set up Node for bridge behavior tests
         uses: actions/setup-node@v7.1.0
         with:
-          node-version: '26.13.0'
+          node-version: '26.13.1'
           package-manager-cache: false
 
       - name: Build

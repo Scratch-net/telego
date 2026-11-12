@@ -8,12 +8,12 @@ frozenlist==1.8.0
 greenlet==3.5.6
 idna==3.20
 multidict==7.2.1
-playwright==1.65.0
+playwright==1.65.1
 propcache==0.5.4
 pyaes==1.6.1
 pyasn1==0.6.5
 pycparser==3.12
-pyee==16.0.1
+pyee==16.0.2
 python-socks==3.2.1
 rsa==4.9.1
 Telethon==1.45.0

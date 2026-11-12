@@ -8,7 +8,7 @@ require (
 	github.com/alecthomas/kong v1.17.0
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/gobwas/ws v1.5.0
-	github.com/gotd/td v0.163.0
+	github.com/gotd/td v0.165.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/panjf2000/gnet/v2 v2.10.0
 	github.com/pelletier/go-toml/v2 v2.4.3
@@ -61,7 +61,6 @@ require (
 	github.com/prometheus/otlptranslator v1.0.0 // indirect
 	github.com/prometheus/procfs v0.23.0 // indirect
 	github.com/refraction-networking/utls v1.8.2 // indirect
-	github.com/rogpeppe/go-internal v1.16.0 // indirect
 	github.com/segmentio/asm v1.2.1 // indirect
 	github.com/shopspring/decimal v1.6.0 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
@@ -76,7 +75,7 @@ require (
 	go.uber.org/atomic v1.12.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.28.0 // indirect
-	golang.org/x/crypto v0.58.0 // indirect
+	golang.org/x/crypto v0.59.0 // indirect
 	golang.org/x/exp v0.0.0-20261109185158-a52e3aef5920 // indirect
 	golang.org/x/mod v0.43.0 // indirect
 	golang.org/x/sync v0.25.0 // indirect
