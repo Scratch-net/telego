@@ -851,7 +851,11 @@ func (s *Server) Start() error {
 	if address == "" {
 		address = ":http"
 	}
-	listener, err := net.Listen("tcp", address)
+	// Go enables MPTCP on listeners by default. The metrics endpoint has no
+	// use for it, so it accepts plain TCP only.
+	var lc net.ListenConfig
+	lc.SetMultipathTCP(false)
+	listener, err := lc.Listen(context.Background(), "tcp", address)
 	if err != nil {
 		return err
 	}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"os"
 	"testing"
 	"time"
 )
@@ -57,5 +58,36 @@ func TestMetricsStartReturnsOccupiedPortError(t *testing.T) {
 		t.Fatal("Start hid the occupied-port error")
 	} else if op, ok := errors.AsType[*net.OpError](err); !ok || op.Op != "listen" {
 		t.Fatalf("Start error = %v, want a listen error", err)
+	}
+}
+
+func TestMetricsListenerRefusesMPTCP(t *testing.T) {
+	if _, err := os.Stat("/proc/sys/net/mptcp/enabled"); err != nil {
+		t.Skip("kernel without MPTCP")
+	}
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := probe.Addr().String()
+	_ = probe.Close()
+	server := &Server{httpServer: &http.Server{Addr: address}}
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.httpServer.Close() })
+	var dialer net.Dialer
+	dialer.SetMultipathTCP(true)
+	conn, err := dialer.DialContext(t.Context(), "tcp", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	used, err := conn.(*net.TCPConn).MultipathTCP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if used {
+		t.Fatal("metrics listener accepted MPTCP")
 	}
 }
