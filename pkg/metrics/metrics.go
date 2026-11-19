@@ -47,6 +47,12 @@ type maskFallbackStatsProvider interface {
 	ReplayCacheEvictions() uint64
 }
 
+// tlsFingerprintStatsProvider supplies the bounded top of client JA4
+// fingerprints.
+type tlsFingerprintStatsProvider interface {
+	TLSFingerprintStats() []gproxy.TLSFingerprintStat
+}
+
 // connectionCloseStatsProvider supplies established connection closes by
 // reason.
 type connectionCloseStatsProvider interface {
@@ -539,6 +545,18 @@ func registerProxyMetrics(meter metric.Meter, provider ProxyStatsProvider) {
 			metric.WithDescription("Replay cache entries evicted before their TTL because the cache was full"),
 			metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
 				observer.Observe(metricValue(fallback.ReplayCacheEvictions()))
+				return nil
+			}),
+		)
+	}
+	if fingerprints, ok := provider.(tlsFingerprintStatsProvider); ok {
+		meter.Int64ObservableGauge("telego_tls_client_fingerprints",
+			metric.WithDescription("ClientHellos since start by kind and JA4 fingerprint: the 16 most frequent per kind, the rest as ja4=\"other\""),
+			metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
+				for _, stat := range fingerprints.TLSFingerprintStats() {
+					observer.Observe(metricValue(stat.Count), metric.WithAttributes(
+						attribute.String("kind", stat.Kind), attribute.String("ja4", stat.JA4)))
+				}
 				return nil
 			}),
 		)

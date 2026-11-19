@@ -66,6 +66,7 @@ type ProxyHandler struct {
 	handshakeFailures [handshakeFailureStageCount]atomic.Uint64
 	maskFallbacks     [maskFallbackReasonCount]atomic.Uint64
 	connectionCloses  [closeReasonCount]atomic.Uint64
+	tlsFingerprints   [tlsFingerprintKindCount]tlsFingerprintTable
 
 	connectionLimitLog logRateLimit
 	ipLimitLog         logRateLimit

@@ -251,6 +251,7 @@ func (h *ProxyHandler) handleTLSPayload(c clientEndpoint, ctx *ConnContext) gnet
 			}
 		}
 		h.recordMaskFallback(reason)
+		h.recordTLSFingerprint(tlsFingerprintMaskFallback, payload)
 		return h.startSplice(c, ctx)
 	}
 
@@ -272,8 +273,11 @@ func (h *ProxyHandler) handleTLSPayload(c clientEndpoint, ctx *ConnContext) gnet
 		h.logger.Debug("[#%d] replay attack detected", ctx.id)
 		h.spliceToDomain(ctx, sni)
 		h.recordMaskFallback(maskFallbackReplay)
+		h.recordTLSFingerprint(tlsFingerprintMaskFallback, payload)
 		return h.startSplice(c, ctx)
 	}
+	// The payload can refer to the input buffer, so count it before Discard.
+	h.recordTLSFingerprint(tlsFingerprintAuthenticated, payload)
 
 	// Discard the TLS record from buffer
 	c.Discard(needed)

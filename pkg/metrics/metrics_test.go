@@ -31,6 +31,9 @@ type countingStatsProvider struct {
 // The production handler must expose the optional close counter.
 var _ connectionCloseStatsProvider = (*gproxy.ProxyHandler)(nil)
 
+// The production handler must expose the JA4 top.
+var _ tlsFingerprintStatsProvider = (*gproxy.ProxyHandler)(nil)
+
 type mockProxyStatsProvider struct{}
 
 func (mockProxyStatsProvider) HandshakeFailureStats() []gproxy.HandshakeFailureStat {
@@ -42,6 +45,13 @@ func (mockProxyStatsProvider) MaskFallbackStats() []gproxy.MaskFallbackStat {
 }
 
 func (mockProxyStatsProvider) ReplayCacheEvictions() uint64 { return 9 }
+
+func (mockProxyStatsProvider) TLSFingerprintStats() []gproxy.TLSFingerprintStat {
+	return []gproxy.TLSFingerprintStat{
+		{Kind: "authenticated", JA4: "t13d1516h2_8daaf6152771_e5627efa2ab1", Count: 11},
+		{Kind: "authenticated", JA4: "other", Count: 2},
+	}
+}
 
 func (mockProxyStatsProvider) ConnectionCloseStats() []gproxy.ConnectionCloseStat {
 	return []gproxy.ConnectionCloseStat{{Reason: "relay_stall_downlink", Total: 4}}
@@ -251,6 +261,8 @@ func TestMetricsIntegration(t *testing.T) {
 		"telego_handshake_failures_total",
 		`telego_mask_fallbacks_total{otel_scope_name="telego",otel_scope_schema_url="",otel_scope_version="",reason="replay"} 6`,
 		`telego_replay_cache_evictions_total{otel_scope_name="telego",otel_scope_schema_url="",otel_scope_version=""} 9`,
+		`telego_tls_client_fingerprints{ja4="t13d1516h2_8daaf6152771_e5627efa2ab1",kind="authenticated",otel_scope_name="telego",otel_scope_schema_url="",otel_scope_version=""} 11`,
+		`telego_tls_client_fingerprints{ja4="other",kind="authenticated",otel_scope_name="telego",otel_scope_schema_url="",otel_scope_version=""} 2`,
 		`telego_connection_closes_total{otel_scope_name="telego",otel_scope_schema_url="",otel_scope_version="",reason="relay_stall_downlink"} 4`,
 		"telego_web_websocket_connections_active",
 		"telego_web_sessions_active",
