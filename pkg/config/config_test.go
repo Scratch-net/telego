@@ -1507,3 +1507,23 @@ func TestDisabledSecretsRejectUnknownName(t *testing.T) {
 		t.Fatalf("err = %v, want unknown secret name", err)
 	}
 }
+
+func TestProfileCacheDir(t *testing.T) {
+	cfg := Config{
+		Secrets:     map[string]string{"alice": "0123456789abcdef0123456789abcdef"},
+		TLSFronting: TLSFrontingConfig{MaskHost: "proxy.example.com"},
+	}
+	runtime, err := cfg.ToGProxyConfig()
+	if err != nil || runtime.ProfileCacheDir != "" {
+		t.Fatalf("default: dir = %q, err = %v; want off", runtime.ProfileCacheDir, err)
+	}
+	cfg.TLSFronting.ProfileCacheDir = "/var/lib/telego"
+	runtime, err = cfg.ToGProxyConfig()
+	if err != nil || runtime.ProfileCacheDir != "/var/lib/telego" {
+		t.Fatalf("absolute: dir = %q, err = %v", runtime.ProfileCacheDir, err)
+	}
+	cfg.TLSFronting.ProfileCacheDir = "cache"
+	if _, err := cfg.ToGProxyConfig(); err == nil {
+		t.Fatal("relative profile-cache-dir was accepted")
+	}
+}

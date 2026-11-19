@@ -387,6 +387,7 @@ mask-host = "www.google.com"  # Host to mimic (SNI validation, proxy links)
 # splice-idle-timeout = "30s" # Idle timeout for spliced connections (default: 30s)
 # fake-cert-size = 0          # Fake cert record size; 0 = auto-match mask host (clamp 256..16384)
 # mask-sni-safelist = ["www.microsoft.com"]  # Probes with these SNIs front to that domain (off = empty)
+# profile-cache-dir = "/var/lib/telego"     # Keep the last good ServerHello profile on disk (off = empty)
 
 # Anti-DPI record shaping (proxy -> client direction)
 # enable-drs = true        # Probe-then-ramp record sizing (1369 -> 16384 bytes after 8 records or 128 KB)
@@ -499,6 +500,30 @@ services:
     cap_add:
       - NET_BIND_SERVICE
 ```
+
+### TLS Front Profile Cache
+
+`[tls-fronting] profile-cache-dir` keeps the last good mask ServerHello profile on disk.
+It is off by default.
+Without it, a restart with a failed first fetch sends a synthetic ServerHello until a retry succeeds.
+With it, telego loads the saved profile before the first fetch.
+
+- telego writes the file at most once per hour, with mode 0600.
+- telego ignores a file with a different host or port, a file larger than 64 KiB, a file older than 7 days, or a ServerHello that is not a valid TLS 1.3 record.
+- A failed write logs a warning. It does not stop the refresh.
+
+In Docker, mount a writable volume:
+
+```bash
+docker run -d \
+  --name telego \
+  -p 443:443 \
+  -v /path/to/config.toml:/config.toml \
+  -v telego-cache:/var/lib/telego \
+  scratchnet/telego:latest
+```
+
+Under systemd with `ProtectSystem=strict`, add `StateDirectory=telego` to the service and use `/var/lib/telego`.
 
 ### Build Locally
 

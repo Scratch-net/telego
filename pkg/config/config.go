@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -77,6 +78,10 @@ type TLSFrontingConfig struct {
 	// ServerHelloPaceScope selects what server-hello-segment-size paces:
 	// "response" (default) or "first-record".
 	ServerHelloPaceScope string `toml:"server-hello-pace-scope"`
+
+	// ProfileCacheDir keeps the last good mask ServerHello profile on disk.
+	// Empty = off. Must be an absolute path.
+	ProfileCacheDir string `toml:"profile-cache-dir"`
 
 	// MaskSNISafelist: opt-in extra domains an unauthenticated probe may be
 	// fronted to when its ClientHello SNI matches. Empty = off (never a relay).
@@ -274,6 +279,9 @@ func (c *Config) validateScalars() error {
 			return fmt.Errorf("%s must be between 0 and 65535 (0 uses the default)", field.name)
 		}
 	}
+	if dir := c.TLSFronting.ProfileCacheDir; dir != "" && !filepath.IsAbs(dir) {
+		return errors.New("tls-fronting.profile-cache-dir must be an absolute path")
+	}
 	if c.TLSFronting.SpliceProxyProtocol < 0 || c.TLSFronting.SpliceProxyProtocol > 2 {
 		return errors.New("tls-fronting.splice-proxy-protocol must be 0, 1, or 2")
 	}
@@ -382,6 +390,7 @@ func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
 	cfg.ServerHelloSegmentSize = c.TLSFronting.ServerHelloSegmentSize
 	cfg.ServerHelloPaceFirstRecord = c.TLSFronting.ServerHelloPaceScope == "first-record"
 	cfg.MaskSNISafelist = c.TLSFronting.MaskSNISafelist
+	cfg.ProfileCacheDir = c.TLSFronting.ProfileCacheDir
 
 	// Splice target (defaults to mask-host:mask-port if not set)
 	cfg.SpliceHost = c.TLSFronting.SpliceHost

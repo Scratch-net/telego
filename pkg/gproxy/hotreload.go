@@ -311,7 +311,7 @@ func (r *HotReloader) warnNonHotChanges(old, new *Config) bool {
 		restartRequired = true
 	}
 
-	if old.MaskHost != new.MaskHost || old.MaskPort != new.MaskPort {
+	if old.MaskHost != new.MaskHost || old.MaskPort != new.MaskPort || old.ProfileCacheDir != new.ProfileCacheDir {
 		r.logger.Warn("TLS fronting settings changed but requires restart")
 		restartRequired = true
 	}

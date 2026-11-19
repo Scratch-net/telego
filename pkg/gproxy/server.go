@@ -58,6 +58,9 @@ type Config struct {
 	// ServerHelloPaceFirstRecord paces only the first TLS record, at most
 	// maxPacedFirstRecord bytes, and sends the rest in one write.
 	ServerHelloPaceFirstRecord bool
+	// ProfileCacheDir keeps the last good mask ServerHello profile on disk, so
+	// a restart can serve it when the first fetch fails. Empty = off.
+	ProfileCacheDir string
 
 	// MaskSNISafelist is an opt-in list of extra domains that an unauthenticated
 	// probe may be fronted to. When a bad-secret ClientHello's SNI is on this

@@ -102,6 +102,15 @@ mask-host = "www.google.com"
 # to override. Clamped to 256..16384.
 # fake-cert-size = 0
 
+# Keep the last good mask ServerHello profile on disk (optional, default off).
+# telego fetches the profile at startup. If that fetch fails, connections get
+# a synthetic ServerHello until a retry succeeds. With this directory set, a
+# restart loads the saved profile first, so a failed fetch still serves it.
+# telego checks the file like a fresh fetch: host and port, size, age (at most
+# 7 days) and a valid TLS 1.3 ServerHello. A file that fails a check is ignored.
+# Use an absolute path that telego can write. In Docker, mount a volume there.
+# profile-cache-dir = "/var/lib/telego"
+
 # SNI-following mask safelist (opt-in active-probe robustness).
 # When an unauthenticated probe presents a ClientHello whose SNI is on this
 # list, it is fronted to THAT domain's own server (port 443) instead of the

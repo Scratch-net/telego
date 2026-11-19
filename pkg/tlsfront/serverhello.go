@@ -30,6 +30,12 @@ type ServerHelloFetcher struct {
 	lastFetch     time.Time
 	refreshPeriod time.Duration
 	worker        refreshWorker
+
+	// Optional disk cache, set before the first refresh. lastSave is
+	// protected by refreshMu.
+	cacheDir  string
+	saveError func(error)
+	lastSave  time.Time
 }
 
 // CertRecordLen returns the payload length of the mask backend's first
@@ -184,13 +190,17 @@ func (f *ServerHelloFetcher) RefreshContext(ctx context.Context) error {
 	template, _ := faketls.ParseServerHelloTemplate(response)
 
 	// Publish only a complete, validated template. Network work never holds mu.
+	fetchedAt := time.Now()
 	f.mu.Lock()
 	f.cachedFull = bytes.Clone(response)
 	f.randomOffset = randomOffset
 	f.template = template
 	f.certRecordLen = certRecordLen
-	f.lastFetch = time.Now()
+	f.lastFetch = fetchedAt
 	f.mu.Unlock()
+	if template != nil {
+		f.persist(response, certRecordLen, fetchedAt)
+	}
 	return nil
 }
 
