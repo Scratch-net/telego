@@ -1522,3 +1522,75 @@ test('default https bridge never asks for a streamed downlink', async () => {
   assert.equal(downs[0].headers.Accept, undefined);
   h.pagehide(); await flush(); assertClean(h);
 });
+
+function padFrame(size) {
+  const data = new Uint8Array(8 + size);
+  new DataView(data.buffer).setUint8(0, 7); new DataView(data.buffer).setUint32(4, size);
+  return data;
+}
+
+function frameTypes(buffer) {
+  const view = new DataView(buffer), types = [];
+  for (let offset = 0; offset < buffer.byteLength; offset += 8 + view.getUint32(offset + 4)) types.push(view.getUint8(offset));
+  return types;
+}
+
+test('https bridge discards downlink PAD frames', async () => {
+  const data = dataFrame(1, 3);
+  const mixed = Buffer.concat([Buffer.from(data), Buffer.from(padFrame(700))]);
+  const { h } = await streamDownBridge('', (count, options) => {
+    if (count === 1) return Promise.resolve(new Response(mixed, { headers: { 'X-Down-Cursor': '1', 'Content-Length': String(mixed.length) } }));
+    if (count === 2) return Promise.resolve(new Response(padFrame(0), { headers: { 'X-Down-Cursor': '2', 'Content-Length': '8' } }));
+    return parked(options);
+  });
+  await flush();
+  const frames = h.messages.filter(value => value instanceof ArrayBuffer && new DataView(value).getUint8(0) !== 17);
+  assert.deepEqual(frames.map(value => Buffer.from(value)), [Buffer.from(data)], 'only the DATA frame reaches Telegram');
+  assert.equal(h.messages.some(value => value.t === 'close' || value.state === 'failed'), false);
+  h.pagehide(); await flush(); assertClean(h);
+});
+
+test('websocket bridge discards PAD frames inside a message', async () => {
+  const h = await liveBridge('websocket');
+  const data = dataFrame(1, 3);
+  h.sockets[0].emit('message', Uint8Array.from(Buffer.concat([Buffer.from(padFrame(10)), Buffer.from(data)])).buffer); await flush();
+  h.sockets[0].emit('message', padFrame(20).buffer); await flush();
+  const frames = h.messages.filter(value => value instanceof ArrayBuffer && new DataView(value).getUint8(0) !== 17);
+  assert.deepEqual(frames.map(value => Buffer.from(value)), [Buffer.from(data)]);
+  assert.equal(h.messages.some(value => value.t === 'close' || value.state === 'failed'), false);
+  h.pagehide(); await flush(); assertClean(h);
+});
+
+for (const carrier of ['https', 'websocket']) {
+  test(carrier + ': padding bridge pads only the first eight uplink batches', async () => {
+    const h = await liveBridge(carrier, false, undefined, 'pad');
+    const sent = () => carrier === 'https'
+      ? h.requests.filter(request => request.url.endsWith('/api/v1/up')).map(request => request.options.body)
+      : h.sockets[0].sent;
+    nativeFrame(h, 1); await flush();
+    for (let index = 0; index < 9; index++) { nativeFrame(h, 1, 2); await flush(); }
+    const bodies = sent();
+    assert.equal(bodies.length, 10);
+    bodies.forEach((body, index) => {
+      const types = frameTypes(body);
+      if (index < 8) {
+        assert.equal(types.at(-1), 7, 'batch ' + index + ' ends with PAD');
+        assert.ok(body.byteLength >= 900 && body.byteLength <= 1400 + 8, 'short batch padded to 900-1400 bytes');
+      } else assert.equal(types.includes(7), false, 'batch ' + index + ' is not padded');
+    });
+    h.pagehide(); await flush(); assertClean(h);
+  });
+}
+
+test('default bridges never pad uplink batches', async () => {
+  for (const carrier of ['https', 'websocket']) {
+    const h = await liveBridge(carrier);
+    nativeFrame(h, 1); await flush();
+    const bodies = carrier === 'https'
+      ? h.requests.filter(request => request.url.endsWith('/api/v1/up')).map(request => request.options.body)
+      : h.sockets[0].sent;
+    assert.equal(bodies.length, 1);
+    assert.equal(bodies[0].byteLength, 8);
+    h.pagehide(); await flush(); assertClean(h);
+  }
+});

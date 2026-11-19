@@ -185,6 +185,13 @@ carrier = "websocket"
 # a large download. Each message also costs one more browser event.
 # websocket-fair-queue = false
 
+# Experimental, https and websocket carriers only. Pad the first 8 carrier
+# batches in each direction, as Xray Vision does: a batch under 900 bytes grows
+# to 900 plus 0-500 bytes, and a longer batch gets 0-256 more bytes. This hides
+# MTProto handshake sizes but adds bytes. Evidence shows that the censor counts
+# bytes on each connection, not frame sizes, so padding stays off by default.
+# pad-first-frames = false
+
 # Telegram Middle-End transport is enabled by default, including when this section is absent.
 # Telego checks ME connections in the background and uses direct DC routes until ME is ready.
 # Changes to this section require a restart.

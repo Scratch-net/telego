@@ -6,12 +6,27 @@ const maxSequence=18446744073709551615n;
 // returns this bridge to plain polls for the rest of its life.
 let downStreaming=streamDownload;
 const downStreamType='application/vnd.telego.web-stream';
+// Opt-in padding of the first uplink batches, as in Xray Vision: a batch under
+// 900 bytes grows to 900 plus 0-500 bytes, a longer batch gets 0-256 bytes.
+const padUpBatches=8;
+let upPadBatches=padFrames?padUpBatches:0;
+function padUp(body){
+ if(!upPadBatches)return body;upPadBatches--;
+ let frames=0;visitFrames(body,()=>{frames++});if(frames>=maxFrames)return body;
+ const content=body.byteLength,random=limit=>Math.floor(Math.random()*(limit+1));
+ const size=Math.min(content<900?Math.max(0,900+random(500)-content-8):random(256),2048,batchLimit-content-8);
+ if(size<0)return body;
+ const padded=new Uint8Array(content+8+size);padded.set(new Uint8Array(body));
+ const view=new DataView(padded.buffer,content);view.setUint8(0,7);view.setUint32(4,size);
+ return padded.buffer;
+}
 function newHTTPUp(){return {sequence:1n,frontier:0n,completed:new Set(),active:new Map()}}
 function launchHTTPUp(state,pending,lane){
  const generation=epoch;
  while(current(generation)&&sessionToken&&pending.length&&state.sequence<=state.frontier+BigInt(httpWindow)){
   if(state.sequence>maxSequence){fail(lane?'lane_up':'up_send',new Error('uplink rejected'),lane&&lane.id);return}
   const batch=joinPending(pending),sequence=state.sequence++,key=String(sequence);
+  if(!lane)batch.body=padUp(batch.body);
   state.active.set(key,batch);
   const alive=()=>current(generation)&&(!lane||lanes.get(lane.id)===lane);
   const settle=()=>{
@@ -57,6 +72,7 @@ function validateDownFrame(view,offset,size,lane){
  else if(type===4){if(!id||size!==4||view.getUint32(offset+8)===0)throw new Error('invalid frame')}
  else if(type===5){if(id||size>64)throw new Error('invalid frame')}
  else if(type===31){if(id)throw new Error('invalid frame')}
+ else if(type===7){if(id||size>2048)throw new Error('invalid frame')}
  else throw new Error('invalid frame');
 }
 async function readDownlink(response,lane,signal,deadline){
@@ -145,4 +161,5 @@ async function pollHTTPS(lane){
 function resetHTTPS(){
  releaseDown(httpDown);for(const lane of lanes.values()){releaseDown(lane.downState);if(lane.upState)lane.upState.active.clear()}
  httpUp.active.clear();httpUp.completed.clear();httpUp.sequence=1n;httpUp.frontier=0n;httpWindow=1;
+ upPadBatches=padFrames?padUpBatches:0;
 }

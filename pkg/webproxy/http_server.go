@@ -172,7 +172,7 @@ func NewHTTPServer(config HTTPServerConfig) (*HTTPServer, error) {
 	server := &HTTPServer{
 		config: config,
 		renderBridge: func(hostname, token string, batch int, carrier CarrierMode, streams int, diagnostics bool) (BridgePage, error) {
-			features := bridgeFeatures{streamDownload: config.Manager.streamDownload}
+			features := bridgeFeatures{streamDownload: config.Manager.streamDownload, padding: config.Manager.padFirstFrames}
 			return renderBridgeAtPath(hostname, token, batch, carrier, streams, diagnostics, config.BasePath, features)
 		},
 		ready:          make(chan struct{}),

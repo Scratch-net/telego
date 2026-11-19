@@ -55,6 +55,16 @@ func TestBridgeBoundedIO(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "https.stream.html"), page.Body, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	for _, carrier := range []CarrierMode{CarrierHTTPS, CarrierWebSocket} {
+		page, err := renderBridgeAtPath("proxy.example.com", token, maxCarrierBatchBytes, carrier,
+			DefaultLimits().MaxStreamsPerSession, true, "", bridgeFeatures{padding: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, string(carrier)+".pad.html"), page.Body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	// Keep one process so the context deadline also stops a stuck test runner.

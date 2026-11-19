@@ -100,6 +100,9 @@ type ManagerConfig struct {
 	// WebSocketFairQueue schedules multiplexed WebSocket downlink messages
 	// fairly across streams and caps each message at 160 KiB.
 	WebSocketFairQueue bool
+	// PadFirstFrames adds one PAD frame to each of the first downlink
+	// batches of https and websocket sessions. Lanes carriers ignore it.
+	PadFirstFrames     bool
 	Profiles           []Profile
 	Backend            string
 	Carrier            CarrierMode

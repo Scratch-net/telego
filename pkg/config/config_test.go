@@ -1134,6 +1134,27 @@ func TestWebProxyWebSocketFairQueueRequiresWebSocket(t *testing.T) {
 	}
 }
 
+func TestWebProxyPadFirstFramesCarriers(t *testing.T) {
+	for _, carrier := range []string{"", "https", "https-lanes", "websocket", "websocket-lanes"} {
+		cfg := &Config{
+			Secrets:  map[string]string{"alice": "0123456789abcdef0123456789abcdef"},
+			WebProxy: WebProxyConfig{Enabled: true, Hostname: "proxy.example.com", Carrier: carrier, PadFirstFrames: true},
+		}
+		runtime, err := cfg.ToWebProxyRuntimeConfig("0.0.0.0:443")
+		supported := carrier == "" || carrier == "https" || carrier == "websocket"
+		if supported && (err != nil || !runtime.PadFirstFrames) ||
+			!supported && (err == nil || !strings.Contains(err.Error(), "pad-first-frames")) {
+			t.Fatalf("carrier %q: pad=%t err=%v", carrier, runtime.PadFirstFrames, err)
+		}
+	}
+	cfg := &Config{WebProxy: WebProxyConfig{Enabled: true}}
+	fingerprint := cfg.webProxyFingerprint()
+	cfg.WebProxy.PadFirstFrames = true
+	if fingerprint == cfg.webProxyFingerprint() {
+		t.Fatal("pad-first-frames change omitted from restart fingerprint")
+	}
+}
+
 func TestWebProxyConfigDefaults(t *testing.T) {
 	cfg := Config{
 		Secrets: map[string]string{"alice": "0123456789abcdef0123456789abcdef"},

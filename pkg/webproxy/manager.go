@@ -87,6 +87,7 @@ type Manager struct {
 	debugDiagnostics bool
 	streamDownload   bool // https carrier only
 	fairDown         bool // websocket carrier only
+	padFirstFrames   bool // https and websocket carriers only
 
 	// Built from the copied profiles before publication; never mutated.
 	capabilityPrefixes map[uint64]struct{}
@@ -159,6 +160,7 @@ func NewManager(config ManagerConfig) (*Manager, error) {
 		debugDiagnostics: config.DebugDiagnostics,
 		streamDownload:   config.StreamDownload && config.Carrier == CarrierHTTPS,
 		fairDown:         config.WebSocketFairQueue && config.Carrier == CarrierWebSocket,
+		padFirstFrames:   config.PadFirstFrames && !config.Carrier.usesLanes(),
 
 		capabilityPrefixes: make(map[uint64]struct{}, len(config.Profiles)),
 
@@ -342,6 +344,7 @@ func (a *BootstrapAuthorization) create(clientIP string, body []byte, owner gnet
 		carrier:               m.carrier,
 		downFrameBytes:        m.downFrameBytes,
 		fairDown:              m.fairDown,
+		padFirstFrames:        m.padFirstFrames,
 		clientIP:              clientIP,
 		backendNet:            m.backendNet,
 		backend:               m.backend,

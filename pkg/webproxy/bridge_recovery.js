@@ -46,9 +46,22 @@ function acceptNative(data){
  result.set(new Uint8Array(data,previous),offset);
  return result.buffer;
 }
+// Padding frames (type 7) are carrier-only and never reach Telegram.
 function deliver(data){
- visitFrames(data,(type,id)=>{if(type===3)activeStreams.delete(id)});
- lastActivity=Date.now();port.postMessage({t:'traffic',up:0,down:data.byteLength});port.postMessage(data,[data]);
+ let padding=null;
+ visitFrames(data,(type,id,start,end)=>{
+  if(type===3)activeStreams.delete(id);
+  else if(type===7){if(id||end-start-8>2048)throw new Error('invalid frame');(padding||(padding=[])).push([start,end])}
+ });
+ lastActivity=Date.now();
+ if(padding){
+  const kept=new Uint8Array(data.byteLength-padding.reduce((total,[start,end])=>total+end-start,0));let offset=0,previous=0;
+  for(const [start,end] of padding){kept.set(new Uint8Array(data,previous,start-previous),offset);offset+=start-previous;previous=end}
+  kept.set(new Uint8Array(data,previous),offset);
+  if(!kept.byteLength)return;
+  data=kept.buffer;
+ }
+ port.postMessage({t:'traffic',up:0,down:data.byteLength});port.postMessage(data,[data]);
 }
 function retireCarrier(){
  resetHTTPS();

@@ -154,6 +154,8 @@ type WebProxyConfig struct {
 	StreamDownload bool `toml:"stream-download"`
 	// WebSocketFairQueue schedules websocket downlink fairly across streams.
 	WebSocketFairQueue bool `toml:"websocket-fair-queue"`
+	// PadFirstFrames pads the first carrier batches in both directions.
+	PadFirstFrames bool `toml:"pad-first-frames"`
 }
 
 // MiddleEndConfig configures Telegram's official Middle-End transport, which
@@ -191,6 +193,7 @@ type WebProxyRuntimeConfig struct {
 	CarrierBatchBytes  int
 	StreamDownload     bool
 	WebSocketFairQueue bool
+	PadFirstFrames     bool
 }
 
 // Duration is a TOML-parseable duration.
@@ -507,6 +510,9 @@ func (c *Config) ToWebProxyRuntimeConfig(mtProxyBind string) (WebProxyRuntimeCon
 	if c.WebProxy.WebSocketFairQueue && carrier != webproxy.CarrierWebSocket {
 		return WebProxyRuntimeConfig{}, errors.New("web-proxy.websocket-fair-queue requires carrier \"websocket\"")
 	}
+	if c.WebProxy.PadFirstFrames && carrier != webproxy.CarrierHTTPS && carrier != webproxy.CarrierWebSocket {
+		return WebProxyRuntimeConfig{}, errors.New("web-proxy.pad-first-frames requires carrier \"https\" or \"websocket\"")
+	}
 
 	bindAddr := c.WebProxy.BindTo
 	if bindAddr == "" {
@@ -579,6 +585,7 @@ func (c *Config) ToWebProxyRuntimeConfig(mtProxyBind string) (WebProxyRuntimeCon
 		CarrierBatchBytes:    c.WebProxy.CarrierBatchKiB * 1024,
 		StreamDownload:       c.WebProxy.StreamDownload,
 		WebSocketFairQueue:   c.WebProxy.WebSocketFairQueue,
+		PadFirstFrames:       c.WebProxy.PadFirstFrames,
 	}, nil
 }
 
@@ -624,7 +631,7 @@ func (c *Config) webProxyFingerprint() string {
 	}
 	trusted := strings.Join(c.WebProxy.TrustedProxyCIDRs, ",")
 	return fmt.Sprintf(
-		"enabled=%t\x00bind=%s\x00hostname=%s\x00base-path=%s\x00backend=%s\x00carrier=%s\x00trusted=%s\x00loops=%d\x00batch=%d\x00stream=%t\x00fair=%t",
+		"enabled=%t\x00bind=%s\x00hostname=%s\x00base-path=%s\x00backend=%s\x00carrier=%s\x00trusted=%s\x00loops=%d\x00batch=%d\x00stream=%t\x00fair=%t\x00pad=%t",
 		c.WebProxy.Enabled,
 		c.WebProxy.BindTo,
 		c.WebProxy.Hostname,
@@ -636,6 +643,7 @@ func (c *Config) webProxyFingerprint() string {
 		c.WebProxy.CarrierBatchKiB,
 		c.WebProxy.StreamDownload,
 		c.WebProxy.WebSocketFairQueue,
+		c.WebProxy.PadFirstFrames,
 	)
 }
 

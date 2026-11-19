@@ -148,7 +148,7 @@ func TestRenderBridgeWebSocketCarrierImplementations(t *testing.T) {
 				"socket.binaryType='arraybuffer'",
 				"event.data instanceof ArrayBuffer",
 				"if(carrier==='websocket')await openWebSocket()",
-				"webSocket.send(batch.body)",
+				"webSocket.send(padUp(batch.body))",
 				"webSocket.bufferedAmount+queuedBytes>queueByteLimit",
 				"socket.onclose=event=>{if(current(generation))fail('ws_closed'",
 				"function openWebSocketLane(lane)",

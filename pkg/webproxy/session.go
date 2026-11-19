@@ -34,6 +34,7 @@ type sessionOptions struct {
 	carrier               CarrierMode
 	downFrameBytes        int
 	fairDown              bool
+	padFirstFrames        bool
 	clientIP              string
 	backendNet            string
 	backend               string
@@ -96,6 +97,7 @@ type carrierLane struct {
 	unackedOwner    *carrierBatchOwnership
 	downCursor      uint64
 	fairAfter       uint32 // fair scheduling starts after this stream ID
+	unackedPadded   bool   // the unacked batch ends with one PAD frame
 	lastUpSequence  uint64
 	lastUpDigest    [16]byte
 	upHistory       [httpUpWindow]upCommit
@@ -126,6 +128,7 @@ type Session struct {
 	carrier        CarrierMode
 	downFrameBytes int // 0 keeps the default DATA frame sizes
 	fairDown       bool
+	padBatches     int // remaining new downlink batches that get a PAD frame
 	clientIP       string
 	backendNet     string
 	backend        string
@@ -207,6 +210,10 @@ func newSession(options sessionOptions) *Session {
 		(downFrameBytes == 0 || downFrameBytes > limit) {
 		downFrameBytes = limit
 	}
+	padBatches := 0
+	if options.padFirstFrames && !carrier.usesLanes() {
+		padBatches = padDownlinkBatches
+	}
 	carrierLanes := make(map[uint32]*carrierLane)
 	if carrier != CarrierWebSocketLanes {
 		carrierLanes[0] = newCarrierLane()
@@ -216,6 +223,7 @@ func newSession(options sessionOptions) *Session {
 		carrier:               carrier,
 		downFrameBytes:        downFrameBytes,
 		fairDown:              fairDown,
+		padBatches:            padBatches,
 		clientIP:              options.clientIP,
 		backendNet:            options.backendNet,
 		backend:               options.backend,
@@ -972,6 +980,7 @@ func (s *Session) pollCarrier(
 			} else {
 				batch = s.takeDownBatchLocked(lane)
 			}
+			lane.unackedPadded = s.padDownBatchLocked(&batch)
 			lane.downCursor++
 			lane.unackedBase = cursor
 			lane.unacked = batch.body
@@ -1072,7 +1081,8 @@ func (s *Session) validateBatchLocked(frames []Frame) bool {
 	changed := make(map[uint32]streamSnapshot)
 	for _, frame := range frames {
 		if frame.StreamID == 0 {
-			if frame.Type != FramePong {
+			// The bridge can pad any uplink batch. Padding is discarded.
+			if frame.Type != FramePong && frame.Type != FramePad {
 				return false
 			}
 			continue
@@ -1634,7 +1644,11 @@ func (s *Session) nextStreamChunk(ctx context.Context, lease *PollLease, deadlin
 		}
 		if len(lane.pendingFrames) != 0 {
 			start := len(lane.unacked)
-			batch := s.takeDownFramesLocked(lane, s.limits.CarrierBatchBytes-start, MaxBatchFrames-lane.unackedItems, true)
+			frames := lane.unackedItems
+			if lane.unackedPadded {
+				frames++
+			}
+			batch := s.takeDownFramesLocked(lane, s.limits.CarrierBatchBytes-start, MaxBatchFrames-frames, true)
 			if batch.items == 0 {
 				s.mu.Unlock()
 				return nil

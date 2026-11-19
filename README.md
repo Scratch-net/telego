@@ -369,6 +369,15 @@ Set `websocket-fair-queue = true` to change the order of each message:
 
 This option works only with `carrier = "websocket"`. It is off by default. Smaller messages need more browser events, so compare the results on your network before you keep it.
 
+### Experimental padding of the first frames
+
+Set `pad-first-frames = true` to pad the first 8 carrier batches in each direction. Telego and the bridge add one padding frame, which the other side discards. The sizes follow Xray Vision: a batch under 900 bytes grows to 900 plus 0-500 bytes, and a longer batch gets 0-256 more bytes. Padding never makes a batch larger than `carrier-batch-kib`.
+
+This option works only with `carrier = "https"` or `carrier = "websocket"`. It is off by default because:
+
+- Padding adds bytes to each connection.
+- The available evidence shows that the censor freezes a connection after a byte count. It does not use frame sizes. Padding can make that limit come sooner.
+
 ---
 
 ## Configuration
@@ -456,6 +465,7 @@ carrier = "websocket"                    # Installer default. Requires upgrade f
 # carrier-batch-kib = 0                     # 0 = 2048 KiB. Experimental: 4-2048
 # stream-download = false                   # Experimental. https carrier only
 # websocket-fair-queue = false              # Experimental. websocket carrier only
+# pad-first-frames = false                  # Experimental. https and websocket carriers only
 
 # Telegram Middle-End transport (enabled by default; changes require a restart)
 [middle-end]
