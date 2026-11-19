@@ -62,7 +62,7 @@ func TestConnectionCloseStatsHaveStableReasons(t *testing.T) {
 	want := []string{
 		"client_eof", "client_error", "upstream_closed", "middleend_closed",
 		"middleend_backpressure", "middleend_terminal", "idle_timeout", "relay_stall_downlink", "relay_stall_uplink",
-		"output_stall", "client_silence", "shutdown", "other",
+		"output_stall", "client_silence", "shutdown", "secret_revoked", "other",
 	}
 	stats := h.ConnectionCloseStats()
 	if len(stats) != len(want) {

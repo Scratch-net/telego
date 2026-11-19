@@ -34,6 +34,11 @@ type ProxyHandler struct {
 	// Hot-reloadable config: IdleTimeout stored as nanoseconds for atomic access
 	idleTimeoutNs atomic.Int64
 
+	// Hot-reloadable enabled secrets. secretSessions maps an authenticated
+	// connection ID to its *secretSession for the reload sweep.
+	secrets        atomic.Pointer[secretSet]
+	secretSessions sync.Map
+
 	// DC client for outgoing connections
 	dcClient              *gnet.Client
 	stopDCClient          func() error
@@ -149,6 +154,7 @@ func NewProxyHandler(cfg *Config, logger Logger) *ProxyHandler {
 
 	// Initialize hot-reloadable config atomically
 	h.idleTimeoutNs.Store(int64(cfg.IdleTimeout))
+	h.secrets.Store(&secretSet{list: cfg.Secrets})
 
 	// Client-silence wedge breaker threshold (ms); 0 keeps it fully disabled.
 	if cfg.ClientSilenceClose > 0 {
@@ -199,7 +205,9 @@ func NewProxyHandler(cfg *Config, logger Logger) *ProxyHandler {
 //   - IdleTimeout: affects new connections only (existing keep their timeout)
 //
 // Non-hot fields (require restart):
-//   - BindAddr, Secrets, MaskHost/Port, ProxyProtocol, MaxIPsPerUser
+//   - BindAddr, MaskHost/Port, ProxyProtocol, MaxIPsPerUser
+//
+// The hot reloader applies secrets separately through ReplaceSecrets.
 func (h *ProxyHandler) ApplyHotConfig(cfg *Config) {
 	// Update idle timeout atomically - thread-safe for concurrent readers
 	h.idleTimeoutNs.Store(int64(cfg.IdleTimeout))
@@ -392,6 +400,9 @@ func (h *ProxyHandler) closeClient(c clientEndpoint, ctx *ConnContext, err error
 		ctx.limitTracked = false
 	}
 	ctx.mu.Unlock()
+	if authenticated {
+		h.secretSessions.Delete(ctx.id)
+	}
 
 	// Log closure with DC info for debugging
 	duration := time.Since(ctx.connTime)

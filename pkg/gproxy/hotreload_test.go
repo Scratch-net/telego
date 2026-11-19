@@ -204,10 +204,10 @@ func TestHotReloader_WarnNonHotChanges(t *testing.T) {
 			wantWarn: true,
 		},
 		{
-			name:     "secrets_count_changed",
+			name:     "secrets_count_changed_is_hot",
 			old:      &Config{Secrets: []Secret{{Name: "a"}}},
 			new:      &Config{Secrets: []Secret{{Name: "a"}, {Name: "b"}}},
-			wantWarn: true,
+			wantWarn: false,
 		},
 		{
 			name:     "mask_host_changed",
@@ -302,8 +302,9 @@ func TestHotReloader_SecretChanges(t *testing.T) {
 
 	hr.warnNonHotChanges(old, new)
 
-	if len(logger.warnings) == 0 {
-		t.Error("expected warning when secret key changes")
+	// Secrets are hot: applySecrets handles them.
+	if len(logger.warnings) != 0 {
+		t.Errorf("unexpected restart warning when secret key changes: %v", logger.warnings)
 	}
 }
 

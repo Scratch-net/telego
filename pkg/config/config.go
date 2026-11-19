@@ -52,6 +52,9 @@ type GeneralConfig struct {
 	IPBlockTimeout      Duration `toml:"ip-block-timeout"`       // How long blocked IPs stay blocked
 	HandshakeTimeout    Duration `toml:"handshake-timeout"`      // Max time for handshake (default 5s)
 	ClockSyncURL        string   `toml:"clock-sync-url"`         // HTTPS URL whose Date header corrects a skewed server clock at startup
+	// DisabledSecrets names [secrets] entries that cannot connect. A config
+	// reload closes their live sessions.
+	DisabledSecrets []string `toml:"disabled-secrets"`
 }
 
 // TLSFrontingConfig configures TLS fronting.
@@ -331,11 +334,18 @@ func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
 		return gproxy.Config{}, errors.New("mask-host is required")
 	}
 
+	disabled, err := c.disabledSecrets()
+	if err != nil {
+		return gproxy.Config{}, err
+	}
 	for _, name := range slices.Sorted(maps.Keys(c.Secrets)) {
 		keyHex := c.Secrets[name]
 		key, err := ParseKey(keyHex)
 		if err != nil {
 			return gproxy.Config{}, fmt.Errorf("invalid secret %q: %w", name, err)
+		}
+		if _, off := disabled[name]; off {
+			continue
 		}
 		cfg.Secrets = append(cfg.Secrets, gproxy.Secret{
 			Name:   name,
@@ -514,9 +524,16 @@ func (c *Config) ToWebProxyRuntimeConfig(mtProxyBind string) (WebProxyRuntimeCon
 		return WebProxyRuntimeConfig{}, fmt.Errorf("invalid web-proxy.backend: %w", err)
 	}
 
+	disabled, err := c.disabledSecrets()
+	if err != nil {
+		return WebProxyRuntimeConfig{}, err
+	}
 	profiles := make([]webproxy.Profile, 0, len(c.Secrets)*2)
 	capabilities := make(map[webproxy.Capability]struct{}, len(c.Secrets)*2)
 	for _, name := range slices.Sorted(maps.Keys(c.Secrets)) {
+		if _, off := disabled[name]; off {
+			continue
+		}
 		keyHex := c.Secrets[name]
 		key, err := ParseKey(keyHex)
 		if err != nil {
@@ -535,7 +552,7 @@ func (c *Config) ToWebProxyRuntimeConfig(mtProxyBind string) (WebProxyRuntimeCon
 		}
 	}
 	if len(profiles) == 0 {
-		return WebProxyRuntimeConfig{}, errors.New("WEB proxy requires at least one secret")
+		return WebProxyRuntimeConfig{}, errors.New("WEB proxy requires at least one enabled secret")
 	}
 
 	return WebProxyRuntimeConfig{
@@ -591,6 +608,19 @@ func (c *Config) webProxyFingerprint() string {
 		trusted,
 		c.WebProxy.NumEventLoops,
 	)
+}
+
+// disabledSecrets returns the names in general.disabled-secrets. Each name
+// must be a [secrets] entry, so a typo cannot leave a user enabled.
+func (c *Config) disabledSecrets() (map[string]struct{}, error) {
+	disabled := make(map[string]struct{}, len(c.General.DisabledSecrets))
+	for _, name := range c.General.DisabledSecrets {
+		if _, ok := c.Secrets[name]; !ok {
+			return nil, fmt.Errorf("general.disabled-secrets names unknown secret %q", name)
+		}
+		disabled[name] = struct{}{}
+	}
+	return disabled, nil
 }
 
 // ParseKey parses a 16-byte hex-encoded key (32 hex chars).

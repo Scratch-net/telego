@@ -52,6 +52,12 @@ log-level = "info"
 # offset (clamped to +-1 day) is applied to the check. Empty = off.
 # clock-sync-url = "https://www.cloudflare.com"
 
+# Secrets that stay in [secrets] but cannot connect. Each name must be in
+# [secrets]. A config reload (SIGHUP or file change) applies this list and
+# [secrets] without a restart, and closes the live sessions of a removed or
+# disabled secret.
+# disabled-secrets = ["user2"]
+
 # Named secrets (32 hex characters = 16 bytes)
 # Generate with: telego generate <hostname>
 [secrets]

@@ -1457,3 +1457,53 @@ func TestWebProxyConfigRequiresExplicitValuesWhenNotDerivable(t *testing.T) {
 		})
 	}
 }
+
+func TestDisabledSecretsAreExcluded(t *testing.T) {
+	cfg := Config{
+		Secrets: map[string]string{
+			"alice": "0123456789abcdef0123456789abcdef",
+			"bob":   "fedcba9876543210fedcba9876543210",
+		},
+		General:     GeneralConfig{DisabledSecrets: []string{"bob"}},
+		TLSFronting: TLSFrontingConfig{MaskHost: "proxy.example.com"},
+		WebProxy:    WebProxyConfig{Enabled: true, Hostname: "proxy.example.com"},
+	}
+	runtime, err := cfg.ToGProxyConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runtime.Secrets) != 1 || runtime.Secrets[0].Name != "alice" {
+		t.Fatalf("secrets = %+v, want only alice", runtime.Secrets)
+	}
+	web, err := cfg.ToWebProxyRuntimeConfig("0.0.0.0:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, profile := range web.Profiles {
+		if profile.Name() != "alice" {
+			t.Fatalf("WEB profile for disabled secret %q", profile.Name())
+		}
+	}
+
+	// Every secret disabled: the proxy runs with no enabled secret, and WEB
+	// has nothing to offer.
+	cfg.General.DisabledSecrets = []string{"alice", "bob"}
+	runtime, err = cfg.ToGProxyConfig()
+	if err != nil || len(runtime.Secrets) != 0 {
+		t.Fatalf("all disabled: secrets = %d, err = %v", len(runtime.Secrets), err)
+	}
+	if _, err := cfg.ToWebProxyRuntimeConfig("0.0.0.0:443"); err == nil {
+		t.Fatal("WEB accepted a config without an enabled secret")
+	}
+}
+
+func TestDisabledSecretsRejectUnknownName(t *testing.T) {
+	cfg := Config{
+		Secrets:     map[string]string{"alice": "0123456789abcdef0123456789abcdef"},
+		General:     GeneralConfig{DisabledSecrets: []string{"alcie"}},
+		TLSFronting: TLSFrontingConfig{MaskHost: "proxy.example.com"},
+	}
+	if _, err := cfg.ToGProxyConfig(); err == nil || !strings.Contains(err.Error(), "alcie") {
+		t.Fatalf("err = %v, want unknown secret name", err)
+	}
+}

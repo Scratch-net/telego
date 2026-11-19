@@ -688,8 +688,26 @@ kill -HUP $(pidof telego)
 
 - `[general].log-level` — Applied immediately
 - `[performance].idle-timeout` — Applies to new connections
+- `[secrets]` and `[general].disabled-secrets` — Applied immediately, without a listener restart
 
-All other configuration changes require a restart, including secrets, listeners, TLS fronting, WEB, ME, metrics, diagnostics, upstream routing, and connection limits.
+A secret reload works as follows:
+
+- An added or enabled secret accepts new clients at once.
+- Sessions of an unchanged secret continue.
+- Sessions of a removed or disabled secret are closed. The close reason is `secret_revoked`.
+- A renamed secret or a secret with a new key counts as a removed secret plus an added secret.
+- If the new config is invalid, telego logs a warning and keeps the current config.
+  For example, `disabled-secrets` must name only entries in `[secrets]`.
+- A secret host comes from `mask-host`. If the host changes, the secret change is not applied and a restart is necessary.
+- WEB credentials are made at startup. A removed or disabled secret cannot connect through WEB after the reload, because its inner MTProto handshake fails.
+  An added secret works through WEB only after a restart.
+
+```toml
+[general]
+disabled-secrets = ["bob"]   # bob stays in [secrets] but cannot connect
+```
+
+All other configuration changes require a restart, including listeners, TLS fronting, WEB, ME, metrics, diagnostics, upstream routing, and connection limits.
 
 ---
 
@@ -864,6 +882,7 @@ The site that starts the close records the reason. The first recorded reason is 
 | `output_stall` | Middle-End output to the client made no progress for the output stall timeout. |
 | `client_silence` | The client-silence breaker closed the connection. |
 | `shutdown` | Telego was stopping. |
+| `secret_revoked` | A config reload removed or disabled the secret of the connection. |
 | `other` | Telego closed the connection for a cause that has no reason, for example a protocol violation. |
 
 A WEB logical stream reports a Telego-side close without a recorded reason as `client_eof`. Its close always passes EOF.

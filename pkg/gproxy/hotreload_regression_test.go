@@ -122,7 +122,6 @@ func TestHotReloaderRestartWarningPersistsUntilConfigReverted(t *testing.T) {
 		warnings := logger.warnings[before:]
 		for _, want := range []string{
 			"WEB proxy settings changed but require restart",
-			"secrets changed but requires restart",
 			"hot settings applied; restart required for other config changes",
 		} {
 			if !slices.Contains(warnings, want) {
@@ -131,6 +130,9 @@ func TestHotReloaderRestartWarningPersistsUntilConfigReverted(t *testing.T) {
 		}
 		if slices.Contains(logger.infos, "config reloaded successfully") {
 			t.Fatal("unapplied restart-only changes were reported as successful")
+		}
+		if got := handler.currentSecrets(); len(got) != 1 || string(got[0].Key) != "replacement-fixture" {
+			t.Fatalf("secrets = %+v, want the reloaded secret", got)
 		}
 		if handler.IdleTimeout() != desired.IdleTimeout || logLevel != "debug" {
 			t.Fatal("restart-only changes prevented hot settings from applying")
