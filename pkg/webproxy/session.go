@@ -33,6 +33,7 @@ type sessionOptions struct {
 	profile               Profile
 	carrier               CarrierMode
 	downFrameBytes        int
+	fairDown              bool
 	clientIP              string
 	backendNet            string
 	backend               string
@@ -94,6 +95,7 @@ type carrierLane struct {
 	unackedBase     uint64
 	unackedOwner    *carrierBatchOwnership
 	downCursor      uint64
+	fairAfter       uint32 // fair scheduling starts after this stream ID
 	lastUpSequence  uint64
 	lastUpDigest    [16]byte
 	upHistory       [httpUpWindow]upCommit
@@ -123,6 +125,7 @@ type Session struct {
 	profile        Profile
 	carrier        CarrierMode
 	downFrameBytes int // 0 keeps the default DATA frame sizes
+	fairDown       bool
 	clientIP       string
 	backendNet     string
 	backend        string
@@ -196,6 +199,14 @@ func newSession(options sessionOptions) *Session {
 	if carrier == "" {
 		carrier = CarrierHTTPS
 	}
+	// Fair scheduling applies only to the multiplexed WebSocket. Its messages
+	// are delivered whole, so it also caps each DATA frame at one message.
+	fairDown := options.fairDown && carrier == CarrierWebSocket
+	downFrameBytes := options.downFrameBytes
+	if limit := options.limits.fairMessageBytes(); fairDown && limit > FrameHeaderSize &&
+		(downFrameBytes == 0 || downFrameBytes > limit) {
+		downFrameBytes = limit
+	}
 	carrierLanes := make(map[uint32]*carrierLane)
 	if carrier != CarrierWebSocketLanes {
 		carrierLanes[0] = newCarrierLane()
@@ -203,7 +214,8 @@ func newSession(options sessionOptions) *Session {
 	session := &Session{
 		profile:               options.profile,
 		carrier:               carrier,
-		downFrameBytes:        options.downFrameBytes,
+		downFrameBytes:        downFrameBytes,
+		fairDown:              fairDown,
 		clientIP:              options.clientIP,
 		backendNet:            options.backendNet,
 		backend:               options.backend,
@@ -954,7 +966,12 @@ func (s *Session) pollCarrier(
 				requestBackendCloses(backends)
 				return nil, cursor, false, nil, ErrProtocol
 			}
-			batch := s.takeDownBatchLocked(lane)
+			var batch downBatch
+			if s.fairDown {
+				batch = s.takeFairDownBatchLocked(lane, s.limits.fairMessageBytes())
+			} else {
+				batch = s.takeDownBatchLocked(lane)
+			}
 			lane.downCursor++
 			lane.unackedBase = cursor
 			lane.unacked = batch.body

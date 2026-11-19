@@ -357,6 +357,18 @@ Set `stream-download = true` to keep one download response open. Telego sends ea
 - Nginx must not buffer the response. The shipped templates set `proxy_buffering off`. Telego also sends `X-Accel-Buffering: no`.
 - The bridge asks for a stream with the `Accept: application/vnd.telego.web-stream` request header. Nginx forwards it without a configuration change.
 
+### Experimental fair WebSocket queue
+
+The `websocket` carrier sends all Telegram streams through one WebSocket. By default, Telego sends the queued frames in arrival order, up to 2048 KiB in one message. The browser delivers only complete messages. A small reply can therefore wait behind a large media download.
+
+Set `websocket-fair-queue = true` to change the order of each message:
+
+- WINDOW control frames go first.
+- DATA and CLOSE frames rotate across streams. The frames of one stream keep their order.
+- Each message carries at most 160 KiB (two full 64 KiB backend reads plus small frames).
+
+This option works only with `carrier = "websocket"`. It is off by default. Smaller messages need more browser events, so compare the results on your network before you keep it.
+
 ---
 
 ## Configuration
@@ -443,6 +455,7 @@ carrier = "websocket"                    # Installer default. Requires upgrade f
 # num-event-loops = 0                       # 0 = automatic
 # carrier-batch-kib = 0                     # 0 = 2048 KiB. Experimental: 4-2048
 # stream-download = false                   # Experimental. https carrier only
+# websocket-fair-queue = false              # Experimental. websocket carrier only
 
 # Telegram Middle-End transport (enabled by default; changes require a restart)
 [middle-end]

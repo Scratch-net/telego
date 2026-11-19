@@ -44,6 +44,7 @@ func newWebProxyRuntime(runtimeConfig config.WebProxyRuntimeConfig, internalAuth
 		managerConfig.Carrier = runtimeConfig.Carrier
 	}
 	managerConfig.StreamDownload = runtimeConfig.StreamDownload
+	managerConfig.WebSocketFairQueue = runtimeConfig.WebSocketFairQueue
 	if runtimeConfig.CarrierBatchBytes > 0 {
 		// A smaller batch also caps DATA frames. Otherwise one 64 KiB backend
 		// read would still fill one response far above the configured target.

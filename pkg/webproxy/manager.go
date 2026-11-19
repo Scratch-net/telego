@@ -86,6 +86,7 @@ type Capacity struct {
 type Manager struct {
 	debugDiagnostics bool
 	streamDownload   bool // https carrier only
+	fairDown         bool // websocket carrier only
 
 	// Built from the copied profiles before publication; never mutated.
 	capabilityPrefixes map[uint64]struct{}
@@ -157,6 +158,7 @@ func NewManager(config ManagerConfig) (*Manager, error) {
 	manager := &Manager{
 		debugDiagnostics: config.DebugDiagnostics,
 		streamDownload:   config.StreamDownload && config.Carrier == CarrierHTTPS,
+		fairDown:         config.WebSocketFairQueue && config.Carrier == CarrierWebSocket,
 
 		capabilityPrefixes: make(map[uint64]struct{}, len(config.Profiles)),
 
@@ -339,6 +341,7 @@ func (a *BootstrapAuthorization) create(clientIP string, body []byte, owner gnet
 		profile:               entry.profile,
 		carrier:               m.carrier,
 		downFrameBytes:        m.downFrameBytes,
+		fairDown:              m.fairDown,
 		clientIP:              clientIP,
 		backendNet:            m.backendNet,
 		backend:               m.backend,

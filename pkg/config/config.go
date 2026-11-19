@@ -152,6 +152,8 @@ type WebProxyConfig struct {
 	CarrierBatchKiB int `toml:"carrier-batch-kib"`
 	// StreamDownload keeps one https downlink response open per batch.
 	StreamDownload bool `toml:"stream-download"`
+	// WebSocketFairQueue schedules websocket downlink fairly across streams.
+	WebSocketFairQueue bool `toml:"websocket-fair-queue"`
 }
 
 // MiddleEndConfig configures Telegram's official Middle-End transport, which
@@ -186,8 +188,9 @@ type WebProxyRuntimeConfig struct {
 	Profiles             []webproxy.Profile
 	BackendProxyProtocol bool
 	// CarrierBatchBytes is zero when the protocol default applies.
-	CarrierBatchBytes int
-	StreamDownload    bool
+	CarrierBatchBytes  int
+	StreamDownload     bool
+	WebSocketFairQueue bool
 }
 
 // Duration is a TOML-parseable duration.
@@ -501,6 +504,9 @@ func (c *Config) ToWebProxyRuntimeConfig(mtProxyBind string) (WebProxyRuntimeCon
 	if c.WebProxy.StreamDownload && carrier != webproxy.CarrierHTTPS {
 		return WebProxyRuntimeConfig{}, errors.New("web-proxy.stream-download requires carrier \"https\"")
 	}
+	if c.WebProxy.WebSocketFairQueue && carrier != webproxy.CarrierWebSocket {
+		return WebProxyRuntimeConfig{}, errors.New("web-proxy.websocket-fair-queue requires carrier \"websocket\"")
+	}
 
 	bindAddr := c.WebProxy.BindTo
 	if bindAddr == "" {
@@ -572,6 +578,7 @@ func (c *Config) ToWebProxyRuntimeConfig(mtProxyBind string) (WebProxyRuntimeCon
 		BackendProxyProtocol: !logicalBackend,
 		CarrierBatchBytes:    c.WebProxy.CarrierBatchKiB * 1024,
 		StreamDownload:       c.WebProxy.StreamDownload,
+		WebSocketFairQueue:   c.WebProxy.WebSocketFairQueue,
 	}, nil
 }
 
@@ -617,7 +624,7 @@ func (c *Config) webProxyFingerprint() string {
 	}
 	trusted := strings.Join(c.WebProxy.TrustedProxyCIDRs, ",")
 	return fmt.Sprintf(
-		"enabled=%t\x00bind=%s\x00hostname=%s\x00base-path=%s\x00backend=%s\x00carrier=%s\x00trusted=%s\x00loops=%d\x00batch=%d\x00stream=%t",
+		"enabled=%t\x00bind=%s\x00hostname=%s\x00base-path=%s\x00backend=%s\x00carrier=%s\x00trusted=%s\x00loops=%d\x00batch=%d\x00stream=%t\x00fair=%t",
 		c.WebProxy.Enabled,
 		c.WebProxy.BindTo,
 		c.WebProxy.Hostname,
@@ -628,6 +635,7 @@ func (c *Config) webProxyFingerprint() string {
 		c.WebProxy.NumEventLoops,
 		c.WebProxy.CarrierBatchKiB,
 		c.WebProxy.StreamDownload,
+		c.WebProxy.WebSocketFairQueue,
 	)
 }
 

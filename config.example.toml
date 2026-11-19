@@ -179,6 +179,12 @@ carrier = "websocket"
 # Nginx needs proxy_buffering off, as in the shipped templates.
 # stream-download = false
 
+# Experimental, websocket carrier only. Send WINDOW control frames first and
+# rotate DATA fairly across Telegram streams. Each WebSocket message carries at
+# most 160 KiB instead of up to 2048 KiB, so a small reply waits less behind
+# a large download. Each message also costs one more browser event.
+# websocket-fair-queue = false
+
 # Telegram Middle-End transport is enabled by default, including when this section is absent.
 # Telego checks ME connections in the background and uses direct DC routes until ME is ready.
 # Changes to this section require a restart.

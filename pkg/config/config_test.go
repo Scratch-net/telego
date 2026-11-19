@@ -1113,6 +1113,27 @@ func TestWebProxyStreamDownloadRequiresHTTPS(t *testing.T) {
 	}
 }
 
+func TestWebProxyWebSocketFairQueueRequiresWebSocket(t *testing.T) {
+	for _, carrier := range []string{"", "https", "https-lanes", "websocket", "websocket-lanes"} {
+		cfg := &Config{
+			Secrets:  map[string]string{"alice": "0123456789abcdef0123456789abcdef"},
+			WebProxy: WebProxyConfig{Enabled: true, Hostname: "proxy.example.com", Carrier: carrier, WebSocketFairQueue: true},
+		}
+		runtime, err := cfg.ToWebProxyRuntimeConfig("0.0.0.0:443")
+		websocket := carrier == "websocket"
+		if websocket && (err != nil || !runtime.WebSocketFairQueue) ||
+			!websocket && (err == nil || !strings.Contains(err.Error(), "websocket-fair-queue")) {
+			t.Fatalf("carrier %q: fair=%t err=%v", carrier, runtime.WebSocketFairQueue, err)
+		}
+	}
+	cfg := &Config{WebProxy: WebProxyConfig{Enabled: true}}
+	fingerprint := cfg.webProxyFingerprint()
+	cfg.WebProxy.WebSocketFairQueue = true
+	if fingerprint == cfg.webProxyFingerprint() {
+		t.Fatal("websocket-fair-queue change omitted from restart fingerprint")
+	}
+}
+
 func TestWebProxyConfigDefaults(t *testing.T) {
 	cfg := Config{
 		Secrets: map[string]string{"alice": "0123456789abcdef0123456789abcdef"},
