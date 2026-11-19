@@ -466,8 +466,8 @@ func printWebProxyLinks(hostname, basePath string, profiles []webproxy.Profile) 
 // defaultBindAddr is the proxy listener when neither the config nor --bind sets one.
 const defaultBindAddr = "0.0.0.0:443"
 
-// warnFallbackLoop logs an error when the splice or certificate target is the
-// proxy listener itself. Such a target splices unrecognized clients back into
+// warnFallbackLoop logs an error when the splice or certificate target of any
+// cover domain is the proxy listener itself. Such a target splices unrecognized clients back into
 // telego again and again. It uses local addresses and middle-end.nat-ip only,
 // without STUN, and does not stop startup. telego doctor also checks the STUN
 // public IP.

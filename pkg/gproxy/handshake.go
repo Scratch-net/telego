@@ -239,9 +239,10 @@ func (h *ProxyHandler) handleTLSPayload(c clientEndpoint, ctx *ConnContext) gnet
 		}
 		h.logger.Debug("[#%d] no matching secret found (payload len=%d, first bytes: %s)", ctx.id, len(payload), hexDump.String())
 
+		// An SNI of an extra cover domain goes to that domain's target.
 		// SNI-following: if this probe's claimed SNI is on the mask safelist,
 		// front it to that domain's own server instead of the default target.
-		if len(h.maskSafelist) > 0 {
+		if !h.spliceToDomain(ctx, sni) && len(h.maskSafelist) > 0 {
 			if sni != "" {
 				if target, ok := h.maskSafelist[strings.ToLower(sni)]; ok {
 					ctx.SetSpliceOverride(target)
@@ -250,6 +251,7 @@ func (h *ProxyHandler) handleTLSPayload(c clientEndpoint, ctx *ConnContext) gnet
 			}
 		}
 		h.recordMaskFallback(reason)
+		h.recordTLSFingerprint(tlsFingerprintMaskFallback, payload)
 		return h.startSplice(c, ctx)
 	}
 
@@ -269,9 +271,13 @@ func (h *ProxyHandler) handleTLSPayload(c clientEndpoint, ctx *ConnContext) gnet
 	// timestamp cannot bypass replay detection.
 	if h.replayCache.Seen(hello.Random[:28]) {
 		h.logger.Debug("[#%d] replay attack detected", ctx.id)
+		h.spliceToDomain(ctx, sni)
 		h.recordMaskFallback(maskFallbackReplay)
+		h.recordTLSFingerprint(tlsFingerprintMaskFallback, payload)
 		return h.startSplice(c, ctx)
 	}
+	// The payload can refer to the input buffer, so count it before Discard.
+	h.recordTLSFingerprint(tlsFingerprintAuthenticated, payload)
 
 	// Discard the TLS record from buffer
 	c.Discard(needed)
@@ -340,16 +346,24 @@ func (h *ProxyHandler) handleTLSPayload(c clientEndpoint, ctx *ConnContext) gnet
 	// Build ServerHello response
 	var response []byte
 
+	// A secret of an extra cover domain uses that domain's profile.
+	helloFetcher, certFetcher := h.serverHelloFetcher, h.certFetcher
+	certHost, certPort, fakeCertSize := h.config.CertHost, h.config.CertPort, h.config.FakeCertSize
+	if domain := h.domainFor(matchedSecret.Host); domain != nil {
+		helloFetcher, certFetcher = domain.serverHelloFetcher, domain.certFetcher
+		certHost, certPort, fakeCertSize = domain.CertHost, domain.CertPort, domain.FakeCertSize
+	}
+
 	// HYBRID MODE: Build the ServerHello from the mask host template (best DPI evasion)
-	if h.serverHelloFetcher != nil {
-		template, fetchErr := h.serverHelloFetcher.Template()
+	if helloFetcher != nil {
+		template, fetchErr := helloFetcher.Template()
 		if fetchErr == nil {
 			// Size the fake cert record to match the mask backend (config override,
 			// else the captured real first cert-record size) so the accept path and
 			// the splice path show the same cert-record length.
-			certSize := h.config.FakeCertSize
+			certSize := fakeCertSize
 			if certSize == 0 {
-				certSize = h.serverHelloFetcher.CertRecordLen()
+				certSize = helloFetcher.CertRecordLen()
 			}
 			opts := &faketls.ServerHelloOptions{
 				Template:     template,
@@ -369,8 +383,8 @@ func (h *ProxyHandler) handleTLSPayload(c clientEndpoint, ctx *ConnContext) gnet
 
 	// LEGACY MODE: Synthetic ServerHello with optional real cert embedding
 	if response == nil {
-		if h.certFetcher != nil {
-			cachedCert := h.certFetcher.CachedCert(h.config.CertHost, h.config.CertPort)
+		if certFetcher != nil {
+			cachedCert := certFetcher.CachedCert(certHost, certPort)
 			if cachedCert != nil && len(cachedCert.RawChain) > 0 {
 				opts := &faketls.ServerHelloOptions{
 					CertChain: cachedCert.GetRawCertChain(),

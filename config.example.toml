@@ -121,6 +121,25 @@ mask-host = "www.google.com"
 # sends the rest in one write, which needs far fewer packets on lossy paths.
 # server-hello-pace-scope = "response"
 
+# Extra cover domains (optional). Without them, every secret uses mask-host.
+# Each domain serves the secrets it lists. The ee link of such a secret
+# contains the domain, so give those users new links.
+# Each domain has its own ServerHello template, certificate and splice target.
+# An unrecognized client whose SNI is the domain is spliced to its target.
+# cert-host and splice-host default to host. The ports default to 443.
+# splice-proxy-protocol defaults to 0 (off). fake-cert-size defaults to 0
+# (match this domain). The splice, cert and fake-cert settings above
+# apply only to mask-host. Keep this table last in [tls-fronting].
+# [[tls-fronting.domains]]
+# host = "www.microsoft.com"
+# secrets = ["user2"]
+# cert-host = "127.0.0.1"
+# cert-port = 8443
+# splice-host = "127.0.0.1"
+# splice-port = 8443
+# splice-proxy-protocol = 0
+# fake-cert-size = 0
+
 # Native Telegram Desktop WEB proxy (optional, requires Nginx with real TLS).
 # This section has no effect while enabled is false. Changes require a restart.
 [web-proxy]

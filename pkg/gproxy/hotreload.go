@@ -280,7 +280,8 @@ func (r *HotReloader) warnNonHotChanges(old, new *Config) bool {
 		}
 	}
 
-	if old.MaskHost != new.MaskHost || old.MaskPort != new.MaskPort {
+	if old.MaskHost != new.MaskHost || old.MaskPort != new.MaskPort ||
+		!slices.Equal(old.Domains, new.Domains) || secretHostsChanged(old.Secrets, new.Secrets) {
 		r.logger.Warn("TLS fronting settings changed but requires restart")
 		restartRequired = true
 	}
@@ -321,4 +322,18 @@ func (r *HotReloader) warnNonHotChanges(old, new *Config) bool {
 		restartRequired = true
 	}
 	return restartRequired
+}
+
+// secretHostsChanged reports whether a secret moved to another cover domain.
+// A changed secret count or name is reported by the secrets check.
+func secretHostsChanged(old, new []Secret) bool {
+	if len(old) != len(new) {
+		return false
+	}
+	for i := range old {
+		if old[i].Host != new[i].Host {
+			return true
+		}
+	}
+	return false
 }

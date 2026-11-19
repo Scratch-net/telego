@@ -6,10 +6,61 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/scratch-net/telego/pkg/gproxy"
 )
+
+func TestDoctorChecksCoverDomains(t *testing.T) {
+	noDoctorSTUN(t)
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte(`bind-to = "127.0.0.1:8443"
+[secrets]
+test = "0123456789abcdef0123456789abcdef"
+other = "fedcba9876543210fedcba9876543210"
+[tls-fronting]
+mask-host = "example.com"
+splice-host = "127.0.0.2"
+splice-port = 1
+[[tls-fronting.domains]]
+host = "cover.example"
+secrets = ["other"]
+splice-host = "127.0.0.1"
+splice-port = 8443
+`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	err := (&DoctorCmd{Config: path, Timeout: time.Second}).Run()
+	if err == nil || !strings.Contains(err.Error(), "tls-fronting.domains[0].splice-host") || !strings.Contains(err.Error(), "telego listener") {
+		t.Fatalf("cover domain loop not reported: %v", err)
+	}
+}
+
+func TestFallbackTargetsIncludeCoverDomains(t *testing.T) {
+	cfg := &gproxy.Config{
+		SpliceHost: "mask.example", SplicePort: 443, CertHost: "mask.example", CertPort: 443,
+		Domains: []gproxy.TLSDomain{
+			{Host: "a.example", SpliceHost: "a.example", SplicePort: 443, CertHost: "a.example", CertPort: 443},
+			{Host: "b.example", SpliceHost: "127.0.0.1", SplicePort: 8080, CertHost: "127.0.0.1", CertPort: 8443},
+		},
+	}
+	var got []string
+	for _, target := range fallbackTargets(cfg) {
+		got = append(got, target.scope+" "+target.option+" "+target.host+":"+strconv.Itoa(target.port))
+	}
+	want := []string{
+		"probe_fallback tls-fronting.splice-host and splice-port mask.example:443",
+		"probe_fallback tls-fronting.domains[0].splice-host and splice-port a.example:443",
+		"probe_fallback tls-fronting.domains[1].splice-host and splice-port 127.0.0.1:8080",
+		"certificate_source tls-fronting.domains[1].cert-host and cert-port 127.0.0.1:8443",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("targets:\n%s", strings.Join(got, "\n"))
+	}
+}
 
 func TestDoctorTimeout(t *testing.T) {
 	for _, timeout := range []time.Duration{0, -time.Second, 31 * time.Second} {

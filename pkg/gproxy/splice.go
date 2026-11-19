@@ -60,21 +60,33 @@ func (h *ProxyHandler) startSplice(client clientEndpoint, ctx *ConnContext) gnet
 	ctx.splice.Store(splice)
 	ctx.startConnectionIdle(client, h.spliceIdleTimeout())
 
-	address := net.JoinHostPort(h.config.SpliceHost, fmt.Sprint(h.config.SplicePort))
-	if override := ctx.consumeSpliceOverride(); override != "" {
-		address = override
-	}
+	address, proxyProtocol := h.spliceTarget(ctx)
 	// Capture client metadata on its owner before dialing. The public client
 	// may close and release gnet's address storage while the dial is running.
 	var header []byte
-	if h.config.SpliceProxyProtocol > 0 {
-		header = buildProxyProtocolHeader(h.config.SpliceProxyProtocol,
+	if proxyProtocol > 0 {
+		header = buildProxyProtocolHeader(proxyProtocol,
 			ctx.RealClientAddr(client.RemoteAddr()), client.LocalAddr())
 	}
 	h.logger.Debug("[#%d] splicing to %s", ctx.id, address)
 	done := retainLogicalWork(client)
 	go func() { defer done(); h.dialSplice(dialContext, splice, address, header) }()
 	return gnet.None
+}
+
+// spliceTarget returns the splice address and PROXY protocol version. A
+// one-shot override from the handshake (an extra cover domain or a
+// safelisted SNI) wins over the configured target.
+func (h *ProxyHandler) spliceTarget(ctx *ConnContext) (string, int) {
+	address := net.JoinHostPort(h.config.SpliceHost, fmt.Sprint(h.config.SplicePort))
+	proxyProtocol := h.config.SpliceProxyProtocol
+	if override, overrideProtocol := ctx.consumeSpliceTarget(); override != "" {
+		address = override
+		if overrideProtocol >= 0 {
+			proxyProtocol = overrideProtocol
+		}
+	}
+	return address, proxyProtocol
 }
 
 // Only connection establishment runs outside gnet. All buffered input, output,

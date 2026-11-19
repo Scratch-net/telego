@@ -55,6 +55,7 @@ type ProxyHandler struct {
 	// TLS fronting
 	certFetcher        *tlsfront.CertFetcher
 	serverHelloFetcher *tlsfront.ServerHelloFetcher // Hybrid mode: fetches real ServerHello
+	domains            []*frontDomain               // Extra cover domains; nil by default
 
 	// Logger
 	logger              Logger
@@ -65,6 +66,7 @@ type ProxyHandler struct {
 	handshakeFailures [handshakeFailureStageCount]atomic.Uint64
 	maskFallbacks     [maskFallbackReasonCount]atomic.Uint64
 	connectionCloses  [closeReasonCount]atomic.Uint64
+	tlsFingerprints   [tlsFingerprintKindCount]tlsFingerprintTable
 
 	connectionLimitLog logRateLimit
 	ipLimitLog         logRateLimit
@@ -131,6 +133,7 @@ func NewProxyHandler(cfg *Config, logger Logger) *ProxyHandler {
 		dcBufPool:      NewBufferPool(64*1024 + 256), // 64KB + TLS header overhead
 		desyncDetector: NewDesyncDetector(),
 	}
+	h.domains = newFrontDomains(cfg.Domains)
 	h.directDCDial = h.dialDirectDC
 	h.spliceDial = dialSpliceTarget
 	h.upstreamContext, h.cancelUpstream = context.WithCancel(context.Background())

@@ -19,6 +19,7 @@ import (
 type ServerHelloFetcher struct {
 	host    string
 	port    int
+	sni     string // ServerName to send; empty sends host
 	timeout time.Duration
 
 	refreshMu     sync.Mutex // Serialize network refreshes without blocking cache readers.
@@ -49,6 +50,15 @@ func NewServerHelloFetcher(host string, port int) *ServerHelloFetcher {
 		timeout:       10 * time.Second,
 		refreshPeriod: 5 * time.Minute, // Refresh every 5 minutes to avoid stale fingerprints
 	}
+}
+
+// NewServerHelloFetcherSNI creates a fetcher that connects to host:port and
+// sends sni as the ServerName. Use it when the connection target is not the
+// mimicked domain, for example a local web server with several names.
+func NewServerHelloFetcherSNI(host string, port int, sni string) *ServerHelloFetcher {
+	f := NewServerHelloFetcher(host, port)
+	f.sni = sni
+	return f
 }
 
 // TLS record types
@@ -142,8 +152,12 @@ func (f *ServerHelloFetcher) RefreshContext(ctx context.Context) error {
 
 	// Use Go's TLS client to perform a real handshake
 	// This generates a proper ClientHello that servers will accept
+	serverName := f.sni
+	if serverName == "" {
+		serverName = f.host
+	}
 	tlsConn := tls.Client(recordingConn, &tls.Config{
-		ServerName:         f.host,
+		ServerName:         serverName,
 		InsecureSkipVerify: true, // We just want to capture the ServerHello
 		MinVersion:         tls.VersionTLS12,
 		MaxVersion:         tls.VersionTLS13,

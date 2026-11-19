@@ -199,6 +199,9 @@ type ConnContext struct {
 	// One-shot splice target override (resolved "host:port") set when an
 	// unauthenticated probe's SNI is on the mask safelist. Consumed by dialSplice.
 	spliceOverride string // protected by mu
+	// spliceOverrideProxyProtocol is the PROXY version for spliceOverride.
+	// -1 uses the configured splice-proxy-protocol. Protected by mu.
+	spliceOverrideProxyProtocol int
 
 	// Timing
 	connTime time.Time
@@ -303,19 +306,33 @@ func (c *ConnContext) trustedProxyTuple() (net.Addr, net.Addr, bool) {
 // SetSpliceOverride records a one-shot splice target ("host:port") for an
 // unauthenticated probe whose SNI is on the mask safelist.
 func (c *ConnContext) SetSpliceOverride(addr string) {
+	c.setSpliceTarget(addr, -1)
+}
+
+// setSpliceTarget records a one-shot splice target with its own PROXY
+// protocol version (0 = off). A version of -1 uses the configured one.
+func (c *ConnContext) setSpliceTarget(addr string, proxyProtocol int) {
 	c.mu.Lock()
 	c.spliceOverride = addr
+	c.spliceOverrideProxyProtocol = proxyProtocol
 	c.mu.Unlock()
 }
 
 // consumeSpliceOverride returns and clears the one-shot splice override, so a
 // reused context never inherits a stale target.
 func (c *ConnContext) consumeSpliceOverride() string {
+	addr, _ := c.consumeSpliceTarget()
+	return addr
+}
+
+// consumeSpliceTarget returns and clears the one-shot splice target and its
+// PROXY protocol version.
+func (c *ConnContext) consumeSpliceTarget() (addr string, proxyProtocol int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	addr := c.spliceOverride
-	c.spliceOverride = ""
-	return addr
+	addr, proxyProtocol = c.spliceOverride, c.spliceOverrideProxyProtocol
+	c.spliceOverride, c.spliceOverrideProxyProtocol = "", 0
+	return addr, proxyProtocol
 }
 
 // DCID returns the DC ID this connection is using (0 if not yet determined).
