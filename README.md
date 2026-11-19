@@ -456,9 +456,17 @@ telego doctor -c <config> [--timeout 10s] [--cert-source]
                              Verify the fallback TLS certificate and mask hostname
 ```
 
-`telego doctor` also prints two warnings. They do not make the command fail.
+Before the TLS check, `telego doctor` fails if the splice target or the certificate source is Telego itself.
+The target is Telego itself when it resolves to the listen address on the listen port.
+A wildcard listen address matches every local address. The public IP also matches.
+`splice-host` and `cert-host` default to `mask-host`. When `mask-host` resolves to the proxy, set them to a different server.
+Otherwise unrecognized clients are spliced back into Telego again and again.
+Telego also logs this error at startup, with local addresses and `[middle-end] nat-ip` only, and starts anyway.
+
+`telego doctor` also prints these warnings. They do not make the command fail.
 
 - The checked endpoint does not negotiate `X25519MLKEM768`. TSPU is reported to block iOS clients when the mask host supports only classical key exchange.
+- No address of a DC answers the MTProto check. The check sends an unauthenticated `req_pq_multi` and needs a `resPQ` that echoes its nonce. A connection reset or close fails the check. The check uses `[upstream] socks5` when it is set.
 - The A and AAAA records of `mask-host` do not include the proxy public IP. TSPU is reported to compare them. Doctor uses `[middle-end] nat-ip` as the public IP. If it is empty, doctor uses STUN. If STUN fails, doctor skips this check.
 
 ---
