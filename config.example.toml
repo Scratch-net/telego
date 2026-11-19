@@ -215,11 +215,13 @@ carrier = "websocket"
 # carrier is an error. Set false to use only ordinary long polls.
 # stream-download = true
 
-# Experimental, websocket carrier only. Send WINDOW control frames first and
+# websocket carrier only. On by default. Send WINDOW control frames first and
 # rotate DATA fairly across Telegram streams. Each WebSocket message carries at
 # most 160 KiB instead of up to 2048 KiB, so a small reply waits less behind
 # a large download. Each message also costs one more browser event.
-# websocket-fair-queue = false
+# The default does not apply to other carriers. An explicit true with another
+# carrier is an error. Set false to send frames in arrival order.
+# websocket-fair-queue = true
 
 # Experimental, https and websocket carriers only. Pad the first 8 carrier
 # batches in each direction, as Xray Vision does: a batch under 900 bytes grows

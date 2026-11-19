@@ -182,7 +182,9 @@ type WebProxyConfig struct {
 	// An explicit true requires the https carrier.
 	StreamDownload *bool `toml:"stream-download"`
 	// WebSocketFairQueue schedules websocket downlink fairly across streams.
-	WebSocketFairQueue bool `toml:"websocket-fair-queue"`
+	// Unset = on for the websocket carrier and off for the other carriers.
+	// An explicit true requires the websocket carrier.
+	WebSocketFairQueue *bool `toml:"websocket-fair-queue"`
 	// PadFirstFrames pads the first carrier batches in both directions.
 	PadFirstFrames bool `toml:"pad-first-frames"`
 }
@@ -642,7 +644,7 @@ func (c *Config) ToWebProxyRuntimeConfig(mtProxyBind string) (WebProxyRuntimeCon
 	if explicitlyOn(c.WebProxy.StreamDownload) && carrier != webproxy.CarrierHTTPS {
 		return WebProxyRuntimeConfig{}, errors.New("web-proxy.stream-download requires carrier \"https\"")
 	}
-	if c.WebProxy.WebSocketFairQueue && carrier != webproxy.CarrierWebSocket {
+	if explicitlyOn(c.WebProxy.WebSocketFairQueue) && carrier != webproxy.CarrierWebSocket {
 		return WebProxyRuntimeConfig{}, errors.New("web-proxy.websocket-fair-queue requires carrier \"websocket\"")
 	}
 	if c.WebProxy.PadFirstFrames && carrier != webproxy.CarrierHTTPS && carrier != webproxy.CarrierWebSocket {
@@ -726,7 +728,7 @@ func (c *Config) ToWebProxyRuntimeConfig(mtProxyBind string) (WebProxyRuntimeCon
 		BackendProxyProtocol: !logicalBackend,
 		CarrierBatchBytes:    c.WebProxy.CarrierBatchKiB * 1024,
 		StreamDownload:       c.WebProxy.streamDownload(carrier),
-		WebSocketFairQueue:   c.WebProxy.WebSocketFairQueue,
+		WebSocketFairQueue:   c.WebProxy.webSocketFairQueue(carrier),
 		PadFirstFrames:       c.WebProxy.PadFirstFrames,
 	}, nil
 }
@@ -778,6 +780,12 @@ func (w WebProxyConfig) streamDownload(carrier webproxy.CarrierMode) bool {
 	return carrier == webproxy.CarrierHTTPS && (w.StreamDownload == nil || *w.StreamDownload)
 }
 
+// webSocketFairQueue is on by default for the websocket carrier only. The
+// default silently does not apply to other carriers.
+func (w WebProxyConfig) webSocketFairQueue(carrier webproxy.CarrierMode) bool {
+	return carrier == webproxy.CarrierWebSocket && (w.WebSocketFairQueue == nil || *w.WebSocketFairQueue)
+}
+
 func (c *Config) webProxyFingerprint() string {
 	if !c.WebProxy.Enabled {
 		return "enabled=false"
@@ -799,7 +807,7 @@ func (c *Config) webProxyFingerprint() string {
 		c.WebProxy.NumEventLoops,
 		c.WebProxy.CarrierBatchKiB,
 		c.WebProxy.streamDownload(carrier),
-		c.WebProxy.WebSocketFairQueue,
+		c.WebProxy.webSocketFairQueue(carrier),
 		c.WebProxy.PadFirstFrames,
 	)
 }

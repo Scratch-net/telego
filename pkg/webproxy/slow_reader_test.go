@@ -157,14 +157,34 @@ func TestHTTPServerWebSocketSlowReaderCompletesMessageBeyondWriteTimeout(t *test
 	started := time.Now()
 	opcode, payload, err := client.readResult(30 * time.Second)
 	elapsed := time.Since(started)
-	if err != nil || opcode != ws.OpBinary || len(payload) != want {
+	if err != nil || opcode != ws.OpBinary {
 		t.Fatalf("slow WebSocket reader got opcode %v, %d of %d bytes after %v: %v", opcode, len(payload), want, elapsed, err)
 	}
+	// The first message alone must take longer than WriteTimeout. The FIFO
+	// queue sends both frames in it; the fair queue sends one stream frame
+	// per message, so read on until both frames have arrived.
 	if elapsed < 2*writeTimeout {
 		t.Fatalf("transfer took %v; the test requires a transfer longer than WriteTimeout", elapsed)
 	}
-	if frames, err := ParseBatch(payload); err != nil || len(frames) != 2 {
-		t.Fatalf("slow WebSocket frames = %d, %v", len(frames), err)
+	received := len(payload)
+	frames, err := ParseBatch(payload)
+	for err == nil && received < want {
+		opcode, payload, err = client.readResult(30 * time.Second)
+		if err == nil && opcode != ws.OpBinary {
+			t.Fatalf("slow WebSocket reader got opcode %v after %d of %d bytes", opcode, received, want)
+		}
+		received += len(payload)
+		var more []Frame
+		if err == nil {
+			more, err = ParseBatch(payload)
+			frames = append(frames, more...)
+		}
+	}
+	if err != nil || received != want {
+		t.Fatalf("slow WebSocket reader got %d of %d bytes after %v: %v", received, want, time.Since(started), err)
+	}
+	if len(frames) != 2 || frames[0].StreamID != 1 || frames[1].StreamID != 2 {
+		t.Fatalf("slow WebSocket frames = %d", len(frames))
 	}
 }
 

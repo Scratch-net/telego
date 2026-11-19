@@ -1161,24 +1161,71 @@ func TestWebProxyStreamDownloadTOML(t *testing.T) {
 	}
 }
 
-func TestWebProxyWebSocketFairQueueRequiresWebSocket(t *testing.T) {
+func TestWebProxyWebSocketFairQueueDefaultsToWebSocket(t *testing.T) {
+	on, off := true, false
 	for _, carrier := range []string{"", "https", "https-lanes", "websocket", "websocket-lanes"} {
-		cfg := &Config{
-			Secrets:  map[string]string{"alice": "0123456789abcdef0123456789abcdef"},
-			WebProxy: WebProxyConfig{Enabled: true, Hostname: "proxy.example.com", Carrier: carrier, WebSocketFairQueue: true},
-		}
-		runtime, err := cfg.ToWebProxyRuntimeConfig("0.0.0.0:443")
 		websocket := carrier == "websocket"
-		if websocket && (err != nil || !runtime.WebSocketFairQueue) ||
-			!websocket && (err == nil || !strings.Contains(err.Error(), "websocket-fair-queue")) {
-			t.Fatalf("carrier %q: fair=%t err=%v", carrier, runtime.WebSocketFairQueue, err)
+		for _, setting := range []*bool{nil, &on, &off} {
+			cfg := &Config{
+				Secrets:  map[string]string{"alice": "0123456789abcdef0123456789abcdef"},
+				WebProxy: WebProxyConfig{Enabled: true, Hostname: "proxy.example.com", Carrier: carrier, WebSocketFairQueue: setting},
+			}
+			runtime, err := cfg.ToWebProxyRuntimeConfig("0.0.0.0:443")
+			switch {
+			case setting == &on && !websocket:
+				// Only an explicit true is rejected on another carrier.
+				if err == nil || !strings.Contains(err.Error(), "websocket-fair-queue") {
+					t.Fatalf("carrier %q explicit true: err = %v", carrier, err)
+				}
+			case err != nil:
+				t.Fatalf("carrier %q setting %v: %v", carrier, setting, err)
+			case runtime.WebSocketFairQueue != (websocket && setting != &off):
+				t.Fatalf("carrier %q setting %v: fair = %t", carrier, setting, runtime.WebSocketFairQueue)
+			}
 		}
 	}
-	cfg := &Config{WebProxy: WebProxyConfig{Enabled: true}}
-	fingerprint := cfg.webProxyFingerprint()
-	cfg.WebProxy.WebSocketFairQueue = true
-	if fingerprint == cfg.webProxyFingerprint() {
+
+	cfg := &Config{WebProxy: WebProxyConfig{Enabled: true, Carrier: "websocket"}}
+	unset := cfg.webProxyFingerprint()
+	cfg.WebProxy.WebSocketFairQueue = &on
+	if cfg.webProxyFingerprint() != unset {
+		t.Fatal("explicit default websocket-fair-queue changed the restart fingerprint")
+	}
+	cfg.WebProxy.WebSocketFairQueue = &off
+	if cfg.webProxyFingerprint() == unset {
 		t.Fatal("websocket-fair-queue change omitted from restart fingerprint")
+	}
+	cfg.WebProxy.Carrier = "https"
+	disabled := cfg.webProxyFingerprint()
+	cfg.WebProxy.WebSocketFairQueue = nil
+	if cfg.webProxyFingerprint() != disabled {
+		t.Fatal("websocket-fair-queue default changed the fingerprint of an https carrier")
+	}
+}
+
+func TestWebProxyWebSocketFairQueueTOML(t *testing.T) {
+	for _, test := range []struct {
+		line string
+		want bool
+	}{
+		{"", true},
+		{"websocket-fair-queue = true", true},
+		{"websocket-fair-queue = false", false},
+	} {
+		path := filepath.Join(t.TempDir(), "config.toml")
+		data := "[secrets]\nalice = \"0123456789abcdef0123456789abcdef\"\n" +
+			"[web-proxy]\nenabled = true\nhostname = \"proxy.example.com\"\ncarrier = \"websocket\"\n" + test.line + "\n"
+		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		runtime, err := cfg.ToWebProxyRuntimeConfig("0.0.0.0:443")
+		if err != nil || runtime.WebSocketFairQueue != test.want {
+			t.Fatalf("%q: fair = %t, err = %v; want %t", test.line, runtime.WebSocketFairQueue, err, test.want)
+		}
 	}
 }
 

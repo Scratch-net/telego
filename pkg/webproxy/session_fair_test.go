@@ -189,7 +189,15 @@ func TestFairDownlinkOnlyForMultiplexedWebSocket(t *testing.T) {
 	}
 	_, session := fairTestSession(t, false)
 	if session.fairDown || session.downFrameBytes != 0 {
-		t.Fatal("default websocket session changed downlink scheduling")
+		t.Fatal("websocket session with the fair queue off changed downlink scheduling")
+	}
+	profiles := testProfiles(t)
+	manager := testManager(t, profiles, func(config *ManagerConfig) {
+		config.Carrier = CarrierWebSocket
+	}, newPipeDialer().DialContext)
+	session = createTestSession(t, manager, profiles[0]).Session
+	if !manager.fairDown || !session.fairDown || session.downFrameBytes != webSocketFairMessageBytes {
+		t.Fatalf("default websocket session: fair = %t, frame bytes = %d", session.fairDown, session.downFrameBytes)
 	}
 }
 

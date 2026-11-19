@@ -100,6 +100,7 @@ type ManagerConfig struct {
 	StreamDownload bool
 	// WebSocketFairQueue schedules multiplexed WebSocket downlink messages
 	// fairly across streams and caps each message at 160 KiB.
+	// DefaultManagerConfig turns it on; other carriers ignore it.
 	WebSocketFairQueue bool
 	// PadFirstFrames adds one PAD frame to each of the first downlink
 	// batches of https and websocket sessions. Lanes carriers ignore it.
@@ -118,12 +119,13 @@ type ManagerConfig struct {
 // reference limits and the standard library TCP dialer.
 func DefaultManagerConfig(profiles []Profile, backend string) ManagerConfig {
 	return ManagerConfig{
-		StreamDownload: true,
-		Profiles:       profiles,
-		Backend:        backend,
-		Carrier:        CarrierHTTPS,
-		Limits:         DefaultLimits(),
-		Timeouts:       DefaultTimeouts(),
+		StreamDownload:     true,
+		WebSocketFairQueue: true,
+		Profiles:           profiles,
+		Backend:            backend,
+		Carrier:            CarrierHTTPS,
+		Limits:             DefaultLimits(),
+		Timeouts:           DefaultTimeouts(),
 	}
 }
 

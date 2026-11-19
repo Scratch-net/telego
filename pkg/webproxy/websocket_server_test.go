@@ -1488,15 +1488,10 @@ func TestHTTPServerWebSocketSlowReaderHoldsPollLeaseUntilDrain(t *testing.T) {
 		}
 	}
 
-	opcode, payload := client.read(t, 30*time.Second)
-	if opcode != ws.OpBinary || len(payload) != 2*(FrameHeaderSize+payloadSize) {
-		t.Fatalf("large downlink = opcode %v, %d bytes", opcode, len(payload))
-	}
-	frames, err := ParseBatch(payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(frames) != 2 || frames[0].StreamID != 1 || frames[1].StreamID != 2 ||
+	// The FIFO queue sends both frames in one message; the fair queue sends
+	// one stream frame per message. Each message holds its own PollLease.
+	frames := readWebSocketDataFrames(t, client, 30*time.Second, 2)
+	if frames[0].StreamID != 1 || frames[1].StreamID != 2 ||
 		!bytes.Equal(frames[0].Payload, bytes.Repeat([]byte{0x61}, payloadSize)) ||
 		!bytes.Equal(frames[1].Payload, bytes.Repeat([]byte{0x62}, payloadSize)) {
 		t.Fatal("AsyncWritev corrupted the leased downlink payload")
@@ -1557,28 +1552,27 @@ func TestHTTPServerWebSocketSlowReaderRemainsFullDuplexUntilPollLeaseDrain(t *te
 		}
 	}
 
-	opcode, payload := client.read(t, 30*time.Second)
-	if opcode != ws.OpBinary || len(payload) != 2*(FrameHeaderSize+payloadSize) {
-		t.Fatalf("large downlink = opcode %v, %d bytes", opcode, len(payload))
-	}
-	frames, err := ParseBatch(payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(frames) != 2 || frames[0].StreamID != 1 || frames[1].StreamID != 2 ||
-		!bytes.Equal(frames[0].Payload, bytes.Repeat([]byte{0x71}, payloadSize)) ||
-		!bytes.Equal(frames[1].Payload, bytes.Repeat([]byte{0x72}, payloadSize)) {
-		t.Fatal("full-duplex input corrupted the leased downlink payload")
-	}
-	uplinkDeadline := time.Now().Add(5 * time.Second)
+	// The FIFO queue sends both leased frames in one message before the echo.
+	// The fair queue sends one stream frame per message and can interleave the
+	// stream 3 echo, so collect each stream until all bytes have arrived.
+	downlink := make([]Frame, 0, 2)
 	receivedUplink := make([]byte, 0, len(uplinkPayload))
-	for len(receivedUplink) < len(uplinkPayload) {
-		frames = readWebSocketBatch(t, client, time.Until(uplinkDeadline))
-		for _, frame := range frames {
-			if frame.Type == FrameData && frame.StreamID == 3 {
+	deadline := time.Now().Add(30 * time.Second)
+	for len(downlink) < 2 || len(receivedUplink) < len(uplinkPayload) {
+		for _, frame := range readWebSocketBatch(t, client, time.Until(deadline)) {
+			switch {
+			case frame.Type != FrameData:
+			case frame.StreamID == 3:
 				receivedUplink = append(receivedUplink, frame.Payload...)
+			default:
+				downlink = append(downlink, frame)
 			}
 		}
+	}
+	if len(downlink) != 2 || downlink[0].StreamID != 1 || downlink[1].StreamID != 2 ||
+		!bytes.Equal(downlink[0].Payload, bytes.Repeat([]byte{0x71}, payloadSize)) ||
+		!bytes.Equal(downlink[1].Payload, bytes.Repeat([]byte{0x72}, payloadSize)) {
+		t.Fatal("full-duplex input corrupted the leased downlink payload")
 	}
 	if !bytes.Equal(receivedUplink, uplinkPayload) {
 		t.Fatal("uplink did not remain active while the downlink PollLease drained")
@@ -1781,6 +1775,25 @@ func (c *webSocketTestClient) close() {
 	if c != nil && c.connection != nil {
 		_ = c.connection.Close()
 	}
+}
+
+// readWebSocketDataFrames reads binary messages until it has count DATA
+// frames, whether they arrive in one message or in several.
+func readWebSocketDataFrames(t *testing.T, client *webSocketTestClient, timeout time.Duration, count int) []Frame {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	frames := make([]Frame, 0, count)
+	for len(frames) < count {
+		for _, frame := range readWebSocketBatch(t, client, time.Until(deadline)) {
+			if frame.Type == FrameData {
+				frames = append(frames, frame)
+			}
+		}
+	}
+	if len(frames) != count {
+		t.Fatalf("read %d DATA frames, want %d", len(frames), count)
+	}
+	return frames
 }
 
 func readWebSocketBatch(t *testing.T, client *webSocketTestClient, timeout time.Duration) []Frame {
