@@ -240,6 +240,18 @@ func TestHotReloader_WarnNonHotChanges(t *testing.T) {
 			wantWarn: true,
 		},
 		{
+			name:     "cover_domain_changed",
+			old:      &Config{Domains: []TLSDomain{{Host: "a.example", SplicePort: 443}}},
+			new:      &Config{Domains: []TLSDomain{{Host: "a.example", SplicePort: 8443}}},
+			wantWarn: true,
+		},
+		{
+			name:     "secret_moved_to_cover_domain",
+			old:      &Config{Secrets: []Secret{{Name: "user1", Key: []byte("key1"), Host: "mask.example"}}},
+			new:      &Config{Secrets: []Secret{{Name: "user1", Key: []byte("key1"), Host: "a.example"}}},
+			wantWarn: true,
+		},
+		{
 			name:     "no_changes",
 			old:      &Config{BindAddr: ":8080"},
 			new:      &Config{BindAddr: ":8080"},

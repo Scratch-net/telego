@@ -28,6 +28,19 @@ type Secret struct {
 	RawHex string // Original hex string for link generation
 }
 
+// TLSDomain is a cover domain besides MaskHost. Secrets whose Host equals
+// Host use its ServerHello template, certificate and splice target. All
+// fields are resolved; none has a default.
+type TLSDomain struct {
+	Host                string
+	CertHost            string
+	CertPort            int
+	SpliceHost          string
+	SplicePort          int
+	SpliceProxyProtocol int // 0 = off, 1 = v1 (text), 2 = v2 (binary)
+	FakeCertSize        int // 0 = match this domain's cert record
+}
+
 // Config configures the gnet proxy server.
 type Config struct {
 	// Secrets is the list of allowed proxy secrets.
@@ -75,6 +88,9 @@ type Config struct {
 	SplicePort          int
 	SpliceProxyProtocol int           // 0 = off, 1 = v1 (text), 2 = v2 (binary)
 	SpliceIdleTimeout   time.Duration // Idle timeout for splice connections (default 30s)
+
+	// Domains are extra cover domains. Empty keeps the single MaskHost.
+	Domains []TLSDomain
 
 	// Performance
 	IPPreference      dc.IPPreference
@@ -262,6 +278,7 @@ func runWithPreparedHandler(
 	if handler.serverHelloFetcher != nil {
 		handler.serverHelloFetcher.StartBackgroundRefresh()
 	}
+	handler.startDomainRefresh()
 
 	// Use atomic pointer to store engine reference
 	var engPtr atomic.Pointer[gnet.Engine]

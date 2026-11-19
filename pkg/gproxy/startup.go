@@ -36,6 +36,9 @@ func (h *ProxyHandler) prepareFrontends() {
 			h.logger.Info("Hybrid TLS mode enabled: using real ServerHello from %s", cfg.CertHost)
 		}
 	}
+	if cfg.FetchRealCert {
+		h.prepareDomains()
+	}
 	if h.middleEnd != nil {
 		h.middleEnd.start()
 	}
@@ -48,6 +51,7 @@ func (h *ProxyHandler) stopServing() error {
 	if h.serverHelloFetcher != nil {
 		h.serverHelloFetcher.StopBackgroundRefresh()
 	}
+	h.stopDomainRefresh()
 	if h.middleEnd != nil {
 		h.middleEnd.stop()
 	}

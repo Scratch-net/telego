@@ -87,6 +87,7 @@ Read the [managed gateway guide](examples/gateway/README.md) for updates, backup
 - **Profile-matched cert record** — The fake certificate record in the FakeTLS ServerHello is sized to match the mask host's real certificate record, so the accept path and the probe (splice) path present identical TLS record lengths
 - **Post-quantum key share** — When a client offers the hybrid X25519MLKEM768 group, the synthetic ServerHello answers with a matching key share instead of downgrading to classical x25519 (a passive group-downgrade tell)
 - **SNI-following mask** — Optional safelist of domains; an unrecognized probe whose SNI is safelisted is forwarded to that domain's own server, so the on-wire conversation matches the SNI it claimed
+- **Several cover domains** — Optional extra SNI domains for chosen secrets. Each domain has its own ServerHello template, certificate, and probe target
 
 ### Operations
 - **Multi-user Support** — Named secrets with per-user tracking and logging
@@ -391,6 +392,17 @@ mask-host = "www.google.com"  # Host to mimic (SNI validation, proxy links)
 # Anti-DPI record shaping (proxy -> client direction)
 # enable-drs = true        # Probe-then-ramp record sizing (1369 -> 16384 bytes after 8 records or 128 KB)
 # enable-split-tls = true  # Emit first ApplicationData record as 1 byte
+
+# Extra cover domains (optional). Keep these tables last in [tls-fronting].
+# [[tls-fronting.domains]]
+# host = "www.microsoft.com"  # SNI and ee link hostname of the listed secrets
+# secrets = ["user2"]         # Names from [secrets]; each secret in one domain at most
+# cert-host = "127.0.0.1"     # Default: host
+# cert-port = 8443            # Default: 443
+# splice-host = "127.0.0.1"   # Default: host
+# splice-port = 8443          # Default: 443
+# splice-proxy-protocol = 0   # Default: 0 (off)
+# fake-cert-size = 0          # Default: 0 (match this domain)
 
 # Native Telegram Desktop WEB proxy (optional; requires Nginx with real TLS)
 [web-proxy]

@@ -3,6 +3,7 @@ package config
 
 import (
 	"bytes"
+	"cmp"
 	cryptoRand "crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -90,6 +91,24 @@ type TLSFrontingConfig struct {
 	// Pointers so an absent TOML key keeps the gproxy.DefaultConfig() default (true).
 	EnableDRS      *bool `toml:"enable-drs"`       // Chrome-style probe-then-ramp record sizer
 	EnableSplitTLS *bool `toml:"enable-split-tls"` // 1-byte first ApplicationData record
+
+	// Domains adds cover domains besides mask-host. Each domain serves the
+	// secrets it lists; all other secrets keep mask-host.
+	Domains []TLSDomainConfig `toml:"domains"`
+}
+
+// TLSDomainConfig is one extra cover domain ([[tls-fronting.domains]]).
+// Unset hosts default to host and unset ports to 443, so each domain gets
+// its own ServerHello template, certificate and splice target.
+type TLSDomainConfig struct {
+	Host                string   `toml:"host"`    // SNI of the listed secrets
+	Secrets             []string `toml:"secrets"` // Names from [secrets]
+	CertHost            string   `toml:"cert-host"`
+	CertPort            int      `toml:"cert-port"`
+	SpliceHost          string   `toml:"splice-host"`
+	SplicePort          int      `toml:"splice-port"`
+	SpliceProxyProtocol int      `toml:"splice-proxy-protocol"` // 0=off, 1=v1, 2=v2
+	FakeCertSize        int      `toml:"fake-cert-size"`        // 0 = match this domain
 }
 
 // PerformanceConfig configures performance settings.
@@ -221,6 +240,9 @@ func Load(path string) (*Config, error) {
 	if err := cfg.validateScalars(); err != nil {
 		return nil, err
 	}
+	if err := cfg.validateDomains(); err != nil {
+		return nil, err
+	}
 	if err := cfg.Metrics.Validate(); err != nil {
 		return nil, err
 	}
@@ -304,9 +326,75 @@ func (c *Config) validateScalars() error {
 	return nil
 }
 
+// validateDomains checks [[tls-fronting.domains]]. Every secret belongs to
+// at most one domain, so its ee link and its SNI stay unique.
+func (c *Config) validateDomains() error {
+	hosts := map[string]bool{strings.ToLower(c.TLSFronting.MaskHost): true}
+	owner := make(map[string]string)
+	for i, domain := range c.TLSFronting.Domains {
+		name := fmt.Sprintf("tls-fronting.domains[%d]", i)
+		if !validDomainHost(domain.Host) {
+			return fmt.Errorf("%s.host must be a DNS hostname", name)
+		}
+		if hosts[strings.ToLower(domain.Host)] {
+			return fmt.Errorf("%s.host %q repeats mask-host or another domain", name, domain.Host)
+		}
+		hosts[strings.ToLower(domain.Host)] = true
+		for _, port := range []struct {
+			option string
+			value  int
+		}{{"cert-port", domain.CertPort}, {"splice-port", domain.SplicePort}} {
+			if port.value < 0 || port.value > 65535 {
+				return fmt.Errorf("%s.%s must be between 0 and 65535 (0 uses 443)", name, port.option)
+			}
+		}
+		if domain.SpliceProxyProtocol < 0 || domain.SpliceProxyProtocol > 2 {
+			return fmt.Errorf("%s.splice-proxy-protocol must be 0, 1, or 2", name)
+		}
+		if domain.FakeCertSize < 0 {
+			return fmt.Errorf("%s.fake-cert-size cannot be negative", name)
+		}
+		if len(domain.Secrets) == 0 {
+			return fmt.Errorf("%s.secrets must name at least one secret", name)
+		}
+		for _, secret := range domain.Secrets {
+			if _, ok := c.Secrets[secret]; !ok {
+				return fmt.Errorf("%s.secrets names unknown secret %q", name, secret)
+			}
+			if previous, ok := owner[secret]; ok {
+				return fmt.Errorf("secret %q is listed for both %q and %q", secret, previous, domain.Host)
+			}
+			owner[secret] = domain.Host
+		}
+	}
+	return nil
+}
+
+// validDomainHost accepts a DNS hostname: letters, digits, hyphens and dots,
+// at most 253 bytes, with no empty label.
+func validDomainHost(host string) bool {
+	if host == "" || len(host) > 253 {
+		return false
+	}
+	for label := range strings.SplitSeq(host, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		if strings.IndexFunc(label, func(r rune) bool {
+			return (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '-'
+		}) >= 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // ToGProxyConfig converts to gproxy.Config.
 func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
 	if err := c.validateScalars(); err != nil {
+		return gproxy.Config{}, err
+	}
+	if err := c.validateDomains(); err != nil {
 		return gproxy.Config{}, err
 	}
 	if err := c.Metrics.Validate(); err != nil {
@@ -331,17 +419,27 @@ func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
 		return gproxy.Config{}, errors.New("mask-host is required")
 	}
 
+	secretHosts := make(map[string]string)
+	for _, domain := range c.TLSFronting.Domains {
+		for _, name := range domain.Secrets {
+			secretHosts[name] = domain.Host
+		}
+	}
 	for _, name := range slices.Sorted(maps.Keys(c.Secrets)) {
 		keyHex := c.Secrets[name]
 		key, err := ParseKey(keyHex)
 		if err != nil {
 			return gproxy.Config{}, fmt.Errorf("invalid secret %q: %w", name, err)
 		}
+		secretHost := host
+		if domainHost, ok := secretHosts[name]; ok {
+			secretHost = domainHost
+		}
 		cfg.Secrets = append(cfg.Secrets, gproxy.Secret{
 			Name:   name,
 			Key:    key,
-			Host:   host,
-			RawHex: BuildFullSecret(key, host),
+			Host:   secretHost,
+			RawHex: BuildFullSecret(key, secretHost),
 		})
 	}
 	cfg.Host = host
@@ -384,6 +482,9 @@ func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
 	}
 	cfg.SpliceProxyProtocol = c.TLSFronting.SpliceProxyProtocol
 	cfg.SpliceIdleTimeout = c.TLSFronting.SpliceIdleTimeout.Duration()
+	for _, domain := range c.TLSFronting.Domains {
+		cfg.Domains = append(cfg.Domains, domain.toGProxy())
+	}
 
 	if c.TLSFronting.EnableDRS != nil {
 		cfg.EnableDRS = *c.TLSFronting.EnableDRS
@@ -454,6 +555,19 @@ func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// toGProxy resolves the defaults of one cover domain.
+func (d TLSDomainConfig) toGProxy() gproxy.TLSDomain {
+	return gproxy.TLSDomain{
+		Host:                d.Host,
+		CertHost:            cmp.Or(d.CertHost, d.Host),
+		CertPort:            cmp.Or(d.CertPort, 443),
+		SpliceHost:          cmp.Or(d.SpliceHost, d.Host),
+		SplicePort:          cmp.Or(d.SplicePort, 443),
+		SpliceProxyProtocol: d.SpliceProxyProtocol,
+		FakeCertSize:        d.FakeCertSize,
+	}
 }
 
 // ToWebProxyRuntimeConfig validates the optional WEB listener and derives its
