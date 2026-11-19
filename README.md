@@ -318,6 +318,30 @@ Use the [manual example](examples/web-proxy/README.md) for an existing website o
 
 The WEB configuration is inactive by default. Configurations without `[web-proxy]` continue to use the existing MTProxy startup path.
 
+### WEB behind a CDN
+
+You can put the WEB hostname behind a CDN. Before you do, read these limits:
+
+- Cloudflare reports that since June 9, 2025, users in Russia load only the first 16 KB of web assets from Cloudflare ([Cloudflare blog](https://blog.cloudflare.com/russian-internet-users-are-unable-to-access-the-open-internet/)). A CDN does not help on these networks.
+- Use a CDN only for networks where you measured that it works.
+
+With a CDN, Nginx receives connections from CDN edge addresses.
+The example Nginx configuration sends `X-Forwarded-For $remote_addr` to Telego.
+Telego uses this address for per-IP and per-user limits.
+Without more configuration, all clients share the address of the CDN edge, and the limits apply to the CDN edge.
+
+To keep the client address, configure the Nginx [realip module](https://nginx.org/en/docs/http/ngx_http_realip_module.html):
+
+```nginx
+# Repeat for each published address range of the CDN.
+set_real_ip_from <cdn-range>;
+# Use the header that the CDN documents, for example CF-Connecting-IP for Cloudflare.
+real_ip_header CF-Connecting-IP;
+```
+
+Nginx then sets `$remote_addr` to the client address.
+Keep the CDN address list current. An address range that is missing makes those clients share one address.
+
 ---
 
 ## Configuration
@@ -570,6 +594,23 @@ server {
     proxy_protocol on;
 }
 ```
+
+---
+
+## Choosing a Mask Host
+
+The mask host sets the SNI that censors see for FakeTLS connections.
+
+Russian DPI is reported to freeze one TCP connection to a foreign data-centre address after about 15-20 KB from server to client ([net4people/bbs#490](https://github.com/net4people/bbs/issues/490)).
+The same reports say that some SNI values are on a whitelist and do not get this freeze.
+The whitelist can be different for each operator.
+The [TCP 16-20 domain whitelist checker](https://github.com/hyperion-cs/dpi-checkers/tree/main/ru/tcp-16-20_dwc) measures it and publishes results.
+
+Before you select a whitelisted domain, read these points:
+
+- It is not verified that FakeTLS connections get the same exemption as other TLS connections.
+- `telego doctor` warns when the mask host does not resolve to the proxy IP, because TSPU is reported to compare them. A whitelisted domain of another company does not resolve to your proxy. The two recommendations conflict. Test on the networks of your users.
+- Probes are spliced to `splice-host`, which is `mask-host` by default. A probe must get the real certificate of the mask host. Do not point `splice-host` at a server that does not have a certificate for that domain.
 
 ---
 
