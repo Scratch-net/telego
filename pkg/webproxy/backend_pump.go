@@ -327,7 +327,7 @@ func (b *backendStream) pumpRead(backend Backend) (bool, error) {
 		s.mu.Unlock()
 		return false, ErrClosed
 	}
-	allowance := min(int(state.sendCredit), RelayDataChunk, readable)
+	allowance := min(int(state.sendCredit), s.downPayloadLimit(RelayDataChunk), readable)
 	controlBytes, _, _ := pendingControlReserve(s.limits)
 	allowance = min(allowance, s.limits.MaxPendingPerSession-controlBytes-s.pendingCost-FrameHeaderSize-queueItemCost)
 	if allowance <= 0 {

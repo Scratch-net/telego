@@ -111,6 +111,9 @@ middle-end.enabled = true
 		{"performance.client-silence-close", `"999ms"`},
 		{"performance.max-write-buffer-mb", "1025"},
 		{"web-proxy.num-event-loops", "-1"},
+		{"web-proxy.carrier-batch-kib", "-1"},
+		{"web-proxy.carrier-batch-kib", "3"},
+		{"web-proxy.carrier-batch-kib", "2049"},
 		{"middle-end.max-connections", "-1"},
 		{"middle-end.queue-budget-mb", "-1"},
 	} {
@@ -1069,6 +1072,24 @@ num-event-loops = 2
 	if runtime.Profiles[1].Name() != "alice" || runtime.Profiles[1].Mode() != webproxy.SecretDD ||
 		runtime.Profiles[1].SecretHex() != "dd0123456789abcdef0123456789abcdef" {
 		t.Fatalf("dd profile = name %q mode %v secret %q", runtime.Profiles[1].Name(), runtime.Profiles[1].Mode(), runtime.Profiles[1].SecretHex())
+	}
+}
+
+func TestWebProxyCarrierBatchKiB(t *testing.T) {
+	for _, test := range []struct{ kib, bytes int }{{0, 0}, {4, 4096}, {16, 16384}, {2048, 2 * 1024 * 1024}} {
+		cfg := &Config{
+			Secrets:  map[string]string{"alice": "0123456789abcdef0123456789abcdef"},
+			WebProxy: WebProxyConfig{Enabled: true, Hostname: "proxy.example.com", CarrierBatchKiB: test.kib},
+		}
+		runtime, err := cfg.ToWebProxyRuntimeConfig("0.0.0.0:443")
+		if err != nil || runtime.CarrierBatchBytes != test.bytes {
+			t.Fatalf("carrier-batch-kib=%d: bytes=%d err=%v", test.kib, runtime.CarrierBatchBytes, err)
+		}
+		fingerprint := cfg.webProxyFingerprint()
+		cfg.WebProxy.CarrierBatchKiB = test.kib + 1
+		if fingerprint == cfg.webProxyFingerprint() {
+			t.Fatal("carrier batch change omitted from restart fingerprint")
+		}
 	}
 }
 

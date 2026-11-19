@@ -164,6 +164,14 @@ carrier = "websocket"
 # gnet event loops for the private WEB HTTP listener (0 = automatic).
 # num-event-loops = 0
 
+# Experimental. Maximum size of each carrier body and downlink DATA frame, in KiB.
+# 0 keeps the 2048 KiB default. The valid override range is 4 through 2048.
+# A small value with Nginx keepalive_requests makes the browser open new connections.
+# This can avoid a censor rule that freezes one connection after about 15-20 KB.
+# Each new connection costs a TLS handshake and a SYN, and throughput drops.
+# Read the README section about connection rotation before you change it.
+# carrier-batch-kib = 0
+
 # Telegram Middle-End transport is enabled by default, including when this section is absent.
 # Telego checks ME connections in the background and uses direct DC routes until ME is ready.
 # Changes to this section require a restart.

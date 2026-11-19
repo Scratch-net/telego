@@ -318,6 +318,31 @@ Use the [manual example](examples/web-proxy/README.md) for an existing website o
 
 The WEB configuration is inactive by default. Configurations without `[web-proxy]` continue to use the existing MTProxy startup path.
 
+### Experimental connection rotation
+
+Some censors freeze one TCP connection after about 15-20 KB from the server to the client. They do not send a reset. More HTTP requests on the same connection do not help. A new connection gets a new byte budget.
+
+The `https` carrier can rotate connections. This mode is an opt-in experiment. Do not use it if WEB works without it.
+
+1. Set `carrier = "https"`.
+2. Set `carrier-batch-kib` to a small value, for example `4`. This value limits each carrier body and each downlink DATA frame. The default is `2048`.
+3. In the Nginx TLS `server` block, close each connection after a few requests:
+
+```nginx
+keepalive_requests 3;   # close the connection after 3 requests (HTTP/1.1 and HTTP/2)
+keepalive_time 30s;     # close the connection after 30 seconds
+```
+
+The browser then opens a new connection for the next request.
+
+The costs are high:
+
+- Each new connection needs a full TLS handshake. The certificate chain uses part of the byte budget of the connection.
+- Throughput becomes very low. Each connection carries only a few small responses.
+- Each new connection sends a SYN. If `synlimit.sh` protects the WEB port, each client IP can open 48 connections per minute, with a burst of 24. Rotation can reach this limit, and then new connections get a reset.
+- Some censors block a port for about 2 minutes after a burst of SYN packets. Fast rotation can cause this block.
+- `keepalive_requests` and `keepalive_time` apply to every request in that `server` block, including the ordinary website.
+
 ---
 
 ## Configuration
@@ -402,6 +427,7 @@ carrier = "websocket"                    # Installer default. Requires upgrade f
 # backend = "127.0.0.1:443"                # Explicit local socket compatibility path
 # trusted-proxy-cidrs = ["127.0.0.1/32"]   # Nginx peers allowed to send X-Forwarded-For
 # num-event-loops = 0                       # 0 = automatic
+# carrier-batch-kib = 0                     # 0 = 2048 KiB. Experimental: 4-2048
 
 # Telegram Middle-End transport (enabled by default; changes require a restart)
 [middle-end]

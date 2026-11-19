@@ -91,6 +91,7 @@ type Manager struct {
 
 	profiles       []Profile
 	carrier        CarrierMode
+	downFrameBytes int
 	backendNet     string
 	backend        string
 	limits         Limits
@@ -159,6 +160,7 @@ func NewManager(config ManagerConfig) (*Manager, error) {
 
 		profiles:                slices.Clone(config.Profiles),
 		carrier:                 config.Carrier,
+		downFrameBytes:          config.DownlinkFrameBytes,
 		backendNet:              backendNetwork,
 		backend:                 backendAddress,
 		limits:                  config.Limits,
@@ -334,6 +336,7 @@ func (a *BootstrapAuthorization) create(clientIP string, body []byte, owner gnet
 	created := newSession(sessionOptions{
 		profile:               entry.profile,
 		carrier:               m.carrier,
+		downFrameBytes:        m.downFrameBytes,
 		clientIP:              clientIP,
 		backendNet:            m.backendNet,
 		backend:               m.backend,

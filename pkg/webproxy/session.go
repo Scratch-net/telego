@@ -32,6 +32,7 @@ type uplinkApplicationReservation interface {
 type sessionOptions struct {
 	profile               Profile
 	carrier               CarrierMode
+	downFrameBytes        int
 	clientIP              string
 	backendNet            string
 	backend               string
@@ -121,6 +122,7 @@ type Session struct {
 	diagnostic     *bridgeDiagnosticState
 	profile        Profile
 	carrier        CarrierMode
+	downFrameBytes int // 0 keeps the default DATA frame sizes
 	clientIP       string
 	backendNet     string
 	backend        string
@@ -201,6 +203,7 @@ func newSession(options sessionOptions) *Session {
 	session := &Session{
 		profile:               options.profile,
 		carrier:               carrier,
+		downFrameBytes:        options.downFrameBytes,
 		clientIP:              options.clientIP,
 		backendNet:            options.backendNet,
 		backend:               options.backend,
@@ -1299,7 +1302,7 @@ func (s *Session) nextReadAllowance(streamID uint32, streamDone <-chan struct{})
 			return 0, false
 		}
 		if state.sendCredit != 0 {
-			allowance := min(int(state.sendCredit), RelayDataChunk)
+			allowance := min(int(state.sendCredit), s.downPayloadLimit(RelayDataChunk))
 			allowance = s.dataFrameAllowanceLocked(allowance)
 			if allowance != 0 {
 				s.mu.Unlock()
@@ -1384,7 +1387,7 @@ func (s *Session) queueFrameLocked(frameType FrameType, streamID uint32, payload
 	if len(lane.pendingFrames) != 0 {
 		last := &lane.pendingFrames[len(lane.pendingFrames)-1]
 		if last.frameType == FrameData && frameType == FrameData && last.streamID == streamID &&
-			len(last.encoded)-FrameHeaderSize+len(payload) <= MaxFramePayload {
+			len(last.encoded)-FrameHeaderSize+len(payload) <= s.downPayloadLimit(MaxFramePayload) {
 			if !s.reservePendingLocked(len(payload), 0, pendingDownlink) {
 				return false
 			}
@@ -1421,6 +1424,15 @@ func (s *Session) queueFrameLocked(frameType FrameType, streamID uint32, payload
 	}
 	s.signalPollLocked(lane)
 	return true
+}
+
+// downPayloadLimit applies the optional downlink frame limit to a DATA payload
+// bound. Without that limit, the bound is unchanged.
+func (s *Session) downPayloadLimit(limit int) int {
+	if s.downFrameBytes == 0 {
+		return limit
+	}
+	return min(limit, s.downFrameBytes-FrameHeaderSize)
 }
 
 func (s *Session) uplinkPendingLimits() (int, int) {
