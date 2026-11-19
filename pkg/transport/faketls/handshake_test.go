@@ -752,3 +752,21 @@ func buildALPNExtension(protocols []string) []byte {
 
 	return buf.Bytes()
 }
+
+func TestWriteApplicationDataChunkedJitterIsSymmetric(t *testing.T) {
+	data := make([]byte, 20000)
+	var below, above bool
+	for range 200 {
+		var buf bytes.Buffer
+		writeApplicationDataChunked(&buf, data)
+		first := int(binary.BigEndian.Uint16(buf.Bytes()[3:5]))
+		if first < 15520 || first > 16480 {
+			t.Fatalf("first record length %d outside 16000 +/- 480", first)
+		}
+		below = below || first < 16000
+		above = above || first > 16000
+	}
+	if !below || !above {
+		t.Fatalf("record lengths not on both sides of 16000: below=%v above=%v", below, above)
+	}
+}

@@ -622,7 +622,7 @@ func writeApplicationDataChunked(buf *bytes.Buffer, data []byte) {
 		jitterRange := baseChunk * jitterPercent / 100 // ~480 bytes
 		var jitterBytes [2]byte
 		rand.Read(jitterBytes[:])
-		jitter := int(jitterBytes[0])%(2*jitterRange+1) - jitterRange // -480 to +480
+		jitter := int(binary.BigEndian.Uint16(jitterBytes[:]))%(2*jitterRange+1) - jitterRange // -480 to +480
 
 		targetChunk := max(baseChunk+jitter, 1000) // Minimum reasonable size
 
