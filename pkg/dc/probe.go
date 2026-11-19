@@ -1,7 +1,10 @@
 package dc
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -9,9 +12,9 @@ import (
 	"net"
 	"sort"
 	"sync"
-	"syscall"
 	"time"
 
+	"github.com/scratch-net/telego/pkg/transport/obfuscated2"
 	"golang.org/x/net/proxy"
 )
 
@@ -81,6 +84,12 @@ func Init() {
 	})
 }
 
+// Check probes every known DC address with the MTProto check and returns the
+// results without changing the stored address order. telego doctor uses it.
+func Check() []DCProbeResult {
+	return probeAllDCs()
+}
+
 // probeAllDCs probes all known DC addresses concurrently.
 func probeAllDCs() []DCProbeResult {
 	// Collect all DCs to probe
@@ -120,7 +129,7 @@ func probeDC(dcID int, addrs []Addr) DCProbeResult {
 
 	for _, addr := range addrs {
 		wg.Go(func() {
-			pr := probeAddr(addr)
+			pr := probeAddr(dcID, addr)
 			mu.Lock()
 			result.Results = append(result.Results, pr)
 			mu.Unlock()
@@ -143,7 +152,7 @@ func probeDC(dcID int, addrs []Addr) DCProbeResult {
 // probeAddr probes a single address and returns the result.
 // When using SOCKS5, we measure actual round-trip by sending data and waiting
 // for response, since TCP handshake alone is handled locally by the proxy.
-func probeAddr(addr Addr) ProbeResult {
+func probeAddr(dcID int, addr Addr) ProbeResult {
 	// Skip IPv6 probing via SOCKS5 - many proxies don't support it properly
 	// and may return false positives (accept connection but can't route).
 	if probeDialer != nil && addr.IsIPv6() {
@@ -181,44 +190,105 @@ func probeAddr(addr Addr) ProbeResult {
 		}
 	}
 	defer conn.Close()
-	rtt, err := probeConnection(conn, ProbeTimeout)
+	rtt, err := probeConnection(conn, dcID, ProbeTimeout)
 	if err != nil {
 		return ProbeResult{Addr: addr, Error: err.Error()}
 	}
 	return ProbeResult{Addr: addr, RTT: rtt, Success: true}
 }
 
-func probeConnection(conn net.Conn, timeout time.Duration) (time.Duration, error) {
-	// Measure actual data RTT by sending garbage handshake and waiting for DC response.
-	// This is more reliable than TCP handshake time, especially through proxies.
-	// Telegram DC will reject invalid handshake quickly, giving us real latency.
-	rttStart := time.Now()
+// MTProto constants for the unauthenticated first handshake step
+// (https://core.telegram.org/schema/mtproto):
+//
+//	req_pq_multi#be7e8ef1 nonce:int128 = ResPQ;
+//	resPQ#05162463 nonce:int128 server_nonce:int128 pq:string
+//	    server_public_key_fingerprints:Vector<long> = ResPQ;
+const (
+	ctorReqPQMulti uint32 = 0xbe7e8ef1
+	ctorResPQ      uint32 = 0x05162463
+	// An unencrypted message envelope is auth_key_id(8), message_id(8) and
+	// message_data_length(4).
+	probeEnvelopeSize = 20
+	// The smallest resPQ holds the envelope, the constructor and the nonce.
+	minResPQFrame = probeEnvelopeSize + 4 + 16
+	// A real resPQ is about 84 bytes plus up to 15 bytes of padding.
+	maxResPQFrame = 256
+)
 
-	// Send 64 bytes of garbage (looks like obfuscated2 handshake)
-	garbage := make([]byte, 64)
+// errNotTelegram means the peer completed TCP but did not answer
+// req_pq_multi with a resPQ that echoes the nonce.
+var errNotTelegram = errors.New("peer did not answer with a matching resPQ")
+
+// probeConnection proves that the peer is a Telegram DC and measures one
+// MTProto round trip. It sends an obfuscated2 handshake for dc with
+// padded-intermediate framing, then req_pq_multi in an unencrypted message.
+// The peer must answer with resPQ and echo the random nonce, which a
+// middlebox that only resets or closes connections cannot do.
+// The same check is used by mtg (github.com/9seconds/mtg, mtglib/dcprobe).
+func probeConnection(conn net.Conn, dc int, timeout time.Duration) (time.Duration, error) {
+	frame, encryptor, decryptor, err := obfuscated2.GenerateServerFrameWithType(dc, obfuscated2.ConnectionTypePaddedIntermediate)
+	if err != nil {
+		return 0, fmt.Errorf("obfuscated2 frame: %w", err)
+	}
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return 0, fmt.Errorf("nonce: %w", err)
+	}
+	const messageSize = probeEnvelopeSize + 4 + 16
+	request := make([]byte, len(frame)+4+messageSize)
+	copy(request, frame)
+	body := request[len(frame):]
+	binary.LittleEndian.PutUint32(body[0:4], messageSize)
+	// auth_key_id stays zero for an unencrypted message.
+	binary.LittleEndian.PutUint64(body[12:20], probeMessageID(time.Now()))
+	binary.LittleEndian.PutUint32(body[20:24], 4+16)
+	binary.LittleEndian.PutUint32(body[24:28], ctorReqPQMulti)
+	copy(body[28:44], nonce[:])
+	encryptor.XORKeyStream(body, body)
+
 	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
 		return 0, fmt.Errorf("set write deadline: %w", err)
 	}
-	if n, err := conn.Write(garbage); err != nil {
+	rttStart := time.Now()
+	if n, err := conn.Write(request); err != nil {
 		return 0, fmt.Errorf("write: %w", err)
-	} else if n != len(garbage) {
+	} else if n != len(request) {
 		return 0, fmt.Errorf("write: %w", io.ErrShortWrite)
 	}
-
-	// Wait for DC to respond or close connection.
-	// DC will either send error response or close - either gives us RTT.
 	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
 		return 0, fmt.Errorf("set read deadline: %w", err)
 	}
-	buf := make([]byte, 1)
-	n, err := conn.Read(buf)
-	if n > 0 || errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET) {
-		return time.Since(rttStart), nil
+	var header [4]byte
+	if _, err := io.ReadFull(conn, header[:]); err != nil {
+		return 0, fmt.Errorf("read resPQ length: %w", err)
 	}
-	if err == nil {
-		err = io.ErrNoProgress
+	decryptor.XORKeyStream(header[:], header[:])
+	size := binary.LittleEndian.Uint32(header[:])
+	if size < minResPQFrame || size > maxResPQFrame {
+		return 0, fmt.Errorf("%w: frame length %d", errNotTelegram, size)
 	}
-	return 0, fmt.Errorf("read: %w", err)
+	response := make([]byte, size)
+	if _, err := io.ReadFull(conn, response); err != nil {
+		return 0, fmt.Errorf("read resPQ: %w", err)
+	}
+	rtt := time.Since(rttStart)
+	decryptor.XORKeyStream(response, response)
+	payload := response[probeEnvelopeSize:]
+	if ctor := binary.LittleEndian.Uint32(payload[0:4]); ctor != ctorResPQ {
+		return 0, fmt.Errorf("%w: constructor 0x%08x", errNotTelegram, ctor)
+	}
+	if !bytes.Equal(payload[4:20], nonce[:]) {
+		return 0, fmt.Errorf("%w: nonce mismatch", errNotTelegram)
+	}
+	return rtt, nil
+}
+
+// probeMessageID returns a client message_id for now: Unix seconds in the
+// high 32 bits, the fraction of a second in the low bits, and the two
+// lowest bits cleared.
+func probeMessageID(now time.Time) uint64 {
+	fraction := uint64(now.Nanosecond()) << 32 / uint64(time.Second)
+	return (uint64(now.Unix())<<32 | fraction) &^ 3
 }
 
 // printProbeResults prints probe results in telemt style.

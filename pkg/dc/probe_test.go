@@ -133,12 +133,7 @@ func TestProbeAddr_DirectConnection(t *testing.T) {
 			if err != nil {
 				return
 			}
-			// Read garbage handshake
-			buf := make([]byte, 64)
-			conn.SetReadDeadline(time.Now().Add(time.Second))
-			conn.Read(buf)
-			// Close (simulates DC rejection)
-			conn.Close()
+			go func() { _, _ = serveFakeDC(conn, validResPQ) }()
 		}
 	}()
 
@@ -146,13 +141,38 @@ func TestProbeAddr_DirectConnection(t *testing.T) {
 	SetProbeSocks5("")
 
 	addr := Addr{Network: "tcp4", Address: ln.Addr().String()}
-	result := probeAddr(addr)
+	result := probeAddr(2, addr)
 
 	if !result.Success {
 		t.Errorf("probe should succeed: %s", result.Error)
 	}
 	if result.RTT <= 0 {
 		t.Error("RTT should be positive")
+	}
+}
+
+func TestProbeAddr_ClosingPeerFails(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			buf := make([]byte, 64)
+			_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+			_, _ = conn.Read(buf)
+			_ = conn.Close()
+		}
+	}()
+	SetProbeSocks5("")
+	result := probeAddr(2, Addr{Network: "tcp4", Address: ln.Addr().String()})
+	if result.Success || result.Error == "" {
+		t.Fatalf("a peer that closes without resPQ passed the probe: %+v", result)
 	}
 }
 
@@ -166,7 +186,7 @@ func TestProbeAddr_ConnectionRefused(t *testing.T) {
 
 	// Try to connect to a port that's not listening
 	addr := Addr{Network: "tcp4", Address: "127.0.0.1:1"} // Port 1 is privileged, unlikely to be open
-	result := probeAddr(addr)
+	result := probeAddr(2, addr)
 
 	if result.Success {
 		t.Error("probe to closed port should fail")
@@ -183,7 +203,7 @@ func TestProbeAddr_IPv6ViaSocks5Skipped(t *testing.T) {
 
 	// IPv6 via SOCKS5 should be skipped
 	addr := Addr{Network: "tcp6", Address: "[::1]:443"}
-	result := probeAddr(addr)
+	result := probeAddr(2, addr)
 
 	if result.Success {
 		t.Error("IPv6 via SOCKS5 should be skipped")
@@ -454,9 +474,7 @@ func BenchmarkProbeAddr(b *testing.B) {
 			if err != nil {
 				return
 			}
-			buf := make([]byte, 64)
-			conn.Read(buf)
-			conn.Close()
+			go func() { _, _ = serveFakeDC(conn, validResPQ) }()
 		}
 	}()
 
@@ -465,6 +483,6 @@ func BenchmarkProbeAddr(b *testing.B) {
 
 	b.ResetTimer()
 	for b.Loop() {
-		probeAddr(addr)
+		probeAddr(2, addr)
 	}
 }
