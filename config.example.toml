@@ -52,6 +52,12 @@ log-level = "info"
 # offset (clamped to +-1 day) is applied to the check. Empty = off.
 # clock-sync-url = "https://www.cloudflare.com"
 
+# Secrets that stay in [secrets] but cannot connect. Each name must be in
+# [secrets]. A config reload (SIGHUP or file change) applies this list and
+# [secrets] without a restart, and closes the live sessions of a removed or
+# disabled secret.
+# disabled-secrets = ["user2"]
+
 # Named secrets (32 hex characters = 16 bytes)
 # Generate with: telego generate <hostname>
 [secrets]
@@ -95,6 +101,15 @@ mask-host = "www.google.com"
 # (probe) path present the same cert-record length. Set an explicit value only
 # to override. Clamped to 256..16384.
 # fake-cert-size = 0
+
+# Keep the last good mask ServerHello profile on disk (optional, default off).
+# telego fetches the profile at startup. If that fetch fails, connections get
+# a synthetic ServerHello until a retry succeeds. With this directory set, a
+# restart loads the saved profile first, so a failed fetch still serves it.
+# telego checks the file like a fresh fetch: host and port, size, age (at most
+# 7 days) and a valid TLS 1.3 ServerHello. A file that fails a check is ignored.
+# Use an absolute path that telego can write. In Docker, mount a volume there.
+# profile-cache-dir = "/var/lib/telego"
 
 # SNI-following mask safelist (opt-in active-probe robustness).
 # When an unauthenticated probe presents a ClientHello whose SNI is on this

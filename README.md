@@ -412,6 +412,7 @@ mask-host = "www.google.com"  # Host to mimic (SNI validation, proxy links)
 # splice-idle-timeout = "30s" # Idle timeout for spliced connections (default: 30s)
 # fake-cert-size = 0          # Fake cert record size; 0 = auto-match mask host (clamp 256..16384)
 # mask-sni-safelist = ["www.microsoft.com"]  # Probes with these SNIs front to that domain (off = empty)
+# profile-cache-dir = "/var/lib/telego"     # Keep the last good ServerHello profile on disk (off = empty)
 
 # Anti-DPI record shaping (proxy -> client direction)
 # enable-drs = true        # Probe-then-ramp record sizing (1369 -> 16384 bytes after 8 records or 128 KB)
@@ -535,6 +536,30 @@ services:
     cap_add:
       - NET_BIND_SERVICE
 ```
+
+### TLS Front Profile Cache
+
+`[tls-fronting] profile-cache-dir` keeps the last good mask ServerHello profile on disk.
+It is off by default.
+Without it, a restart with a failed first fetch sends a synthetic ServerHello until a retry succeeds.
+With it, telego loads the saved profile before the first fetch.
+
+- telego writes the file at most once per hour, with mode 0600.
+- telego ignores a file with a different host or port, a file larger than 64 KiB, a file older than 7 days, or a ServerHello that is not a valid TLS 1.3 record.
+- A failed write logs a warning. It does not stop the refresh.
+
+In Docker, mount a writable volume:
+
+```bash
+docker run -d \
+  --name telego \
+  -p 443:443 \
+  -v /path/to/config.toml:/config.toml \
+  -v telego-cache:/var/lib/telego \
+  scratchnet/telego:latest
+```
+
+Under systemd with `ProtectSystem=strict`, add `StateDirectory=telego` to the service and use `/var/lib/telego`.
 
 ### Build Locally
 
@@ -741,8 +766,26 @@ kill -HUP $(pidof telego)
 
 - `[general].log-level` — Applied immediately
 - `[performance].idle-timeout` — Applies to new connections
+- `[secrets]` and `[general].disabled-secrets` — Applied immediately, without a listener restart
 
-All other configuration changes require a restart, including secrets, listeners, TLS fronting, WEB, ME, metrics, diagnostics, upstream routing, and connection limits.
+A secret reload works as follows:
+
+- An added or enabled secret accepts new clients at once.
+- Sessions of an unchanged secret continue.
+- Sessions of a removed or disabled secret are closed. The close reason is `secret_revoked`.
+- A renamed secret or a secret with a new key counts as a removed secret plus an added secret.
+- If the new config is invalid, telego logs a warning and keeps the current config.
+  For example, `disabled-secrets` must name only entries in `[secrets]`.
+- A secret host comes from `mask-host`. If the host changes, the secret change is not applied and a restart is necessary.
+- WEB credentials are made at startup. A removed or disabled secret cannot connect through WEB after the reload, because its inner MTProto handshake fails.
+  An added secret works through WEB only after a restart.
+
+```toml
+[general]
+disabled-secrets = ["bob"]   # bob stays in [secrets] but cannot connect
+```
+
+All other configuration changes require a restart, including listeners, TLS fronting, WEB, ME, metrics, diagnostics, upstream routing, and connection limits.
 
 ---
 
@@ -925,6 +968,7 @@ The site that starts the close records the reason. The first recorded reason is 
 | `output_stall` | Middle-End output to the client made no progress for the output stall timeout. |
 | `client_silence` | The client-silence breaker closed the connection. |
 | `shutdown` | Telego was stopping. |
+| `secret_revoked` | A config reload removed or disabled the secret of the connection. |
 | `other` | Telego closed the connection for a cause that has no reason, for example a protocol violation. |
 
 A WEB logical stream reports a Telego-side close without a recorded reason as `client_eof`. Its close always passes EOF.

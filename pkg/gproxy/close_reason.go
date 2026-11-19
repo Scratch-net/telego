@@ -25,6 +25,7 @@ const (
 	closeReasonOutputStall
 	closeReasonClientSilence
 	closeReasonShutdown
+	closeReasonSecretRevoked
 	closeReasonOther
 	closeReasonCount
 )
@@ -43,6 +44,7 @@ var closeReasonNames = [...]string{
 	"output_stall",
 	"client_silence",
 	"shutdown",
+	"secret_revoked",
 	"other",
 }
 

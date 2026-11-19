@@ -126,6 +126,8 @@ func getShardIdx(secret []byte) int {
 func (l *UserIPLimiter) getOrCreateUserState(shard *userLimiterShard, secretKey [secretKeySize]byte, secretName string) *userIPState {
 	state, exists := shard.users[secretKey]
 	if exists {
+		// A config reload can rename a secret and keep its key.
+		state.secretName = secretName
 		return state
 	}
 

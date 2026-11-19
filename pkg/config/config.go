@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -53,6 +54,9 @@ type GeneralConfig struct {
 	IPBlockTimeout      Duration `toml:"ip-block-timeout"`       // How long blocked IPs stay blocked
 	HandshakeTimeout    Duration `toml:"handshake-timeout"`      // Max time for handshake (default 5s)
 	ClockSyncURL        string   `toml:"clock-sync-url"`         // HTTPS URL whose Date header corrects a skewed server clock at startup
+	// DisabledSecrets names [secrets] entries that cannot connect. A config
+	// reload closes their live sessions.
+	DisabledSecrets []string `toml:"disabled-secrets"`
 }
 
 // TLSFrontingConfig configures TLS fronting.
@@ -75,6 +79,10 @@ type TLSFrontingConfig struct {
 	// ServerHelloPaceScope selects what server-hello-segment-size paces:
 	// "response" (default) or "first-record".
 	ServerHelloPaceScope string `toml:"server-hello-pace-scope"`
+
+	// ProfileCacheDir keeps the last good mask ServerHello profile on disk.
+	// Empty = off. Must be an absolute path.
+	ProfileCacheDir string `toml:"profile-cache-dir"`
 
 	// MaskSNISafelist: opt-in extra domains an unauthenticated probe may be
 	// fronted to when its ClientHello SNI matches. Empty = off (never a relay).
@@ -293,6 +301,9 @@ func (c *Config) validateScalars() error {
 			return fmt.Errorf("%s must be between 0 and 65535 (0 uses the default)", field.name)
 		}
 	}
+	if dir := c.TLSFronting.ProfileCacheDir; dir != "" && !filepath.IsAbs(dir) {
+		return errors.New("tls-fronting.profile-cache-dir must be an absolute path")
+	}
 	if c.TLSFronting.SpliceProxyProtocol < 0 || c.TLSFronting.SpliceProxyProtocol > 2 {
 		return errors.New("tls-fronting.splice-proxy-protocol must be 0, 1, or 2")
 	}
@@ -425,11 +436,18 @@ func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
 			secretHosts[name] = domain.Host
 		}
 	}
+	disabled, err := c.disabledSecrets()
+	if err != nil {
+		return gproxy.Config{}, err
+	}
 	for _, name := range slices.Sorted(maps.Keys(c.Secrets)) {
 		keyHex := c.Secrets[name]
 		key, err := ParseKey(keyHex)
 		if err != nil {
 			return gproxy.Config{}, fmt.Errorf("invalid secret %q: %w", name, err)
+		}
+		if _, off := disabled[name]; off {
+			continue
 		}
 		secretHost := host
 		if domainHost, ok := secretHosts[name]; ok {
@@ -470,6 +488,7 @@ func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
 	cfg.ServerHelloSegmentSize = c.TLSFronting.ServerHelloSegmentSize
 	cfg.ServerHelloPaceFirstRecord = c.TLSFronting.ServerHelloPaceScope == "first-record"
 	cfg.MaskSNISafelist = c.TLSFronting.MaskSNISafelist
+	cfg.ProfileCacheDir = c.TLSFronting.ProfileCacheDir
 
 	// Splice target (defaults to mask-host:mask-port if not set)
 	cfg.SpliceHost = c.TLSFronting.SpliceHost
@@ -628,9 +647,16 @@ func (c *Config) ToWebProxyRuntimeConfig(mtProxyBind string) (WebProxyRuntimeCon
 		return WebProxyRuntimeConfig{}, fmt.Errorf("invalid web-proxy.backend: %w", err)
 	}
 
+	disabled, err := c.disabledSecrets()
+	if err != nil {
+		return WebProxyRuntimeConfig{}, err
+	}
 	profiles := make([]webproxy.Profile, 0, len(c.Secrets)*2)
 	capabilities := make(map[webproxy.Capability]struct{}, len(c.Secrets)*2)
 	for _, name := range slices.Sorted(maps.Keys(c.Secrets)) {
+		if _, off := disabled[name]; off {
+			continue
+		}
 		keyHex := c.Secrets[name]
 		key, err := ParseKey(keyHex)
 		if err != nil {
@@ -649,7 +675,7 @@ func (c *Config) ToWebProxyRuntimeConfig(mtProxyBind string) (WebProxyRuntimeCon
 		}
 	}
 	if len(profiles) == 0 {
-		return WebProxyRuntimeConfig{}, errors.New("WEB proxy requires at least one secret")
+		return WebProxyRuntimeConfig{}, errors.New("WEB proxy requires at least one enabled secret")
 	}
 
 	return WebProxyRuntimeConfig{
@@ -705,6 +731,19 @@ func (c *Config) webProxyFingerprint() string {
 		trusted,
 		c.WebProxy.NumEventLoops,
 	)
+}
+
+// disabledSecrets returns the names in general.disabled-secrets. Each name
+// must be a [secrets] entry, so a typo cannot leave a user enabled.
+func (c *Config) disabledSecrets() (map[string]struct{}, error) {
+	disabled := make(map[string]struct{}, len(c.General.DisabledSecrets))
+	for _, name := range c.General.DisabledSecrets {
+		if _, ok := c.Secrets[name]; !ok {
+			return nil, fmt.Errorf("general.disabled-secrets names unknown secret %q", name)
+		}
+		disabled[name] = struct{}{}
+	}
+	return disabled, nil
 }
 
 // ParseKey parses a 16-byte hex-encoded key (32 hex chars).

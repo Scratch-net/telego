@@ -1,6 +1,10 @@
 package gproxy
 
 import (
+	"errors"
+	"io/fs"
+	"time"
+
 	"github.com/panjf2000/gnet/v2"
 
 	"github.com/scratch-net/telego/pkg/tlsfront"
@@ -29,6 +33,7 @@ func (h *ProxyHandler) prepareFrontends() {
 			h.logger.Debug("Certificate fetched: %d certs in chain", len(cert.Chain))
 		}
 		h.serverHelloFetcher = tlsfront.NewServerHelloFetcher(cfg.CertHost, cfg.CertPort)
+		h.loadProfileCache()
 		h.logger.Debug("Fetching real ServerHello from %s:%d for hybrid TLS mode...", cfg.CertHost, cfg.CertPort)
 		if err := h.serverHelloFetcher.Refresh(); err != nil {
 			h.logger.Warn("Failed to fetch ServerHello template: %v (will retry)", err)
@@ -41,6 +46,29 @@ func (h *ProxyHandler) prepareFrontends() {
 	}
 	if h.middleEnd != nil {
 		h.middleEnd.start()
+	}
+}
+
+// loadProfileCache enables the optional disk cache and loads the last good
+// profile before the startup fetch. If that fetch fails, connections use
+// the cached profile instead of the synthetic ServerHello.
+func (h *ProxyHandler) loadProfileCache() {
+	dir := h.config.ProfileCacheDir
+	if dir == "" {
+		return
+	}
+	h.serverHelloFetcher.EnableDiskCache(dir)
+	h.serverHelloFetcher.OnDiskCacheError(func(err error) {
+		h.logger.Warn("Failed to save TLS front profile cache: %v", err)
+	})
+	fetchedAt, err := h.serverHelloFetcher.LoadDiskCache()
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		h.logger.Info("No TLS front profile cache in %s yet", dir)
+	case err != nil:
+		h.logger.Warn("Ignoring TLS front profile cache in %s: %v", dir, err)
+	default:
+		h.logger.Info("Loaded TLS front profile cache from %s (fetched %s)", dir, fetchedAt.UTC().Format(time.RFC3339))
 	}
 }
 

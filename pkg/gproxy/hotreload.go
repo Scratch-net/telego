@@ -223,7 +223,7 @@ func (r *HotReloader) reload() {
 	}
 	newCfg, logLevel, err := r.loadConfig()
 	if err != nil {
-		r.logger.Warn("config reload failed: %v", err)
+		r.logger.Warn("config reload failed, keeping the current config: %v", err)
 		return
 	}
 
@@ -247,11 +247,60 @@ func (r *HotReloader) reload() {
 
 	// Apply hot config to handler
 	r.handler.ApplyHotConfig(newCfg)
+	if r.initialCfg != nil && !r.applySecrets(r.initialCfg, newCfg) {
+		restartRequired = true
+	}
 	if restartRequired {
 		r.logger.Warn("hot settings applied; restart required for other config changes")
 	} else {
 		r.logger.Info("config reloaded successfully")
 	}
+}
+
+// applySecrets publishes the new enabled secrets and closes sessions of the
+// removed ones. A secret host is a TLS fronting setting, so a secret whose
+// host was not in the startup config needs a restart. Then no secret change
+// is applied and the result is false.
+func (r *HotReloader) applySecrets(initial, next *Config) bool {
+	hosts := make(map[string]struct{}, len(initial.Secrets)+1)
+	hosts[initial.Host] = struct{}{}
+	for i := range initial.Secrets {
+		hosts[initial.Secrets[i].Host] = struct{}{}
+	}
+	for i := range next.Secrets {
+		if _, ok := hosts[next.Secrets[i].Host]; !ok {
+			r.logger.Warn("secrets not reloaded: secret %q uses a new host; restart required", next.Secrets[i].Name)
+			return false
+		}
+	}
+	current := &secretSet{list: r.handler.currentSecrets()}
+	nextSet := &secretSet{list: next.Secrets}
+	var added, removed []string
+	for i := range next.Secrets {
+		if !current.contains(&next.Secrets[i]) {
+			added = append(added, next.Secrets[i].Name)
+		}
+	}
+	for i := range current.list {
+		if !nextSet.contains(&current.list[i]) {
+			removed = append(removed, current.list[i].Name)
+		}
+	}
+	if len(added) == 0 && len(removed) == 0 {
+		return true
+	}
+	closed := r.handler.ReplaceSecrets(next.Secrets)
+	r.logger.Info("secrets reloaded: %d enabled, added %v, removed %v, closed %d sessions",
+		len(next.Secrets), added, removed, closed)
+	if len(next.Secrets) == 0 {
+		r.logger.Warn("no enabled secrets; every client goes to the mask host")
+	}
+	if len(added) > 0 {
+		// WEB credentials are derived once at startup. A removed secret
+		// fails the inner MTProto handshake, so only additions need this.
+		r.logger.Info("WEB proxy credentials are fixed at startup; if WEB is enabled, added secrets work for WEB after a restart")
+	}
+	return true
 }
 
 // warnNonHotChanges logs warnings for config changes that require restart.
@@ -262,26 +311,8 @@ func (r *HotReloader) warnNonHotChanges(old, new *Config) bool {
 		restartRequired = true
 	}
 
-	if len(old.Secrets) != len(new.Secrets) {
-		r.logger.Warn("secrets count changed (%d -> %d) but requires restart", len(old.Secrets), len(new.Secrets))
-		restartRequired = true
-	} else {
-		// Check if secrets changed
-		for i := range old.Secrets {
-			if i >= len(new.Secrets) {
-				break
-			}
-			if old.Secrets[i].Name != new.Secrets[i].Name ||
-				string(old.Secrets[i].Key) != string(new.Secrets[i].Key) {
-				r.logger.Warn("secrets changed but requires restart")
-				restartRequired = true
-				break
-			}
-		}
-	}
-
 	if old.MaskHost != new.MaskHost || old.MaskPort != new.MaskPort ||
-		!slices.Equal(old.Domains, new.Domains) || secretHostsChanged(old.Secrets, new.Secrets) {
+		!slices.Equal(old.Domains, new.Domains) || old.ProfileCacheDir != new.ProfileCacheDir {
 		r.logger.Warn("TLS fronting settings changed but requires restart")
 		restartRequired = true
 	}
@@ -322,18 +353,4 @@ func (r *HotReloader) warnNonHotChanges(old, new *Config) bool {
 		restartRequired = true
 	}
 	return restartRequired
-}
-
-// secretHostsChanged reports whether a secret moved to another cover domain.
-// A changed secret count or name is reported by the secrets check.
-func secretHostsChanged(old, new []Secret) bool {
-	if len(old) != len(new) {
-		return false
-	}
-	for i := range old {
-		if old[i].Host != new[i].Host {
-			return true
-		}
-	}
-	return false
 }

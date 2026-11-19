@@ -59,8 +59,9 @@ func (h *ProxyHandler) handleDDFrame(c clientEndpoint, ctx *ConnContext) gnet.Ac
 	var matchedSecret *Secret
 	var err error
 
-	for i := range h.config.Secrets {
-		s := &h.config.Secrets[i]
+	secrets := h.currentSecrets()
+	for i := range secrets {
+		s := &secrets[i]
 		dcID, connectionType, encryptor, decryptor, err = obfuscated2.ParseClientFrameWithType(s.Key, data[:obfuscated2.FrameSize])
 		if err == nil {
 			matchedSecret = s
@@ -90,6 +91,9 @@ func (h *ProxyHandler) handleDDFrame(c clientEndpoint, ctx *ConnContext) gnet.Ac
 	ctx.mu.Lock()
 	ctx.secret = matchedSecret
 	ctx.mu.Unlock()
+	if !h.trackSecretSession(c, ctx, matchedSecret) {
+		return h.failHandshake(ctx, handshakeFailureAdmission)
+	}
 
 	// Get client IP for limiter checks
 	clientAddr := ctx.RealClientAddr(c.RemoteAddr())
@@ -287,6 +291,9 @@ func (h *ProxyHandler) handleTLSPayload(c clientEndpoint, ctx *ConnContext) gnet
 	ctx.clientHello = hello
 	ctx.secret = matchedSecret
 	ctx.mu.Unlock()
+	if !h.trackSecretSession(c, ctx, matchedSecret) {
+		return h.failHandshake(ctx, handshakeFailureAdmission)
+	}
 
 	// Get client IP for limiter checks
 	clientAddr := ctx.RealClientAddr(c.RemoteAddr())
@@ -435,8 +442,9 @@ func (h *ProxyHandler) handleTLSPayload(c clientEndpoint, ctx *ConnContext) gnet
 // a match, reason tells why the hello goes to the mask host.
 func (h *ProxyHandler) matchClientHello(payload []byte, sni string) (*faketls.ClientHello, *Secret, maskFallbackReason) {
 	reason := maskFallbackUnknownSNI
-	for i := range h.config.Secrets {
-		s := &h.config.Secrets[i]
+	secrets := h.currentSecrets()
+	for i := range secrets {
+		s := &secrets[i]
 		if sni != "" && sni != s.Host {
 			continue
 		}
