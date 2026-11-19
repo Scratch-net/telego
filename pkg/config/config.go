@@ -71,6 +71,9 @@ type TLSFrontingConfig struct {
 	// accept-vs-mask cert-record-length tell.
 	FakeCertSize           int `toml:"fake-cert-size"`
 	ServerHelloSegmentSize int `toml:"server-hello-segment-size"`
+	// ServerHelloPaceScope selects what server-hello-segment-size paces:
+	// "response" (default) or "first-record".
+	ServerHelloPaceScope string `toml:"server-hello-pace-scope"`
 
 	// MaskSNISafelist: opt-in extra domains an unauthenticated probe may be
 	// fronted to when its ClientHello SNI matches. Empty = off (never a relay).
@@ -231,6 +234,11 @@ func (c *Config) validateScalars() error {
 	if size := c.TLSFronting.ServerHelloSegmentSize; size != 0 && (size < 64 || size > 1460) {
 		return errors.New("tls-fronting.server-hello-segment-size must be 0 or between 64 and 1460 bytes")
 	}
+	switch c.TLSFronting.ServerHelloPaceScope {
+	case "", "response", "first-record":
+	default:
+		return errors.New(`tls-fronting.server-hello-pace-scope must be "response" or "first-record"`)
+	}
 	for _, field := range []struct {
 		name  string
 		value int64
@@ -362,6 +370,7 @@ func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
 	}
 	cfg.FakeCertSize = c.TLSFronting.FakeCertSize
 	cfg.ServerHelloSegmentSize = c.TLSFronting.ServerHelloSegmentSize
+	cfg.ServerHelloPaceFirstRecord = c.TLSFronting.ServerHelloPaceScope == "first-record"
 	cfg.MaskSNISafelist = c.TLSFronting.MaskSNISafelist
 
 	// Splice target (defaults to mask-host:mask-port if not set)

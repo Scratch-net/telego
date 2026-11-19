@@ -55,6 +55,9 @@ type Config struct {
 	FakeCertSize int
 	// ServerHelloSegmentSize paces Linux TCP handshake writes. Zero disables it.
 	ServerHelloSegmentSize int
+	// ServerHelloPaceFirstRecord paces only the first TLS record, at most
+	// maxPacedFirstRecord bytes, and sends the rest in one write.
+	ServerHelloPaceFirstRecord bool
 
 	// MaskSNISafelist is an opt-in list of extra domains that an unauthenticated
 	// probe may be fronted to. When a bad-secret ClientHello's SNI is on this

@@ -116,6 +116,10 @@ mask-host = "www.google.com"
 # This value excludes TCP headers and timestamps. It does not change the MSS.
 # Bulk traffic keeps its negotiated MSS. Other platforms and WEB streams ignore it.
 # server-hello-segment-size = 0
+# What the pacing covers: "response" (default) paces the whole response.
+# "first-record" paces only the first TLS record (at most 2048 bytes) and
+# sends the rest in one write, which needs far fewer packets on lossy paths.
+# server-hello-pace-scope = "response"
 
 # Native Telegram Desktop WEB proxy (optional, requires Nginx with real TLS).
 # This section has no effect while enabled is false. Changes require a restart.

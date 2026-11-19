@@ -399,3 +399,53 @@ func capturePacedSocket(t *testing.T, server, client *net.TCPConn) func(int, int
 		t.Logf("isolated packet capture: %d handshake packets <= %d payload bytes; %d larger bulk packets", helloPackets, segmentSize, bulkPackets)
 	}
 }
+
+func TestServerHelloPacingFirstRecordOnly(t *testing.T) {
+	record := append([]byte{faketls.RecordTypeHandshake, 3, 3, 0, 122}, bytes.Repeat([]byte{0x5a}, 122)...)
+	response := append(record, bytes.Repeat([]byte{0x6b}, 3969)...)
+	h, peer, socket, ctx, start := startPacingTest(t, response)
+	h.config.ServerHelloPaceFirstRecord = true
+	before := pacingTCPInfo(t, socket)
+	start <- nil
+	conn := <-h.opened
+	_ = peer.SetReadDeadline(time.Now().Add(5 * time.Second))
+	got := make([]byte, len(response))
+	if _, err := io.ReadFull(peer, got); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, response) {
+		t.Fatal("paced response changed")
+	}
+	deadline := time.Now().Add(time.Second)
+	for ctx.State() != StateReadO2Frame {
+		if time.Now().After(deadline) {
+			t.Fatal("paced response did not resume O2")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	after := pacingEnrolledInfo(t, conn)
+	segments := after.Data_segs_out - before.Data_segs_out
+	// 127 bytes in 92-byte chunks is 2 segments; the 3969-byte rest needs
+	// at most a few more at the loopback MSS.
+	if segments < 3 || segments > 8 {
+		t.Fatalf("%d data segments for a first-record-only paced response", segments)
+	}
+	t.Logf("first-record pacing sent %d bytes in %d data segments", len(response), segments)
+}
+
+func TestPacedPrefix(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		response []byte
+		want     int
+	}{
+		{"short header", []byte{0x16, 3, 3}, 3},
+		{"first record", append([]byte{0x16, 3, 3, 0, 10}, make([]byte, 100)...), 15},
+		{"truncated record", append([]byte{0x16, 3, 3, 0, 200}, make([]byte, 100)...), 105},
+		{"capped record", append([]byte{0x16, 3, 3, 0x10, 0}, make([]byte, 5000)...), maxPacedFirstRecord},
+	} {
+		if got := pacedPrefix(tc.response); got != tc.want {
+			t.Errorf("%s: pacedPrefix = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
