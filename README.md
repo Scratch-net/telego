@@ -368,13 +368,13 @@ The costs are high:
 - Some censors block a port for about 2 minutes after a burst of SYN packets. Fast rotation can cause this block.
 - `keepalive_requests` and `keepalive_time` apply to every request in that `server` block, including the ordinary website.
 
-Do not combine rotation with `stream-download`. A stream keeps one response open on one connection.
+If you use rotation, set `stream-download = false`. A stream keeps one response open on one connection.
 
-### Experimental streamed download
+### Streamed download
 
-By default, the `https` carrier sends one long poll for each downlink batch. Each batch then waits for one round trip.
+Without streaming, the `https` carrier sends one long poll for each downlink batch. Each batch then waits for one round trip.
 
-Set `stream-download = true` to keep one download response open. Telego sends each new downlink frame in that response at once. This option works only with `carrier = "https"`. It is off by default.
+With `stream-download`, the bridge keeps one download response open. Telego sends each new downlink frame in that response at once. This option is on by default for `carrier = "https"`. The default does not apply to other carriers, and an explicit `stream-download = true` with another carrier is an error. Set `stream-download = false` to use only ordinary long polls.
 
 - A streamed response ends after the long-poll time (25 seconds) or when it reaches the batch size.
 - If a stream breaks, the bridge asks for the same batch again with an ordinary long poll. Telego sends the complete batch again, and the bridge skips the frames that it already delivered.
@@ -500,7 +500,7 @@ carrier = "websocket"                    # Installer default. Requires upgrade f
 # trusted-proxy-cidrs = ["127.0.0.1/32"]   # Nginx peers allowed to send X-Forwarded-For
 # num-event-loops = 0                       # 0 = automatic
 # carrier-batch-kib = 0                     # 0 = 2048 KiB. Experimental: 4-2048
-# stream-download = false                   # Experimental. https carrier only
+# stream-download = true                    # Default on. https carrier only
 # websocket-fair-queue = false              # Experimental. websocket carrier only
 # pad-first-frames = false                  # Experimental. https and websocket carriers only
 

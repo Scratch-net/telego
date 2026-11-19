@@ -206,12 +206,14 @@ carrier = "websocket"
 # Read the README section about connection rotation before you change it.
 # carrier-batch-kib = 0
 
-# Experimental, https carrier only. Keep one download response open and send
+# https carrier only. On by default. Keep one download response open and send
 # each new downlink frame at once, without a new long poll for each batch.
 # A response ends after the long-poll time (25 seconds) or when the batch is full.
 # The bridge returns to ordinary long polls after any error.
 # Nginx needs proxy_buffering off, as in the shipped templates.
-# stream-download = false
+# The default does not apply to other carriers. An explicit true with another
+# carrier is an error. Set false to use only ordinary long polls.
+# stream-download = true
 
 # Experimental, websocket carrier only. Send WINDOW control frames first and
 # rotate DATA fairly across Telegram streams. Each WebSocket message carries at

@@ -96,6 +96,7 @@ type ManagerConfig struct {
 	DownlinkFrameBytes int
 	// StreamDownload lets the https carrier keep one downlink response open
 	// and append frames to it. The bridge must ask for it on each poll.
+	// DefaultManagerConfig turns it on; other carriers ignore it.
 	StreamDownload bool
 	// WebSocketFairQueue schedules multiplexed WebSocket downlink messages
 	// fairly across streams and caps each message at 160 KiB.
@@ -117,11 +118,12 @@ type ManagerConfig struct {
 // reference limits and the standard library TCP dialer.
 func DefaultManagerConfig(profiles []Profile, backend string) ManagerConfig {
 	return ManagerConfig{
-		Profiles: profiles,
-		Backend:  backend,
-		Carrier:  CarrierHTTPS,
-		Limits:   DefaultLimits(),
-		Timeouts: DefaultTimeouts(),
+		StreamDownload: true,
+		Profiles:       profiles,
+		Backend:        backend,
+		Carrier:        CarrierHTTPS,
+		Limits:         DefaultLimits(),
+		Timeouts:       DefaultTimeouts(),
 	}
 }
 

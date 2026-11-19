@@ -245,6 +245,32 @@ func TestStreamDownloadRequiresOptionAndHeader(t *testing.T) {
 	}
 }
 
+// The default manager configuration streams the https downlink, and the bridge
+// page that the server renders asks for it. Other carriers ignore the default.
+func TestStreamDownloadDefaultOnForHTTPSOnly(t *testing.T) {
+	token, _, err := newToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, carrier := range []CarrierMode{CarrierHTTPS, CarrierHTTPSLanes, CarrierWebSocket, CarrierWebSocketLanes} {
+		app := newHTTPTestApplicationWithConfig(t, time.Second, func(config *ManagerConfig) {
+			config.Carrier = carrier
+		}, nil)
+		want := carrier == CarrierHTTPS
+		if app.manager.streamDownload != want {
+			t.Fatalf("carrier %q: streamDownload = %t", carrier, app.manager.streamDownload)
+		}
+		page, err := app.server.renderBridge("proxy.example.com", token, maxCarrierBatchBytes, carrier,
+			DefaultLimits().MaxStreamsPerSession, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := bytes.Contains(page.Body, []byte("streamDownload=true")); got != want {
+			t.Fatalf("carrier %q: bridge requests streams = %t", carrier, got)
+		}
+	}
+}
+
 func TestChunkedParts(t *testing.T) {
 	if got := bytes.Join(chunkedParts(bytes.Repeat([]byte{'x'}, 26)), nil); string(got) != "1a\r\n"+string(bytes.Repeat([]byte{'x'}, 26))+"\r\n" {
 		t.Fatalf("chunk = %q", got)

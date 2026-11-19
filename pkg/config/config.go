@@ -178,7 +178,9 @@ type WebProxyConfig struct {
 	// Zero keeps the 2048 KiB protocol default.
 	CarrierBatchKiB int `toml:"carrier-batch-kib"`
 	// StreamDownload keeps one https downlink response open per batch.
-	StreamDownload bool `toml:"stream-download"`
+	// Unset = on for the https carrier and off for the other carriers.
+	// An explicit true requires the https carrier.
+	StreamDownload *bool `toml:"stream-download"`
 	// WebSocketFairQueue schedules websocket downlink fairly across streams.
 	WebSocketFairQueue bool `toml:"websocket-fair-queue"`
 	// PadFirstFrames pads the first carrier batches in both directions.
@@ -637,7 +639,7 @@ func (c *Config) ToWebProxyRuntimeConfig(mtProxyBind string) (WebProxyRuntimeCon
 	if err := validateCarrierBatchKiB(c.WebProxy.CarrierBatchKiB); err != nil {
 		return WebProxyRuntimeConfig{}, err
 	}
-	if c.WebProxy.StreamDownload && carrier != webproxy.CarrierHTTPS {
+	if explicitlyOn(c.WebProxy.StreamDownload) && carrier != webproxy.CarrierHTTPS {
 		return WebProxyRuntimeConfig{}, errors.New("web-proxy.stream-download requires carrier \"https\"")
 	}
 	if c.WebProxy.WebSocketFairQueue && carrier != webproxy.CarrierWebSocket {
@@ -723,7 +725,7 @@ func (c *Config) ToWebProxyRuntimeConfig(mtProxyBind string) (WebProxyRuntimeCon
 		Profiles:             profiles,
 		BackendProxyProtocol: !logicalBackend,
 		CarrierBatchBytes:    c.WebProxy.CarrierBatchKiB * 1024,
-		StreamDownload:       c.WebProxy.StreamDownload,
+		StreamDownload:       c.WebProxy.streamDownload(carrier),
 		WebSocketFairQueue:   c.WebProxy.WebSocketFairQueue,
 		PadFirstFrames:       c.WebProxy.PadFirstFrames,
 	}, nil
@@ -765,10 +767,25 @@ func webProxyListenerAddr(bindAddr string) (net.Addr, error) {
 	return tcpAddr, nil
 }
 
+// explicitlyOn reports whether an optional bool is set to true in the file.
+func explicitlyOn(value *bool) bool {
+	return value != nil && *value
+}
+
+// streamDownload is on by default for the https carrier only. The default
+// silently does not apply to other carriers.
+func (w WebProxyConfig) streamDownload(carrier webproxy.CarrierMode) bool {
+	return carrier == webproxy.CarrierHTTPS && (w.StreamDownload == nil || *w.StreamDownload)
+}
+
 func (c *Config) webProxyFingerprint() string {
 	if !c.WebProxy.Enabled {
 		return "enabled=false"
 	}
+	// The fingerprint holds the effective value, so writing the default
+	// explicitly does not ask for a restart. An invalid carrier fails startup
+	// and hot reload validation anyway.
+	carrier, _ := webproxy.ParseCarrierMode(c.WebProxy.Carrier)
 	trusted := strings.Join(c.WebProxy.TrustedProxyCIDRs, ",")
 	return fmt.Sprintf(
 		"enabled=%t\x00bind=%s\x00hostname=%s\x00base-path=%s\x00backend=%s\x00carrier=%s\x00trusted=%s\x00loops=%d\x00batch=%d\x00stream=%t\x00fair=%t\x00pad=%t",
@@ -781,7 +798,7 @@ func (c *Config) webProxyFingerprint() string {
 		trusted,
 		c.WebProxy.NumEventLoops,
 		c.WebProxy.CarrierBatchKiB,
-		c.WebProxy.StreamDownload,
+		c.WebProxy.streamDownload(carrier),
 		c.WebProxy.WebSocketFairQueue,
 		c.WebProxy.PadFirstFrames,
 	)

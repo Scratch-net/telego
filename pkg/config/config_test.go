@@ -1093,23 +1093,71 @@ func TestWebProxyCarrierBatchKiB(t *testing.T) {
 	}
 }
 
-func TestWebProxyStreamDownloadRequiresHTTPS(t *testing.T) {
+func TestWebProxyStreamDownloadDefaultsToHTTPS(t *testing.T) {
+	on, off := true, false
 	for _, carrier := range []string{"", "https", "https-lanes", "websocket", "websocket-lanes"} {
-		cfg := &Config{
-			Secrets:  map[string]string{"alice": "0123456789abcdef0123456789abcdef"},
-			WebProxy: WebProxyConfig{Enabled: true, Hostname: "proxy.example.com", Carrier: carrier, StreamDownload: true},
-		}
-		runtime, err := cfg.ToWebProxyRuntimeConfig("0.0.0.0:443")
 		https := carrier == "" || carrier == "https"
-		if https && (err != nil || !runtime.StreamDownload) || !https && (err == nil || !strings.Contains(err.Error(), "stream-download")) {
-			t.Fatalf("carrier %q: stream=%t err=%v", carrier, runtime.StreamDownload, err)
+		for _, setting := range []*bool{nil, &on, &off} {
+			cfg := &Config{
+				Secrets:  map[string]string{"alice": "0123456789abcdef0123456789abcdef"},
+				WebProxy: WebProxyConfig{Enabled: true, Hostname: "proxy.example.com", Carrier: carrier, StreamDownload: setting},
+			}
+			runtime, err := cfg.ToWebProxyRuntimeConfig("0.0.0.0:443")
+			switch {
+			case setting == &on && !https:
+				// Only an explicit true is rejected on another carrier.
+				if err == nil || !strings.Contains(err.Error(), "stream-download") {
+					t.Fatalf("carrier %q explicit true: err = %v", carrier, err)
+				}
+			case err != nil:
+				t.Fatalf("carrier %q setting %v: %v", carrier, setting, err)
+			case runtime.StreamDownload != (https && setting != &off):
+				t.Fatalf("carrier %q setting %v: stream = %t", carrier, setting, runtime.StreamDownload)
+			}
 		}
 	}
+
 	cfg := &Config{WebProxy: WebProxyConfig{Enabled: true}}
-	fingerprint := cfg.webProxyFingerprint()
-	cfg.WebProxy.StreamDownload = true
-	if fingerprint == cfg.webProxyFingerprint() {
+	unset := cfg.webProxyFingerprint()
+	cfg.WebProxy.StreamDownload = &on
+	if cfg.webProxyFingerprint() != unset {
+		t.Fatal("explicit default stream-download changed the restart fingerprint")
+	}
+	cfg.WebProxy.StreamDownload = &off
+	if cfg.webProxyFingerprint() == unset {
 		t.Fatal("stream-download change omitted from restart fingerprint")
+	}
+	cfg.WebProxy.Carrier = "websocket"
+	disabled := cfg.webProxyFingerprint()
+	cfg.WebProxy.StreamDownload = nil
+	if cfg.webProxyFingerprint() != disabled {
+		t.Fatal("stream-download default changed the fingerprint of a websocket carrier")
+	}
+}
+
+func TestWebProxyStreamDownloadTOML(t *testing.T) {
+	for _, test := range []struct {
+		line string
+		want bool
+	}{
+		{"", true},
+		{"stream-download = true", true},
+		{"stream-download = false", false},
+	} {
+		path := filepath.Join(t.TempDir(), "config.toml")
+		data := "[secrets]\nalice = \"0123456789abcdef0123456789abcdef\"\n" +
+			"[web-proxy]\nenabled = true\nhostname = \"proxy.example.com\"\n" + test.line + "\n"
+		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		runtime, err := cfg.ToWebProxyRuntimeConfig("0.0.0.0:443")
+		if err != nil || runtime.StreamDownload != test.want {
+			t.Fatalf("%q: stream = %t, err = %v; want %t", test.line, runtime.StreamDownload, err, test.want)
+		}
 	}
 }
 
