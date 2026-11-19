@@ -99,13 +99,13 @@ func (p *serverHelloPacer) step() {
 	}
 	if !busy {
 		end := min(p.offset+p.size, len(p.data))
-		n, writeErr := p.conn.Write(p.data[p.offset:end])
-		if writeErr != nil || n != end-p.offset {
+		n, writeErr := writeServerHelloChunk(p.conn, p.data[p.offset:end])
+		if writeErr != nil {
 			p.mu.Unlock()
 			p.fail()
 			return
 		}
-		p.offset = end
+		p.offset += n
 	}
 	if p.timer == nil {
 		p.timer = time.AfterFunc(serverHelloPaceDelay, p.enqueue)
