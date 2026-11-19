@@ -1691,17 +1691,30 @@ func TestProfileCacheDir(t *testing.T) {
 		Secrets:     map[string]string{"alice": "0123456789abcdef0123456789abcdef"},
 		TLSFronting: TLSFrontingConfig{MaskHost: "proxy.example.com"},
 	}
-	runtime, err := cfg.ToGProxyConfig()
-	if err != nil || runtime.ProfileCacheDir != "" {
-		t.Fatalf("default: dir = %q, err = %v; want off", runtime.ProfileCacheDir, err)
+	for _, test := range []struct {
+		setting, state, dir string
+		isDefault           bool
+	}{
+		{"", "", "/var/lib/telego", true},
+		{"", "/var/lib/telego-state", "/var/lib/telego-state", true},
+		// systemd joins several StateDirectory= entries with ':'.
+		{"", "/var/lib/a:/var/lib/b", "/var/lib/a", true},
+		{"", "relative", "/var/lib/telego", true},
+		{"off", "/var/lib/telego-state", "", false},
+		{"/srv/telego", "/var/lib/telego-state", "/srv/telego", false},
+	} {
+		t.Setenv("STATE_DIRECTORY", test.state)
+		cfg.TLSFronting.ProfileCacheDir = test.setting
+		runtime, err := cfg.ToGProxyConfig()
+		if err != nil || runtime.ProfileCacheDir != test.dir || runtime.ProfileCacheDefault != test.isDefault {
+			t.Fatalf("setting %q, STATE_DIRECTORY %q: dir = %q, default = %t, err = %v; want %q, %t",
+				test.setting, test.state, runtime.ProfileCacheDir, runtime.ProfileCacheDefault, err, test.dir, test.isDefault)
+		}
 	}
-	cfg.TLSFronting.ProfileCacheDir = "/var/lib/telego"
-	runtime, err = cfg.ToGProxyConfig()
-	if err != nil || runtime.ProfileCacheDir != "/var/lib/telego" {
-		t.Fatalf("absolute: dir = %q, err = %v", runtime.ProfileCacheDir, err)
-	}
-	cfg.TLSFronting.ProfileCacheDir = "cache"
-	if _, err := cfg.ToGProxyConfig(); err == nil {
-		t.Fatal("relative profile-cache-dir was accepted")
+	for _, dir := range []string{"cache", "OFF", "none"} {
+		cfg.TLSFronting.ProfileCacheDir = dir
+		if _, err := cfg.ToGProxyConfig(); err == nil {
+			t.Fatalf("profile-cache-dir %q was accepted", dir)
+		}
 	}
 }

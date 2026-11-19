@@ -74,6 +74,10 @@ type Config struct {
 	// ProfileCacheDir keeps the last good mask ServerHello profile on disk, so
 	// a restart can serve it when the first fetch fails. Empty = off.
 	ProfileCacheDir string
+	// ProfileCacheDefault marks ProfileCacheDir as the built-in default. If
+	// that directory cannot be created or written at startup, the cache is
+	// off for the run and one info line is logged instead of warnings.
+	ProfileCacheDefault bool
 
 	// MaskSNISafelist is an opt-in list of extra domains that an unauthenticated
 	// probe may be fronted to. When a bad-secret ClientHello's SNI is on this

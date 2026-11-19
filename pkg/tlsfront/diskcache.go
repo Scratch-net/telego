@@ -55,6 +55,23 @@ func (f *ServerHelloFetcher) EnableDiskCache(dir string) {
 	f.cacheDir = dir
 }
 
+// CheckDiskCacheDir creates dir when it is missing and checks that a cache
+// file can be created in it, with the same calls that a save uses.
+func CheckDiskCacheDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	temp, err := os.CreateTemp(dir, ".serverhello-*.tmp")
+	if err != nil {
+		return err
+	}
+	closeErr := temp.Close()
+	if err := os.Remove(temp.Name()); err != nil {
+		return err
+	}
+	return closeErr
+}
+
 // LoadDiskCache publishes a cached profile when no fetch has succeeded yet.
 // It checks the file like a fresh fetch: bounded size, the same host and
 // port, an age limit, and a ServerHello that parses as a TLS 1.3 template.

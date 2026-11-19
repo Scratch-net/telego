@@ -228,3 +228,24 @@ func TestDiskCacheDoesNotReplaceFetchedProfile(t *testing.T) {
 		t.Fatal("fetched profile changed")
 	}
 }
+
+func TestCheckDiskCacheDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "a", "b")
+	if err := CheckDiskCacheDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
+		t.Fatalf("dir = %v, err = %v; want a 0700 directory", info, err)
+	}
+	if entries, err := os.ReadDir(dir); err != nil || len(entries) != 0 {
+		t.Fatalf("check left entries %v, err = %v", entries, err)
+	}
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckDiskCacheDir(filepath.Join(file, "telego")); err == nil {
+		t.Fatal("check accepted a path below a regular file")
+	}
+}

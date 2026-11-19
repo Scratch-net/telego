@@ -81,7 +81,9 @@ type TLSFrontingConfig struct {
 	ServerHelloPaceScope string `toml:"server-hello-pace-scope"`
 
 	// ProfileCacheDir keeps the last good mask ServerHello profile on disk.
-	// Empty = off. Must be an absolute path.
+	// Unset = $STATE_DIRECTORY or /var/lib/telego; that default is off for the
+	// run when the directory cannot be written. "off" = off. Otherwise it must
+	// be an absolute path.
 	ProfileCacheDir string `toml:"profile-cache-dir"`
 
 	// MaskSNISafelist: opt-in extra domains an unauthenticated probe may be
@@ -319,8 +321,8 @@ func (c *Config) validateScalars() error {
 			return fmt.Errorf("%s must be between 0 and 65535 (0 uses the default)", field.name)
 		}
 	}
-	if dir := c.TLSFronting.ProfileCacheDir; dir != "" && !filepath.IsAbs(dir) {
-		return errors.New("tls-fronting.profile-cache-dir must be an absolute path")
+	if dir := c.TLSFronting.ProfileCacheDir; dir != "" && dir != profileCacheOff && !filepath.IsAbs(dir) {
+		return errors.New(`tls-fronting.profile-cache-dir must be an absolute path or "off"`)
 	}
 	if c.TLSFronting.SpliceProxyProtocol < 0 || c.TLSFronting.SpliceProxyProtocol > 2 {
 		return errors.New("tls-fronting.splice-proxy-protocol must be 0, 1, or 2")
@@ -511,7 +513,14 @@ func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
 	cfg.ServerHelloSegmentSize = c.TLSFronting.ServerHelloSegmentSize
 	cfg.ServerHelloPaceFirstRecord = c.TLSFronting.ServerHelloPaceScope == "first-record"
 	cfg.MaskSNISafelist = c.TLSFronting.MaskSNISafelist
-	cfg.ProfileCacheDir = c.TLSFronting.ProfileCacheDir
+	switch dir := c.TLSFronting.ProfileCacheDir; dir {
+	case "":
+		cfg.ProfileCacheDir = defaultProfileCacheDir()
+		cfg.ProfileCacheDefault = true
+	case profileCacheOff:
+	default:
+		cfg.ProfileCacheDir = dir
+	}
 
 	// Splice target (defaults to mask-host:mask-port if not set)
 	cfg.SpliceHost = c.TLSFronting.SpliceHost
@@ -610,6 +619,23 @@ func (d TLSDomainConfig) toGProxy() gproxy.TLSDomain {
 		SpliceProxyProtocol: d.SpliceProxyProtocol,
 		FakeCertSize:        d.FakeCertSize,
 	}
+}
+
+const (
+	// profileCacheOff turns the TLS front profile cache off.
+	profileCacheOff = "off"
+	// defaultStateDir is the cache directory outside systemd StateDirectory=.
+	defaultStateDir = "/var/lib/telego"
+)
+
+// defaultProfileCacheDir returns the directory that systemd StateDirectory=
+// passes in $STATE_DIRECTORY, else /var/lib/telego. systemd joins several
+// state directories with ':'; the first one is used.
+func defaultProfileCacheDir() string {
+	if dir, _, _ := strings.Cut(os.Getenv("STATE_DIRECTORY"), ":"); filepath.IsAbs(dir) {
+		return dir
+	}
+	return defaultStateDir
 }
 
 // ToWebProxyRuntimeConfig validates the optional WEB listener and derives its

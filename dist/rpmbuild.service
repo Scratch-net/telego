@@ -26,6 +26,8 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectHome=true
 ProtectSystem=full
+# Writable /var/lib/telego for the TLS front profile cache ($STATE_DIRECTORY).
+StateDirectory=telego
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 

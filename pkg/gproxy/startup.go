@@ -57,6 +57,15 @@ func (h *ProxyHandler) loadProfileCache() {
 	if dir == "" {
 		return
 	}
+	if h.config.ProfileCacheDefault {
+		// The default directory may not exist or be writable, for example
+		// without StateDirectory= or in a read-only container. One check
+		// decides for the whole run, so the cache never warns about it.
+		if err := tlsfront.CheckDiskCacheDir(dir); err != nil {
+			h.logger.Info("TLS front profile cache is off for this run: %v", err)
+			return
+		}
+	}
 	h.serverHelloFetcher.EnableDiskCache(dir)
 	h.serverHelloFetcher.OnDiskCacheError(func(err error) {
 		h.logger.Warn("Failed to save TLS front profile cache: %v", err)
