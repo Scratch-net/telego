@@ -7,9 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -20,6 +23,7 @@ import (
 	"github.com/scratch-net/telego/pkg/gproxy"
 	"github.com/scratch-net/telego/pkg/log"
 	"github.com/scratch-net/telego/pkg/metrics"
+	"github.com/scratch-net/telego/pkg/tlsfront"
 	"github.com/scratch-net/telego/pkg/transport/middleend"
 	"github.com/scratch-net/telego/pkg/webproxy"
 )
@@ -87,8 +91,10 @@ func (c *RunCmd) Run() error {
 
 	// Default bind address
 	if cfg.BindAddr == "" {
-		cfg.BindAddr = "0.0.0.0:443"
+		cfg.BindAddr = defaultBindAddr
 	}
+
+	warnFallbackLoop(&cfg, fileCfg.MiddleEnd.NATIP)
 
 	var webRuntimeConfig config.WebProxyRuntimeConfig
 	var webRuntime *webProxyRuntime
@@ -251,7 +257,7 @@ func (c *RunCmd) Run() error {
 				proxyCfg.BindAddr = c.Bind
 			}
 			if proxyCfg.BindAddr == "" {
-				proxyCfg.BindAddr = "0.0.0.0:443"
+				proxyCfg.BindAddr = defaultBindAddr
 			}
 			if fileCfg.WebProxy.Enabled {
 				if _, err := fileCfg.ToWebProxyRuntimeConfig(proxyCfg.BindAddr); err != nil {
@@ -454,6 +460,33 @@ func printWebProxyLinks(hostname, basePath string, profiles []webproxy.Profile) 
 			Str("tg_link", links.Telegram).
 			Str("https_link", links.HTTPS).
 			Msg("Telegram WEB proxy links")
+	}
+}
+
+// defaultBindAddr is the proxy listener when neither the config nor --bind sets one.
+const defaultBindAddr = "0.0.0.0:443"
+
+// warnFallbackLoop logs an error when the splice or certificate target is the
+// proxy listener itself. Such a target splices unrecognized clients back into
+// telego again and again. It uses local addresses and middle-end.nat-ip only,
+// without STUN, and does not stop startup. telego doctor also checks the STUN
+// public IP.
+func warnFallbackLoop(cfg *gproxy.Config, natIP string) {
+	var own []netip.Addr
+	if ip, err := netip.ParseAddr(strings.TrimSpace(natIP)); err == nil {
+		own = append(own, ip)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	for _, target := range fallbackTargets(cfg) {
+		addr, match, err := tlsfront.SelfTarget(ctx, net.DefaultResolver.LookupNetIP, tlsfront.LocalAddrs, target.host, target.port, cfg.BindAddr, own...)
+		if err != nil {
+			log.Debug().Err(err).Str("scope", target.scope).Msg("Fallback loop check failed")
+		} else if match {
+			log.Error().Str("scope", target.scope).Str("target", net.JoinHostPort(target.host, strconv.Itoa(target.port))).
+				Str("resolved", addr.String()).Str("bind", cfg.BindAddr).Str("option", target.option).
+				Msg("Fallback target is this telego listener; unrecognized clients would loop back into telego")
+		}
 	}
 }
 

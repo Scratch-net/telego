@@ -225,3 +225,70 @@ func TestCheckMaskHostAddress(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestSelfTarget(t *testing.T) {
+	records := map[string][]string{
+		"mask.example.com":  {"203.0.113.7"},
+		"other.example.com": {"198.51.100.1"},
+		"localhost":         {"127.0.0.1", "::1"},
+		"bind.example.com":  {"192.0.2.10"},
+		"self.example.com":  {"192.0.2.10"},
+	}
+	lookup := func(_ context.Context, network, host string) ([]netip.Addr, error) {
+		if network != "ip" {
+			t.Fatalf("lookup network %s", network)
+		}
+		if addr, err := netip.ParseAddr(host); err == nil {
+			return []netip.Addr{addr}, nil
+		}
+		values, ok := records[host]
+		if !ok {
+			return nil, errors.New("no such host")
+		}
+		var addrs []netip.Addr
+		for _, value := range values {
+			addrs = append(addrs, netip.MustParseAddr(value))
+		}
+		return addrs, nil
+	}
+	local := func() ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("::1"), netip.MustParseAddr("10.0.0.5")}, nil
+	}
+	public := netip.MustParseAddr("203.0.113.7")
+	for _, tc := range []struct {
+		name string
+		host string
+		port int
+		bind string
+		own  []netip.Addr
+		want string
+	}{
+		{name: "public IP on bind port", host: "mask.example.com", port: 443, bind: "0.0.0.0:443", own: []netip.Addr{public}, want: "203.0.113.7"},
+		{name: "public IP on other port", host: "mask.example.com", port: 8443, bind: "0.0.0.0:443", own: []netip.Addr{public}},
+		{name: "public IP unknown", host: "mask.example.com", port: 443, bind: "0.0.0.0:443"},
+		{name: "loopback with wildcard bind", host: "localhost", port: 443, bind: ":443", want: "127.0.0.1"},
+		{name: "interface address with tcp prefix", host: "10.0.0.5", port: 443, bind: "tcp://[::]:443", want: "10.0.0.5"},
+		{name: "loopback with specific bind", host: "127.0.0.1", port: 443, bind: "10.0.0.5:443"},
+		{name: "bind host name", host: "self.example.com", port: 443, bind: "bind.example.com:443", want: "192.0.2.10"},
+		{name: "remote host", host: "other.example.com", port: 443, bind: "0.0.0.0:443", own: []netip.Addr{public}},
+		{name: "unix socket", host: "127.0.0.1", port: 443, bind: "unix:///run/telego.sock"},
+		{name: "unix path", host: "127.0.0.1", port: 443, bind: "/run/telego.sock"},
+		{name: "invalid own address", host: "other.example.com", port: 443, bind: "10.0.0.5:443", own: []netip.Addr{{}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr, match, err := SelfTarget(t.Context(), lookup, local, tc.host, tc.port, tc.bind, tc.own...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if match != (tc.want != "") || (match && addr.String() != tc.want) {
+				t.Fatalf("addr=%v match=%v, want %q", addr, match, tc.want)
+			}
+		})
+	}
+	if _, _, err := SelfTarget(t.Context(), lookup, local, "missing.example.com", 443, "0.0.0.0:443"); err == nil {
+		t.Fatal("unresolved target did not fail")
+	}
+	if _, _, err := SelfTarget(t.Context(), lookup, local, "127.0.0.1", 443, "443"); err == nil {
+		t.Fatal("invalid bind address did not fail")
+	}
+}

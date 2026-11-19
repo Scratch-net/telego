@@ -43,7 +43,56 @@ func TestDoctorPublicIP(t *testing.T) {
 	}
 }
 
+// noDoctorSTUN makes doctor tests independent from the network.
+func noDoctorSTUN(t *testing.T) {
+	t.Helper()
+	previous := doctorDiscoverPublicIP
+	doctorDiscoverPublicIP = func() (string, error) { return "", errors.New("STUN disabled in tests") }
+	t.Cleanup(func() { doctorDiscoverPublicIP = previous })
+}
+
+func TestDoctorRejectsFallbackLoop(t *testing.T) {
+	noDoctorSTUN(t)
+	for _, tc := range []struct {
+		name, config, scope, option string
+	}{
+		{name: "splice", scope: "probe_fallback", option: "splice-host", config: `bind-to = "0.0.0.0:443"
+[tls-fronting]
+mask-host = "127.0.0.1"
+cert-host = "127.0.0.2"
+cert-port = 1
+`},
+		{name: "certificate", scope: "certificate_source", option: "cert-host", config: `bind-to = "127.0.0.1:8443"
+[tls-fronting]
+mask-host = "example.com"
+splice-host = "127.0.0.2"
+splice-port = 1
+cert-host = "127.0.0.1"
+cert-port = 8443
+`},
+		{name: "nat-ip", scope: "probe_fallback", option: "splice-host", config: `bind-to = "0.0.0.0:443"
+[tls-fronting]
+mask-host = "203.0.113.7"
+[middle-end]
+nat-ip = "203.0.113.7"
+`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			body := "secrets.test = \"0123456789abcdef0123456789abcdef\"\n" + tc.config
+			if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			err := (&DoctorCmd{Config: path, Timeout: time.Second}).Run()
+			if err == nil || !strings.Contains(err.Error(), tc.scope) || !strings.Contains(err.Error(), "telego listener") || !strings.Contains(err.Error(), tc.option) {
+				t.Fatalf("loop not reported: %v", err)
+			}
+		})
+	}
+}
+
 func TestDoctorTargetScope(t *testing.T) {
+	noDoctorSTUN(t)
 	path := filepath.Join(t.TempDir(), "config.toml")
 	if err := os.WriteFile(path, []byte(`secrets.test = "0123456789abcdef0123456789abcdef"
 [tls-fronting]

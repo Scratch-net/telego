@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -119,4 +121,66 @@ func diagnosticProxyHeader(conn net.Conn, version int) ([]byte, error) {
 	header = append(header, dstIP...)
 	header = binary.BigEndian.AppendUint16(header, uint16(src.Port))
 	return binary.BigEndian.AppendUint16(header, uint16(dst.Port)), nil
+}
+
+// SelfTarget reports whether host:port reaches the proxy's own TCP listener.
+// bind is the listener address, with an optional tcp:// prefix. When its IP is
+// unspecified, every address from localAddrs counts as the listener. own adds
+// other addresses that reach the listener, for example the public IP.
+// A Unix socket listener never matches. The first matching address is returned.
+func SelfTarget(ctx context.Context, lookup LookupNetIPFunc, localAddrs func() ([]netip.Addr, error), host string, port int, bind string, own ...netip.Addr) (netip.Addr, bool, error) {
+	if strings.HasPrefix(bind, "unix://") || strings.HasPrefix(bind, "/") {
+		return netip.Addr{}, false, nil
+	}
+	bindHost, bindPort, err := net.SplitHostPort(strings.TrimPrefix(bind, "tcp://"))
+	if err != nil {
+		return netip.Addr{}, false, fmt.Errorf("parse bind address: %w", err)
+	}
+	if strconv.Itoa(port) != bindPort {
+		return netip.Addr{}, false, nil
+	}
+	listener := append([]netip.Addr(nil), own...)
+	bindIP, err := netip.ParseAddr(bindHost)
+	if bindHost == "" || (err == nil && bindIP.IsUnspecified()) {
+		local, err := localAddrs()
+		if err != nil {
+			return netip.Addr{}, false, fmt.Errorf("list local addresses: %w", err)
+		}
+		listener = append(listener, local...)
+	} else if err == nil {
+		listener = append(listener, bindIP)
+	} else {
+		resolved, err := lookup(ctx, "ip", bindHost)
+		if err != nil {
+			return netip.Addr{}, false, fmt.Errorf("resolve bind host: %w", err)
+		}
+		listener = append(listener, resolved...)
+	}
+	targets, err := lookup(ctx, "ip", host)
+	if err != nil {
+		return netip.Addr{}, false, fmt.Errorf("resolve target host: %w", err)
+	}
+	for _, target := range targets {
+		for _, addr := range listener {
+			if addr.IsValid() && target.Unmap() == addr.Unmap() {
+				return target.Unmap(), true, nil
+			}
+		}
+	}
+	return netip.Addr{}, false, nil
+}
+
+// LocalAddrs returns the IP addresses of all local network interfaces.
+func LocalAddrs() ([]netip.Addr, error) {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]netip.Addr, 0, len(addrs))
+	for _, addr := range addrs {
+		if prefix, err := netip.ParsePrefix(addr.String()); err == nil {
+			out = append(out, prefix.Addr().Unmap())
+		}
+	}
+	return out, nil
 }
