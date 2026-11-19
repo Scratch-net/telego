@@ -2,6 +2,10 @@
 let httpWindow=1,downRetainedBytes=0;
 const httpUp=newHTTPUp(),httpDown={transaction:null},downWaiters=new Set();
 const maxSequence=18446744073709551615n;
+// An opt-in https bridge asks for streamed downlinks. Any retry or failed body
+// returns this bridge to plain polls for the rest of its life.
+let downStreaming=streamDownload;
+const downStreamType='application/vnd.telego.web-stream';
 function newHTTPUp(){return {sequence:1n,frontier:0n,completed:new Set(),active:new Map()}}
 function launchHTTPUp(state,pending,lane){
  const generation=epoch;
@@ -110,7 +114,7 @@ async function readDownlink(response,lane,signal,deadline){
   if(!frames||offset!==position||position<owner.retained)throw new Error('invalid frame batch');
   if(lane)lane.cursor=next;else downCursor=next;
   complete=true;releaseDown(state);return new ArrayBuffer(0);
- }finally{if(!complete)cancel();signal.removeEventListener('abort',cancel);reader.releaseLock()}
+ }finally{if(!complete){cancel();downStreaming=false}signal.removeEventListener('abort',cancel);reader.releaseLock()}
 }
 async function pollHTTPS(lane){
  if(lane&&lane.polling)return;if(lane)lane.polling=true;
@@ -119,7 +123,11 @@ async function pollHTTPS(lane){
   while(current(generation)&&sessionToken&&(!lane||lanes.get(lane.id)===lane)){
    const controller=new AbortController();if(lane)lane.controller=controller;else pollController=controller;
    const headers={'X-Down-Cursor':lane?lane.cursor:downCursor};if(lane)headers['X-Lane-ID']=String(lane.id);
-   const response=await request('/api/v1/down',()=>options('POST',sessionToken,null,headers,controller.signal),null,
+   let attempt=0;
+   const response=await request('/api/v1/down',()=>{
+    if(attempt++)downStreaming=false;
+    return options('POST',sessionToken,null,!lane&&downStreaming?Object.assign({Accept:downStreamType},headers):headers,controller.signal);
+   },null,
     (response,signal,deadline)=>readDownlink(response,lane,signal,deadline));
    if(!current(generation))return;
    if(response.status===204){

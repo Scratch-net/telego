@@ -1093,6 +1093,26 @@ func TestWebProxyCarrierBatchKiB(t *testing.T) {
 	}
 }
 
+func TestWebProxyStreamDownloadRequiresHTTPS(t *testing.T) {
+	for _, carrier := range []string{"", "https", "https-lanes", "websocket", "websocket-lanes"} {
+		cfg := &Config{
+			Secrets:  map[string]string{"alice": "0123456789abcdef0123456789abcdef"},
+			WebProxy: WebProxyConfig{Enabled: true, Hostname: "proxy.example.com", Carrier: carrier, StreamDownload: true},
+		}
+		runtime, err := cfg.ToWebProxyRuntimeConfig("0.0.0.0:443")
+		https := carrier == "" || carrier == "https"
+		if https && (err != nil || !runtime.StreamDownload) || !https && (err == nil || !strings.Contains(err.Error(), "stream-download")) {
+			t.Fatalf("carrier %q: stream=%t err=%v", carrier, runtime.StreamDownload, err)
+		}
+	}
+	cfg := &Config{WebProxy: WebProxyConfig{Enabled: true}}
+	fingerprint := cfg.webProxyFingerprint()
+	cfg.WebProxy.StreamDownload = true
+	if fingerprint == cfg.webProxyFingerprint() {
+		t.Fatal("stream-download change omitted from restart fingerprint")
+	}
+}
+
 func TestWebProxyConfigDefaults(t *testing.T) {
 	cfg := Config{
 		Secrets: map[string]string{"alice": "0123456789abcdef0123456789abcdef"},

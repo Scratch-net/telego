@@ -94,6 +94,9 @@ type ManagerConfig struct {
 	// 64 KiB backend reads and 1 MiB frame coalescing. Set it with a small
 	// CarrierBatchBytes so that one frame cannot exceed the batch target.
 	DownlinkFrameBytes int
+	// StreamDownload lets the https carrier keep one downlink response open
+	// and append frames to it. The bridge must ask for it on each poll.
+	StreamDownload     bool
 	Profiles           []Profile
 	Backend            string
 	Carrier            CarrierMode

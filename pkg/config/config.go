@@ -150,6 +150,8 @@ type WebProxyConfig struct {
 	// CarrierBatchKiB bounds each carrier body and downlink DATA frame.
 	// Zero keeps the 2048 KiB protocol default.
 	CarrierBatchKiB int `toml:"carrier-batch-kib"`
+	// StreamDownload keeps one https downlink response open per batch.
+	StreamDownload bool `toml:"stream-download"`
 }
 
 // MiddleEndConfig configures Telegram's official Middle-End transport, which
@@ -185,6 +187,7 @@ type WebProxyRuntimeConfig struct {
 	BackendProxyProtocol bool
 	// CarrierBatchBytes is zero when the protocol default applies.
 	CarrierBatchBytes int
+	StreamDownload    bool
 }
 
 // Duration is a TOML-parseable duration.
@@ -495,6 +498,9 @@ func (c *Config) ToWebProxyRuntimeConfig(mtProxyBind string) (WebProxyRuntimeCon
 	if err := validateCarrierBatchKiB(c.WebProxy.CarrierBatchKiB); err != nil {
 		return WebProxyRuntimeConfig{}, err
 	}
+	if c.WebProxy.StreamDownload && carrier != webproxy.CarrierHTTPS {
+		return WebProxyRuntimeConfig{}, errors.New("web-proxy.stream-download requires carrier \"https\"")
+	}
 
 	bindAddr := c.WebProxy.BindTo
 	if bindAddr == "" {
@@ -565,6 +571,7 @@ func (c *Config) ToWebProxyRuntimeConfig(mtProxyBind string) (WebProxyRuntimeCon
 		Profiles:             profiles,
 		BackendProxyProtocol: !logicalBackend,
 		CarrierBatchBytes:    c.WebProxy.CarrierBatchKiB * 1024,
+		StreamDownload:       c.WebProxy.StreamDownload,
 	}, nil
 }
 
@@ -610,7 +617,7 @@ func (c *Config) webProxyFingerprint() string {
 	}
 	trusted := strings.Join(c.WebProxy.TrustedProxyCIDRs, ",")
 	return fmt.Sprintf(
-		"enabled=%t\x00bind=%s\x00hostname=%s\x00base-path=%s\x00backend=%s\x00carrier=%s\x00trusted=%s\x00loops=%d\x00batch=%d",
+		"enabled=%t\x00bind=%s\x00hostname=%s\x00base-path=%s\x00backend=%s\x00carrier=%s\x00trusted=%s\x00loops=%d\x00batch=%d\x00stream=%t",
 		c.WebProxy.Enabled,
 		c.WebProxy.BindTo,
 		c.WebProxy.Hostname,
@@ -620,6 +627,7 @@ func (c *Config) webProxyFingerprint() string {
 		trusted,
 		c.WebProxy.NumEventLoops,
 		c.WebProxy.CarrierBatchKiB,
+		c.WebProxy.StreamDownload,
 	)
 }
 

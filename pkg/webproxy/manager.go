@@ -85,6 +85,7 @@ type Capacity struct {
 // stream and queue budgets.
 type Manager struct {
 	debugDiagnostics bool
+	streamDownload   bool // https carrier only
 
 	// Built from the copied profiles before publication; never mutated.
 	capabilityPrefixes map[uint64]struct{}
@@ -155,6 +156,7 @@ func NewManager(config ManagerConfig) (*Manager, error) {
 	}
 	manager := &Manager{
 		debugDiagnostics: config.DebugDiagnostics,
+		streamDownload:   config.StreamDownload && config.Carrier == CarrierHTTPS,
 
 		capabilityPrefixes: make(map[uint64]struct{}, len(config.Profiles)),
 

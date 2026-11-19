@@ -701,6 +701,9 @@ type PollLease struct {
 	ownsSlot  bool
 	once      sync.Once
 	bodyOwner *carrierBatchOwnership
+	// fresh marks a lease whose body is a new batch rather than a replay.
+	// Only a fresh batch can grow into a streamed response.
+	fresh bool
 }
 
 // Replay storage and its serialized response share the established logical
@@ -963,6 +966,7 @@ func (s *Session) pollCarrier(
 			next := lane.downCursor
 			body := batch.body
 			lease.retainBodyLocked()
+			lease.fresh = true
 			s.mu.Unlock()
 			return body, next, false, lease, nil
 		}
@@ -1553,12 +1557,19 @@ func (s *Session) notifyBudgetLocked() {
 }
 
 func (s *Session) takeDownBatchLocked(lane *carrierLane) downBatch {
+	return s.takeDownFramesLocked(lane, s.limits.CarrierBatchBytes, MaxBatchFrames, false)
+}
+
+// takeDownFramesLocked removes a queue prefix of at most frameLimit frames
+// and byteLimit encoded bytes. Unless mustFit is set, the first frame is
+// always taken, even when it alone exceeds byteLimit.
+func (s *Session) takeDownFramesLocked(lane *carrierLane, byteLimit, frameLimit int, mustFit bool) downBatch {
 	size := 0
 	cost := 0
 	count := 0
-	for count < len(lane.pendingFrames) && count < MaxBatchFrames {
+	for count < len(lane.pendingFrames) && count < frameLimit {
 		next := len(lane.pendingFrames[count].encoded)
-		if count != 0 && size+next > s.limits.CarrierBatchBytes {
+		if (count != 0 || mustFit) && size+next > byteLimit {
 			break
 		}
 		size += next
@@ -1582,6 +1593,64 @@ func (s *Session) takeDownBatchLocked(lane *carrierLane) downBatch {
 		lane.pendingFrames = nil
 	}
 	return downBatch{body: body, cost: cost, items: count}
+}
+
+// nextStreamChunk appends queued frames to the fresh batch that lease is
+// sending as a streamed response. It returns only the appended bytes. It
+// returns nil when the stream must end: the batch is full, the deadline or
+// ctx expired, a newer poll superseded the lease, or the batch is no longer
+// the lane's replay batch. A later poll for the same cursor replays the whole
+// batch: the first body plus every chunk that this function returned.
+func (s *Session) nextStreamChunk(ctx context.Context, lease *PollLease, deadline time.Time) []byte {
+	if lease == nil || !lease.fresh || lease.claim == nil {
+		return nil
+	}
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	lane := lease.lane
+	s.mu.Lock()
+	for {
+		if s.closed || lane.superseded != lease.claim || !lease.ownsSlot || lease.bodyOwner == nil ||
+			lane.unackedOwner != lease.bodyOwner || s.carrierLanes[0] != lane || !time.Now().Before(deadline) {
+			s.mu.Unlock()
+			return nil
+		}
+		if len(lane.pendingFrames) != 0 {
+			start := len(lane.unacked)
+			batch := s.takeDownFramesLocked(lane, s.limits.CarrierBatchBytes-start, MaxBatchFrames-lane.unackedItems, true)
+			if batch.items == 0 {
+				s.mu.Unlock()
+				return nil
+			}
+			// Append writes only past the length of earlier slices, so queued
+			// owned writes of earlier chunks keep their bytes.
+			lane.unacked = append(lane.unacked, batch.body...)
+			lane.unackedCost += batch.cost
+			lane.unackedItems += batch.items
+			lease.bodyOwner.cost += batch.cost
+			lease.bodyOwner.items += batch.items
+			s.carrierOwnedCost += batch.cost
+			s.carrierOwnedItems += batch.items
+			s.lastActivity = time.Now()
+			chunk := lane.unacked[start:len(lane.unacked):len(lane.unacked)]
+			s.mu.Unlock()
+			return chunk
+		}
+		notify := lane.notify
+		s.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-lease.claim:
+			return nil
+		case <-s.done:
+			return nil
+		case <-timer.C:
+			return nil
+		case <-notify:
+		}
+		s.mu.Lock()
+	}
 }
 
 func (s *Session) rememberClosedLocked(streamID uint32) {

@@ -11,8 +11,8 @@ const budget = 90000;
 const batchLimit = 2 * 1024 * 1024;
 const flush = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
 
-function harness(carrier, smallBatch = false, diagnostics = true, startedAt = 0) {
-  const html = readFileSync(join(process.env.TELEGO_BRIDGE_FIXTURES, carrier + (!diagnostics ? '.quiet.html' : smallBatch ? '.small.html' : '.html')), 'utf8');
+function harness(carrier, smallBatch = false, diagnostics = true, startedAt = 0, variant = '') {
+  const html = readFileSync(join(process.env.TELEGO_BRIDGE_FIXTURES, carrier + (variant ? '.' + variant + '.html' : !diagnostics ? '.quiet.html' : smallBatch ? '.small.html' : '.html')), 'utf8');
   const match = /<script nonce="[^"]+">([\s\S]*?)<\/script>/.exec(html);
   assert.ok(match, 'rendered script exists');
   let now = startedAt, nextTimer = 0;
@@ -134,8 +134,8 @@ function parked(options) {
   });
 }
 
-async function liveBridge(carrier, diagnostics = false, configure) {
-  const h = harness(carrier, false, diagnostics);
+async function liveBridge(carrier, diagnostics = false, configure, variant = '') {
+  const h = harness(carrier, false, diagnostics, 0, variant);
   let sessions = 0;
   h.recoveryResponse = () => new Response(JSON.stringify({ version: 1, bootstrap: 'B'.repeat(43), carrier, batch: batchLimit, streams: 128 }), {
     headers: { 'Content-Type': 'application/vnd.telego.web-recovery+json' },
@@ -1454,4 +1454,71 @@ test('a retired epoch cannot release a replacement batch that reuses its sequenc
  requests[1].resolve(new Response(null,{status:204,headers:{'X-Up-Ack':'1'}}));await flush();
  assert.equal(h.api.state().queuedBytes,0);assert.equal(h.api.state().queuedItems,0);assert.equal(h.api.httpUp.active.size,0);
  h.pagehide();await flush();assertClean(h);
+});
+
+function streamDownBridge(variant, respondDown) {
+  const downs = [];
+  return liveBridge('https', false, fixture => {
+    const respond = fixture.sandbox.respond;
+    fixture.sandbox.respond = (url, options) => {
+      if (!url.endsWith('/api/v1/down')) return respond(url, options);
+      downs.push(options);
+      return respondDown(downs.length, options);
+    };
+  }, variant).then(h => ({ h, downs }));
+}
+
+function deliveredData(h) {
+  return h.messages.filter(value => value instanceof ArrayBuffer && new DataView(value).getUint8(0) === 2).map(value => Buffer.from(value));
+}
+
+test('stream download delivers each frame before the response ends and keeps streaming', async () => {
+  const stream = streamResponse({ end: false, headers: { 'X-Down-Cursor': '1' } });
+  const { h, downs } = await streamDownBridge('stream', (count, options) => count === 1 ? Promise.resolve(stream.response) : parked(options));
+  assert.equal(downs[0].headers.Accept, 'application/vnd.telego.web-stream');
+  const first = dataFrame(1, 3), second = dataFrame(1, 5);
+  stream.controller.enqueue(first); await flush();
+  assert.deepEqual(deliveredData(h), [Buffer.from(first)], 'a complete frame is delivered while the stream is open');
+  stream.controller.enqueue(second.slice(0, 6)); await flush();
+  stream.controller.enqueue(second.slice(6)); await flush();
+  assert.deepEqual(deliveredData(h), [Buffer.from(first), Buffer.from(second)]);
+  assert.equal(downs.length, 1, 'no new poll while the stream is open');
+  stream.controller.close(); await flush();
+  assert.equal(downs.length, 2);
+  assert.equal(downs[1].headers['X-Down-Cursor'], '1');
+  assert.equal(downs[1].headers.Accept, 'application/vnd.telego.web-stream', 'a clean stream keeps the streamed mode');
+  assert.equal(h.api.state().downRetainedBytes, 0);
+  h.pagehide(); await flush(); assertClean(h);
+});
+
+test('broken stream replays the batch once and falls back to plain polls', async () => {
+  const stream = streamResponse({ end: false, headers: { 'X-Down-Cursor': '1' } });
+  const first = dataFrame(1, 3), second = dataFrame(1, 5);
+  const replay = Buffer.concat([Buffer.from(first), Buffer.from(second)]);
+  const { h, downs } = await streamDownBridge('stream', (count, options) => {
+    if (count === 1) return Promise.resolve(stream.response);
+    if (count === 2) return Promise.resolve(new Response(replay, { headers: { 'X-Down-Cursor': '1', 'Content-Length': String(replay.length) } }));
+    return parked(options);
+  });
+  stream.controller.enqueue(new Uint8Array(Buffer.concat([Buffer.from(first), Buffer.from(second.slice(0, 4))]))); await flush();
+  assert.deepEqual(deliveredData(h), [Buffer.from(first)]);
+  stream.controller.error(new TypeError('network changed')); await flush();
+  await h.advance(400);
+  assert.ok(downs.length >= 2, 'the logical poll retries');
+  assert.equal(downs[1].headers['X-Down-Cursor'], '0', 'the retry asks for the same batch');
+  assert.equal(downs[1].headers.Accept, undefined, 'the retry uses a plain poll');
+  assert.deepEqual(deliveredData(h), [Buffer.from(first), Buffer.from(second)], 'the replay delivers only the missing frame');
+  assert.equal(downs.length, 3);
+  assert.equal(downs[2].headers['X-Down-Cursor'], '1');
+  assert.equal(downs[2].headers.Accept, undefined, 'the bridge stays on plain polls');
+  assert.equal(h.api.state().recovering, false);
+  assert.equal(h.messages.some(value => value.t === 'close' || value.state === 'failed'), false);
+  h.pagehide(); await flush(); assertClean(h);
+});
+
+test('default https bridge never asks for a streamed downlink', async () => {
+  const { h, downs } = await streamDownBridge('', (count, options) => parked(options));
+  assert.equal(downs.length, 1);
+  assert.equal(downs[0].headers.Accept, undefined);
+  h.pagehide(); await flush(); assertClean(h);
 });

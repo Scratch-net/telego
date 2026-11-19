@@ -343,6 +343,20 @@ The costs are high:
 - Some censors block a port for about 2 minutes after a burst of SYN packets. Fast rotation can cause this block.
 - `keepalive_requests` and `keepalive_time` apply to every request in that `server` block, including the ordinary website.
 
+Do not combine rotation with `stream-download`. A stream keeps one response open on one connection.
+
+### Experimental streamed download
+
+By default, the `https` carrier sends one long poll for each downlink batch. Each batch then waits for one round trip.
+
+Set `stream-download = true` to keep one download response open. Telego sends each new downlink frame in that response at once. This option works only with `carrier = "https"`. It is off by default.
+
+- A streamed response ends after the long-poll time (25 seconds) or when it reaches the batch size.
+- If a stream breaks, the bridge asks for the same batch again with an ordinary long poll. Telego sends the complete batch again, and the bridge skips the frames that it already delivered.
+- After any error, the bridge uses ordinary long polls until Telegram Desktop loads a new bridge page.
+- Nginx must not buffer the response. The shipped templates set `proxy_buffering off`. Telego also sends `X-Accel-Buffering: no`.
+- The bridge asks for a stream with the `Accept: application/vnd.telego.web-stream` request header. Nginx forwards it without a configuration change.
+
 ---
 
 ## Configuration
@@ -428,6 +442,7 @@ carrier = "websocket"                    # Installer default. Requires upgrade f
 # trusted-proxy-cidrs = ["127.0.0.1/32"]   # Nginx peers allowed to send X-Forwarded-For
 # num-event-loops = 0                       # 0 = automatic
 # carrier-batch-kib = 0                     # 0 = 2048 KiB. Experimental: 4-2048
+# stream-download = false                   # Experimental. https carrier only
 
 # Telegram Middle-End transport (enabled by default; changes require a restart)
 [middle-end]

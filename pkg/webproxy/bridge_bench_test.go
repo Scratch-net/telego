@@ -12,7 +12,7 @@ func BenchmarkRenderBridgeWebSocket(b *testing.B) {
 	}
 	b.ReportAllocs()
 	for b.Loop() {
-		if _, err := renderBridgeAtPath("proxy.example.com", token, maxCarrierBatchBytes, CarrierWebSocket, 128, false, ""); err != nil {
+		if _, err := renderBridgeAtPath("proxy.example.com", token, maxCarrierBatchBytes, CarrierWebSocket, 128, false, "", bridgeFeatures{}); err != nil {
 			b.Fatal(err)
 		}
 	}
