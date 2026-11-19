@@ -352,3 +352,28 @@ func TestUserLimiterFollowsRenamedSecret(t *testing.T) {
 		t.Fatalf("stats = %+v, want the new name", stats)
 	}
 }
+
+func TestHotReloadSecretsAcceptCoverDomainHost(t *testing.T) {
+	alice := reloadTestSecret("alice", 1)
+	cfg := &Config{Host: "example.com", Secrets: []Secret{alice}, Domains: []TLSDomain{{Host: "d.example"}}}
+	handler := NewProxyHandler(cfg, &testLogger{})
+	logger := &testLogger{}
+	reloader := NewHotReloader(HotReloadConfig{
+		LoadConfig: func() (*Config, string, error) {
+			bob := reloadTestSecret("bob", 2)
+			bob.Host = "d.example"
+			next := *cfg
+			next.Secrets = []Secret{alice, bob}
+			return &next, "", nil
+		},
+		Handler: handler,
+		Logger:  logger,
+	})
+	reloader.reload()
+	if got := handler.currentSecrets(); len(got) != 2 {
+		t.Fatalf("secrets = %+v, want alice and bob", got)
+	}
+	if loggedFormat(logger, "uses a new host") {
+		t.Fatal("a startup cover domain was treated as a new host")
+	}
+}

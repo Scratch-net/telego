@@ -264,6 +264,11 @@ func (r *HotReloader) reload() {
 func (r *HotReloader) applySecrets(initial, next *Config) bool {
 	hosts := make(map[string]struct{}, len(initial.Secrets)+1)
 	hosts[initial.Host] = struct{}{}
+	// Cover domains have profiles from startup, also when all their secrets
+	// were disabled then.
+	for i := range initial.Domains {
+		hosts[initial.Domains[i].Host] = struct{}{}
+	}
 	for i := range initial.Secrets {
 		hosts[initial.Secrets[i].Host] = struct{}{}
 	}
