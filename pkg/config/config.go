@@ -174,6 +174,15 @@ type WebProxyConfig struct {
 	Carrier           string   `toml:"carrier"`
 	TrustedProxyCIDRs []string `toml:"trusted-proxy-cidrs"`
 	NumEventLoops     int      `toml:"num-event-loops"`
+	// CarrierBatchKiB bounds each carrier body and downlink DATA frame.
+	// Zero keeps the 2048 KiB protocol default.
+	CarrierBatchKiB int `toml:"carrier-batch-kib"`
+	// StreamDownload keeps one https downlink response open per batch.
+	StreamDownload bool `toml:"stream-download"`
+	// WebSocketFairQueue schedules websocket downlink fairly across streams.
+	WebSocketFairQueue bool `toml:"websocket-fair-queue"`
+	// PadFirstFrames pads the first carrier batches in both directions.
+	PadFirstFrames bool `toml:"pad-first-frames"`
 }
 
 // MiddleEndConfig configures Telegram's official Middle-End transport, which
@@ -207,6 +216,11 @@ type WebProxyRuntimeConfig struct {
 	NumEventLoops        int
 	Profiles             []webproxy.Profile
 	BackendProxyProtocol bool
+	// CarrierBatchBytes is zero when the protocol default applies.
+	CarrierBatchBytes  int
+	StreamDownload     bool
+	WebSocketFairQueue bool
+	PadFirstFrames     bool
 }
 
 // Duration is a TOML-parseable duration.
@@ -322,6 +336,11 @@ func (c *Config) validateScalars() error {
 	// Disabled optional sections have always ignored dormant settings.
 	if c.WebProxy.Enabled && c.WebProxy.NumEventLoops < 0 {
 		return errors.New("web-proxy.num-event-loops cannot be negative")
+	}
+	if c.WebProxy.Enabled {
+		if err := validateCarrierBatchKiB(c.WebProxy.CarrierBatchKiB); err != nil {
+			return err
+		}
 	}
 	if c.General.MaxConnections < 0 {
 		return errors.New("general.max-connections cannot be negative")
@@ -615,6 +634,18 @@ func (c *Config) ToWebProxyRuntimeConfig(mtProxyBind string) (WebProxyRuntimeCon
 	if err != nil {
 		return WebProxyRuntimeConfig{}, fmt.Errorf("invalid web-proxy.carrier: %w", err)
 	}
+	if err := validateCarrierBatchKiB(c.WebProxy.CarrierBatchKiB); err != nil {
+		return WebProxyRuntimeConfig{}, err
+	}
+	if c.WebProxy.StreamDownload && carrier != webproxy.CarrierHTTPS {
+		return WebProxyRuntimeConfig{}, errors.New("web-proxy.stream-download requires carrier \"https\"")
+	}
+	if c.WebProxy.WebSocketFairQueue && carrier != webproxy.CarrierWebSocket {
+		return WebProxyRuntimeConfig{}, errors.New("web-proxy.websocket-fair-queue requires carrier \"websocket\"")
+	}
+	if c.WebProxy.PadFirstFrames && carrier != webproxy.CarrierHTTPS && carrier != webproxy.CarrierWebSocket {
+		return WebProxyRuntimeConfig{}, errors.New("web-proxy.pad-first-frames requires carrier \"https\" or \"websocket\"")
+	}
 
 	bindAddr := c.WebProxy.BindTo
 	if bindAddr == "" {
@@ -691,7 +722,26 @@ func (c *Config) ToWebProxyRuntimeConfig(mtProxyBind string) (WebProxyRuntimeCon
 		NumEventLoops:        c.WebProxy.NumEventLoops,
 		Profiles:             profiles,
 		BackendProxyProtocol: !logicalBackend,
+		CarrierBatchBytes:    c.WebProxy.CarrierBatchKiB * 1024,
+		StreamDownload:       c.WebProxy.StreamDownload,
+		WebSocketFairQueue:   c.WebProxy.WebSocketFairQueue,
+		PadFirstFrames:       c.WebProxy.PadFirstFrames,
 	}, nil
+}
+
+// The lower bound keeps every frame header and a useful payload in one body.
+// The upper bound is the 2 MiB WEB protocol cap that the bridge also enforces.
+const (
+	minCarrierBatchKiB = 4
+	maxCarrierBatchKiB = 2048
+)
+
+func validateCarrierBatchKiB(value int) error {
+	if value != 0 && (value < minCarrierBatchKiB || value > maxCarrierBatchKiB) {
+		return fmt.Errorf("web-proxy.carrier-batch-kib must be 0 (default %d) or %d through %d",
+			maxCarrierBatchKiB, minCarrierBatchKiB, maxCarrierBatchKiB)
+	}
+	return nil
 }
 
 func webProxyListenerAddr(bindAddr string) (net.Addr, error) {
@@ -721,7 +771,7 @@ func (c *Config) webProxyFingerprint() string {
 	}
 	trusted := strings.Join(c.WebProxy.TrustedProxyCIDRs, ",")
 	return fmt.Sprintf(
-		"enabled=%t\x00bind=%s\x00hostname=%s\x00base-path=%s\x00backend=%s\x00carrier=%s\x00trusted=%s\x00loops=%d",
+		"enabled=%t\x00bind=%s\x00hostname=%s\x00base-path=%s\x00backend=%s\x00carrier=%s\x00trusted=%s\x00loops=%d\x00batch=%d\x00stream=%t\x00fair=%t\x00pad=%t",
 		c.WebProxy.Enabled,
 		c.WebProxy.BindTo,
 		c.WebProxy.Hostname,
@@ -730,6 +780,10 @@ func (c *Config) webProxyFingerprint() string {
 		c.WebProxy.Carrier,
 		trusted,
 		c.WebProxy.NumEventLoops,
+		c.WebProxy.CarrierBatchKiB,
+		c.WebProxy.StreamDownload,
+		c.WebProxy.WebSocketFairQueue,
+		c.WebProxy.PadFirstFrames,
 	)
 }
 

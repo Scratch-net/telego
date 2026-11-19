@@ -111,6 +111,9 @@ middle-end.enabled = true
 		{"performance.client-silence-close", `"999ms"`},
 		{"performance.max-write-buffer-mb", "1025"},
 		{"web-proxy.num-event-loops", "-1"},
+		{"web-proxy.carrier-batch-kib", "-1"},
+		{"web-proxy.carrier-batch-kib", "3"},
+		{"web-proxy.carrier-batch-kib", "2049"},
 		{"middle-end.max-connections", "-1"},
 		{"middle-end.queue-budget-mb", "-1"},
 	} {
@@ -1069,6 +1072,86 @@ num-event-loops = 2
 	if runtime.Profiles[1].Name() != "alice" || runtime.Profiles[1].Mode() != webproxy.SecretDD ||
 		runtime.Profiles[1].SecretHex() != "dd0123456789abcdef0123456789abcdef" {
 		t.Fatalf("dd profile = name %q mode %v secret %q", runtime.Profiles[1].Name(), runtime.Profiles[1].Mode(), runtime.Profiles[1].SecretHex())
+	}
+}
+
+func TestWebProxyCarrierBatchKiB(t *testing.T) {
+	for _, test := range []struct{ kib, bytes int }{{0, 0}, {4, 4096}, {16, 16384}, {2048, 2 * 1024 * 1024}} {
+		cfg := &Config{
+			Secrets:  map[string]string{"alice": "0123456789abcdef0123456789abcdef"},
+			WebProxy: WebProxyConfig{Enabled: true, Hostname: "proxy.example.com", CarrierBatchKiB: test.kib},
+		}
+		runtime, err := cfg.ToWebProxyRuntimeConfig("0.0.0.0:443")
+		if err != nil || runtime.CarrierBatchBytes != test.bytes {
+			t.Fatalf("carrier-batch-kib=%d: bytes=%d err=%v", test.kib, runtime.CarrierBatchBytes, err)
+		}
+		fingerprint := cfg.webProxyFingerprint()
+		cfg.WebProxy.CarrierBatchKiB = test.kib + 1
+		if fingerprint == cfg.webProxyFingerprint() {
+			t.Fatal("carrier batch change omitted from restart fingerprint")
+		}
+	}
+}
+
+func TestWebProxyStreamDownloadRequiresHTTPS(t *testing.T) {
+	for _, carrier := range []string{"", "https", "https-lanes", "websocket", "websocket-lanes"} {
+		cfg := &Config{
+			Secrets:  map[string]string{"alice": "0123456789abcdef0123456789abcdef"},
+			WebProxy: WebProxyConfig{Enabled: true, Hostname: "proxy.example.com", Carrier: carrier, StreamDownload: true},
+		}
+		runtime, err := cfg.ToWebProxyRuntimeConfig("0.0.0.0:443")
+		https := carrier == "" || carrier == "https"
+		if https && (err != nil || !runtime.StreamDownload) || !https && (err == nil || !strings.Contains(err.Error(), "stream-download")) {
+			t.Fatalf("carrier %q: stream=%t err=%v", carrier, runtime.StreamDownload, err)
+		}
+	}
+	cfg := &Config{WebProxy: WebProxyConfig{Enabled: true}}
+	fingerprint := cfg.webProxyFingerprint()
+	cfg.WebProxy.StreamDownload = true
+	if fingerprint == cfg.webProxyFingerprint() {
+		t.Fatal("stream-download change omitted from restart fingerprint")
+	}
+}
+
+func TestWebProxyWebSocketFairQueueRequiresWebSocket(t *testing.T) {
+	for _, carrier := range []string{"", "https", "https-lanes", "websocket", "websocket-lanes"} {
+		cfg := &Config{
+			Secrets:  map[string]string{"alice": "0123456789abcdef0123456789abcdef"},
+			WebProxy: WebProxyConfig{Enabled: true, Hostname: "proxy.example.com", Carrier: carrier, WebSocketFairQueue: true},
+		}
+		runtime, err := cfg.ToWebProxyRuntimeConfig("0.0.0.0:443")
+		websocket := carrier == "websocket"
+		if websocket && (err != nil || !runtime.WebSocketFairQueue) ||
+			!websocket && (err == nil || !strings.Contains(err.Error(), "websocket-fair-queue")) {
+			t.Fatalf("carrier %q: fair=%t err=%v", carrier, runtime.WebSocketFairQueue, err)
+		}
+	}
+	cfg := &Config{WebProxy: WebProxyConfig{Enabled: true}}
+	fingerprint := cfg.webProxyFingerprint()
+	cfg.WebProxy.WebSocketFairQueue = true
+	if fingerprint == cfg.webProxyFingerprint() {
+		t.Fatal("websocket-fair-queue change omitted from restart fingerprint")
+	}
+}
+
+func TestWebProxyPadFirstFramesCarriers(t *testing.T) {
+	for _, carrier := range []string{"", "https", "https-lanes", "websocket", "websocket-lanes"} {
+		cfg := &Config{
+			Secrets:  map[string]string{"alice": "0123456789abcdef0123456789abcdef"},
+			WebProxy: WebProxyConfig{Enabled: true, Hostname: "proxy.example.com", Carrier: carrier, PadFirstFrames: true},
+		}
+		runtime, err := cfg.ToWebProxyRuntimeConfig("0.0.0.0:443")
+		supported := carrier == "" || carrier == "https" || carrier == "websocket"
+		if supported && (err != nil || !runtime.PadFirstFrames) ||
+			!supported && (err == nil || !strings.Contains(err.Error(), "pad-first-frames")) {
+			t.Fatalf("carrier %q: pad=%t err=%v", carrier, runtime.PadFirstFrames, err)
+		}
+	}
+	cfg := &Config{WebProxy: WebProxyConfig{Enabled: true}}
+	fingerprint := cfg.webProxyFingerprint()
+	cfg.WebProxy.PadFirstFrames = true
+	if fingerprint == cfg.webProxyFingerprint() {
+		t.Fatal("pad-first-frames change omitted from restart fingerprint")
 	}
 }
 

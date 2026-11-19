@@ -198,6 +198,34 @@ carrier = "websocket"
 # gnet event loops for the private WEB HTTP listener (0 = automatic).
 # num-event-loops = 0
 
+# Experimental. Maximum size of each carrier body and downlink DATA frame, in KiB.
+# 0 keeps the 2048 KiB default. The valid override range is 4 through 2048.
+# A small value with Nginx keepalive_requests makes the browser open new connections.
+# This can avoid a censor rule that freezes one connection after about 15-20 KB.
+# Each new connection costs a TLS handshake and a SYN, and throughput drops.
+# Read the README section about connection rotation before you change it.
+# carrier-batch-kib = 0
+
+# Experimental, https carrier only. Keep one download response open and send
+# each new downlink frame at once, without a new long poll for each batch.
+# A response ends after the long-poll time (25 seconds) or when the batch is full.
+# The bridge returns to ordinary long polls after any error.
+# Nginx needs proxy_buffering off, as in the shipped templates.
+# stream-download = false
+
+# Experimental, websocket carrier only. Send WINDOW control frames first and
+# rotate DATA fairly across Telegram streams. Each WebSocket message carries at
+# most 160 KiB instead of up to 2048 KiB, so a small reply waits less behind
+# a large download. Each message also costs one more browser event.
+# websocket-fair-queue = false
+
+# Experimental, https and websocket carriers only. Pad the first 8 carrier
+# batches in each direction, as Xray Vision does: a batch under 900 bytes grows
+# to 900 plus 0-500 bytes, and a longer batch gets 0-256 more bytes. This hides
+# MTProto handshake sizes but adds bytes. Evidence shows that the censor counts
+# bytes on each connection, not frame sizes, so padding stays off by default.
+# pad-first-frames = false
+
 # Telegram Middle-End transport is enabled by default, including when this section is absent.
 # Telego checks ME connections in the background and uses direct DC routes until ME is ready.
 # Changes to this section require a restart.

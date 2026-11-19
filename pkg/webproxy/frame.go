@@ -14,6 +14,9 @@ const (
 	InitialStreamWindow = 4 * 1024 * 1024
 	RelayDataChunk      = 64 * 1024
 	maxPingPayload      = 64
+	// MaxPadPayload bounds one PAD frame. Vision-style padding needs at most
+	// 900 + 500 bytes for a short batch.
+	MaxPadPayload = 2048
 )
 
 var (
@@ -28,12 +31,14 @@ var (
 type FrameType uint8
 
 const (
-	FrameOpen    FrameType = 0x01
-	FrameData    FrameType = 0x02
-	FrameClose   FrameType = 0x03
-	FrameWindow  FrameType = 0x04
-	FramePing    FrameType = 0x05
-	FramePong    FrameType = 0x06
+	FrameOpen   FrameType = 0x01
+	FrameData   FrameType = 0x02
+	FrameClose  FrameType = 0x03
+	FrameWindow FrameType = 0x04
+	FramePing   FrameType = 0x05
+	FramePong   FrameType = 0x06
+	// FramePad carries padding on stream zero. Both sides discard it.
+	FramePad     FrameType = 0x07
 	FrameHello   FrameType = 0x10
 	FrameWelcome FrameType = 0x11
 	FrameBye     FrameType = 0x1f
@@ -126,12 +131,12 @@ func ValidateFrame(frame Frame, direction Direction) error {
 	switch direction {
 	case ClientToRelay:
 		switch frame.Type {
-		case FrameOpen, FrameData, FrameClose, FrameWindow, FramePong, FrameHello:
+		case FrameOpen, FrameData, FrameClose, FrameWindow, FramePong, FrameHello, FramePad:
 			return nil
 		}
 	case RelayToClient:
 		switch frame.Type {
-		case FrameData, FrameClose, FrameWindow, FramePing, FrameWelcome, FrameBye:
+		case FrameData, FrameClose, FrameWindow, FramePing, FrameWelcome, FrameBye, FramePad:
 			return nil
 		}
 	default:
@@ -211,6 +216,10 @@ func validateFrameShape(frame Frame) error {
 	case FramePing, FramePong:
 		if frame.StreamID != 0 || len(frame.Payload) > maxPingPayload {
 			return fmt.Errorf("%w: PING and PONG require stream zero and at most %d payload bytes", ErrInvalidFrame, maxPingPayload)
+		}
+	case FramePad:
+		if frame.StreamID != 0 || len(frame.Payload) > MaxPadPayload {
+			return fmt.Errorf("%w: PAD requires stream zero and at most %d payload bytes", ErrInvalidFrame, MaxPadPayload)
 		}
 	case FrameHello:
 		if frame.StreamID != 0 || len(frame.Payload) != 1 || frame.Payload[0] != 1 {

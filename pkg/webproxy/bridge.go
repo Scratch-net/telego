@@ -55,10 +55,21 @@ func renderBridgeForCarrier(
 	maxStreamsPerSession int,
 	diagnostics bool,
 ) (BridgePage, error) {
-	return renderBridgeAtPath(hostname, bootstrapToken, batchBytes, carrier, maxStreamsPerSession, diagnostics, "")
+	return renderBridgeAtPath(hostname, bootstrapToken, batchBytes, carrier, maxStreamsPerSession, diagnostics, "", bridgeFeatures{})
 }
 
-func renderBridgeAtPath(hostname, bootstrapToken string, batchBytes int, carrier CarrierMode, maxStreamsPerSession int, diagnostics bool, basePath string) (BridgePage, error) {
+// bridgeFeatures selects opt-in carrier behavior. The zero value renders the
+// established bridge behavior.
+type bridgeFeatures struct {
+	// streamDownload lets the https bridge ask for one streamed response per
+	// downlink batch. The bridge returns to plain polls after any error.
+	streamDownload bool
+	// padding pads the first uplink batches of https and websocket bridges.
+	// Every bridge discards downlink PAD frames.
+	padding bool
+}
+
+func renderBridgeAtPath(hostname, bootstrapToken string, batchBytes int, carrier CarrierMode, maxStreamsPerSession int, diagnostics bool, basePath string, features bridgeFeatures) (BridgePage, error) {
 	if err := ValidateBasePath(basePath); err != nil {
 		return BridgePage{}, err
 	}
@@ -108,11 +119,14 @@ func renderBridgeAtPath(hostname, bootstrapToken string, batchBytes int, carrier
 		"__MAX_STREAMS__", strconv.Itoa(maxStreamsPerSession),
 		"__WEBSOCKET_TARGET__", string(webSocketTargetJSON),
 		"__DIAGNOSTICS__", strconv.FormatBool(diagnostics),
+		"__STREAM_DOWN__", strconv.FormatBool(features.streamDownload && carrier == CarrierHTTPS),
+		"__PADDING__", strconv.FormatBool(features.padding && !carrier.usesLanes()),
 	).Replace(document)
 	if strings.Contains(body, "__NONCE__") || strings.Contains(body, "__ORIGIN__") ||
 		strings.Contains(body, "__BOOTSTRAP__") || strings.Contains(body, "__CARRIER__") ||
 		strings.Contains(body, "__BATCH_LIMIT__") || strings.Contains(body, "__MAX_STREAMS__") ||
-		strings.Contains(body, "__WEBSOCKET_TARGET__") || strings.Contains(body, "__DIAGNOSTICS__") {
+		strings.Contains(body, "__WEBSOCKET_TARGET__") || strings.Contains(body, "__DIAGNOSTICS__") ||
+		strings.Contains(body, "__STREAM_DOWN__") || strings.Contains(body, "__PADDING__") {
 		return BridgePage{}, errors.New("WEB bridge template replacement failed")
 	}
 	connectSource := "connect-src 'self'"
@@ -337,7 +351,7 @@ function runWebSocketUp(){
   scheduleWebSocketUp();return;
  }
  try{
-  const batch=joinPending(upPending);webSocket.send(batch.body);refreshWebSocketBuffered(webSocket,null);release(batch.total,batch.count);
+  const batch=joinPending(upPending);webSocket.send(padUp(batch.body));refreshWebSocketBuffered(webSocket,null);release(batch.total,batch.count);
   port.postMessage({t:'traffic',up:batch.total,down:0});if(upPending.length)queueMicrotask(runWebSocketUp);else if(webSocket.bufferedAmount)scheduleWebSocketUp();
  }catch(error){fail('ws_send',error,0,webSocket)}
 }
@@ -430,7 +444,7 @@ const bridgeDocument = `<!doctype html>
 <script nonce="__NONCE__">
 (()=>{
 'use strict';
-const relayOrigin=__ORIGIN__,carrier=__CARRIER__,batchLimit=__BATCH_LIMIT__,streamLimit=__MAX_STREAMS__;
+const relayOrigin=__ORIGIN__,carrier=__CARRIER__,batchLimit=__BATCH_LIMIT__,streamLimit=__MAX_STREAMS__,streamDownload=__STREAM_DOWN__,padFrames=__PADDING__;
 let bootstrap=__BOOTSTRAP__;
 const capabilityMatch=/^\?bridge=([A-Za-z0-9_-]{43})$/.exec(location.search||''),bridgeCapability=capabilityMatch?capabilityMatch[1]:'';
 const match=/^#android=([A-Za-z0-9_-]{43})$/.exec(location.hash),androidNonce=match?match[1]:'';

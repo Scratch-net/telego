@@ -81,6 +81,8 @@ func TestValidateFrameShapes(t *testing.T) {
 		{"welcome", Frame{Type: FrameWelcome}, RelayToClient},
 		{"bye empty", Frame{Type: FrameBye}, RelayToClient},
 		{"bye reason", Frame{Type: FrameBye, Payload: []byte("reason")}, RelayToClient},
+		{"pad client", Frame{Type: FramePad, Payload: make([]byte, MaxPadPayload)}, ClientToRelay},
+		{"pad relay empty", Frame{Type: FramePad}, RelayToClient},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -123,6 +125,8 @@ func TestRejectInvalidFrameShapes(t *testing.T) {
 		{"welcome stream", Frame{Type: FrameWelcome, StreamID: 1}},
 		{"welcome payload", Frame{Type: FrameWelcome, Payload: []byte{1}}},
 		{"bye stream", Frame{Type: FrameBye, StreamID: 1}},
+		{"pad stream", Frame{Type: FramePad, StreamID: 1}},
+		{"pad oversized", Frame{Type: FramePad, Payload: make([]byte, MaxPadPayload+1)}},
 		{"payload too large", Frame{Type: FrameData, StreamID: 1, Payload: make([]byte, MaxFramePayload+1)}},
 	}
 	for _, test := range tests {

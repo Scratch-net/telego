@@ -32,6 +32,9 @@ type uplinkApplicationReservation interface {
 type sessionOptions struct {
 	profile               Profile
 	carrier               CarrierMode
+	downFrameBytes        int
+	fairDown              bool
+	padFirstFrames        bool
 	clientIP              string
 	backendNet            string
 	backend               string
@@ -93,6 +96,8 @@ type carrierLane struct {
 	unackedBase     uint64
 	unackedOwner    *carrierBatchOwnership
 	downCursor      uint64
+	fairAfter       uint32 // fair scheduling starts after this stream ID
+	unackedPadded   bool   // the unacked batch ends with one PAD frame
 	lastUpSequence  uint64
 	lastUpDigest    [16]byte
 	upHistory       [httpUpWindow]upCommit
@@ -121,6 +126,9 @@ type Session struct {
 	diagnostic     *bridgeDiagnosticState
 	profile        Profile
 	carrier        CarrierMode
+	downFrameBytes int // 0 keeps the default DATA frame sizes
+	fairDown       bool
+	padBatches     int // remaining new downlink batches that get a PAD frame
 	clientIP       string
 	backendNet     string
 	backend        string
@@ -194,6 +202,18 @@ func newSession(options sessionOptions) *Session {
 	if carrier == "" {
 		carrier = CarrierHTTPS
 	}
+	// Fair scheduling applies only to the multiplexed WebSocket. Its messages
+	// are delivered whole, so it also caps each DATA frame at one message.
+	fairDown := options.fairDown && carrier == CarrierWebSocket
+	downFrameBytes := options.downFrameBytes
+	if limit := options.limits.fairMessageBytes(); fairDown && limit > FrameHeaderSize &&
+		(downFrameBytes == 0 || downFrameBytes > limit) {
+		downFrameBytes = limit
+	}
+	padBatches := 0
+	if options.padFirstFrames && !carrier.usesLanes() {
+		padBatches = padDownlinkBatches
+	}
 	carrierLanes := make(map[uint32]*carrierLane)
 	if carrier != CarrierWebSocketLanes {
 		carrierLanes[0] = newCarrierLane()
@@ -201,6 +221,9 @@ func newSession(options sessionOptions) *Session {
 	session := &Session{
 		profile:               options.profile,
 		carrier:               carrier,
+		downFrameBytes:        downFrameBytes,
+		fairDown:              fairDown,
+		padBatches:            padBatches,
 		clientIP:              options.clientIP,
 		backendNet:            options.backendNet,
 		backend:               options.backend,
@@ -698,6 +721,9 @@ type PollLease struct {
 	ownsSlot  bool
 	once      sync.Once
 	bodyOwner *carrierBatchOwnership
+	// fresh marks a lease whose body is a new batch rather than a replay.
+	// Only a fresh batch can grow into a streamed response.
+	fresh bool
 }
 
 // Replay storage and its serialized response share the established logical
@@ -948,7 +974,13 @@ func (s *Session) pollCarrier(
 				requestBackendCloses(backends)
 				return nil, cursor, false, nil, ErrProtocol
 			}
-			batch := s.takeDownBatchLocked(lane)
+			var batch downBatch
+			if s.fairDown {
+				batch = s.takeFairDownBatchLocked(lane, s.limits.fairMessageBytes())
+			} else {
+				batch = s.takeDownBatchLocked(lane)
+			}
+			lane.unackedPadded = s.padDownBatchLocked(&batch)
 			lane.downCursor++
 			lane.unackedBase = cursor
 			lane.unacked = batch.body
@@ -960,6 +992,7 @@ func (s *Session) pollCarrier(
 			next := lane.downCursor
 			body := batch.body
 			lease.retainBodyLocked()
+			lease.fresh = true
 			s.mu.Unlock()
 			return body, next, false, lease, nil
 		}
@@ -1048,7 +1081,8 @@ func (s *Session) validateBatchLocked(frames []Frame) bool {
 	changed := make(map[uint32]streamSnapshot)
 	for _, frame := range frames {
 		if frame.StreamID == 0 {
-			if frame.Type != FramePong {
+			// The bridge can pad any uplink batch. Padding is discarded.
+			if frame.Type != FramePong && frame.Type != FramePad {
 				return false
 			}
 			continue
@@ -1299,7 +1333,7 @@ func (s *Session) nextReadAllowance(streamID uint32, streamDone <-chan struct{})
 			return 0, false
 		}
 		if state.sendCredit != 0 {
-			allowance := min(int(state.sendCredit), RelayDataChunk)
+			allowance := min(int(state.sendCredit), s.downPayloadLimit(RelayDataChunk))
 			allowance = s.dataFrameAllowanceLocked(allowance)
 			if allowance != 0 {
 				s.mu.Unlock()
@@ -1384,7 +1418,7 @@ func (s *Session) queueFrameLocked(frameType FrameType, streamID uint32, payload
 	if len(lane.pendingFrames) != 0 {
 		last := &lane.pendingFrames[len(lane.pendingFrames)-1]
 		if last.frameType == FrameData && frameType == FrameData && last.streamID == streamID &&
-			len(last.encoded)-FrameHeaderSize+len(payload) <= MaxFramePayload {
+			len(last.encoded)-FrameHeaderSize+len(payload) <= s.downPayloadLimit(MaxFramePayload) {
 			if !s.reservePendingLocked(len(payload), 0, pendingDownlink) {
 				return false
 			}
@@ -1421,6 +1455,15 @@ func (s *Session) queueFrameLocked(frameType FrameType, streamID uint32, payload
 	}
 	s.signalPollLocked(lane)
 	return true
+}
+
+// downPayloadLimit applies the optional downlink frame limit to a DATA payload
+// bound. Without that limit, the bound is unchanged.
+func (s *Session) downPayloadLimit(limit int) int {
+	if s.downFrameBytes == 0 {
+		return limit
+	}
+	return min(limit, s.downFrameBytes-FrameHeaderSize)
 }
 
 func (s *Session) uplinkPendingLimits() (int, int) {
@@ -1541,12 +1584,19 @@ func (s *Session) notifyBudgetLocked() {
 }
 
 func (s *Session) takeDownBatchLocked(lane *carrierLane) downBatch {
+	return s.takeDownFramesLocked(lane, s.limits.CarrierBatchBytes, MaxBatchFrames, false)
+}
+
+// takeDownFramesLocked removes a queue prefix of at most frameLimit frames
+// and byteLimit encoded bytes. Unless mustFit is set, the first frame is
+// always taken, even when it alone exceeds byteLimit.
+func (s *Session) takeDownFramesLocked(lane *carrierLane, byteLimit, frameLimit int, mustFit bool) downBatch {
 	size := 0
 	cost := 0
 	count := 0
-	for count < len(lane.pendingFrames) && count < MaxBatchFrames {
+	for count < len(lane.pendingFrames) && count < frameLimit {
 		next := len(lane.pendingFrames[count].encoded)
-		if count != 0 && size+next > s.limits.CarrierBatchBytes {
+		if (count != 0 || mustFit) && size+next > byteLimit {
 			break
 		}
 		size += next
@@ -1570,6 +1620,68 @@ func (s *Session) takeDownBatchLocked(lane *carrierLane) downBatch {
 		lane.pendingFrames = nil
 	}
 	return downBatch{body: body, cost: cost, items: count}
+}
+
+// nextStreamChunk appends queued frames to the fresh batch that lease is
+// sending as a streamed response. It returns only the appended bytes. It
+// returns nil when the stream must end: the batch is full, the deadline or
+// ctx expired, a newer poll superseded the lease, or the batch is no longer
+// the lane's replay batch. A later poll for the same cursor replays the whole
+// batch: the first body plus every chunk that this function returned.
+func (s *Session) nextStreamChunk(ctx context.Context, lease *PollLease, deadline time.Time) []byte {
+	if lease == nil || !lease.fresh || lease.claim == nil {
+		return nil
+	}
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	lane := lease.lane
+	s.mu.Lock()
+	for {
+		if s.closed || lane.superseded != lease.claim || !lease.ownsSlot || lease.bodyOwner == nil ||
+			lane.unackedOwner != lease.bodyOwner || s.carrierLanes[0] != lane || !time.Now().Before(deadline) {
+			s.mu.Unlock()
+			return nil
+		}
+		if len(lane.pendingFrames) != 0 {
+			start := len(lane.unacked)
+			frames := lane.unackedItems
+			if lane.unackedPadded {
+				frames++
+			}
+			batch := s.takeDownFramesLocked(lane, s.limits.CarrierBatchBytes-start, MaxBatchFrames-frames, true)
+			if batch.items == 0 {
+				s.mu.Unlock()
+				return nil
+			}
+			// Append writes only past the length of earlier slices, so queued
+			// owned writes of earlier chunks keep their bytes.
+			lane.unacked = append(lane.unacked, batch.body...)
+			lane.unackedCost += batch.cost
+			lane.unackedItems += batch.items
+			lease.bodyOwner.cost += batch.cost
+			lease.bodyOwner.items += batch.items
+			s.carrierOwnedCost += batch.cost
+			s.carrierOwnedItems += batch.items
+			s.lastActivity = time.Now()
+			chunk := lane.unacked[start:len(lane.unacked):len(lane.unacked)]
+			s.mu.Unlock()
+			return chunk
+		}
+		notify := lane.notify
+		s.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-lease.claim:
+			return nil
+		case <-s.done:
+			return nil
+		case <-timer.C:
+			return nil
+		case <-notify:
+		}
+		s.mu.Lock()
+	}
 }
 
 func (s *Session) rememberClosedLocked(streamID uint32) {

@@ -89,7 +89,20 @@ func DefaultTimeouts() Timeouts {
 // TCP or an absolute Unix-socket path, with an optional unix:// prefix.
 type ManagerConfig struct {
 	// DebugDiagnostics enables bounded reconnect diagnostics. Disabled by default.
-	DebugDiagnostics   bool
+	DebugDiagnostics bool
+	// DownlinkFrameBytes caps each encoded downlink DATA frame. Zero keeps
+	// 64 KiB backend reads and 1 MiB frame coalescing. Set it with a small
+	// CarrierBatchBytes so that one frame cannot exceed the batch target.
+	DownlinkFrameBytes int
+	// StreamDownload lets the https carrier keep one downlink response open
+	// and append frames to it. The bridge must ask for it on each poll.
+	StreamDownload bool
+	// WebSocketFairQueue schedules multiplexed WebSocket downlink messages
+	// fairly across streams and caps each message at 160 KiB.
+	WebSocketFairQueue bool
+	// PadFirstFrames adds one PAD frame to each of the first downlink
+	// batches of https and websocket sessions. Lanes carriers ignore it.
+	PadFirstFrames     bool
 	Profiles           []Profile
 	Backend            string
 	Carrier            CarrierMode
@@ -131,6 +144,10 @@ func validateManagerConfig(config ManagerConfig) error {
 	}
 	if !config.Carrier.valid() {
 		return fmt.Errorf("%w: unsupported carrier mode %q", ErrInvalidManagerConfig, config.Carrier)
+	}
+	if config.DownlinkFrameBytes != 0 &&
+		(config.DownlinkFrameBytes <= FrameHeaderSize || config.DownlinkFrameBytes > maxCarrierBatchBytes) {
+		return fmt.Errorf("%w: downlink frame limit must be 0 or hold a header and payload within 2 MiB", ErrInvalidManagerConfig)
 	}
 
 	limits := config.Limits

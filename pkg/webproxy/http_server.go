@@ -172,7 +172,8 @@ func NewHTTPServer(config HTTPServerConfig) (*HTTPServer, error) {
 	server := &HTTPServer{
 		config: config,
 		renderBridge: func(hostname, token string, batch int, carrier CarrierMode, streams int, diagnostics bool) (BridgePage, error) {
-			return renderBridgeAtPath(hostname, token, batch, carrier, streams, diagnostics, config.BasePath)
+			features := bridgeFeatures{streamDownload: config.Manager.streamDownload, padding: config.Manager.padFirstFrames}
+			return renderBridgeAtPath(hostname, token, batch, carrier, streams, diagnostics, config.BasePath, features)
 		},
 		ready:          make(chan struct{}),
 		done:           make(chan struct{}),
@@ -952,6 +953,8 @@ type preparedRequest struct {
 	webSocketLane      *WebSocketLaneLease
 	webSocketMultiplex bool
 	httpUp             *httpUpReservation
+	// streamDown records that the bridge asked for a streamed downlink.
+	streamDown bool
 }
 
 func (h *httpEventHandler) prepare(
@@ -1111,7 +1114,10 @@ func (h *httpEventHandler) prepare(
 		if err != nil {
 			return nil, requestSanitizedFallback
 		}
-		return &preparedRequest{request: request, kind: requestDown, session: session, cursor: cursor, laneID: laneID, clientIP: clientIP}, requestCarrier
+		return &preparedRequest{
+			request: request, kind: requestDown, session: session, cursor: cursor, laneID: laneID, clientIP: clientIP,
+			streamDown: request.headers["accept"] == downStreamMediaType,
+		}, requestCarrier
 	default:
 		return nil, requestSanitizedFallback
 	}
@@ -1341,7 +1347,7 @@ func (h *httpEventHandler) dispatch(
 				{"X-Down-Cursor", strconv.FormatUint(request.cursor, 10)},
 			}, close: closeAfter}
 		}
-		err := asyncWriteOwned(connection, response.encodedParts(), func(current gnet.Conn, writeErr error) error {
+		finish := func(current gnet.Conn, writeErr error) error {
 			if writeErr != nil {
 				response.lease.Release()
 				cancel()
@@ -1358,13 +1364,44 @@ func (h *httpEventHandler) dispatch(
 			}
 			state.armDeadline(current, h.server.config.IdleTimeout)
 			return current.Wake(nil)
-		})
-		if err != nil {
-			response.lease.Release()
-			cancel()
-			state.finishRequest()
-			_ = connection.Close()
 		}
+		if response.streamUntil.IsZero() {
+			if err := asyncWriteOwned(connection, response.encodedParts(), finish); err != nil {
+				response.lease.Release()
+				cancel()
+				state.finishRequest()
+				_ = connection.Close()
+			}
+			return
+		}
+		// A streamed downlink writes its head and later chunks without the
+		// completion callback. Their write errors close the connection, and
+		// the canceled context ends the stream here.
+		chunkWritten := func(current gnet.Conn, writeErr error) error {
+			if writeErr != nil {
+				cancel()
+				return current.EventLoop().Close(current)
+			}
+			return nil
+		}
+		err := asyncWriteOwned(connection, response.encodedParts(), chunkWritten)
+		for err == nil {
+			chunk := request.session.nextStreamChunk(ctx, response.lease, response.streamUntil)
+			if chunk == nil {
+				break
+			}
+			err = asyncWriteOwned(connection, chunkedParts(chunk), chunkWritten)
+		}
+		if err == nil && ctx.Err() == nil {
+			err = asyncWriteOwned(connection, [][]byte{[]byte(lastChunk)}, finish)
+			if err == nil {
+				return
+			}
+		}
+		response.lease.Release()
+		cancel()
+		state.finishRequest()
+		_ = connection.Close()
 	}()
 }
 
@@ -1458,6 +1495,7 @@ func (h *httpEventHandler) serve(
 		}}
 
 	case requestDown:
+		started := time.Now()
 		var responseBody []byte
 		var cursor uint64
 		var laneClosed bool
@@ -1493,6 +1531,11 @@ func (h *httpEventHandler) serve(
 		headers = append(headers, responseHeader{"Content-Type", "application/octet-stream"})
 		response := newCarrierResponse(200, headers, responseBody)
 		response.lease = lease
+		if request.streamDown && manager.streamDownload && lease.fresh {
+			// The stream ends no later than an ordinary long poll would. The
+			// operation deadline set in dispatch then still covers its last write.
+			response.streamUntil = started.Add(manager.timeouts.LongPoll)
+		}
 		return response
 
 	case requestDelete:
@@ -1527,6 +1570,22 @@ type carrierResponse struct {
 	body    []byte
 	close   bool
 	lease   *PollLease
+	// A nonzero streamUntil sends body as the first chunk of a chunked
+	// response. dispatch appends later chunks until this time.
+	streamUntil time.Time
+}
+
+// downStreamMediaType in Accept asks for a streamed downlink response. Like
+// the recovery media type, it is an ordinary header that Nginx forwards.
+const downStreamMediaType = "application/vnd.telego.web-stream"
+
+const lastChunk = "0\r\n\r\n"
+
+// chunkedParts frames one HTTP/1.1 chunk. The data part is owned by the
+// carrier batch and is not copied.
+func chunkedParts(data []byte) [][]byte {
+	size := strconv.AppendInt(make([]byte, 0, 10), int64(len(data)), 16)
+	return [][]byte{append(size, "\r\n"...), data, []byte("\r\n")}
 }
 
 func newCarrierResponse(status int, headers []responseHeader, body []byte) carrierResponse {
@@ -1722,6 +1781,9 @@ func (r carrierResponse) encoded() []byte {
 
 func (r carrierResponse) encodedParts() [][]byte {
 	header := r.encodedHeader()
+	if !r.streamUntil.IsZero() {
+		return append([][]byte{header}, chunkedParts(r.body)...)
+	}
 	if len(r.body) == 0 {
 		return [][]byte{header}
 	}
@@ -1741,7 +1803,9 @@ func (r carrierResponse) encodedHeader() []byte {
 		header = append(header, field.value...)
 		header = append(header, "\r\n"...)
 	}
-	if r.status != 204 {
+	if !r.streamUntil.IsZero() {
+		header = append(header, "Transfer-Encoding: chunked\r\n"...)
+	} else if r.status != 204 {
 		header = append(header, "Content-Length: "...)
 		header = strconv.AppendInt(header, int64(len(r.body)), 10)
 		header = append(header, "\r\n"...)

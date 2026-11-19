@@ -85,12 +85,16 @@ type Capacity struct {
 // stream and queue budgets.
 type Manager struct {
 	debugDiagnostics bool
+	streamDownload   bool // https carrier only
+	fairDown         bool // websocket carrier only
+	padFirstFrames   bool // https and websocket carriers only
 
 	// Built from the copied profiles before publication; never mutated.
 	capabilityPrefixes map[uint64]struct{}
 
 	profiles       []Profile
 	carrier        CarrierMode
+	downFrameBytes int
 	backendNet     string
 	backend        string
 	limits         Limits
@@ -154,11 +158,15 @@ func NewManager(config ManagerConfig) (*Manager, error) {
 	}
 	manager := &Manager{
 		debugDiagnostics: config.DebugDiagnostics,
+		streamDownload:   config.StreamDownload && config.Carrier == CarrierHTTPS,
+		fairDown:         config.WebSocketFairQueue && config.Carrier == CarrierWebSocket,
+		padFirstFrames:   config.PadFirstFrames && !config.Carrier.usesLanes(),
 
 		capabilityPrefixes: make(map[uint64]struct{}, len(config.Profiles)),
 
 		profiles:                slices.Clone(config.Profiles),
 		carrier:                 config.Carrier,
+		downFrameBytes:          config.DownlinkFrameBytes,
 		backendNet:              backendNetwork,
 		backend:                 backendAddress,
 		limits:                  config.Limits,
@@ -334,6 +342,9 @@ func (a *BootstrapAuthorization) create(clientIP string, body []byte, owner gnet
 	created := newSession(sessionOptions{
 		profile:               entry.profile,
 		carrier:               m.carrier,
+		downFrameBytes:        m.downFrameBytes,
+		fairDown:              m.fairDown,
+		padFirstFrames:        m.padFirstFrames,
 		clientIP:              clientIP,
 		backendNet:            m.backendNet,
 		backend:               m.backend,

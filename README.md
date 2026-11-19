@@ -343,6 +343,66 @@ real_ip_header CF-Connecting-IP;
 Nginx then sets `$remote_addr` to the client address.
 Keep the CDN address list current. An address range that is missing makes those clients share one address.
 
+### Experimental connection rotation
+
+Some censors freeze one TCP connection after about 15-20 KB from the server to the client. They do not send a reset. More HTTP requests on the same connection do not help. A new connection gets a new byte budget.
+
+The `https` carrier can rotate connections. This mode is an opt-in experiment. Do not use it if WEB works without it.
+
+1. Set `carrier = "https"`.
+2. Set `carrier-batch-kib` to a small value, for example `4`. This value limits each carrier body and each downlink DATA frame. The default is `2048`.
+3. In the Nginx TLS `server` block, close each connection after a few requests:
+
+```nginx
+keepalive_requests 3;   # close the connection after 3 requests (HTTP/1.1 and HTTP/2)
+keepalive_time 30s;     # close the connection after 30 seconds
+```
+
+The browser then opens a new connection for the next request.
+
+The costs are high:
+
+- Each new connection needs a full TLS handshake. The certificate chain uses part of the byte budget of the connection.
+- Throughput becomes very low. Each connection carries only a few small responses.
+- Each new connection sends a SYN. If `synlimit.sh` protects the WEB port, each client IP can open 48 connections per minute, with a burst of 24. Rotation can reach this limit, and then new connections get a reset.
+- Some censors block a port for about 2 minutes after a burst of SYN packets. Fast rotation can cause this block.
+- `keepalive_requests` and `keepalive_time` apply to every request in that `server` block, including the ordinary website.
+
+Do not combine rotation with `stream-download`. A stream keeps one response open on one connection.
+
+### Experimental streamed download
+
+By default, the `https` carrier sends one long poll for each downlink batch. Each batch then waits for one round trip.
+
+Set `stream-download = true` to keep one download response open. Telego sends each new downlink frame in that response at once. This option works only with `carrier = "https"`. It is off by default.
+
+- A streamed response ends after the long-poll time (25 seconds) or when it reaches the batch size.
+- If a stream breaks, the bridge asks for the same batch again with an ordinary long poll. Telego sends the complete batch again, and the bridge skips the frames that it already delivered.
+- After any error, the bridge uses ordinary long polls until Telegram Desktop loads a new bridge page.
+- Nginx must not buffer the response. The shipped templates set `proxy_buffering off`. Telego also sends `X-Accel-Buffering: no`.
+- The bridge asks for a stream with the `Accept: application/vnd.telego.web-stream` request header. Nginx forwards it without a configuration change.
+
+### Experimental fair WebSocket queue
+
+The `websocket` carrier sends all Telegram streams through one WebSocket. By default, Telego sends the queued frames in arrival order, up to 2048 KiB in one message. The browser delivers only complete messages. A small reply can therefore wait behind a large media download.
+
+Set `websocket-fair-queue = true` to change the order of each message:
+
+- WINDOW control frames go first.
+- DATA and CLOSE frames rotate across streams. The frames of one stream keep their order.
+- Each message carries at most 160 KiB (two full 64 KiB backend reads plus small frames).
+
+This option works only with `carrier = "websocket"`. It is off by default. Smaller messages need more browser events, so compare the results on your network before you keep it.
+
+### Experimental padding of the first frames
+
+Set `pad-first-frames = true` to pad the first 8 carrier batches in each direction. Telego and the bridge add one padding frame, which the other side discards. The sizes follow Xray Vision: a batch under 900 bytes grows to 900 plus 0-500 bytes, and a longer batch gets 0-256 more bytes. Padding never makes a batch larger than `carrier-batch-kib`.
+
+This option works only with `carrier = "https"` or `carrier = "websocket"`. It is off by default because:
+
+- Padding adds bytes to each connection.
+- The available evidence shows that the censor freezes a connection after a byte count. It does not use frame sizes. Padding can make that limit come sooner.
+
 ---
 
 ## Configuration
@@ -439,6 +499,10 @@ carrier = "websocket"                    # Installer default. Requires upgrade f
 # backend = "127.0.0.1:443"                # Explicit local socket compatibility path
 # trusted-proxy-cidrs = ["127.0.0.1/32"]   # Nginx peers allowed to send X-Forwarded-For
 # num-event-loops = 0                       # 0 = automatic
+# carrier-batch-kib = 0                     # 0 = 2048 KiB. Experimental: 4-2048
+# stream-download = false                   # Experimental. https carrier only
+# websocket-fair-queue = false              # Experimental. websocket carrier only
+# pad-first-frames = false                  # Experimental. https and websocket carriers only
 
 # Telegram Middle-End transport (enabled by default; changes require a restart)
 [middle-end]
