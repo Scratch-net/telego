@@ -25,7 +25,7 @@ func TestGatewaySetupACMEWebrootPermissions(t *testing.T) {
 		repeat  bool
 		carrier string
 	}{
-		{name: "fresh", carrier: "websocket"},
+		{name: "fresh", carrier: "https"},
 		{name: "repair_existing_private_webroot", repeat: true, carrier: "websocket"},
 		{name: "preserve_existing_lanes", repeat: true, carrier: "websocket-lanes"},
 	} {

@@ -163,12 +163,12 @@ Telego поддерживает нативный WEB-протокол Telegram D
 [web-proxy]
 enabled = true
 hostname = "proxy.example.com"
-carrier = "websocket"
+carrier = "https"
 bind-to = "127.0.0.1:8080"
 trusted-proxy-cidrs = ["127.0.0.1/32"]
 ```
 
-Установщик по умолчанию выбирает `websocket`: одно общее соединение для всех потоков Telegram. Nginx передаёт заголовки WebSocket Upgrade. Повторная установка сохраняет выбранный транспорт.
+Установщик по умолчанию выбирает `https`: некоторые фильтруемые сети обрывают WebSocket-соединения. Nginx также передаёт заголовки WebSocket Upgrade, поэтому `--carrier websocket` тоже работает. Повторная установка сохраняет выбранный транспорт.
 
 `websocket-lanes` остаётся доступен для отдельных очередей потоков. Он требует больше соединений и рукопожатий. Скорость зависит от клиента, сети и нагрузки.
 
@@ -234,7 +234,7 @@ mask-host = "www.google.com"
 [web-proxy]
 enabled = false
 # hostname = "proxy.example.com"
-carrier = "websocket" # Транспорт по умолчанию в установщике.
+carrier = "https" # Транспорт по умолчанию, в том числе в установщике.
 # bind-to = "127.0.0.1:8080"
 # backend = "127.0.0.1:443" # Совместимый путь через локальный сокет
 # trusted-proxy-cidrs = ["127.0.0.1/32"]

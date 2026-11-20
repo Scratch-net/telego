@@ -1457,7 +1457,7 @@ func TestDockerWebProxyExampleConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToWebProxyRuntimeConfig: %v", err)
 	}
-	if runtime.Carrier != webproxy.CarrierWebSocket {
+	if runtime.Carrier != webproxy.CarrierHTTPS {
 		t.Fatalf("example carrier = %q", runtime.Carrier)
 	}
 	managerConfig := webproxy.DefaultManagerConfig(runtime.Profiles, runtime.Backend)

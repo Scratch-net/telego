@@ -2,7 +2,7 @@
 
 This example gives full control of the Nginx, Telego, and certificate configuration.
 
-It selects `websocket`, which shares one connection across Telegram streams. The included Nginx configuration forwards WebSocket upgrades.
+It selects `https`, because some filtered networks break WebSocket connections. The included Nginx configuration also forwards WebSocket upgrades.
 
 Use the [managed gateway](../gateway/README.md) for a new VPS with no existing website configuration.
 

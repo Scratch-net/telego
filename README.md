@@ -53,7 +53,7 @@ curl -fsSL https://raw.githubusercontent.com/Scratch-net/telego/main/examples/ga
 
 The installer configures Telego, Nginx, the TLS certificate, automatic renewal, and persistent host storage.
 
-The installer selects `websocket`, which shares one connection across Telegram streams. ME starts automatically and uses direct routing until its connections are ready.
+The installer selects the `https` carrier, because some filtered networks break WebSocket connections. ME starts automatically and uses direct routing until its connections are ready.
 
 By default, MTProxy and WEB share port 443. Use `--mtproxy-port 9443` to keep WEB on 443 and move MTProxy.
 
@@ -255,16 +255,16 @@ WEB streams enter the shared MTProxy session core directly on gnet. The default 
 
 An explicit `backend` value selects a local TCP or Unix socket for compatibility. This path retains the authenticated PROXY preface. Nginx terminates real TLS in both paths.
 
-The installer selects `websocket` and configures Nginx to forward WebSocket upgrades. Repeat installations preserve the saved carrier.
+The installer selects `https` and also configures Nginx to forward WebSocket upgrades. Repeat installations preserve the saved carrier.
 `websocket-lanes` remains available for separate stream queues. It requires more connections and handshakes, and its performance depends on the client, network, and workload.
 
 The `carrier` value selects one of four transports:
 
 | Value | Transport | Requirements |
 |-------|-----------|--------------|
-| `https` | One serialized fetch and long-poll carrier | This value is the default when `carrier` is empty or absent. |
+| `https` | One serialized fetch and long-poll carrier | Default when `carrier` is empty or absent, and installer default. |
 | `https-lanes` | One fetch and long-poll lane for each Telegram stream | Alternative for deployments without WebSocket support. Requires public HTTP/2. |
-| `websocket` | One multiplexed WebSocket for the WEB session | Installer default. Forward HTTP/1.1 `Upgrade` and `Connection` headers to Telego. |
+| `websocket` | One multiplexed WebSocket for the WEB session | Shares one connection across streams. Some filtered networks break it. Forward HTTP/1.1 `Upgrade` and `Connection` headers to Telego. |
 | `websocket-lanes` | One WebSocket for each Telegram stream | Separate stream queues, with additional connections and handshakes. Requires HTTP/1.1 upgrade forwarding. |
 
 Current Telegram Desktop manages the WEB carrier. The user does not need to open or keep a browser tab.
@@ -492,8 +492,8 @@ mask-host = "www.google.com"  # Host to mimic (SNI validation, proxy links)
 # Native Telegram Desktop WEB proxy (optional; requires Nginx with real TLS)
 [web-proxy]
 enabled = false
-carrier = "websocket"                    # Installer default. Requires upgrade forwarding.
-# Other values: https, https-lanes, websocket-lanes
+carrier = "https"                        # Default and installer default
+# Other values: https-lanes, websocket, websocket-lanes
 # hostname = "proxy.example.com"            # Required public certificate hostname
 # bind-to = "127.0.0.1:8080"               # Private HTTP/1.1 listener
 # backend = "127.0.0.1:443"                # Explicit local socket compatibility path
